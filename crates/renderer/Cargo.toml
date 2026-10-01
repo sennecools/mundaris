@@ -5,6 +5,8 @@ edition.workspace = true
 publish = false
 
 [dependencies]
+mundaris_math = { path = "../math" }
+glam.workspace = true
 egui.workspace = true
 egui-wgpu.workspace = true
 egui-winit.workspace = true
@@ -13,6 +15,9 @@ thiserror.workspace = true
 tracing.workspace = true
 wgpu.workspace = true
 winit.workspace = true
+
+[dev-dependencies]
+naga.workspace = true
 
 [lints]
 workspace = true

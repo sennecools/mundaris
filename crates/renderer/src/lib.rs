@@ -5,6 +5,11 @@
 
 #![forbid(unsafe_code)]
 
+mod debug;
+mod view;
+pub use debug::{DebugFrame, DebugLine, DebugProjection, DebugStaging};
+pub use view::*;
+
 use std::sync::Arc;
 
 use egui_wgpu::ScreenDescriptor;
@@ -16,6 +21,8 @@ use winit::{event::WindowEvent, window::Window};
 /// Failures that can occur while preparing or presenting a native renderer.
 #[derive(Debug, thiserror::Error)]
 pub enum RendererError {
+    #[error(transparent)]
+    Preparation(#[from] RenderPreparationError),
     /// The window surface could not be created.
     #[error("creating the window presentation surface: {0}")]
     CreateSurface(#[from] wgpu::CreateSurfaceError),
@@ -48,6 +55,7 @@ pub struct Renderer {
     egui_renderer: egui_wgpu::Renderer,
     window: Arc<Window>,
     suspended: bool,
+    debug: Option<debug::DebugRenderer>,
 }
 
 impl Renderer {
@@ -136,6 +144,7 @@ impl Renderer {
             egui_renderer,
             window,
             suspended,
+            debug: None,
         })
     }
 
@@ -157,10 +166,30 @@ impl Renderer {
         self.surface_config.width = width;
         self.surface_config.height = height;
         self.surface.configure(&self.device, &self.surface_config);
+        if let Some(debug) = &mut self.debug {
+            debug.resize(&self.device, width, height);
+        }
     }
 
     /// Clears and presents a frame containing UI supplied by the application.
     pub fn render(&mut self, ui: impl FnMut(&egui::Context)) -> Result<(), RendererError> {
+        self.render_frame(None, ui)
+    }
+
+    /// Draws a completely validated, view-bound debug frame before application UI.
+    pub fn render_debug(
+        &mut self,
+        frame: &DebugFrame<'_, '_, '_>,
+        ui: impl FnMut(&egui::Context),
+    ) -> Result<(), RendererError> {
+        self.render_frame(Some(frame), ui)
+    }
+
+    fn render_frame(
+        &mut self,
+        debug_frame: Option<&DebugFrame<'_, '_, '_>>,
+        ui: impl FnMut(&egui::Context),
+    ) -> Result<(), RendererError> {
         if self.suspended {
             return Ok(());
         }
@@ -217,6 +246,18 @@ impl Renderer {
             &screen_descriptor,
         );
 
+        if let Some(frame) = debug_frame {
+            let debug = self.debug.get_or_insert_with(|| {
+                debug::DebugRenderer::new(
+                    &self.device,
+                    self.surface_config.format,
+                    self.surface_config.width,
+                    self.surface_config.height,
+                )
+            });
+            debug.draw(&self.device, &self.queue, &mut encoder, &view, frame)?;
+        }
+
         {
             let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Mundaris clear and UI pass"),
@@ -225,12 +266,16 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.025,
-                            g: 0.035,
-                            b: 0.06,
-                            a: 1.0,
-                        }),
+                        load: if debug_frame.is_some() {
+                            wgpu::LoadOp::Load
+                        } else {
+                            wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.025,
+                                g: 0.035,
+                                b: 0.06,
+                                a: 1.0,
+                            })
+                        },
                         store: wgpu::StoreOp::Store,
                     },
                 })],
