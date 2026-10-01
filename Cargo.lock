@@ -1151,6 +1151,7 @@ dependencies = [
 name = "mundaris_simulation"
 version = "0.0.1"
 dependencies = [
+ "glam",
  "mundaris_math",
  "thiserror 2.0.21",
 ]

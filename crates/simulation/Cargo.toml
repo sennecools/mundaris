@@ -5,6 +5,7 @@ edition.workspace = true
 publish = false
 
 [dependencies]
+glam.workspace = true
 mundaris_math = { path = "../math" }
 thiserror.workspace = true
 
