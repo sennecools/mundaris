@@ -93,6 +93,16 @@ pub enum RenderPreparationError {
 
 /// Observer-centred view with camera-local axes (+X right, +Y up, -Z forward).
 /// Retains a tree borrow even if the lightweight evaluation wrapper is dropped.
+/// ```compile_fail
+/// use std::num::NonZeroU64;
+/// use mundaris_math::*;
+/// use mundaris_renderer::*;
+/// let mut tree = FrameTree::new(NonZeroU64::new(1).unwrap());
+/// let pose = FramePose::new(FramePosition::new(tree.root(), LocalPosition::origin()), UnitRotation::identity());
+/// let view = PreparedView::new(&tree.evaluate(), pose, RenderPrecisionBudget::near_debug()).unwrap();
+/// tree.update_states(1.0, &[]).unwrap();
+/// let _ = view.prepare_source(tree.root());
+/// ```
 pub struct PreparedView<'a> {
     evaluation: FrameEvaluation<'a>,
     observer: FramePose,

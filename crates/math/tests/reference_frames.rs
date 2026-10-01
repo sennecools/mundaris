@@ -223,6 +223,16 @@ fn bounded_depth_and_noncommuting_property_sweep() {
                     .unwrap();
                 assert!((direction.local().unit().length() - 1.0).abs() <= 1e-12);
                 assert_eq!(converted, evaluation.convert_position(p, b).unwrap());
+                assert_eq!(
+                    converted.local().metres().to_array().map(f64::to_bits),
+                    evaluation
+                        .convert_position(p, b)
+                        .unwrap()
+                        .local()
+                        .metres()
+                        .to_array()
+                        .map(f64::to_bits)
+                );
             }
         }
     }

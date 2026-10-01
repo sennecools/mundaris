@@ -17,7 +17,12 @@ wgpu.workspace = true
 winit.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 naga.workspace = true
+
+[[bench]]
+name = "view_preparation"
+harness = false
 
 [lints]
 workspace = true

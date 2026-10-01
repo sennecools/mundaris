@@ -111,6 +111,10 @@ impl Direction3 {
 }
 
 /// Derivative of point components relative to their frame, in metres/second.
+/// ```compile_fail
+/// use mundaris_math::{Displacement3, LinearVelocity3};
+/// let velocity: LinearVelocity3 = Displacement3::zero();
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LinearVelocity3(DVec3);
 

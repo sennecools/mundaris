@@ -8,5 +8,12 @@ publish = false
 glam.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "reference_frames"
+harness = false
+
 [lints]
 workspace = true

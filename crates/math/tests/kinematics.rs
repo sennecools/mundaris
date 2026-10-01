@@ -313,3 +313,63 @@ fn astronomical_pose_velocity_handoff_and_common_motion_cancellation() {
         before
     );
 }
+
+#[test]
+fn body_scale_motion_round_trip_and_finite_derivative_overflow() {
+    let mut tree = FrameTree::new(NonZeroU64::new(1).unwrap());
+    let root = tree.root();
+    let body = tree
+        .insert(
+            root,
+            state(
+                DVec3::new(1e6, 2e6, -3e6),
+                DVec3::new(1.0, 2.0, 3.0),
+                0.7,
+                DVec3::new(30_000.0, 20_000.0, 0.0),
+                DVec3::new(0.1, 0.2, 0.3),
+            ),
+        )
+        .unwrap();
+    let local = point(
+        body,
+        DVec3::new(0.01, 6_371_001.7, -30.0),
+        DVec3::new(0.1, 0.2, 0.3),
+    );
+    let converted = tree
+        .evaluate()
+        .convert_kinematic_point(local, root)
+        .unwrap();
+    let returned = tree
+        .evaluate()
+        .convert_kinematic_point(converted, body)
+        .unwrap();
+    close(
+        returned.position().local().metres(),
+        local.position().local().metres(),
+        1e-7,
+    );
+    close(
+        returned.velocity().relative().metres_per_second(),
+        local.velocity().relative().metres_per_second(),
+        1e-6,
+    );
+    tree.update_states(
+        1.0,
+        &[(
+            body,
+            state(
+                DVec3::ZERO,
+                DVec3::Y,
+                0.0,
+                DVec3::ZERO,
+                DVec3::new(0.0, 0.0, f64::MAX),
+            ),
+        )],
+    )
+    .unwrap();
+    assert!(matches!(
+        tree.evaluate()
+            .convert_kinematic_point(point(body, DVec3::new(3.0, 0.0, 0.0), DVec3::ZERO), root),
+        Err(FrameError::Math(MathError::ArithmeticOverflow))
+    ));
+}

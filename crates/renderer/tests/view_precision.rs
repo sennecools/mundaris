@@ -121,3 +121,31 @@ fn source_centering_before_body_rotation_and_extreme_common_ancestry() {
         }
     }
 }
+
+#[test]
+fn million_metre_source_points_are_subtracted_before_camera_rotation() {
+    let tree = FrameTree::new(NonZeroU64::new(1).unwrap());
+    let root = tree.root();
+    let origin = DVec3::new(6_371_000.0, 6_371_000.0, -6_371_000.0);
+    let camera = UnitRotation::from_axis_angle(
+        Direction3::try_new(DVec3::new(1.0, 2.0, 3.0)).unwrap(),
+        0.91,
+    )
+    .unwrap();
+    let observer = FramePose::new(point(root, origin), camera);
+    let view = PreparedView::new(
+        &tree.evaluate(),
+        observer,
+        RenderPrecisionBudget::near_debug(),
+    )
+    .unwrap();
+    let source = view.prepare_source(root).unwrap();
+    for delta in [DVec3::new(0.001, 0.01, -5.0), DVec3::new(20.0, 3.3, -30.0)] {
+        let actual = source
+            .view_displacement(point(root, origin + delta))
+            .unwrap()
+            .metres();
+        let analytic = camera.quaternion().conjugate() * delta;
+        close(actual, analytic, 1e-9);
+    }
+}
