@@ -146,9 +146,12 @@ impl FixedStepRunner {
         crate::system_diagnostics(system)?;
         let work = IntegrationWorkspace::new(system, config.fixed_step_s)?;
         let baseline = work.states().to_vec().into_boxed_slice();
-        let mut history = History::new(&baseline, config.history_ticks, config.history_bytes)?;
+        // Live and private replay rings share one payload ceiling. Reserving both
+        // before stepping preserves cancellation without exceeding the byte policy.
+        let ring_byte_budget = config.history_bytes / 2;
+        let mut history = History::new(&baseline, config.history_ticks, ring_byte_budget)?;
         history.push(0, &baseline);
-        let replay_history = History::new(&baseline, config.history_ticks, config.history_bytes)?;
+        let replay_history = History::new(&baseline, config.history_ticks, ring_byte_budget)?;
         let mut clock = TimeController::new(system.sample_time());
         clock.set_paused(true);
         Ok(Self {

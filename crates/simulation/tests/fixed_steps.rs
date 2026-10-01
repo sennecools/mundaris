@@ -341,12 +341,11 @@ fn direct_headless_ticks_append_staleness_and_small_history_cap() {
         &world,
         SimulationConfig::try_new(10.0)
             .unwrap()
-            .with_limits(4, 16, 2048, 1024)
+            .with_limits(4, 16, 2048, 2048)
             .unwrap(),
     )
     .unwrap();
-    assert!(r.report().history_payload_bytes <= 1024);
-    assert!(r.report().replay_history_payload_bytes <= 1024);
+    assert!(r.report().history_payload_bytes + r.report().replay_history_payload_bytes <= 2048);
     r.request_forward_to_tick(12).unwrap();
     let report = r.pump(&mut world, |_, _| {}).unwrap();
     assert_eq!(report.work_steps, 4);
