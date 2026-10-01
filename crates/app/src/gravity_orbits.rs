@@ -97,7 +97,6 @@ pub struct GravityOrbitsDemo {
     diagnostic: Option<String>,
     coherent: bool,
     seeking: bool,
-    direction_seed_pending: bool,
     last_wall: Option<Instant>,
     hidden: bool,
     diagnostics: SystemDiagnostics,
@@ -168,7 +167,6 @@ impl GravityOrbitsDemo {
             diagnostic: None,
             coherent: true,
             seeking: false,
-            direction_seed_pending: false,
             last_wall: None,
             hidden: false,
             diagnostics,
@@ -203,7 +201,6 @@ impl GravityOrbitsDemo {
             self.runner.tick(),
             &self.system,
         );
-        self.direction_seed_pending = false;
     }
     fn reseed_diagnostics(&mut self) -> Result<()> {
         self.diagnostics = system_diagnostics(&self.system)?;
@@ -233,15 +230,12 @@ impl GravityOrbitsDemo {
                 let rate = PlaybackRate::try_multiplier(rate)?;
                 if self.runner.rate().multiplier().signum() != rate.multiplier().signum() {
                     self.seed_trails();
-                    self.direction_seed_pending = true;
                 }
                 self.runner.set_rate(rate);
             }
             Command::ResumeAdmission => self.runner.resume_admission(),
             Command::Single(forward) => {
                 self.runner.single_step(forward)?;
-                self.seed_trails();
-                self.direction_seed_pending = true;
                 self.seeking = false;
             }
             Command::Seek(tick) => {
@@ -407,17 +401,11 @@ impl GravityOrbitsDemo {
         }
         let branch = self.runner.branch_generation();
         let seeking = self.seeking;
-        let seed_pending = &mut self.direction_seed_pending;
         let trails = &mut self.trails;
         let started = Instant::now();
         let result = self.runner.pump(&mut self.system, |tick, world| {
             if !seeking {
-                if *seed_pending {
-                    trails.clear_and_seed(branch, tick, world);
-                    *seed_pending = false;
-                } else {
-                    trails.record_committed(branch, tick, world);
-                }
+                trails.record_committed(branch, tick, world);
             }
         });
         self.pump_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -912,5 +900,22 @@ mod tests {
         assert_eq!(demo.trails.sample_count(), 1);
         assert!(demo.diagnostic.is_some());
         assert!(demo.projection.coherent_view(&demo.system).is_ok());
+    }
+    #[test]
+    fn repeated_single_steps_preserve_committed_trail_cadence() {
+        let mut demo = GravityOrbitsDemo::new().unwrap();
+        demo.command(Command::Load(GravityFixture::Circular))
+            .unwrap();
+        for _ in 0..16 {
+            demo.command(Command::Single(true)).unwrap();
+            demo.update(Duration::ZERO);
+        }
+        assert_eq!(demo.trails.retained_ticks(), [0, 8, 16]);
+        demo.command(Command::Single(false)).unwrap();
+        demo.update(Duration::ZERO);
+        assert_eq!(demo.trails.retained_ticks(), [15]);
+        demo.command(Command::Single(false)).unwrap();
+        demo.update(Duration::ZERO);
+        assert_eq!(demo.trails.retained_ticks(), [15]);
     }
 }

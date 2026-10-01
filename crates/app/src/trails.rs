@@ -141,6 +141,7 @@ impl TrailHistory {
         };
         if branch != self.branch
             || (direction != 0 && self.direction != 0 && direction != self.direction)
+            || (direction < 0 && self.direction == 0)
         {
             self.clear_and_seed(branch, tick, system);
             self.direction = direction;
