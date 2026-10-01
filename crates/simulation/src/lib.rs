@@ -3,8 +3,12 @@
 
 #![forbid(unsafe_code)]
 
+mod diagnostics;
 mod gravity;
+mod integrator;
 mod time;
+pub use diagnostics::*;
 pub use gravity::*;
+pub use integrator::*;
 pub use mundaris_math::SimulationInstant;
 pub use time::*;

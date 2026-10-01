@@ -1153,6 +1153,7 @@ version = "0.0.1"
 dependencies = [
  "glam",
  "mundaris_math",
+ "mundaris_world",
  "thiserror 2.0.21",
 ]
 
