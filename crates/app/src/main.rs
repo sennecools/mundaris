@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
-use std::{sync::Arc, time::Duration};
+mod redraw;
+
+use std::{sync::Arc, time::Instant};
 
 use anyhow::{Context, Result, anyhow};
 use mundaris_renderer::Renderer;
@@ -10,14 +12,16 @@ use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
     event::WindowEvent,
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    event_loop::{ActiveEventLoop, EventLoop},
     window::{Window, WindowId},
 };
 
 struct MundarisApp {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
-    startup_error: Option<anyhow::Error>,
+    application_error: Option<anyhow::Error>,
+    occluded: bool,
+    redraw_schedule: redraw::RedrawSchedule,
 }
 
 impl MundarisApp {
@@ -25,13 +29,25 @@ impl MundarisApp {
         Self {
             window: None,
             renderer: None,
-            startup_error: None,
+            application_error: None,
+            occluded: false,
+            redraw_schedule: redraw::RedrawSchedule::default(),
         }
     }
 
     fn fail(&mut self, event_loop: &ActiveEventLoop, error: anyhow::Error) {
-        self.startup_error = Some(error);
+        self.application_error = Some(error);
         event_loop.exit();
+    }
+
+    fn drawable(&self) -> bool {
+        self.window.as_ref().is_some_and(|window| {
+            let size = window.inner_size();
+            !self.occluded
+                && size.width > 0
+                && size.height > 0
+                && window.is_minimized() != Some(true)
+        })
     }
 }
 
@@ -47,7 +63,10 @@ impl ApplicationHandler for MundarisApp {
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(error) => {
-                self.fail(event_loop, error.into());
+                self.fail(
+                    event_loop,
+                    anyhow::Error::new(error).context("creating the native window"),
+                );
                 return;
             }
         };
@@ -67,6 +86,14 @@ impl ApplicationHandler for MundarisApp {
         self.renderer = Some(renderer);
     }
 
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        // Release presentation resources before the native window on suspension.
+        self.renderer = None;
+        self.window = None;
+        self.occluded = false;
+        self.redraw_schedule = redraw::RedrawSchedule::default();
+    }
+
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -84,12 +111,16 @@ impl ApplicationHandler for MundarisApp {
             return;
         };
 
-        let response = renderer.on_window_event(&event);
+        let repaint = renderer.on_window_event(&event);
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => renderer.resize(size.width, size.height),
+            WindowEvent::Occluded(occluded) => self.occluded = occluded,
             WindowEvent::RedrawRequested => {
-                if let Err(error) = renderer.render() {
+                if self.occluded || window.is_minimized() == Some(true) {
+                    return;
+                }
+                if let Err(error) = renderer.render(bootstrap_ui) {
                     self.fail(
                         event_loop,
                         anyhow::Error::new(error).context("rendering a frame"),
@@ -100,19 +131,29 @@ impl ApplicationHandler for MundarisApp {
             _ => {}
         }
 
-        if response.repaint {
+        if repaint && !self.occluded && window.is_minimized() != Some(true) {
             window.request_redraw();
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        event_loop.set_control_flow(ControlFlow::WaitUntil(
-            std::time::Instant::now() + Duration::from_millis(16),
-        ));
-        if let Some(window) = &self.window {
+        let (control_flow, request_redraw) =
+            self.redraw_schedule.update(Instant::now(), self.drawable());
+        event_loop.set_control_flow(control_flow);
+        if request_redraw && let Some(window) = &self.window {
             window.request_redraw();
         }
     }
+}
+
+fn bootstrap_ui(context: &egui::Context) {
+    egui::Window::new("Mundaris")
+        .collapsible(false)
+        .resizable(false)
+        .show(context, |ui| {
+            ui.label("Bootstrap environment");
+            ui.label("Renderer initialized");
+        });
 }
 
 fn main() -> Result<()> {
@@ -131,7 +172,7 @@ fn main() -> Result<()> {
         .run_app(&mut app)
         .context("running the native application event loop")?;
 
-    if let Some(error) = app.startup_error {
+    if let Some(error) = app.application_error {
         return Err(error);
     }
 

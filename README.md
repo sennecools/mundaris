@@ -10,7 +10,13 @@ The initial native development targets are **Windows x86-64** and **Linux x86-64
 
 - Stable Rust with the `rustfmt` and `clippy` components (the included `rust-toolchain.toml` requests them).
 - Native graphics drivers and a desktop session to run the interactive application.
-- On Linux, the development packages required by `winit`/`wgpu` for the selected X11/Wayland and Vulkan configuration.
+- On Linux, native development packages for X11/Wayland and Vulkan. For Ubuntu/Debian, the same packages used by CI can be installed with:
+
+  ```bash
+  sudo apt-get install libvulkan-dev libwayland-dev libxkbcommon-dev \
+    libxkbcommon-x11-dev libx11-dev libx11-xcb-dev libxcb-randr0-dev \
+    libxcb-xfixes0-dev libxcb-shape0-dev libxcb-xkb-dev pkg-config
+  ```
 
 ## Build and run
 
@@ -28,6 +34,8 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ```
+
+CI uses `--locked` for Cargo compilation/lint/test commands to enforce the committed `Cargo.lock`. Tests remain headless; they do not create windows or GPU devices. For interactive validation, run the app and check the panel, resize, minimize/restore, and clean exit. Compilation alone does not establish those runtime behaviors.
 
 ## Workspace map
 

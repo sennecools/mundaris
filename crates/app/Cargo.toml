@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
+egui.workspace = true
 mundaris_renderer = { path = "../renderer" }
 tracing.workspace = true
 tracing-subscriber.workspace = true

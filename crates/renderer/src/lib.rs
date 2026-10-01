@@ -103,7 +103,9 @@ impl Renderer {
             alpha_mode,
             view_formats: vec![],
         };
-        surface.configure(&device, &surface_config);
+        if !suspended {
+            surface.configure(&device, &surface_config);
+        }
 
         let egui_context = egui::Context::default();
         let egui_state = EguiWinitState::new(
@@ -112,7 +114,7 @@ impl Renderer {
             window.as_ref(),
             Some(window.scale_factor() as f32),
             window.theme(),
-            None,
+            Some(device.limits().max_texture_dimension_2d as usize),
         );
         let egui_renderer =
             egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
@@ -137,9 +139,11 @@ impl Renderer {
         })
     }
 
-    /// Passes native window input to egui and reports whether it consumed the event.
-    pub fn on_window_event(&mut self, event: &WindowEvent) -> egui_winit::EventResponse {
-        self.egui_state.on_window_event(self.window.as_ref(), event)
+    /// Passes native window input to egui and reports whether it needs a repaint.
+    pub fn on_window_event(&mut self, event: &WindowEvent) -> bool {
+        self.egui_state
+            .on_window_event(self.window.as_ref(), event)
+            .repaint
     }
 
     /// Updates presentation dimensions, deferring configuration while minimized.
@@ -155,8 +159,8 @@ impl Renderer {
         self.surface.configure(&self.device, &self.surface_config);
     }
 
-    /// Draws the clear frame and small bootstrap UI, then presents it.
-    pub fn render(&mut self) -> Result<(), RendererError> {
+    /// Clears and presents a frame containing UI supplied by the application.
+    pub fn render(&mut self, ui: impl FnMut(&egui::Context)) -> Result<(), RendererError> {
         if self.suspended {
             return Ok(());
         }
@@ -181,15 +185,7 @@ impl Renderer {
         };
 
         let raw_input = self.egui_state.take_egui_input(self.window.as_ref());
-        let full_output = self.egui_context.run(raw_input, |context| {
-            egui::Window::new("Mundaris")
-                .collapsible(false)
-                .resizable(false)
-                .show(context, |ui| {
-                    ui.label("Bootstrap environment");
-                    ui.label("Renderer initialized");
-                });
-        });
+        let full_output = self.egui_context.run(raw_input, ui);
         self.egui_state
             .handle_platform_output(self.window.as_ref(), full_output.platform_output);
 
@@ -251,6 +247,8 @@ impl Renderer {
 
         self.queue
             .submit(extra_command_buffers.into_iter().chain([encoder.finish()]));
+        // Wayland uses this notification to coordinate compositor frame callbacks.
+        self.window.pre_present_notify();
         frame.present();
 
         for texture_id in &full_output.textures_delta.free {
