@@ -230,3 +230,26 @@ fn independent_spin_properties_coherent_publish_and_live_append() {
     );
     assert_eq!(world.sample_time().seconds_since_epoch(), -50.0);
 }
+
+#[test]
+fn coherent_view_rejects_stale_metadata_and_wrong_system() {
+    let mut world = CelestialSystem::new(ns(1), SimulationInstant::ZERO);
+    let id = insert(&mut world, 1.5e11, 0.7);
+    let mut projection = CelestialFrameProjection::build(&world, ns(10)).unwrap();
+    assert!(projection.coherent_view(&world).is_ok());
+    world
+        .edit_body(id, "renamed", BodyProperties::new(1.0, 1.0).unwrap())
+        .unwrap();
+    assert!(matches!(
+        projection.coherent_view(&world),
+        Err(FrameProjectionError::IncoherentPublication)
+    ));
+    let wrong = CelestialSystem::new(ns(2), SimulationInstant::ZERO);
+    let old_revision = projection.represented_revision();
+    assert!(projection.publish(&wrong).is_err());
+    assert_eq!(projection.represented_revision(), old_revision);
+    assert!(projection.coherent_view(&world).is_err());
+    assert!(projection.coherent_view(&wrong).is_err());
+    projection.publish(&world).unwrap();
+    assert!(projection.coherent_view(&world).is_ok());
+}

@@ -17,6 +17,8 @@ pub enum FrameProjectionError {
     WrongSystem(BodyId),
     #[error("body has not been projected: {0:?}")]
     UnknownBody(BodyId),
+    #[error("world and frame projection do not represent the same committed revision and instant")]
+    IncoherentPublication,
     #[error(transparent)]
     FramePublicationFailed(#[from] FrameError),
     #[error(transparent)]
@@ -53,6 +55,24 @@ fn states(state: BodyState) -> Result<[FrameState; 2], MathError> {
     ])
 }
 impl CelestialFrameProjection {
+    /// Explicit coherence gate. Both immutable borrows survive through preparation
+    /// and rendering; neither side can be mutated while this paired view is alive.
+    pub fn coherent_view<'a>(
+        &'a self,
+        system: &'a CelestialSystem,
+    ) -> Result<CoherentCelestialView<'a>, FrameProjectionError> {
+        if self.namespace != system.namespace
+            || self.body_frames.len() != system.body_count()
+            || self.represented_revision != system.revision()
+            || self.tree.evaluate().sample_time_s() != system.sample_time().seconds_since_epoch()
+        {
+            return Err(FrameProjectionError::IncoherentPublication);
+        }
+        Ok(CoherentCelestialView {
+            system,
+            projection: self,
+        })
+    }
     /// Supply a fresh tree namespace on every independent build, including rebuilds.
     pub fn build(
         system: &CelestialSystem,
@@ -140,5 +160,22 @@ impl CelestialFrameProjection {
     }
     pub fn represented_revision(&self) -> u64 {
         self.represented_revision
+    }
+}
+
+/// Read-only world/projection pair known to describe one committed state.
+pub struct CoherentCelestialView<'a> {
+    system: &'a CelestialSystem,
+    projection: &'a CelestialFrameProjection,
+}
+impl<'a> CoherentCelestialView<'a> {
+    pub fn system(&self) -> &'a CelestialSystem {
+        self.system
+    }
+    pub fn projection(&self) -> &'a CelestialFrameProjection {
+        self.projection
+    }
+    pub fn evaluation(&self) -> FrameEvaluation<'a> {
+        self.projection.tree.evaluate()
     }
 }

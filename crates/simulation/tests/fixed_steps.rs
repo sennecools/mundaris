@@ -280,3 +280,54 @@ fn hundred_retained_snapshots_restore_exactly_and_origin_pauses() {
     assert!(r.paused());
     assert_eq!(r.report().status, PlaybackStatus::OriginBoundary);
 }
+
+#[test]
+fn thousand_gravity_commits_projection_coherence_and_rebuild() {
+    let mut world = circular(0.0, DVec3::ZERO, DVec3::ZERO);
+    let mut r = runner(&world, 512, 65536, 2048);
+    let mut projection =
+        CelestialFrameProjection::build(&world, std::num::NonZeroU64::new(1).unwrap()).unwrap();
+    for _ in 0..1000 {
+        r.single_step(true).unwrap();
+        r.pump(&mut world, |_, _| {}).unwrap();
+        assert!(projection.coherent_view(&world).is_err());
+        projection.publish(&world).unwrap();
+        let paired = projection.coherent_view(&world).unwrap();
+        let evaluation = paired.evaluation();
+        for (id, body) in paired.system().bodies() {
+            let frames = paired.projection().frames_for(id).unwrap();
+            let anchor = evaluation.state(frames.translating).unwrap();
+            assert_eq!(
+                anchor.parent_from_local().translation().metres(),
+                body.state().center_in_system().metres()
+            );
+            assert_eq!(
+                anchor.motion().unwrap().origin_velocity_in_parent(),
+                body.state().center_velocity_in_system()
+            );
+            assert_eq!(
+                evaluation
+                    .state(frames.body_fixed)
+                    .unwrap()
+                    .parent_from_local()
+                    .translation(),
+                mundaris_math::Displacement3::zero()
+            );
+        }
+    }
+    let states_before = states(&world);
+    let revision = world.revision();
+    let rebuilt =
+        CelestialFrameProjection::build(&world, std::num::NonZeroU64::new(2).unwrap()).unwrap();
+    for (id, _) in world.bodies() {
+        let old = projection.frames_for(id).unwrap().body_fixed;
+        let new = rebuilt.frames_for(id).unwrap().body_fixed;
+        assert_ne!(old, new);
+        assert_eq!(
+            projection.tree().evaluate().transform_to_root(old).unwrap(),
+            rebuilt.tree().evaluate().transform_to_root(new).unwrap()
+        );
+    }
+    assert_eq!(world.revision(), revision);
+    assert_eq!(states(&world), states_before);
+}
