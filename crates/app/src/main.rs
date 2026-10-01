@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod redraw;
+mod reference_frames;
 
 use std::{sync::Arc, time::Instant};
 
@@ -22,17 +23,23 @@ struct MundarisApp {
     application_error: Option<anyhow::Error>,
     occluded: bool,
     redraw_schedule: redraw::RedrawSchedule,
+    demo: Option<reference_frames::ReferenceFrameDemo>,
 }
 
 impl MundarisApp {
-    fn new() -> Self {
-        Self {
+    fn new(reference_frames: bool) -> Result<Self> {
+        Ok(Self {
             window: None,
             renderer: None,
             application_error: None,
             occluded: false,
             redraw_schedule: redraw::RedrawSchedule::default(),
-        }
+            demo: if reference_frames {
+                Some(reference_frames::ReferenceFrameDemo::new()?)
+            } else {
+                None
+            },
+        })
     }
 
     fn fail(&mut self, event_loop: &ActiveEventLoop, error: anyhow::Error) {
@@ -120,11 +127,14 @@ impl ApplicationHandler for MundarisApp {
                 if self.occluded || window.is_minimized() == Some(true) {
                     return;
                 }
-                if let Err(error) = renderer.render(bootstrap_ui) {
-                    self.fail(
-                        event_loop,
-                        anyhow::Error::new(error).context("rendering a frame"),
-                    );
+                let size = window.inner_size();
+                let result = if let Some(demo) = &mut self.demo {
+                    demo.render(renderer, size.width, size.height)
+                } else {
+                    renderer.render(bootstrap_ui).map_err(anyhow::Error::new)
+                };
+                if let Err(error) = result {
+                    self.fail(event_loop, error.context("rendering a frame"));
                     return;
                 }
             }
@@ -167,7 +177,17 @@ fn main() -> Result<()> {
         .map_err(|error| anyhow!("initializing structured logging: {error}"))?;
 
     let event_loop = EventLoop::new().context("creating the native event loop")?;
-    let mut app = MundarisApp::new();
+    let mut reference_frames = false;
+    for argument in std::env::args().skip(1) {
+        if argument == "--reference-frames" && !reference_frames {
+            reference_frames = true;
+        } else {
+            anyhow::bail!(
+                "unknown or duplicate argument: {argument}; usage: mundaris_app [--reference-frames]"
+            );
+        }
+    }
+    let mut app = MundarisApp::new(reference_frames)?;
     event_loop
         .run_app(&mut app)
         .context("running the native application event loop")?;

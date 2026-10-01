@@ -973,6 +973,8 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "egui",
+ "glam",
+ "mundaris_math",
  "mundaris_renderer",
  "tracing",
  "tracing-subscriber",
