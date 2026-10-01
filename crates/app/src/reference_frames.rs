@@ -397,6 +397,20 @@ impl ReferenceFrameDemo {
                 returned.reexpress(self.fixture.tree.evaluate(), before.pose.position().frame())?;
                 let residual = residuals(returned, before)?;
                 check_handoff(residual)?;
+                if target != self.fixture.tree.root()
+                    && before.pose.position().frame() != self.fixture.tree.root()
+                {
+                    ensure!(
+                        residual.position_m <= 1e-7,
+                        "body/local re-expression position residual {} m",
+                        residual.position_m
+                    );
+                    ensure!(
+                        residual.velocity_m_s <= 1e-6,
+                        "body/local re-expression velocity residual {} m/s",
+                        residual.velocity_m_s
+                    );
+                }
                 self.observer = after;
                 self.residual = residual;
                 self.controls.mode = Mode::Manual;
@@ -808,6 +822,20 @@ mod tests {
         assert!(
             demo.observer
                 .reexpress(demo.fixture.tree.evaluate(), other.root())
+                .is_err()
+        );
+        assert_eq!(demo.observer, before);
+        let unknown = demo
+            .fixture
+            .tree
+            .insert(
+                demo.fixture.regional,
+                FrameState::new(RigidTransform::identity(), None),
+            )
+            .unwrap();
+        assert!(
+            demo.observer
+                .reexpress(demo.fixture.tree.evaluate(), unknown)
                 .is_err()
         );
         assert_eq!(demo.observer, before);
