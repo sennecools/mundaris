@@ -53,6 +53,22 @@ fn no_self_force_and_deterministic_order() {
     for (n, pairs) in [(3, 3), (16, 120), (64, 2016), (256, 32640), (1024, 523776)] {
         assert_eq!(pair_count(n).unwrap(), pairs);
     }
+    let mut first = [DVec3::ZERO; 2];
+    let mut second = [DVec3::ZERO; 2];
+    evaluate_accelerations(
+        &[2e20; 2],
+        &[DVec3::ZERO, DVec3::new(3e7, 4e7, 0.0)],
+        &mut first,
+    )
+    .unwrap();
+    evaluate_accelerations(
+        &[2e20; 2],
+        &[DVec3::ZERO, DVec3::new(3e7, 4e7, 0.0)],
+        &mut second,
+    )
+    .unwrap();
+    assert_eq!(first, second);
+    assert_eq!(first[0], -first[1]);
 }
 
 #[test]

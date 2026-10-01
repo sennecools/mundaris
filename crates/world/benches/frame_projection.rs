@@ -26,7 +26,7 @@ fn fixture(count: usize) -> CelestialSystem {
 fn benches(c: &mut Criterion) {
     let mut group = c.benchmark_group("frame_projection");
     let mut namespace = 1u64;
-    for count in [64, 1024, 4096] {
+    for count in [3, 16, 64, 256, 1024, 4096] {
         let world = fixture(count);
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::new("build", count), &count, |b, _| {

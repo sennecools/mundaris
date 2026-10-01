@@ -54,6 +54,28 @@ fn states(state: BodyState) -> Result<[FrameState; 2], MathError> {
         ),
     ])
 }
+fn preflight_capacity_revision(
+    bodies: usize,
+    projected: usize,
+    revision: u64,
+) -> Result<(), FrameProjectionError> {
+    let total = bodies
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(1))
+        .ok_or(FrameError::CapacityExceeded)?;
+    if total as u128 > u32::MAX as u128 + 1 {
+        return Err(FrameError::CapacityExceeded.into());
+    }
+    let appends = bodies
+        .checked_sub(projected)
+        .and_then(|n| n.checked_mul(2))
+        .ok_or(FrameError::CapacityExceeded)?;
+    revision
+        .checked_add(appends as u64)
+        .and_then(|r| r.checked_add(1))
+        .ok_or(FrameError::RevisionOverflow)?;
+    Ok(())
+}
 impl CelestialFrameProjection {
     /// Explicit coherence gate. Both immutable borrows survive through preparation
     /// and rendering; neither side can be mutated while this paired view is alive.
@@ -95,21 +117,11 @@ impl CelestialFrameProjection {
         if self.namespace != system.namespace || self.body_frames.len() > system.body_count() {
             return Err(FrameProjectionError::FrameProjectionMismatch);
         }
-        let total_frames = system
-            .body_count()
-            .checked_mul(2)
-            .and_then(|count| count.checked_add(1))
-            .ok_or(FrameError::CapacityExceeded)?;
-        if total_frames as u128 > u32::MAX as u128 + 1 {
-            return Err(FrameError::CapacityExceeded.into());
-        }
-        let append_count = (system.body_count() - self.body_frames.len()) * 2;
-        self.tree
-            .evaluate()
-            .revision()
-            .checked_add(append_count as u64)
-            .and_then(|r| r.checked_add(1))
-            .ok_or(FrameError::RevisionOverflow)?;
+        preflight_capacity_revision(
+            system.body_count(),
+            self.body_frames.len(),
+            self.tree.evaluate().revision(),
+        )?;
         // Numeric conversion only copies checked f64 vectors; validate before any append.
         for (_, body) in system.bodies() {
             states(*body.state())?;
@@ -164,6 +176,15 @@ impl CelestialFrameProjection {
 }
 
 /// Read-only world/projection pair known to describe one committed state.
+/// ```compile_fail
+/// use mundaris_world::*;
+/// use std::num::NonZeroU64;
+/// let mut world=CelestialSystem::new(NonZeroU64::new(1).unwrap(),SimulationInstant::ZERO);
+/// let projection=CelestialFrameProjection::build(&world,NonZeroU64::new(1).unwrap()).unwrap();
+/// let pair=projection.coherent_view(&world).unwrap();
+/// world.update_states(SimulationInstant::ZERO,&[]).unwrap();
+/// let _=pair.system().revision();
+/// ```
 pub struct CoherentCelestialView<'a> {
     system: &'a CelestialSystem,
     projection: &'a CelestialFrameProjection,
@@ -177,5 +198,38 @@ impl<'a> CoherentCelestialView<'a> {
     }
     pub fn evaluation(&self) -> FrameEvaluation<'a> {
         self.projection.tree.evaluate()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn capacity_and_revision_preflight_fail_before_any_derived_mutation() {
+        assert!(matches!(
+            preflight_capacity_revision(usize::MAX, 0, 0),
+            Err(FrameProjectionError::FramePublicationFailed(
+                FrameError::CapacityExceeded
+            ))
+        ));
+        assert!(matches!(
+            preflight_capacity_revision(u32::MAX as usize / 2 + 1, 0, 0),
+            Err(FrameProjectionError::FramePublicationFailed(
+                FrameError::CapacityExceeded
+            ))
+        ));
+        assert!(matches!(
+            preflight_capacity_revision(1, 1, u64::MAX),
+            Err(FrameProjectionError::FramePublicationFailed(
+                FrameError::RevisionOverflow
+            ))
+        ));
+        assert!(matches!(
+            preflight_capacity_revision(2, 1, u64::MAX - 2),
+            Err(FrameProjectionError::FramePublicationFailed(
+                FrameError::RevisionOverflow
+            ))
+        ));
+        assert!(preflight_capacity_revision(2, 1, u64::MAX - 3).is_ok());
     }
 }

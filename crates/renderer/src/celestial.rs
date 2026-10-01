@@ -308,6 +308,9 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
             let screen = self.projection.project_marker(center)?;
             let diameter = 2.0 * radius * self.projection.focal_pixels()
                 / (-center.z).max(self.projection.near_m());
+            if !diameter.is_finite() {
+                return Err(RenderPreparationError::InvalidDebugGeometry);
+            }
             let representation = if -center.z + radius <= self.projection.near_m() {
                 SphereRepresentation::Culled
             } else if distance - radius > self.range_m {
@@ -327,6 +330,10 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
                         LocalPosition::try_metres(radius * unit)?,
                     );
                     let delta = prepared.view_displacement(point)?.metres();
+                    // Representation fallback cannot hide invalid later f64 vertices.
+                    if fallback {
+                        continue;
+                    }
                     match self.projection.narrow(delta, 0.001 * radius, self.range_m) {
                         Ok((position, error, pixels)) => {
                             let normal = prepared
@@ -345,7 +352,6 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
                             | RenderPreparationError::OutsideRenderRange { .. },
                         ) => {
                             fallback = true;
-                            break;
                         }
                         Err(error) => return Err(error),
                     }

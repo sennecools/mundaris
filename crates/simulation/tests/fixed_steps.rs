@@ -333,3 +333,69 @@ fn thousand_gravity_commits_projection_coherence_and_rebuild() {
     assert_eq!(world.revision(), revision);
     assert_eq!(states(&world), states_before);
 }
+
+#[test]
+fn direct_headless_ticks_append_staleness_and_small_history_cap() {
+    let mut world = circular(0.0, DVec3::ZERO, DVec3::ZERO);
+    let mut r = FixedStepRunner::new(
+        &world,
+        SimulationConfig::try_new(10.0)
+            .unwrap()
+            .with_limits(4, 16, 2048, 1024)
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(r.report().history_payload_bytes <= 1024);
+    assert!(r.report().replay_history_payload_bytes <= 1024);
+    r.request_forward_to_tick(12).unwrap();
+    let report = r.pump(&mut world, |_, _| {}).unwrap();
+    assert_eq!(report.work_steps, 4);
+    assert_eq!(report.tick, 4);
+    drain(&mut r, &mut world);
+    assert_eq!(r.tick(), 12);
+    assert!(r.request_forward_to_tick(11).is_err());
+    world
+        .insert_body(
+            "appended",
+            BodyProperties::new(1.0, 1.0).unwrap(),
+            state(DVec3::Z * 1e8, DVec3::ZERO),
+        )
+        .unwrap();
+    assert!(matches!(
+        r.pump(&mut world, |_, _| {}).unwrap_err().source,
+        SimulationError::StaleSession
+    ));
+    r.rebranch_after_edit(&world).unwrap();
+    assert_eq!(r.tick(), 0);
+    assert_eq!(r.branch_generation(), 1);
+}
+
+#[test]
+fn orientation_and_spin_branch_do_not_change_gravity_or_translation() {
+    let mut a = circular(0.0, DVec3::ZERO, DVec3::ZERO);
+    let mut b = circular(0.0, DVec3::ZERO, DVec3::ZERO);
+    let mut ar = runner(&a, 512, 65536, 2048);
+    let mut br = runner(&b, 512, 65536, 2048);
+    let id = b.bodies().nth(1).unwrap().0;
+    let old = *b.body(id).unwrap().state();
+    let changed = BodyState::new(
+        old.center_in_system(),
+        old.center_velocity_in_system(),
+        mundaris_math::UnitRotation::from_axis_angle(
+            mundaris_math::Direction3::try_new(DVec3::Y).unwrap(),
+            0.7,
+        )
+        .unwrap(),
+        mundaris_math::AngularVelocity3::try_radians_per_second(DVec3::new(0.0001, 0.0002, 0.0003))
+            .unwrap(),
+    );
+    br.edit_state(&mut b, id, changed).unwrap();
+    ar.request_forward_to_tick(1000).unwrap();
+    br.request_forward_to_tick(1000).unwrap();
+    drain(&mut ar, &mut a);
+    drain(&mut br, &mut b);
+    for (a, b) in states(&a).into_iter().zip(states(&b)) {
+        assert_eq!(a.center_in_system(), b.center_in_system());
+        assert_eq!(a.center_velocity_in_system(), b.center_velocity_in_system());
+    }
+}

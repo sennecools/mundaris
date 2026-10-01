@@ -13,6 +13,7 @@ struct Maxima {
     com: f64,
     phase: f64,
     period: f64,
+    oracle_crossing_interpolation_s: f64,
 }
 fn run(e: f64, periods: f64, h: f64, boosted: bool) -> Maxima {
     let (offset, boost) = if boosted {
@@ -68,6 +69,16 @@ fn run(e: f64, periods: f64, h: f64, boosted: bool) -> Maxima {
                     max.period = max
                         .period
                         .max(((time - last_return) / period() - 1.0).abs());
+                    let oracle_return = (returns + 1) as f64 * period();
+                    let k0 = (oracle_return / h).floor();
+                    let t0 = k0 * h;
+                    let n = std::f64::consts::TAU / period();
+                    let interpolated = t0
+                        + h * ((returns + 1) as f64 * std::f64::consts::TAU - n * t0)
+                            / (n * (t0 + h) - n * t0);
+                    max.oracle_crossing_interpolation_s = max
+                        .oracle_crossing_interpolation_s
+                        .max((interpolated - oracle_return).abs());
                 }
                 last_return = time;
                 crossing += std::f64::consts::TAU;
@@ -85,6 +96,7 @@ fn run(e: f64, periods: f64, h: f64, boosted: bool) -> Maxima {
         assert!(max.radius <= 2e-5);
         assert!(max.energy <= 1e-7);
         assert!(max.period <= 1e-5);
+        assert!(max.oracle_crossing_interpolation_s <= 1e-8);
         assert!(max.phase <= if periods > 100.0 { 0.03 } else { 0.003 });
     } else {
         assert!(max.energy <= 2e-5);

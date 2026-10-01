@@ -1105,6 +1105,7 @@ name = "mundaris_app"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "criterion",
  "egui",
  "glam",
  "mundaris_math",
@@ -1151,6 +1152,7 @@ dependencies = [
 name = "mundaris_simulation"
 version = "0.0.1"
 dependencies = [
+ "criterion",
  "glam",
  "mundaris_math",
  "mundaris_world",

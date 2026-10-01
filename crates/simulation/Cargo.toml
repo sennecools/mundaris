@@ -10,5 +10,16 @@ mundaris_math = { path = "../math" }
 mundaris_world = { path = "../world" }
 thiserror.workspace = true
 
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "gravity"
+harness = false
+
+[[bench]]
+name = "fixed_steps"
+harness = false
+
 [lints]
 workspace = true

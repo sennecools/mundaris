@@ -167,4 +167,16 @@ fn f64_trail_clipping_and_marker_selection() {
     ];
     assert_eq!(select_marker(&markers, [100.0, 100.0]), Some(0));
     assert_eq!(select_marker(&markers, [109.0, 100.0]), None);
+    assert!(
+        frame
+            .append_historical_lines(
+                root,
+                &[DebugLine {
+                    endpoints: [FramePosition::new(root, LocalPosition::origin()); 2],
+                    color: [f32::NAN; 4]
+                }]
+            )
+            .is_err()
+    );
+    assert!(frame.validate().is_err());
 }

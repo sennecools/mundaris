@@ -425,6 +425,7 @@ impl GravityOrbitsDemo {
             Ok(report) => report,
             Err(error) => {
                 self.diagnostic = Some(error.to_string());
+                self.seeking = false;
                 *error.report
             }
         };
@@ -534,7 +535,7 @@ impl GravityOrbitsDemo {
             }
             let selected = self.requests[self.selected];
             let source = selected.body_fixed_frame;
-            let lines = std::array::from_fn::<_, 3, _>(|i| {
+            let line = |i: usize| {
                 let endpoint =
                     [DVec3::X, DVec3::Y, DVec3::Z][i] * (1.2 * selected.reference_radius_m);
                 Ok::<_, anyhow::Error>(DebugLine {
@@ -548,8 +549,8 @@ impl GravityOrbitsDemo {
                         [0.1, 0.3, 1.0, 1.0],
                     ][i],
                 })
-            });
-            let lines = lines.into_iter().collect::<Result<Vec<_>>>()?;
+            };
+            let lines = [line(0)?, line(1)?, line(2)?];
             frame.append_historical_lines(source, &lines)?;
             Ok(())
         })();
@@ -719,12 +720,12 @@ fn draw_ui(
         ui.label(format!("Requested {}x / achieved {} / {:?}",info.runner.rate().multiplier(),info.achieved_rate.map_or_else(||"not yet measured".into(),|r|format!("{r:.3}x (wall sample)")),info.advance.status));
         ui.label(format!("Pending {} ticks / {:.3} s (fraction {:.3} s)",info.advance.backlog_ticks,info.advance.pending_simulation_seconds,info.advance.fractional_seconds));
         ui.label(format!("Latest update: {} work / {} forward / {} restore; {:.3} ms",info.advance.work_steps,info.advance.forward_steps,info.advance.restored_steps,info.pump_ms));
-        ui.label(format!("Rejected demand {:.3} s / explicitly cancelled {:.3} s",info.advance.rejected_simulation_seconds,info.advance.cancelled_simulation_seconds));
+        ui.label(format!("Latest rejected demand {:.3} s / latest explicit cancellation {:.3} s",info.advance.rejected_simulation_seconds,info.advance.cancelled_simulation_seconds));
         if let Some(remaining)=info.advance.replay_remaining {
             ui.colored_label(egui::Color32::YELLOW,format!("Private replay: {remaining} work remaining, estimate {}",info.throughput.map_or_else(||"unmeasured".into(),|rate|format!("{:.2} wall s",remaining as f64/rate))));
             if ui.button("Cancel seek/replay (retain live world)").clicked() {controls.pending=Some(Command::CancelSeek);}
         }
-        ui.label(format!("History ticks {:?}, {} bytes; snapshots restore / positive-step replay",info.advance.retained_ticks,info.advance.history_payload_bytes));
+        ui.label(format!("History ticks {:?}, {} live + {} private replay bytes; snapshots restore / positive-step replay",info.advance.retained_ticks,info.advance.history_payload_bytes,info.advance.replay_history_payload_bytes));
         ui.horizontal(|ui| {
             if ui.button(if info.runner.paused() {"Resume"} else {"Pause (cancel debt)"}).clicked() {controls.pending=Some(Command::Pause(!info.runner.paused()));}
             if ui.button("Single +").clicked() {controls.pending=Some(Command::Single(true));}

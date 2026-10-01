@@ -88,6 +88,7 @@ pub struct SimulationAdvanceReport {
     pub replay_remaining: Option<u64>,
     pub retained_ticks: Option<(u64, u64)>,
     pub history_payload_bytes: usize,
+    pub replay_history_payload_bytes: usize,
     pub branch_generation: u64,
 }
 
@@ -198,8 +199,11 @@ impl FixedStepRunner {
         self.segment_elapsed = Duration::ZERO;
     }
     fn clear_demand(&mut self) {
-        self.cancelled += self.clock.requested_time().seconds_since_epoch()
+        let cancelled = self.clock.requested_time().seconds_since_epoch()
             - self.authority().seconds_since_epoch();
+        if cancelled != 0.0 {
+            self.cancelled = cancelled;
+        }
         self.target = self.tick;
         self.segment(self.authority());
     }
@@ -266,7 +270,7 @@ impl FixedStepRunner {
             return Err(SimulationError::TimeResolution);
         }
         if self.overload {
-            self.rejected += seconds;
+            self.rejected = seconds;
             return Ok(());
         }
         let cumulative = self
@@ -293,7 +297,7 @@ impl FixedStepRunner {
         tick_time(self.epoch, self.config.fixed_step_s, target)?;
         if target.abs_diff(self.tick) > self.config.backlog_limit {
             self.overload = true;
-            self.rejected += seconds;
+            self.rejected = seconds;
             self.status = PlaybackStatus::DemandHaltedOverload;
             return Ok(());
         }
@@ -355,6 +359,26 @@ impl FixedStepRunner {
         }
         Ok(())
     }
+    /// Headless exact forward demand. Integration still respects fixed h and the
+    /// work/admission ceilings; this is not a seek or an immediate world mutation.
+    pub fn request_forward_to_tick(&mut self, target: u64) -> Result<(), SimulationError> {
+        if target < self.tick || self.replay.is_some() || self.seek.is_some() {
+            return Err(SimulationError::InvalidConfig);
+        }
+        let time = tick_time(self.epoch, self.config.fixed_step_s, target)?;
+        if target - self.tick > self.config.backlog_limit {
+            self.overload = true;
+            self.status = PlaybackStatus::DemandHaltedOverload;
+            self.rejected =
+                time.seconds_since_epoch() - self.clock.requested_time().seconds_since_epoch();
+            return Ok(());
+        }
+        self.clock.set_paused(false);
+        self.segment(time);
+        self.target = target;
+        self.single = false;
+        Ok(())
+    }
     pub fn report(&self) -> SimulationAdvanceReport {
         let requested = self.clock.requested_time();
         SimulationAdvanceReport {
@@ -384,6 +408,7 @@ impl FixedStepRunner {
                 .map(|r| r.target.saturating_sub(r.tick) + u64::from(!r.initialized) + 1),
             retained_ticks: self.history.range(),
             history_payload_bytes: self.history.bytes(),
+            replay_history_payload_bytes: self.replay_history.bytes(),
             branch_generation: self.branch,
         }
     }
@@ -404,6 +429,9 @@ impl FixedStepRunner {
         let result = self.pump_inner(system, &mut after_commit, &mut counters);
         if let Err(source) = result {
             self.clock.set_paused(true);
+            self.replay = None;
+            self.seek = None;
+            self.single = false;
             self.status = PlaybackStatus::NumericalFailure;
             let mut report = self.report();
             Self::counters(&mut report, counters, self.work.ids.len());
@@ -552,6 +580,8 @@ impl FixedStepRunner {
     }
     pub fn reset_branch(&mut self, system: &mut CelestialSystem) -> Result<(), SimulationError> {
         self.work.check(system)?;
+        let cancelled = self.clock.requested_time().seconds_since_epoch()
+            - self.authority().seconds_since_epoch();
         self.work.restore(&self.baseline)?;
         self.work.commit_candidate(system, self.epoch)?;
         self.tick = 0;
@@ -561,6 +591,7 @@ impl FixedStepRunner {
         self.set_rate(PlaybackRate::NORMAL);
         self.overload = false;
         self.status = PlaybackStatus::Paused;
+        self.cancelled = cancelled;
         Ok(())
     }
     /// External mutation is detected, never silently regathered. Explicit paused
@@ -590,6 +621,8 @@ impl FixedStepRunner {
             .ok_or(SimulationError::InvalidConfig)?;
         let mut replacement = Self::new(system, config)?;
         replacement.branch = branch;
+        replacement.cancelled = self.clock.requested_time().seconds_since_epoch()
+            - self.authority().seconds_since_epoch();
         *self = replacement;
         Ok(())
     }
@@ -632,6 +665,8 @@ impl FixedStepRunner {
         replacement.history.clear();
         replacement.history.push(0, &replacement.baseline);
         replacement.branch = branch;
+        replacement.cancelled = self.clock.requested_time().seconds_since_epoch()
+            - self.authority().seconds_since_epoch();
         Ok(replacement)
     }
     pub fn edit_properties(

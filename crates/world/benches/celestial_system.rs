@@ -47,7 +47,7 @@ fn benches(c: &mut Criterion) {
     }
     lookup.finish();
     let mut group = c.benchmark_group("full_state_publication");
-    for count in [64, 1024, 4096] {
+    for count in [3, 16, 64, 256, 1024, 4096] {
         let mut world = fixture(count);
         let updates: Vec<_> = world
             .bodies()
@@ -61,6 +61,32 @@ fn benches(c: &mut Criterion) {
             b.iter(|| {
                 world
                     .update_states(black_box(SimulationInstant::ZERO), black_box(&updates))
+                    .unwrap();
+                black_box(&world);
+            })
+        });
+    }
+    group.finish();
+    let mut group = c.benchmark_group("new_time_full_state_publication");
+    for count in [3, 16, 64, 256, 1024] {
+        let mut world = fixture(count);
+        let mut time = 0.0;
+        let updates: Vec<_> = world
+            .bodies()
+            .map(|(body, b)| BodyStateUpdate {
+                body,
+                state: *b.state(),
+            })
+            .collect();
+        group.throughput(Throughput::Elements(count as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, _| {
+            b.iter(|| {
+                time += 1.0;
+                world
+                    .update_states(
+                        black_box(SimulationInstant::try_seconds_since_epoch(time).unwrap()),
+                        black_box(&updates),
+                    )
                     .unwrap();
                 black_box(&world);
             })
