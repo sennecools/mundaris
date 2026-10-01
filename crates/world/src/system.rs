@@ -76,7 +76,7 @@ impl CelestialSystem {
         self.bodies.len()
     }
     /// Dense deterministic enumeration for future simulation working buffers.
-    pub fn bodies(&self) -> impl ExactSizeIterator<Item = (BodyId, &CelestialBody)> {
+    pub fn bodies(&self) -> impl ExactSizeIterator<Item = (BodyId, &CelestialBody)> + Clone {
         self.bodies
             .iter()
             .enumerate()

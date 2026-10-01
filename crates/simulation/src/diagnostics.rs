@@ -3,7 +3,7 @@
 use crate::{GRAVITATIONAL_CONSTANT_M3_KG_S2 as G, SimulationError};
 use glam::DVec3;
 use mundaris_math::SimulationInstant;
-use mundaris_world::CelestialSystem;
+use mundaris_world::{BodyState, CelestialSystem};
 
 #[derive(Default)]
 struct Sum {
@@ -56,27 +56,46 @@ impl SystemDiagnostics {
 }
 
 pub fn system_diagnostics(system: &CelestialSystem) -> Result<SystemDiagnostics, SimulationError> {
+    diagnostics(
+        system.sample_time(),
+        system
+            .bodies()
+            .map(|(_, b)| (b.properties().mass_kg(), *b.state())),
+    )
+}
+
+pub(crate) fn dense_diagnostics(
+    time: SimulationInstant,
+    masses: &[f64],
+    states: &[BodyState],
+) -> Result<SystemDiagnostics, SimulationError> {
+    diagnostics(time, masses.iter().copied().zip(states.iter().copied()))
+}
+
+fn diagnostics(
+    time: SimulationInstant,
+    bodies: impl Iterator<Item = (f64, BodyState)> + Clone,
+) -> Result<SystemDiagnostics, SimulationError> {
     let mut mass = Sum::default();
     let mut kinetic = Sum::default();
     let mut potential = Sum::default();
     let mut momentum = VectorSum::default();
     let mut com_delta = VectorSum::default();
     let mut qp = Sum::default();
-    let anchor = system
-        .bodies()
+    let anchor = bodies
+        .clone()
         .next()
-        .map_or(DVec3::ZERO, |(_, b)| b.state().center_in_system().metres());
-    for (_, b) in system.bodies() {
-        mass.add(b.properties().mass_kg());
+        .map_or(DVec3::ZERO, |(_, state)| state.center_in_system().metres());
+    for (m, _) in bodies.clone() {
+        mass.add(m);
     }
     let total_mass = mass.total();
     if !total_mass.is_finite() {
         return Err(SimulationError::DiagnosticArithmetic);
     }
-    for (_, b) in system.bodies() {
-        let m = b.properties().mass_kg();
-        let x = b.state().center_in_system().metres();
-        let v = b.state().center_velocity_in_system().metres_per_second();
+    for (m, state) in bodies.clone() {
+        let x = state.center_in_system().metres();
+        let v = state.center_velocity_in_system().metres_per_second();
         kinetic.add((0.5 * m) * v.dot(v));
         momentum.add(m * v);
         qp.add(m * crate::gravity::distance(v));
@@ -91,23 +110,22 @@ pub fn system_diagnostics(system: &CelestialSystem) -> Result<SystemDiagnostics,
     };
     let mut angular = VectorSum::default();
     let mut ql = Sum::default();
-    for (i, (_, b)) in system.bodies().enumerate() {
-        let m = b.properties().mass_kg();
-        let x = b.state().center_in_system().metres();
+    for (i, (m, state)) in bodies.clone().enumerate() {
+        let x = state.center_in_system().metres();
         let relative = x - center;
-        let v = b.state().center_velocity_in_system().metres_per_second() - vcom;
+        let v = state.center_velocity_in_system().metres_per_second() - vcom;
         angular.add(relative.cross(m * v));
         ql.add((m * crate::gravity::distance(relative)) * crate::gravity::distance(v));
-        for (_, other) in system.bodies().skip(i + 1) {
-            let r = crate::gravity::distance(other.state().center_in_system().metres() - x);
+        for (other_mass, other) in bodies.clone().skip(i + 1) {
+            let r = crate::gravity::distance(other.center_in_system().metres() - x);
             if !r.is_normal() {
                 return Err(SimulationError::DiagnosticArithmetic);
             }
-            potential.add(-((G * m / r) * other.properties().mass_kg()));
+            potential.add(-((G * m / r) * other_mass));
         }
     }
     let result = SystemDiagnostics {
-        sampled_time: system.sample_time(),
+        sampled_time: time,
         kinetic_energy_j: kinetic.total(),
         potential_energy_j: potential.total(),
         linear_momentum_kg_m_s: momentum,

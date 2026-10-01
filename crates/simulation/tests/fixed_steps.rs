@@ -177,6 +177,8 @@ fn edit_preflight_rejects_without_changing_session_and_name_retains_history() {
     let report = r.report();
     let coincident = state(old[0].center_in_system().metres(), DVec3::ZERO);
     assert!(r.edit_state(&mut w, ids[1], coincident).is_err());
+    let invalid_diagnostic = state(old[1].center_in_system().metres(), DVec3::X * 1e200);
+    assert!(r.edit_state(&mut w, ids[1], invalid_diagnostic).is_err());
     assert_eq!(states(&w), old);
     assert_eq!(w.revision(), revision);
     assert!(!r.paused());

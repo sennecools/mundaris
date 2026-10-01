@@ -142,6 +142,7 @@ impl FixedStepRunner {
         config: SimulationConfig,
     ) -> Result<Self, SimulationError> {
         tick_time(system.sample_time(), config.fixed_step_s, 0)?;
+        crate::system_diagnostics(system)?;
         let work = IntegrationWorkspace::new(system, config.fixed_step_s)?;
         let baseline = work.states().to_vec().into_boxed_slice();
         let mut history = History::new(&baseline, config.history_ticks, config.history_bytes)?;
@@ -536,7 +537,9 @@ impl FixedStepRunner {
             self.status = PlaybackStatus::Replaying;
         } else if self.overload {
             self.status = PlaybackStatus::DemandHaltedOverload;
-        } else if self.status != PlaybackStatus::OriginBoundary {
+        } else if self.status != PlaybackStatus::OriginBoundary
+            && self.status != PlaybackStatus::NumericalFailure
+        {
             self.status = if self.clock.paused() {
                 PlaybackStatus::Paused
             } else if self.target != self.tick {
@@ -620,6 +623,11 @@ impl FixedStepRunner {
         }
         replacement.work.restore(&replacement.baseline)?;
         replacement.work.promote();
+        crate::diagnostics::dense_diagnostics(
+            system.sample_time(),
+            &replacement.work.masses_kg,
+            &replacement.baseline,
+        )?;
         replacement.replay_work = replacement.work.clone();
         replacement.history.clear();
         replacement.history.push(0, &replacement.baseline);
