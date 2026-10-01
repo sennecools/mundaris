@@ -1,5 +1,6 @@
 //! Append-only frame topology and immutable, single-instant relative evaluation.
 
+use crate::{AngularVelocity3, FramePose, FrameVelocity, KinematicPoint, LinearVelocity3};
 use crate::{
     FrameDirection, FrameDisplacement, FrameMotion, FramePosition, LocalPosition, MathError,
     RigidTransform, UnitRotation, coordinates::arithmetic,
@@ -312,6 +313,92 @@ impl<'a> FrameEvaluation<'a> {
     pub fn transform_to_root(self, frame: FrameId) -> Result<RigidTransform, FrameError> {
         self.branch(self.tree.index(frame)?, 0)
     }
+
+    fn moving_branch(
+        self,
+        mut index: usize,
+        ancestor: usize,
+    ) -> Result<(RigidTransform, FrameMotion), FrameError> {
+        let mut pose = RigidTransform::identity();
+        let mut motion = FrameMotion::stationary();
+        while index != ancestor {
+            let state = self.tree.nodes[index].state;
+            let outer_motion = state
+                .motion
+                .ok_or(FrameError::MissingMotion(self.tree.id(index)))?;
+            let outer = state.parent_from_local;
+            let rotated_origin = outer.rotation().rotate_raw(pose.translation().metres())?;
+            let omega = outer_motion
+                .angular_velocity_in_parent()
+                .radians_per_second();
+            let velocity = arithmetic(
+                arithmetic(
+                    outer_motion.origin_velocity_in_parent().metres_per_second()
+                        + arithmetic(omega.cross(rotated_origin))?,
+                )? + outer
+                    .rotation()
+                    .rotate_raw(motion.origin_velocity_in_parent().metres_per_second())?,
+            )?;
+            let angular = arithmetic(
+                omega
+                    + outer
+                        .rotation()
+                        .rotate_raw(motion.angular_velocity_in_parent().radians_per_second())?,
+            )?;
+            motion = FrameMotion::new(
+                LinearVelocity3::try_metres_per_second(velocity)?,
+                AngularVelocity3::try_radians_per_second(angular)?,
+            );
+            pose = outer.compose(pose)?;
+            index = self.parent_index(index);
+        }
+        Ok((pose, motion))
+    }
+
+    /// Derivative preparation visits only edges below the LCA. Unknown is not zero.
+    pub fn prepare_kinematic_conversion(
+        self,
+        from: FrameId,
+        to: FrameId,
+    ) -> Result<PreparedKinematicConversion<'a>, FrameError> {
+        let ancestor = self.lca(from, to)?;
+        let (source, source_motion) = self.moving_branch(from.index as usize, ancestor)?;
+        let (target, target_motion) = self.moving_branch(to.index as usize, ancestor)?;
+        let rotation = target.rotation().inverse().compose(source.rotation());
+        Ok(PreparedKinematicConversion {
+            pose: PreparedFrameConversion {
+                evaluation: self,
+                from,
+                to,
+                source,
+                target,
+                rotation,
+            },
+            source_motion,
+            target_motion,
+        })
+    }
+
+    pub fn convert_kinematic_point(
+        self,
+        point: KinematicPoint,
+        target: FrameId,
+    ) -> Result<KinematicPoint, FrameError> {
+        self.prepare_kinematic_conversion(point.position().frame(), target)?
+            .convert_point(point)
+    }
+
+    /// Coordinate re-expression, not physical attachment or a control-mode change.
+    pub fn reexpress_pose(self, pose: FramePose, target: FrameId) -> Result<FramePose, FrameError> {
+        let prepared = self.prepare_conversion(pose.position().frame(), target)?;
+        if pose.position().frame() == target {
+            return Ok(pose);
+        }
+        Ok(FramePose::new(
+            prepared.convert_position(pose.position())?,
+            prepared.rotation().compose(pose.orientation()),
+        ))
+    }
     /// Walk only branches below the LCA, retaining their separate origins.
     pub fn prepare_conversion(
         self,
@@ -364,6 +451,69 @@ pub struct PreparedFrameConversion<'a> {
     source: RigidTransform,
     target: RigidTransform,
     rotation: UnitRotation,
+}
+
+/// Instantaneous point-and-derivative conversion retaining the same tree borrow.
+/// No position-free velocity transform is provided: rotating frames need a lever arm.
+pub struct PreparedKinematicConversion<'a> {
+    pose: PreparedFrameConversion<'a>,
+    source_motion: FrameMotion,
+    target_motion: FrameMotion,
+}
+impl PreparedKinematicConversion<'_> {
+    pub fn convert_point(&self, value: KinematicPoint) -> Result<KinematicPoint, FrameError> {
+        agree(self.pose.from, value.position().frame())?;
+        if self.pose.from == self.pose.to {
+            return Ok(value);
+        }
+        let source_point = self
+            .pose
+            .source
+            .rotation()
+            .rotate_raw(value.position().local().metres())?;
+        let lever = arithmetic(
+            arithmetic(
+                self.pose.source.translation().metres() - self.pose.target.translation().metres(),
+            )? + source_point,
+        )?;
+        let source_omega = self
+            .source_motion
+            .angular_velocity_in_parent()
+            .radians_per_second();
+        let target_omega = self
+            .target_motion
+            .angular_velocity_in_parent()
+            .radians_per_second();
+        let in_lca = arithmetic(
+            arithmetic(
+                self.source_motion
+                    .origin_velocity_in_parent()
+                    .metres_per_second()
+                    + arithmetic(source_omega.cross(source_point))?,
+            )? + self
+                .pose
+                .source
+                .rotation()
+                .rotate_raw(value.velocity().relative().metres_per_second())?,
+        )?;
+        let relative = arithmetic(
+            arithmetic(
+                in_lca
+                    - self
+                        .target_motion
+                        .origin_velocity_in_parent()
+                        .metres_per_second(),
+            )? - arithmetic(target_omega.cross(lever))?,
+        )?;
+        let velocity = self.pose.target.rotation().inverse().rotate_raw(relative)?;
+        KinematicPoint::try_new(
+            self.pose.convert_position(value.position())?,
+            FrameVelocity::new(
+                self.pose.to,
+                LinearVelocity3::try_metres_per_second(velocity)?,
+            ),
+        )
+    }
 }
 impl PreparedFrameConversion<'_> {
     pub fn rotation(&self) -> UnitRotation {
