@@ -1,8 +1,8 @@
 # Mundaris
 
-Mundaris is planned as a native desktop world-building and planetary simulation application, designed to span astronomical and local surface scales. Checked reference frames, an editable celestial body model and explicit simulation-time control are implemented. Procedural worlds and gravitational evolution remain future work.
+Mundaris is a native desktop world-building and planetary simulation project spanning astronomical and local surface scales. Checked reference frames, editable celestial state, deterministic Newtonian gravity, fixed-step orbital integration and minimal celestial debug rendering are implemented. Procedural worlds remain future work.
 
-**Status:** early private development — Phase 2 celestial model/time implementation is present. Windows automated checks and native startup/close pass; full visual, Linux and current-change remote CI acceptance remain open. See [Phase 2 evidence](docs/phase-2-validation.md) and [Phase 1 evidence](docs/phase-1-validation.md).
+**Status:** Phase 3 implemented and validated on Windows, including the operator-reported visual sequence. Linux native/release/interactive and current-revision remote CI acceptance remain open. See [Phase 3 evidence](docs/phase-3-validation.md), [Phase 2 evidence](docs/phase-2-validation.md), and [Phase 1 evidence](docs/phase-1-validation.md). Prerequisite evidence was deferred explicitly in [ADR 0004](docs/adr/0004-gravity-integration-and-playback.md).
 
 The initial native development targets are **Windows x86-64** and **Linux x86-64**.
 
@@ -25,11 +25,31 @@ cargo build --workspace
 cargo run -p mundaris_app
 cargo run --locked -p mundaris_app -- --reference-frames
 cargo run --locked -p mundaris_app -- --celestial-model
+cargo run --locked -p mundaris_app -- --gravity-orbits
 ```
 
 Normal invocation opens the bootstrap panel. `--reference-frames` draws abstract axes and wire boxes attached to an analytically translating/rotating hierarchy, with source-centred rendering, precision diagnostics, pause/seek/reset, a `1e16 m` shared-offset stress mode, continuous approach, paused frame re-expression, and centimetre movement buttons. Begin approach while paused, then select Play. Re-expression and local movement are available while paused. This fixture contains no planet, terrain, or physics simulation.
 
 `--celestial-model` creates Solace, Aurelia and Luma at star/planet/moon-scale magnitudes. Their bounded `-600..600 s` prescribed motion is an analytic validation fixture, not orbital physics. The panel provides rate/reverse/pause, explicit seek/reset, body selection, translating/body-fixed focus and observer re-expression, projection rebuilding, and atomic name/mass/reference-radius edits. Body-local axes are drawn through the generic renderer; distant bodies have textual bearing/distance markers. Reset preserves body IDs, restores fixture properties/state, and selects Aurelia in body-fixed focus at `0 s`, `1x`, paused.
+
+`--gravity-orbits` starts the mutual-gravity Solace/Aurelia/Luma hierarchy at `0 s`,
+fixed `h=60 s`, overview, Aurelia selected, `1000x` selected but paused. Resume
+explicitly; changing a rate alone does not unpause. The circular oracle is an
+explicit replacement fixture with `h=10 s`. Drag outside the panel to orbit,
+wheel to zoom, click markers/names or Tab to select, and focus/fit/overview to
+inspect the same connected system. Physical spheres, debug shading, selected axes,
+labels and navigation markers are derived and never change physical radius.
+
+The panel distinguishes requested/authoritative time, measured achieved rate,
+pending ticks/time, work per update, lag and overload. At most 512 work units run
+per update; exceeding the 65,536-tick admission cap halts new demand visibly while
+retained debt drains at unchanged h. Pause cancels debt. Reverse restores bounded
+snapshots or privately replays positive steps from the branch baseline. Seek shows
+quantization before confirmation; replay can be cancelled without changing live
+state. Reset preserves IDs/edited baseline/focus; loading an original fixture is
+separate. Mass/radius/velocity edits start a paused new branch; names retain history.
+Trails are actual committed history, inertial or explicitly simultaneous
+body-relative history. They are cleared on branch/seek/direction/mode changes.
 
 ## Quality checks
 
@@ -44,11 +64,11 @@ CI uses `--locked` for Cargo compilation/lint/test commands to enforce the commi
 ## Workspace map
 
 - `mundaris_app` — process entry point, native event loop, logging, and composition.
-- `mundaris_renderer` — checked observer-relative CPU preparation, debug line drawing, `wgpu` surface and `egui` integration.
+- `mundaris_renderer` — observer-relative precision, forward-depth debug lines, reverse-Z celestial spheres/trails, `wgpu` and `egui` integration.
 - `mundaris_core` — reserved for small, genuinely shared foundations.
 - `mundaris_math` — finite SI coordinate/time values, rigid rotations/transforms, transactional frame trees, LCA conversions and instantaneous kinematics.
 - `mundaris_world` — authoritative append-only celestial bodies, coherent system state/time and disposable body-to-frame projection.
-- `mundaris_simulation` — checked requested-time playback control; future evolution of authoritative state.
+- `mundaris_simulation` — deterministic serial f64 gravity/KDK, fixed-step demand/backlog, snapshots/replay, and conserved-quantity diagnostics.
 - `docs/` — architecture constraints, development standards, performance policy, roadmap, and ADRs.
 
 ## Focused validation and benchmarks
@@ -60,9 +80,19 @@ cargo bench --locked -p mundaris_renderer --bench view_preparation
 cargo test --locked -p mundaris_world -p mundaris_simulation -p mundaris_math --release
 cargo bench --locked -p mundaris_world --bench celestial_system
 cargo bench --locked -p mundaris_world --bench frame_projection
+cargo test --locked -p mundaris_simulation --release --test orbits long_run -- --ignored --nocapture
+cargo bench --locked -p mundaris_simulation --bench gravity
+cargo bench --locked -p mundaris_simulation --bench fixed_steps
+cargo bench --locked -p mundaris_renderer --bench celestial_preparation
+cargo bench --locked -p mundaris_app --bench trail_history
 ```
 
-Benchmarks are CPU-only, use Criterion, and stay outside normal CI. Workloads, hardware, results, and numerical limitations are in [performance notes](docs/performance.md); architectural decisions are in [ADR 0002](docs/adr/0002-reference-frames-and-precision.md) and [ADR 0003](docs/adr/0003-celestial-domain-and-time.md).
+Benchmarks are CPU-only, use Criterion, and stay outside normal CI. Large 512-step
+1024-body probes take several seconds per batch and extend Criterion's measurement
+time. Workloads, distributions and limitations are in [performance notes](docs/performance.md).
+Decisions are in [ADR 0002](docs/adr/0002-reference-frames-and-precision.md),
+[ADR 0003](docs/adr/0003-celestial-domain-and-time.md), and
+[ADR 0004](docs/adr/0004-gravity-integration-and-playback.md).
 
 ## Repository status
 

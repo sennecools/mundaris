@@ -7,7 +7,7 @@
 | `mundaris_core` | Small, dependency-light foundations shared by multiple systems when a concrete need exists. |
 | `mundaris_math` | Checked f64 SI coordinates and working-epoch time value, rigid transforms, runtime frame tree, LCA evaluation and instantaneous derivative conversion using `glam`. |
 | `mundaris_world` | Authoritative celestial properties/kinematics, one coherent sample instant, transactional mutations and derived body/frame associations. |
-| `mundaris_simulation` | Requested-time playback control; future evolution of authoritative world state. |
+| `mundaris_simulation` | Serial Newtonian gravity/KDK, integer fixed ticks, admitted demand, bounded snapshots/replay and numerical diagnostics. |
 | `mundaris_renderer` | GPU presentation infrastructure and disposable visual representations. |
 | `mundaris_app` | Native process, event loop, logging, and top-level subsystem composition. |
 
@@ -15,7 +15,7 @@ Dependencies point inward toward lightweight/domain foundations. World and simul
 
 The long-term intent is detailed in [the engine design](../MUNDARIS_ENGINE_DESIGN.md). [Phase 1](../MUNDARIS_PHASE_1_REFERENCE_FRAMES.md) implements generic frame-tree mathematics in `mundaris_math`, an app-owned validation fixture/observer session, and read-only mathematical evaluation passed to the renderer. Future domain-owned tree instances/associations belong in `mundaris_world`. Runtime frame identity remains distinct from persistent domain/generated-content identity.
 
-Current project dependencies are app → renderer/math/world/simulation, renderer → math, world → math, simulation → math. Simulation can later depend on world without a cycle. Core remains documentation-only. Criterion is a dev dependency of math/renderer/world; matching naga is a renderer dev dependency for headless shader validation. World/simulation have no graphics dependencies.
+Current project dependencies are app → renderer/math/world/simulation, renderer → math, world → math, simulation → math/world. Core remains documentation-only. Criterion is a dev dependency of math/renderer/world/simulation/app; matching naga validates renderer WGSL headlessly. World/simulation have no graphics dependencies.
 
 ## Celestial domain and time
 
@@ -40,6 +40,24 @@ durations and changes requested time only. The app's pure bounded analytic
 producer explicitly samples/commits the world and then publishes frames; this is
 not an integrator or a free-seek promise for future integrated simulations.
 
+Phase 3's `FixedStepRunner` operates on borrowed mutable world state, never frames.
+It gathers stable dense IDs/masses/full states into reusable candidate buffers,
+evaluates serial lexicographic unordered pairs in f64, and uses full-time KDK
+velocities. One new force pass is needed per warm step; old acceleration was
+validated at initialization or the previous successful drift. Candidate validation
+precedes one transactional full-state world commit. Cache promotion and complete
+history recording follow success. A narrow callback observes every public commit
+for app trail sampling. External revisions/appends reject stale sessions.
+
+Integer time is reconstructed from epoch/tick/fixed h with resolution guards.
+Rate-segment anchors plus cumulative exact Duration distinguish admitted demand
+from achieved authority. Work is bounded; over-cap intervals are rejected visibly,
+preserving previous debt. Reverse uses recent complete snapshots and deterministic
+positive replay outside retention. Private replay publishes only its completed
+target. Physical edits preflight proposed force/diagnostics/capacity, then capture a
+new immutable branch baseline; name edits preserve physical history. See
+[ADR 0004](adr/0004-gravity-integration-and-playback.md).
+
 `CelestialFrameProjection` is world-owned, disposable and rebuildable using a
 fresh caller-supplied tree namespace. Every body has a root-child translating
 anchor (center/velocity, identity rotation, zero spin) and a rotating body-fixed
@@ -50,6 +68,12 @@ state into one Phase 1 batch at the exact system instant; represented revision i
 recorded after success. No mutable tree access is exposed and no celestial body
 stores a frame ID. Renderer/UI receive read-only views; editor commands use world
 validation. See [ADR 0003](adr/0003-celestial-domain-and-time.md).
+
+The explicit `coherent_view` gate validates system namespace/topology, represented
+revision and exact sample time, retaining both immutable borrows through render
+preparation/submission. App projects once after pumping; failure pauses and
+suppresses celestial drawing, retaining valid physics. Fresh projection namespaces
+are remapped through body identity/attachment role rather than persisted FrameId.
 
 ## State and representation boundaries
 
@@ -75,7 +99,23 @@ Future large procedural regions should be reconstructed from explicit determinis
 
 ## Native presentation boundary
 
-The renderer creates a native surface/device, presents, handles resizing, draws an optional line-list/depth debug pass, and integrates `egui`. The app's celestial validation uses those generic facilities without adding renderer domain dependencies. Gravity, planet generation, terrain, persistence and general editor systems remain unimplemented.
+The renderer creates a native surface/device, presents, handles resizing, draws
+the existing forward-depth debug path or separate infinite reverse-Z celestial
+path, and integrates egui. Celestial requests contain copied physical radius,
+fixed-frame handles and styles, without BodyId/world/simulation dependencies.
+One 642-vertex/1280-triangle indexed icosphere topology is reusable; each vertex is
+formed in f64 source coordinates, source-centred, camera-rotated and narrowed under
+physical-radius and 0.05-pixel budgets. Camera-axis normals and color/flags provide
+debug shading. Opaque spheres write reverse depth; historical lines test without
+writes, before no-depth navigation overlays/UI. No depth bias is used.
+
+App owns the focus camera, selection and bounded synchronized f64 TrailHistory.
+Trail samples are committed tick/time/all-body centres, without frame handles.
+Simultaneous relative history subtracts both bodies at each historical sample;
+today's projection only labels conversion sources. Clipping/narrowing/staging are
+renderer-owned. Failed frames cannot upload partial batches. The app library target
+supports headless session tests and history benchmarks in the existing package.
+Planet generation, terrain/LOD, persistence and general editor systems remain deferred.
 
 The app supplies the bootstrap panel through a per-frame UI callback; the renderer owns only UI input and GPU integration. Native events and UI types stay at this app/renderer boundary. An `Arc<Window>` safely keeps the surface's native handle alive without leaks or shared mutable domain state. Presentation notifies `winit` before submitting the frame to the compositor.
 

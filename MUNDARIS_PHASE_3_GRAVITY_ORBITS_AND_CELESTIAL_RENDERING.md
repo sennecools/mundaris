@@ -1,6 +1,6 @@
 # Mundaris — Phase 3: Gravity, Orbits & Celestial Rendering
 
-> **Status:** implementation-ready engineering specification; Phase 3 is not implemented.
+> **Status:** implemented and Windows-validated; Linux/current-revision CI acceptance remains open — see [Phase 3 validation](docs/phase-3-validation.md).
 >
 > **Targets:** stable Rust, Rust 2024, native Windows x86-64 and Linux x86-64.
 >
@@ -78,7 +78,7 @@ Projection append preflights capacity/revision; private depth-two topology valid
 4. Current app render-time elapsed accounting can include minimized/occluded time; resume resets the tick but restoration is insufficient for physical stepping. Failed bounded analytic sampling can leave requested time ahead of authoritative time, as documented. Phase 3 needs explicit lifecycle/demand/failure handling rather than copying this loop.
 5. Full Windows Phase 2 visual sequence, Linux native/release/interactive and current-change CI remain open. ADR 0002's prerequisite is not waived. Resolve gates before implementation or record an explicit reviewed change.
 
-No engine source correction is authorized here. Add private projection capacity/revision rollback regression coverage during implementation if needed. Existing publication benchmarks often use coincident body centres: valid publication inputs, invalid gravity fixtures.
+The audit above records the pre-implementation baseline. The implementation request authorized Phase 3 and an explicit reviewed prerequisite deferral, recorded in ADR 0004. Projection capacity/revision preflight regressions are now covered. Existing publication benchmarks often use coincident body centres: valid publication inputs, invalid gravity fixtures.
 
 ## 3. Scope and invariants
 
@@ -319,7 +319,7 @@ Simulation panel: requested/authoritative time, branch/tick, rate/pause/overload
 
 ### 11.2 Prospective acceptance bounds
 
-These are proposed criteria, **not measured results**. Record actual maxima/convergence before acceptance; do not silently loosen tolerances. First require finite values; orbital accuracy never uses exact float equality.
+These remain the required acceptance bounds. Actual measured maxima/convergence are recorded in [Phase 3 validation](docs/phase-3-validation.md); no tolerance was loosened. First require finite values; orbital accuracy never uses exact float equality.
 
 | Fixture/duration | Metric/bound and rationale |
 | --- | --- |
@@ -498,7 +498,7 @@ Finite inputs do not guarantee finite arithmetic. Never upload NaN/substitute de
 
 ## 17. File-level implementation plan
 
-All paths below are **future implementation**, not source changes authorized by this design task. Each row states ownership/dependencies; preserve current conventions.
+The table records the implementation responsibilities and ownership. Concrete APIs, the additional app library/history benchmark target and evidence are documented in ADR 0004 and the validation record. Preserve current conventions.
 
 | File | Responsibility/types/functions/dependencies and placement rationale |
 | --- | --- |
@@ -558,11 +558,11 @@ Math/core need no physics modules; renderer trail buffers and app history are en
 9. Wire --gravity-orbits, headless session-command tests and native operator sequence.
 10. Separated benchmarks/full quality/focused release/native/remote evidence, drift docs/ADR/review.
 
-Each stage leaves smoke/reference-frames/celestial-model modes buildable and their tests passing. This document creates no Phase 3 implementation.
+Each implemented stage left smoke/reference-frames/celestial-model modes buildable and their tests passing. Healthy milestone commits and validation evidence are recorded separately.
 
 ## 19. Validation application
 
-Future command:
+Implemented command:
 
 ```text
 cargo run --locked -p mundaris_app -- --gravity-orbits
@@ -616,7 +616,7 @@ Tests use independent formulas/convergence/explicit coordinates; comparing only 
 
 ## 21. Performance/threading
 
-Existing stable Criterion/black_box/reused finite nonconstant data. Compile all targets, run benches locally outside CI. Record hardware/OS/compiler/profile/glam features/lockfile, N/pairs/h/history, medians/distributions/allocation inspection. No hardware timing assertions in correctness tests.
+Existing stable Criterion/black_box/reused finite nonconstant data. Compile all targets, run benches locally outside CI. Record hardware/OS/compiler/profile/glam features/lockfile, N/pairs/h/history, medians/distributions/allocation inspection. No hardware timing assertions in correctness tests. The measured Windows baseline is in [performance](docs/performance.md#phase-3-baseline--2026-10-01).
 
 | Group | Workloads |
 | --- | --- |
@@ -648,48 +648,48 @@ Before implementation review numerical tolerances against analytic error scales,
 
 ## 23. Definition of Done
 
-All boxes remain open until actual implementation evidence exists.
+Checked boxes below are supported by [Phase 3 validation](docs/phase-3-validation.md), ADR 0004 and measured performance. Windows evidence does not satisfy the open Linux/remote-CI criteria.
 
 ### Quality
 
-- [ ] Stable Rust/Rust2024, six non-publishable crates, no unsafe/cycles/prohibited framework/unrelated upgrades.
-- [ ] `cargo fmt --all -- --check` passes.
-- [ ] `cargo build --locked --workspace` passes.
-- [ ] `cargo check --locked --workspace --all-targets --all-features` passes, including benches.
-- [ ] `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` passes.
-- [ ] `cargo test --locked --workspace --all-features` passes headlessly, including old tests/compile-fail contracts.
-- [ ] `cargo test --locked -p mundaris_simulation -p mundaris_world -p mundaris_math -p mundaris_renderer -p mundaris_app --release --all-features` passes.
-- [ ] `cargo test --locked -p mundaris_simulation --release --test orbits long_run -- --ignored --nocapture` passes/records maxima.
-- [ ] `cargo doc --locked --workspace --all-features --no-deps` passes with RUSTDOCFLAGS=-D warnings in host shell.
-- [ ] `git diff --check`, UTF-8/LF/final-newline, Markdown fences/links/status checked.
+- [x] Stable Rust/Rust2024, six non-publishable crates, no unsafe/cycles/prohibited framework/unrelated upgrades.
+- [x] `cargo fmt --all -- --check` passes.
+- [x] `cargo build --locked --workspace` passes.
+- [x] `cargo check --locked --workspace --all-targets --all-features` passes, including benches.
+- [x] `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` passes.
+- [x] `cargo test --locked --workspace --all-features` passes headlessly, including old tests/compile-fail contracts.
+- [x] `cargo test --locked -p mundaris_simulation -p mundaris_world -p mundaris_math -p mundaris_renderer -p mundaris_app --release --all-features` passes.
+- [x] `cargo test --locked -p mundaris_simulation --release --test orbits long_run -- --ignored --nocapture` passes/records maxima.
+- [x] `cargo doc --locked --workspace --all-features --no-deps` passes with RUSTDOCFLAGS=-D warnings in host shell.
+- [x] `git diff --check`, UTF-8/LF/final-newline, Markdown fences/links/status checked.
 
 ### Physics/architecture
 
-- [ ] Symmetric unsoftened gravity/no self-force/KDK full-time velocities/constant spin pass independent tests.
-- [ ] Section11 E/P/L/COM/radius/period/phase/convergence/long-run bounds pass; actual drift documented per debug/release/native target.
-- [ ] Fixed h independent of FPS/UI/rate; fractions/caps/lifecycle/overload report honest accuracy.
-- [ ] Pause/step/reset/reverse/seek/cancel/edit semantics implemented; history bounded/replay guarantees honest.
-- [ ] Transactional per-step world publication, post-success cache/history promotion, coherent/rebuildable projection/stale-state detection.
-- [ ] No authoritative render/frame identity, global rebase/attached-object rewriting or graphics dependence in simulation.
+- [x] Symmetric unsoftened gravity/no self-force/KDK full-time velocities/constant spin pass independent tests.
+- [x] Section11 E/P/L/COM/radius/period/phase/convergence/long-run bounds pass; actual drift documented per debug/release/native target.
+- [x] Fixed h independent of FPS/UI/rate; fractions/caps/lifecycle/overload report honest accuracy.
+- [x] Pause/step/reset/reverse/seek/cancel/edit semantics implemented; history bounded/replay guarantees honest.
+- [x] Transactional per-step world publication, post-success cache/history promotion, coherent/rebuildable projection/stale-state detection.
+- [x] No authoritative render/frame identity, global rebase/attached-object rewriting or graphics dependence in simulation.
 
 ### Visible/performance/platform
 
-- [ ] --gravity-orbits star/planet/moon visibly evolve from all-pair gravity; old modes still work.
-- [ ] Physical spheres/debug shading/markers/labels/selection/depth/precision/layout/WGSL verified; aids change no radius/physics/distance/identity.
-- [ ] One connected selection/focus/orbit/zoom/overview experience with diagnostics.
-- [ ] Actual inertial/labelled relative trails bounded/invalidated/refilled correctly.
-- [ ] Numerical failure preserves last good state; lag/overload visible without changing h.
-- [ ] Separated measured benchmark baseline/sustainable rates with workload/hardware/profile/error/allocation evidence.
-- [ ] Windows native build/headless/focused release and full Section19 visual sequence pass with backend evidence.
+- [x] --gravity-orbits star/planet/moon visibly evolve from all-pair gravity; old modes still work.
+- [x] Physical spheres/debug shading/markers/labels/selection/depth/precision/layout/WGSL verified; aids change no radius/physics/distance/identity.
+- [x] One connected selection/focus/orbit/zoom/overview experience with diagnostics.
+- [x] Actual inertial/labelled relative trails bounded/invalidated/refilled correctly.
+- [x] Numerical failure preserves last good state; lag/overload visible without changing h.
+- [x] Separated measured benchmark baseline/sustainable rates with workload/hardware/profile/error/allocation evidence.
+- [x] Windows native build/headless/focused release and full Section19 visual sequence pass with backend evidence.
 - [ ] Linux native build/headless/focused release and full Section19 visual sequence pass with backend evidence.
 - [ ] Current-revision remote Linux-quality/Windows-compatibility CI pass through normal workflow. CI compilation is not native visual evidence.
 
 ### Documentation/review
 
-- [ ] Phase3 validation record reports actual maxima/native/CI evidence; absent evidence remains open.
-- [ ] ADR0004 records gravity/KDK/time/overload/history/reverse/seek alternatives/guarantees/measurements/revisit triggers.
-- [ ] README/architecture/roadmap/performance distinguish implemented versus proposed capabilities.
-- [ ] Correctness/architecture/performance review and Phase1/2 prerequisite acceptance or explicit reviewed gate change.
-- [ ] No terrain/LOD/generation/atmosphere/gameplay/general graphics/collision/timeline/scaling scope leakage.
+- [x] Phase3 validation record reports actual maxima/native/CI evidence; absent evidence remains open.
+- [x] ADR0004 records gravity/KDK/time/overload/history/reverse/seek alternatives/guarantees/measurements/revisit triggers.
+- [x] README/architecture/roadmap/performance distinguish implemented versus proposed capabilities.
+- [x] Correctness/architecture/performance review and Phase1/2 prerequisite acceptance or explicit reviewed gate change.
+- [x] No terrain/LOD/generation/atmosphere/gameplay/general graphics/collision/timeline/scaling scope leakage.
 
 Objective end state: a small, genuine, numerically inspectable and visibly moving celestial system preserving authoritative world and disposable frame/render ownership.

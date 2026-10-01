@@ -478,7 +478,7 @@ mundaris_core
     └── no domain dependency upward
 ```
 
-Current project dependencies are app → renderer/math/world/simulation, renderer → math, world → math, and simulation → math. Math owns frame algorithms and the checked instant value; world owns celestial state and disposable frame projection; simulation currently owns requested-time policy. Core remains documentation-only. Simulation can add world for gravity without a cycle. Add dependencies for real callers, not to reproduce the diagram. [Phase 1 validation](docs/phase-1-validation.md) and [Phase 2 validation](docs/phase-2-validation.md) distinguish implementation from outstanding platform/visual/remote-CI acceptance.
+Current project dependencies are app → renderer/math/world/simulation, renderer → math, world → math, and simulation → math/world. Math owns frame algorithms and the checked instant value; world owns celestial state and disposable frame projection; simulation owns gravity/KDK and fixed-step playback/history. Core remains documentation-only. Add dependencies for real callers, not to reproduce the diagram. [Phase 1 validation](docs/phase-1-validation.md), [Phase 2 validation](docs/phase-2-validation.md), and [Phase 3 validation](docs/phase-3-validation.md) distinguish implementation from outstanding platform/remote-CI acceptance.
 
 This structure is intentionally small.
 
@@ -2715,7 +2715,7 @@ Existing and next ADR responsibilities:
 ```text
 0002 reference frame and precision model (implemented)
 0003 celestial domain, time and frame projection (implemented)
-0004 gravity, integration and playback (planned for Phase 3 acceptance)
+0004 gravity, integration and playback (implemented, platform acceptance open)
 later planetary partition, terrain/edit, LOD, generation, persistence,
       vegetation identity and CPU/GPU decisions receive numbers when concrete
 ```
@@ -2871,7 +2871,7 @@ Topics:
 - historical trails from actual committed simulation states;
 - orbital tests, validation application and measured benchmarks.
 
-The [Phase 3 specification](MUNDARIS_PHASE_3_GRAVITY_ORBITS_AND_CELESTIAL_RENDERING.md) resolves gravity/integrator/time/history and debug rendering choices. Implementation has not begun. No terrain, planetary LOD, atmosphere, collision system or general lighting engine is included.
+The [Phase 3 specification](MUNDARIS_PHASE_3_GRAVITY_ORBITS_AND_CELESTIAL_RENDERING.md) resolves gravity/integrator/time/history and debug rendering choices. Implementation and Windows numerical/native evidence are recorded in [Phase 3 validation](docs/phase-3-validation.md) and [ADR 0004](docs/adr/0004-gravity-integration-and-playback.md). Linux/current CI acceptance remains open. No terrain, planetary LOD, atmosphere, collision system or general lighting engine is included.
 
 ## Phase 4 — Planet surface partition prototype
 

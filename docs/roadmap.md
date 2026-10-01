@@ -5,7 +5,7 @@ These are exploratory phases, not promises or fixed delivery dates. Experiments,
 0. Repository and native graphics bootstrap
 1. [Coordinates, reference frames, and precision](../MUNDARIS_PHASE_1_REFERENCE_FRAMES.md)
 2. [Celestial model and simulation time](../MUNDARIS_PHASE_2_CELESTIAL_MODEL_AND_TIME.md)
-3. [Gravity, orbits and basic celestial rendering](../MUNDARIS_PHASE_3_GRAVITY_ORBITS_AND_CELESTIAL_RENDERING.md) (specified; implementation not begun)
+3. [Gravity, orbits and basic celestial rendering](../MUNDARIS_PHASE_3_GRAVITY_ORBITS_AND_CELESTIAL_RENDERING.md) (implemented; Linux/current CI acceptance open)
 4. Planet surface partition/LOD prototype
 5. Procedural base terrain
 6. Terrain representation and sparse-edit prototype
@@ -22,5 +22,12 @@ authoritative body identity/properties/kinematics, explicit requested/sample tim
 transactional batches, disposable two-frame body projections and an analytic
 editor fixture. Its Windows automated/release checks and native startup/close
 pass. Full visual sequences, Linux validation and current-change remote CI remain
-open; Phase 1's pending cross-platform acceptance has not been waived. No Phase 3
-gravity, orbital mechanics, terrain or full celestial rendering is implemented.
+open. The explicit reviewed sequencing deferral is recorded in ADR 0004;
+unverified prerequisite evidence is not acceptance.
+
+Phase 3 now adds mutual Newtonian gravity/KDK, fixed ticks and honest backlog,
+bounded reverse/seek replay, coherent world/projection views, minimal physical
+debug spheres, connected camera/navigation and actual-history trails. Windows
+debug/release/long-run checks, benchmarks and the operator-reported visual sequence
+are recorded in [Phase 3 validation](phase-3-validation.md). Linux native and
+current-revision CI remain open. Phase 4 has not begun.
