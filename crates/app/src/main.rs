@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod celestial_model;
 mod redraw;
 mod reference_frames;
 
@@ -24,10 +25,11 @@ struct MundarisApp {
     occluded: bool,
     redraw_schedule: redraw::RedrawSchedule,
     demo: Option<reference_frames::ReferenceFrameDemo>,
+    celestial_demo: Option<celestial_model::CelestialModelDemo>,
 }
 
 impl MundarisApp {
-    fn new(reference_frames: bool) -> Result<Self> {
+    fn new(reference_frames: bool, celestial_model: bool) -> Result<Self> {
         Ok(Self {
             window: None,
             renderer: None,
@@ -36,6 +38,11 @@ impl MundarisApp {
             redraw_schedule: redraw::RedrawSchedule::default(),
             demo: if reference_frames {
                 Some(reference_frames::ReferenceFrameDemo::new()?)
+            } else {
+                None
+            },
+            celestial_demo: if celestial_model {
+                Some(celestial_model::CelestialModelDemo::new()?)
             } else {
                 None
             },
@@ -91,6 +98,9 @@ impl ApplicationHandler for MundarisApp {
         info!("native window and renderer initialized");
         self.window = Some(window);
         self.renderer = Some(renderer);
+        if let Some(demo) = &mut self.celestial_demo {
+            demo.reset_wall_tick();
+        }
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
@@ -129,6 +139,8 @@ impl ApplicationHandler for MundarisApp {
                 }
                 let size = window.inner_size();
                 let result = if let Some(demo) = &mut self.demo {
+                    demo.render(renderer, size.width, size.height)
+                } else if let Some(demo) = &mut self.celestial_demo {
                     demo.render(renderer, size.width, size.height)
                 } else {
                     renderer.render(bootstrap_ui).map_err(anyhow::Error::new)
@@ -178,16 +190,19 @@ fn main() -> Result<()> {
 
     let event_loop = EventLoop::new().context("creating the native event loop")?;
     let mut reference_frames = false;
+    let mut celestial_model = false;
     for argument in std::env::args().skip(1) {
-        if argument == "--reference-frames" && !reference_frames {
+        if argument == "--reference-frames" && !reference_frames && !celestial_model {
             reference_frames = true;
+        } else if argument == "--celestial-model" && !reference_frames && !celestial_model {
+            celestial_model = true;
         } else {
             anyhow::bail!(
-                "unknown or duplicate argument: {argument}; usage: mundaris_app [--reference-frames]"
+                "unknown, conflicting or duplicate argument: {argument}; usage: mundaris_app [--reference-frames | --celestial-model]"
             );
         }
     }
-    let mut app = MundarisApp::new(reference_frames)?;
+    let mut app = MundarisApp::new(reference_frames, celestial_model)?;
     event_loop
         .run_app(&mut app)
         .context("running the native application event loop")?;

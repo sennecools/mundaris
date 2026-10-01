@@ -764,4 +764,4 @@ Phase 1 is complete only when all criteria below have recorded evidence. This sp
 - [x] ADR 0002 records the validated reference-frame/precision decision and explicit revisit triggers; deferred decisions remain deferred.
 - [x] Correctness, architecture, and performance review gates have been completed against this checklist before work expands to Phase 2.
 
-Evidence is recorded in [the Phase 1 validation record](docs/phase-1-validation.md). Checked build/quality items above refer to the current Windows host; the two combined cross-platform criteria remain open for Linux and current-revision CI evidence. Phase 2 has not begun.
+Evidence is recorded in [the Phase 1 validation record](docs/phase-1-validation.md). Checked build/quality items above refer to the current Windows host; the two combined cross-platform criteria remain open for Linux and current-revision CI evidence. Phase 2 implementation is now recorded in [its validation record](docs/phase-2-validation.md); outstanding Phase 1 acceptance has not been waived.

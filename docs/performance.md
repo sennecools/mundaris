@@ -83,3 +83,56 @@ The very small publication measurements were investigated by explicitly observin
 ### Numerical tradeoffs and platforms
 
 Benchmarks use valid bounded inputs; they never bypass precision validation. Source coordinates already rounded through astronomical root space cannot recover their low bits. Debug geometry has a finite representation budget, not a universal world cutoff. See [validation evidence](phase-1-validation.md) for numerical maxima and native Windows results. Linux build/release/interactive and current-revision remote CI remain unverified; no Linux timing baseline is claimed.
+
+## Phase 2 baseline — 2026-10-01
+
+Host: AMD Ryzen 7 9800X3D, 8 reported cores/logical processors; Windows 11 Pro
+x86-64 10.0.26200. Rust 1.98.1 stable (`48a229cea`, LLVM 22.1.8),
+`x86_64-pc-windows-msvc`. Unmodified optimized bench profile, Criterion 0.8.2;
+no dependency upgrades, native-CPU flags, custom allocator, cache or parallelism.
+
+```bash
+cargo bench --locked -p mundaris_world --bench celestial_system -- --sample-size 20 --warm-up-time 0.1 --measurement-time 0.5
+cargo bench --locked -p mundaris_world --bench frame_projection -- --sample-size 20 --warm-up-time 0.1 --measurement-time 0.5
+```
+
+Both targets ran. Values below are Criterion central estimates and 95% confidence
+intervals, **per complete batch**, in microseconds. Short measurements are a local
+baseline, not an engine performance guarantee. Raw reports are under ignored
+`target/criterion/`. Inputs/outputs and post-edit/publication systems are observed
+through `black_box`. Lookup measures ID validation/address lookup, not reading
+every physical field. Property edits replace validated mass/radius without name
+allocations. Full-state batches are prepared once and reuse duplicate scratch.
+Projection republishing updates all 2B edges, not a dirty subset. Build includes
+tree/mapping/staging allocations and destruction. Live append uses Criterion
+batched setup outside timing, then one body insertion plus full projection
+publication (including vector capacity growth); returned systems are destroyed
+outside the timed routine. Live-append throughput is not an O(1) insertion claim.
+
+| Bodies | Lookup µs [95% CI] | Property edit µs [95% CI] |
+| --- | --- | --- |
+| 64 | 0.03135 [0.03120, 0.03150] | 0.03718 [0.03696, 0.03745] |
+| 1,024 | 0.5129 [0.5067, 0.5187] | 0.7394 [0.7341, 0.7446] |
+| 16,384 | 8.143 [8.103, 8.180] | 15.046 [14.944, 15.156] |
+
+| Bodies | Full state µs [95% CI] | Projection build µs [95% CI] | Full republish µs [95% CI] | Live append µs [95% CI] |
+| --- | --- | --- | --- | --- |
+| 64 | 0.1191 [0.1179, 0.1206] | 2.050 [2.032, 2.076] | 0.7237 [0.7144, 0.7332] | 6.814 [6.590, 6.980] |
+| 1,024 | 2.383 [2.373, 2.395] | 43.993 [43.560, 44.411] | 12.726 [12.633, 12.825] | 37.523 [32.789, 40.614] |
+| 4,096 | 10.763 [10.671, 10.859] | 518.06 [515.42, 521.31] | 58.062 [57.833, 58.273] | 269.42 [260.24, 282.27] |
+
+Full state and republish show approximately body-linear work with working-set
+effects. Construction grows more sharply at 4,096 bodies; it includes increasing
+allocations/reallocations and destruction, unlike hot republishing. No allocator
+profile was collected, so the cause is not established. Code inspection finds
+bounded linear passes plus amortized vector appends, no nested body traversal or
+quadratic algorithm. Live-append estimates have broad allocation/batching-sensitive
+intervals. Outliers were present in lookup/edit/state/build/append groups and are
+retained. No optimization or timing threshold was introduced to hide them.
+
+Allocation expectations are based on code inspection, not a counting allocator:
+state batches use pre-existing duplicate flags and caller updates; full projection
+republish reuses its vector once topology is prepared. Neither has per-body heap
+allocation in the hot path. Body insertion/name authoring, projection build/growth,
+UI drafts/markers and renderer first use can allocate. No clock microbenchmark was
+added. Linux timings remain unverified.

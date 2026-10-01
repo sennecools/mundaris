@@ -10,6 +10,8 @@ egui.workspace = true
 glam.workspace = true
 mundaris_math = { path = "../math" }
 mundaris_renderer = { path = "../renderer" }
+mundaris_simulation = { path = "../simulation" }
+mundaris_world = { path = "../world" }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 winit.workspace = true

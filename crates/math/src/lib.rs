@@ -9,8 +9,10 @@
 
 mod coordinates;
 mod frames;
+mod time;
 mod transform;
 
 pub use coordinates::*;
 pub use frames::*;
+pub use time::*;
 pub use transform::*;

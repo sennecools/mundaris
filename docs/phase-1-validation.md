@@ -2,7 +2,7 @@
 
 ## Status
 
-The Phase 1 implementation and all locally executable automated criteria pass on Windows x86-64. The full Windows visual sequence was reported passed by the operator. **Full Definition of Done remains open for Linux native build/numerical/release/interactive evidence and current-revision remote CI.** Phase 2 has not begun.
+The Phase 1 implementation and all locally executable automated criteria pass on Windows x86-64. The full Windows visual sequence was reported passed by the operator. **Full Definition of Done remains open for Linux native build/numerical/release/interactive evidence and current-revision remote CI.** Phase 2 implementation is now recorded separately in [Phase 2 validation](phase-2-validation.md); this Phase 1 record preserves its original evidence.
 
 The authoritative requirements are [Phase 1](../MUNDARIS_PHASE_1_REFERENCE_FRAMES.md). [ADR 0002](adr/0002-reference-frames-and-precision.md) records concrete signatures/ownership decisions; [performance](performance.md) contains reproducible workloads, timings and distributions.
 

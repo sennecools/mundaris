@@ -1109,6 +1109,8 @@ dependencies = [
  "glam",
  "mundaris_math",
  "mundaris_renderer",
+ "mundaris_simulation",
+ "mundaris_world",
  "tracing",
  "tracing-subscriber",
  "winit",
@@ -1148,10 +1150,20 @@ dependencies = [
 [[package]]
 name = "mundaris_simulation"
 version = "0.0.1"
+dependencies = [
+ "mundaris_math",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "mundaris_world"
 version = "0.0.1"
+dependencies = [
+ "criterion",
+ "glam",
+ "mundaris_math",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "naga"

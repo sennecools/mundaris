@@ -478,7 +478,7 @@ mundaris_core
     └── no domain dependency upward
 ```
 
-Current Phase 1 project dependencies are app → renderer/math and renderer → math. Math implements checked frame mathematics with `glam`; core, world, and simulation remain documentation-only. Add dependencies when real callers require them, rather than to reproduce the diagram. Implementation/platform evidence is recorded in [Phase 1 validation](docs/phase-1-validation.md); Linux/remote-CI acceptance remains open.
+Current project dependencies are app → renderer/math/world/simulation, renderer → math, world → math, and simulation → math. Math owns frame algorithms and the checked instant value; world owns celestial state and disposable frame projection; simulation currently owns requested-time policy. Core remains documentation-only. Simulation can add world for gravity without a cycle. Add dependencies for real callers, not to reproduce the diagram. [Phase 1 validation](docs/phase-1-validation.md) and [Phase 2 validation](docs/phase-2-validation.md) distinguish implementation from outstanding platform/visual/remote-CI acceptance.
 
 This structure is intentionally small.
 
@@ -541,7 +541,7 @@ Expected future responsibilities:
 
 It does not own GPU resources.
 
-Future domain state owns its frame tree and associations between domain identities and runtime frames. Math owns the tree's algorithms, not a global world instance. Runtime frame handles are not persistent body, terrain-region, or generated-object identities.
+Phase 2 world state owns celestial bodies and a separate disposable `CelestialFrameProjection` containing the tree and domain-to-frame associations. Authoritative bodies store no runtime frame handle. Math owns the tree algorithms and the low-level `SimulationInstant`, not a global world instance or playback policy. Runtime frame handles are not persistent body, terrain-region, or generated-object identities.
 
 ## 9.4 `mundaris_simulation`
 
@@ -2710,18 +2710,14 @@ Changing generator behavior without tracking compatibility can corrupt the visua
 
 Significant decisions should receive ADRs once they become concrete.
 
-Likely future ADRs:
+Existing and next ADR responsibilities:
 
 ```text
-0002 reference frame and precision model
-0003 celestial simulation time model
-0004 planetary surface partition strategy
-0005 authoritative terrain + sparse edit representation
-0006 terrain LOD transition strategy
-0007 procedural generator versioning
-0008 project persistence format
-0009 vegetation generated identity model
-0010 CPU/GPU terrain generation boundary
+0002 reference frame and precision model (implemented)
+0003 celestial domain, time and frame projection (implemented)
+0004 gravity, integration and playback (planned for Phase 3 acceptance)
+later planetary partition, terrain/edit, LOD, generation, persistence,
+      vegetation identity and CPU/GPU decisions receive numbers when concrete
 ```
 
 An ADR should describe:
@@ -2844,7 +2840,7 @@ Topics:
 - mass/radius;
 - translation/orientation;
 - simulation time;
-- simple orbital motion;
+- independent prescribed analytic motion for validation, not orbital mechanics;
 - rotation;
 - time acceleration;
 - renderer consumes body transforms.
@@ -2856,22 +2852,26 @@ Validation:
 - one moon;
 - stable relative views under accelerated time.
 
-## Phase 3 — Basic planet representation
+Implementation exists; see [Phase 2 specification](MUNDARIS_PHASE_2_CELESTIAL_MODEL_AND_TIME.md) and its validation record. Outstanding platform/visual acceptance is not implied by this roadmap.
+
+## Phase 3 — Gravity, orbits and basic celestial rendering
 
 Goal:
 
-> render a body-scale planet representation that works through approach.
+> evolve a small connected celestial system under Newtonian gravity and make its actual motion visually and numerically inspectable.
 
 Topics:
 
-- simple sphere/ellipsoid;
-- body-local camera relation;
-- horizon;
-- basic lighting;
-- body culling;
-- transition from astronomical point/sphere representation.
+- point-mass N-body gravity and a justified fixed-step orbital integrator;
+- deterministic authoritative full-state publication;
+- separate wall/render/requested/authoritative time and explicit acceleration/backlog policy;
+- honest bounded reverse/seek/reset/edit semantics and numerical diagnostics;
+- physically sized debug spheres, navigation markers, labels and selection;
+- connected focus/orbit/zoom/overview using reference frames;
+- historical trails from actual committed simulation states;
+- orbital tests, validation application and measured benchmarks.
 
-No detailed terrain.
+The [Phase 3 specification](MUNDARIS_PHASE_3_GRAVITY_ORBITS_AND_CELESTIAL_RENDERING.md) resolves gravity/integrator/time/history and debug rendering choices. Implementation has not begun. No terrain, planetary LOD, atmosphere, collision system or general lighting engine is included.
 
 ## Phase 4 — Planet surface partition prototype
 

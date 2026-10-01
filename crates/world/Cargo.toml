@@ -4,5 +4,21 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
+[dependencies]
+mundaris_math = { path = "../math" }
+thiserror.workspace = true
+
+[dev-dependencies]
+glam.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "celestial_system"
+harness = false
+
+[[bench]]
+name = "frame_projection"
+harness = false
+
 [lints]
 workspace = true

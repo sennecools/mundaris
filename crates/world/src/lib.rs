@@ -1,7 +1,15 @@
-//! Authoritative world and celestial-domain state for future Mundaris systems.
-//!
-//! World state will describe what exists independently of how it is simulated or
-//! rendered. Domain state will not depend on platform or GPU APIs. This crate is
-//! intentionally empty until real world concepts are ready to be modeled.
+//! Authoritative celestial bodies in one finite system coordinate basis and instant.
+//! Reference frames are a disposable projection, never the universe database.
+//! Body and tree namespaces are caller-assigned and must not be reused for independent
+//! instances. Body storage is append-only; handles have no persistence contract.
 
 #![forbid(unsafe_code)]
+
+mod body;
+mod frame_projection;
+mod system;
+
+pub use body::*;
+pub use frame_projection::*;
+pub use mundaris_math::SimulationInstant;
+pub use system::*;

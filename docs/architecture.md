@@ -5,9 +5,9 @@
 | Crate | Responsibility |
 | --- | --- |
 | `mundaris_core` | Small, dependency-light foundations shared by multiple systems when a concrete need exists. |
-| `mundaris_math` | Checked f64 coordinates, rigid transforms, runtime frame tree, LCA evaluation and instantaneous derivative conversion using `glam`. |
-| `mundaris_world` | Authoritative world and celestial-domain state, independent of presentation. |
-| `mundaris_simulation` | Evolution of authoritative world state over time. |
+| `mundaris_math` | Checked f64 SI coordinates and working-epoch time value, rigid transforms, runtime frame tree, LCA evaluation and instantaneous derivative conversion using `glam`. |
+| `mundaris_world` | Authoritative celestial properties/kinematics, one coherent sample instant, transactional mutations and derived body/frame associations. |
+| `mundaris_simulation` | Requested-time playback control; future evolution of authoritative world state. |
 | `mundaris_renderer` | GPU presentation infrastructure and disposable visual representations. |
 | `mundaris_app` | Native process, event loop, logging, and top-level subsystem composition. |
 
@@ -15,7 +15,41 @@ Dependencies point inward toward lightweight/domain foundations. World and simul
 
 The long-term intent is detailed in [the engine design](../MUNDARIS_ENGINE_DESIGN.md). [Phase 1](../MUNDARIS_PHASE_1_REFERENCE_FRAMES.md) implements generic frame-tree mathematics in `mundaris_math`, an app-owned validation fixture/observer session, and read-only mathematical evaluation passed to the renderer. Future domain-owned tree instances/associations belong in `mundaris_world`. Runtime frame identity remains distinct from persistent domain/generated-content identity.
 
-Current project dependencies are app → renderer/math and renderer → math. Core, world and simulation remain documentation-only. Criterion is a dev dependency of math/renderer; matching naga is a renderer dev dependency for headless shader validation.
+Current project dependencies are app → renderer/math/world/simulation, renderer → math, world → math, simulation → math. Simulation can later depend on world without a cycle. Core remains documentation-only. Criterion is a dev dependency of math/renderer/world; matching naga is a renderer dev dependency for headless shader validation. World/simulation have no graphics dependencies.
+
+## Celestial domain and time
+
+`CelestialSystem` owns contiguous append-only bodies with opaque namespaced `BodyId`,
+validated positive mass/reference radius, checked system-space center and velocity,
+body-to-system unit quaternion, angular velocity in system axes, one
+`SimulationInstant` and checked revision. Names are display metadata limited to
+1–128 UTF-8 bytes. No classification, primary hierarchy or gravitational constant
+is needed. `BodyState::new` is infallible because its four private math value types
+have already validated every component; raw non-finite values cannot enter it.
+
+Property/metadata edits are atomic and independent of state edits. State batches
+accept arbitrary ID ordering, reject foreign/unknown/duplicate IDs before commit,
+and increment revision once. Reusable dense duplicate flags cost O(U) without hot
+allocations. Moving to a different instant requires every body's state; same-time
+authoring can edit subsets. Immutable borrowing supplies coherent reads without
+cloning an entire system or introducing a snapshot framework.
+
+`SimulationInstant` lives in math as a finite, dimensioned seconds value relative
+to a local working epoch. Simulation's `TimeController` consumes monotonic host
+durations and changes requested time only. The app's pure bounded analytic
+producer explicitly samples/commits the world and then publishes frames; this is
+not an integrator or a free-seek promise for future integrated simulations.
+
+`CelestialFrameProjection` is world-owned, disposable and rebuildable using a
+fresh caller-supplied tree namespace. Every body has a root-child translating
+anchor (center/velocity, identity rotation, zero spin) and a rotating body-fixed
+child (zero translation/linear motion, authoritative orientation/spin). Other
+bodies never inherit that spin. Dense body/frame mappings survive live appends.
+Full publication reuses staging, preflights capacity/revisions and copies f64
+state into one Phase 1 batch at the exact system instant; represented revision is
+recorded after success. No mutable tree access is exposed and no celestial body
+stores a frame ID. Renderer/UI receive read-only views; editor commands use world
+validation. See [ADR 0003](adr/0003-celestial-domain-and-time.md).
 
 ## State and representation boundaries
 
@@ -41,7 +75,7 @@ Future large procedural regions should be reconstructed from explicit determinis
 
 ## Native presentation boundary
 
-The renderer creates a native surface/device, presents, handles resizing, draws an optional line-list/depth debug pass, and integrates `egui`. Core, world, and simulation crates intentionally contain no speculative domain types. Planet generation, terrain, persistence and general editor systems remain unimplemented.
+The renderer creates a native surface/device, presents, handles resizing, draws an optional line-list/depth debug pass, and integrates `egui`. The app's celestial validation uses those generic facilities without adding renderer domain dependencies. Gravity, planet generation, terrain, persistence and general editor systems remain unimplemented.
 
 The app supplies the bootstrap panel through a per-frame UI callback; the renderer owns only UI input and GPU integration. Native events and UI types stay at this app/renderer boundary. An `Arc<Window>` safely keeps the surface's native handle alive without leaks or shared mutable domain state. Presentation notifies `winit` before submitting the frame to the compositor.
 
