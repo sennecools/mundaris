@@ -35,4 +35,4 @@ These constraints preserve room for future experiments. They do not prescribe a 
 - Streaming applies to derived representations and caches; distant authoritative world state does not cease to exist when unloaded.
 - Future parallel work should favor immutable inputs and produced outputs, batch work, minimize synchronization, and preserve determinism where required.
 
-None of these systems or structures is implemented as part of the repository bootstrap.
+The bootstrap implemented none of these domain systems. Phase 1 now validates generic rigid-frame coordinates and observer-relative precision; the future domain/generation/editing systems above remain deferred.

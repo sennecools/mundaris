@@ -15,6 +15,6 @@ These are exploratory phases, not promises or fixed delivery dates. Experiments,
 10. World-builder editing workflow
 11. Deeper simulation experiments: hydrology, erosion, tectonics, climate, and local physics
 
-Only repository bootstrap and the smallest graphics/UI smoke application exist today.
+Repository bootstrap and Phase 1's reference-frame implementation exist today. [Recorded acceptance](phase-1-validation.md) includes Windows numerical/runtime evidence and the remaining Linux/CI checks.
 
-Phase 1 is specified, not implemented. Its validation uses generic moving frames and debug primitives; it does not introduce planets, terrain, gravity, or orbital mechanics.
+Phase 1 validation uses generic moving frames and debug primitives; it does not introduce planets, terrain, gravity, or orbital mechanics. Phase 2 has not begun; cross-platform Phase 1 acceptance remains a prerequisite.

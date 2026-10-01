@@ -478,7 +478,7 @@ mundaris_core
     └── no domain dependency upward
 ```
 
-Currently, the only project-crate dependency is app → renderer. Core, math, world, and simulation are documentation-only; `glam` is selected centrally but is not yet linked by math. Add dependencies when real callers require them, rather than to reproduce the diagram.
+Current Phase 1 project dependencies are app → renderer/math and renderer → math. Math implements checked frame mathematics with `glam`; core, world, and simulation remain documentation-only. Add dependencies when real callers require them, rather than to reproduce the diagram. Implementation/platform evidence is recorded in [Phase 1 validation](docs/phase-1-validation.md); Linux/remote-CI acceptance remains open.
 
 This structure is intentionally small.
 

@@ -2,7 +2,7 @@
 
 Mundaris is planned as a native desktop world-building and planetary simulation application, designed to span astronomical and local surface scales. The long-term vision includes editable moving celestial bodies, procedural worlds, and an editor workflow; none of those engine systems are implemented yet.
 
-**Status:** early private development — repository and graphics-stack bootstrap.
+**Status:** early private development — Phase 1 reference-frame implementation is present. Windows validation is recorded; Linux and current-revision remote CI acceptance remain open. See [validation evidence](docs/phase-1-validation.md).
 
 The initial native development targets are **Windows x86-64** and **Linux x86-64**.
 
@@ -23,9 +23,10 @@ The initial native development targets are **Windows x86-64** and **Linux x86-64
 ```bash
 cargo build --workspace
 cargo run -p mundaris_app
+cargo run --locked -p mundaris_app -- --reference-frames
 ```
 
-The current app opens a native window, initializes `wgpu`, presents a clear frame, and displays a small `egui` bootstrap panel. It does not contain a planet, terrain, or simulation.
+Normal invocation opens the bootstrap panel. `--reference-frames` draws abstract axes and wire boxes attached to an analytically translating/rotating hierarchy, with source-centred rendering, precision diagnostics, pause/seek/reset, a `1e16 m` shared-offset stress mode, continuous approach, paused frame re-expression, and centimetre movement buttons. Begin approach while paused, then select Play. Re-expression and local movement are available while paused. This fixture contains no planet, terrain, or physics simulation.
 
 ## Quality checks
 
@@ -40,12 +41,22 @@ CI uses `--locked` for Cargo compilation/lint/test commands to enforce the commi
 ## Workspace map
 
 - `mundaris_app` — process entry point, native event loop, logging, and composition.
-- `mundaris_renderer` — `wgpu` surface and minimal `egui` presentation integration.
+- `mundaris_renderer` — checked observer-relative CPU preparation, debug line drawing, `wgpu` surface and `egui` integration.
 - `mundaris_core` — reserved for small, genuinely shared foundations.
-- `mundaris_math` — mathematical conventions and future coordinate primitives.
+- `mundaris_math` — finite coordinate types, rigid rotations/transforms, transactional frame trees, LCA conversions and instantaneous kinematics.
 - `mundaris_world` — future authoritative world-domain state.
 - `mundaris_simulation` — future evolution of authoritative state over time.
 - `docs/` — architecture constraints, development standards, performance policy, roadmap, and ADRs.
+
+## Focused validation and benchmarks
+
+```bash
+cargo test --locked -p mundaris_math -p mundaris_renderer --release
+cargo bench --locked -p mundaris_math --bench reference_frames
+cargo bench --locked -p mundaris_renderer --bench view_preparation
+```
+
+Benchmarks are CPU-only, use Criterion, and stay outside normal CI. Workloads, hardware, results, and numerical limitations are in [performance notes](docs/performance.md); architectural decisions are in [ADR 0002](docs/adr/0002-reference-frames-and-precision.md). Phase 2 has not begun.
 
 ## Repository status
 

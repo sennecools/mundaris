@@ -1,6 +1,6 @@
 # Mundaris — Phase 1: Coordinates, Reference Frames & Precision
 
-> **Status:** implementation specification; implementation has not begun
+> **Status:** implemented; Windows validation recorded, Linux/current-revision CI acceptance open — see [validation evidence](docs/phase-1-validation.md)
 >
 > **Targets:** stable Rust, Rust 2024, native Windows x86-64 and Linux x86-64
 >
@@ -667,7 +667,7 @@ Projection and debug vertex packing APIs accept only validated render-relative v
 
 ## 18. File-level implementation plan
 
-All entries below are **future implementation work**. This design task creates/modifies documentation only.
+The entries below defined the implementation plan. The Phase 1 implementation now exists; concrete API choices, measurements and remaining platform evidence are recorded in [ADR 0002](docs/adr/0002-reference-frames-and-precision.md) and [validation evidence](docs/phase-1-validation.md).
 
 | File | Responsibility and important types/relationships |
 | --- | --- |
@@ -725,41 +725,43 @@ Phase 1 is complete only when all criteria below have recorded evidence. This sp
 
 ### Build and quality
 
-- [ ] Stable Rust/Rust 2024, existing six packages, `publish = false`, no project-owned unsafe code, no unrelated dependency upgrades.
-- [ ] `cargo build --locked --workspace` passes.
-- [ ] `cargo fmt --all -- --check` passes.
-- [ ] `cargo check --locked --workspace --all-targets --all-features` passes.
-- [ ] `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` passes.
-- [ ] `cargo test --locked --workspace --all-features` passes, including compile-fail documentation examples and the concrete matrix/sweep. No test requires GPU/display.
-- [ ] `cargo test --locked -p mundaris_math -p mundaris_renderer --release` passes once for numerical/profile agreement; this focused release check stays outside normal CI.
-- [ ] `cargo doc --locked --workspace --all-features --no-deps` passes with Rustdoc warnings denied (`RUSTDOCFLAGS=-D warnings` supplied using the host shell's environment syntax).
-- [ ] `git diff --check` passes; documentation links, final newlines, UTF-8/LF, and public units/space contracts are checked.
+- [x] Stable Rust/Rust 2024, existing six packages, `publish = false`, no project-owned unsafe code, no unrelated dependency upgrades.
+- [x] `cargo build --locked --workspace` passes.
+- [x] `cargo fmt --all -- --check` passes.
+- [x] `cargo check --locked --workspace --all-targets --all-features` passes.
+- [x] `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` passes.
+- [x] `cargo test --locked --workspace --all-features` passes, including compile-fail documentation examples and the concrete matrix/sweep. No test requires GPU/display.
+- [x] `cargo test --locked -p mundaris_math -p mundaris_renderer --release` passes once for numerical/profile agreement; this focused release check stays outside normal CI.
+- [x] `cargo doc --locked --workspace --all-features --no-deps` passes with Rustdoc warnings denied (`RUSTDOCFLAGS=-D warnings` supplied using the host shell's environment syntax).
+- [x] `git diff --check` passes; documentation links, final newlines, UTF-8/LF, and public units/space contracts are checked.
 
 ### Mathematical correctness and architecture
 
-- [ ] Checked rigid transforms, unit quaternion normalization, composition/inverse, axis/handedness conventions, and all point/displacement/direction/velocity distinctions are implemented and documented.
-- [ ] Single-root frame graph rejects invalid identities/cycles/root edits and mutates transactionally; handle namespaces and append-only limitations are documented/tested.
-- [ ] One-instant borrowed evaluations and prepared conversions cannot silently survive tree mutation; unknown derivatives cause explicit kinematic errors.
-- [ ] LCA-relative and source-centered paths pass local/body/astronomical/extreme shared-ancestry tolerances. No nearby-render path flattens via root transforms.
-- [ ] Moving a parent updates no attached point/local primitive arrays. Both co-moving and independent observers produce the expected observations.
-- [ ] Observer pose and velocity re-expression preserves instantaneous physical state within stated budgets. Physical attachment is a distinct deliberate operation.
-- [ ] Renderer depends on math, owns narrowing/projection/GPU data, and consumes read-only state. World/simulation remain independent of graphics; app contains only fixture/session/orchestration behavior.
-- [ ] No conventional global rebasing, celestial mechanics/domain model, terrain/LOD/generation, physics engine, persistence format, speculative framework, or new crate is introduced.
+- [x] Checked rigid transforms, unit quaternion normalization, composition/inverse, axis/handedness conventions, and all point/displacement/direction/velocity distinctions are implemented and documented.
+- [x] Single-root frame graph rejects invalid identities/cycles/root edits and mutates transactionally; handle namespaces and append-only limitations are documented/tested.
+- [x] One-instant borrowed evaluations and prepared conversions cannot silently survive tree mutation; unknown derivatives cause explicit kinematic errors.
+- [x] LCA-relative and source-centered paths pass local/body/astronomical/extreme shared-ancestry tolerances. No nearby-render path flattens via root transforms.
+- [x] Moving a parent updates no attached point/local primitive arrays. Both co-moving and independent observers produce the expected observations.
+- [x] Observer pose and velocity re-expression preserves instantaneous physical state within stated budgets. Physical attachment is a distinct deliberate operation.
+- [x] Renderer depends on math, owns narrowing/projection/GPU data, and consumes read-only state. World/simulation remain independent of graphics; app contains only fixture/session/orchestration behavior.
+- [x] No conventional global rebasing, celestial mechanics/domain model, terrain/LOD/generation, physics engine, persistence format, speculative framework, or new crate is introduced.
 
 ### Renderer and validation mode
 
-- [ ] `--reference-frames` runs the specified primitive fixture, analytic motion, pause/seek/reset, stress-offset mode, approach, and manual re-expression with numerical diagnostics.
-- [ ] Shader/layout tests prove view-relative inputs, 32-byte vertices, 64-byte projection, right-handed forward view, and `wgpu` `0..1` depth. No astronomical `f32` coordinates or duplicate camera subtraction cross to GPU.
-- [ ] Near conversion budgets and out-of-range handling are explicit; distant UI markers are labelled and finite. There is one connected tree/observer rather than disconnected scenes.
-- [ ] Replay over `0..600 s` at both offsets meets Section 15's numerical stability; approach/handoff meets position/orientation/velocity budgets.
+- [x] `--reference-frames` runs the specified primitive fixture, analytic motion, pause/seek/reset, stress-offset mode, approach, and manual re-expression with numerical diagnostics.
+- [x] Shader/layout tests prove view-relative inputs, 32-byte vertices, 64-byte projection, right-handed forward view, and `wgpu` `0..1` depth. No astronomical `f32` coordinates or duplicate camera subtraction cross to GPU.
+- [x] Near conversion budgets and out-of-range handling are explicit; distant UI markers are labelled and finite. There is one connected tree/observer rather than disconnected scenes.
+- [x] Replay over `0..600 s` at both offsets meets Section 15's numerical stability; approach/handoff meets position/orientation/velocity budgets.
 - [ ] Windows x86-64 and Linux x86-64 both pass native build/check and headless numerical test requirements, including the focused release check. Existing Linux quality and Windows compatibility CI jobs pass; local Windows tests need not become a duplicated full CI job.
 - [ ] The Section 15 interactive sequence is actually performed on both native platforms with OS/GPU/backend recorded: stable nearby geometry, no handoff snap, responsive UI, resize/minimize/restore, and clean shutdown. If a graphical session or second host is unavailable, record the missing evidence and leave this criterion open.
 
 ### Performance and documentation
 
-- [ ] Focused math and CPU view benchmarks exist, compile under all-targets checks, and are run locally with a reproducible baseline on at least one supported native target.
-- [ ] Benchmark groups separate preparation/update/batch cost and compare prepared batches with direct queries. No window/device bootstrap timings or normal-CI benchmark execution.
-- [ ] Hot conversion/batch paths reuse storage and allocate no per-point/path data; measured structural surprises are investigated. No arbitrary timing threshold is substituted for evidence.
-- [ ] README/current architecture describe implemented scope accurately; performance notes record workload/hardware/compiler/results, numerical tradeoffs, and remaining platform evidence.
-- [ ] ADR 0002 records the validated reference-frame/precision decision and explicit revisit triggers; deferred decisions remain deferred.
-- [ ] Correctness, architecture, and performance review gates have been completed against this checklist before work expands to Phase 2.
+- [x] Focused math and CPU view benchmarks exist, compile under all-targets checks, and are run locally with a reproducible baseline on at least one supported native target.
+- [x] Benchmark groups separate preparation/update/batch cost and compare prepared batches with direct queries. No window/device bootstrap timings or normal-CI benchmark execution.
+- [x] Hot conversion/batch paths reuse storage and allocate no per-point/path data; measured structural surprises are investigated. No arbitrary timing threshold is substituted for evidence.
+- [x] README/current architecture describe implemented scope accurately; performance notes record workload/hardware/compiler/results, numerical tradeoffs, and remaining platform evidence.
+- [x] ADR 0002 records the validated reference-frame/precision decision and explicit revisit triggers; deferred decisions remain deferred.
+- [x] Correctness, architecture, and performance review gates have been completed against this checklist before work expands to Phase 2.
+
+Evidence is recorded in [the Phase 1 validation record](docs/phase-1-validation.md). Checked build/quality items above refer to the current Windows host; the two combined cross-platform criteria remain open for Linux and current-revision CI evidence. Phase 2 has not begun.
