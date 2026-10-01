@@ -8,7 +8,9 @@
 #![forbid(unsafe_code)]
 
 mod coordinates;
+mod frames;
 mod transform;
 
 pub use coordinates::*;
+pub use frames::*;
 pub use transform::*;

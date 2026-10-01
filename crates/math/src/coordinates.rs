@@ -1,5 +1,6 @@
 //! Finite dimensional values; a containing frame or transform supplies the basis.
 
+use crate::{FrameError, FrameId, UnitRotation};
 use glam::DVec3;
 
 /// Invalid numeric input or non-finite arithmetic output.
@@ -138,5 +139,128 @@ impl AngularVelocity3 {
     }
     pub fn radians_per_second(self) -> DVec3 {
         self.0
+    }
+}
+
+/// A point labelled with an opaque runtime frame handle.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FramePosition {
+    frame: FrameId,
+    local: LocalPosition,
+}
+impl FramePosition {
+    pub fn new(frame: FrameId, local: LocalPosition) -> Self {
+        Self { frame, local }
+    }
+    pub fn frame(self) -> FrameId {
+        self.frame
+    }
+    pub fn local(self) -> LocalPosition {
+        self.local
+    }
+    pub fn displacement_from(self, origin: Self) -> Result<FrameDisplacement, FrameError> {
+        crate::frames::agree(self.frame, origin.frame)?;
+        Ok(FrameDisplacement::new(
+            self.frame,
+            self.local.displacement_from(origin.local)?,
+        ))
+    }
+    pub fn displaced(self, offset: FrameDisplacement) -> Result<Self, FrameError> {
+        crate::frames::agree(self.frame, offset.frame)?;
+        Ok(Self::new(self.frame, self.local.displaced(offset.local)?))
+    }
+}
+
+/// A metre offset labelled with its basis, not an origin.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrameDisplacement {
+    frame: FrameId,
+    local: Displacement3,
+}
+impl FrameDisplacement {
+    pub fn new(frame: FrameId, local: Displacement3) -> Self {
+        Self { frame, local }
+    }
+    pub fn frame(self) -> FrameId {
+        self.frame
+    }
+    pub fn local(self) -> Displacement3 {
+        self.local
+    }
+}
+
+/// A dimensionless direction labelled with its basis.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrameDirection {
+    frame: FrameId,
+    local: Direction3,
+}
+impl FrameDirection {
+    pub fn new(frame: FrameId, local: Direction3) -> Self {
+        Self { frame, local }
+    }
+    pub fn frame(self) -> FrameId {
+        self.frame
+    }
+    pub fn local(self) -> Direction3 {
+        self.local
+    }
+}
+
+/// Derivative relative to a frame, in metres/second; requires a point to convert.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrameVelocity {
+    frame: FrameId,
+    relative: LinearVelocity3,
+}
+impl FrameVelocity {
+    pub fn new(frame: FrameId, relative: LinearVelocity3) -> Self {
+        Self { frame, relative }
+    }
+    pub fn frame(self) -> FrameId {
+        self.frame
+    }
+    pub fn relative(self) -> LinearVelocity3 {
+        self.relative
+    }
+}
+
+/// A mathematical pose: position and pose-local-to-frame orientation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FramePose {
+    position: FramePosition,
+    orientation: UnitRotation,
+}
+impl FramePose {
+    pub fn new(position: FramePosition, orientation: UnitRotation) -> Self {
+        Self {
+            position,
+            orientation,
+        }
+    }
+    pub fn position(self) -> FramePosition {
+        self.position
+    }
+    pub fn orientation(self) -> UnitRotation {
+        self.orientation
+    }
+}
+
+/// Point and relative derivative in the same frame, at one caller-supplied instant.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KinematicPoint {
+    position: FramePosition,
+    velocity: FrameVelocity,
+}
+impl KinematicPoint {
+    pub fn try_new(position: FramePosition, velocity: FrameVelocity) -> Result<Self, FrameError> {
+        crate::frames::agree(position.frame(), velocity.frame())?;
+        Ok(Self { position, velocity })
+    }
+    pub fn position(self) -> FramePosition {
+        self.position
+    }
+    pub fn velocity(self) -> FrameVelocity {
+        self.velocity
     }
 }

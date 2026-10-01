@@ -1,5 +1,33 @@
 //! Rigid column-vector transforms, never scale, shear or reflection.
 
+/// Child motion relative to parent, both derivatives expressed in parent axes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrameMotion {
+    origin_velocity_in_parent: LinearVelocity3,
+    angular_velocity_in_parent: AngularVelocity3,
+}
+impl FrameMotion {
+    pub fn new(
+        origin_velocity_in_parent: LinearVelocity3,
+        angular_velocity_in_parent: AngularVelocity3,
+    ) -> Self {
+        Self {
+            origin_velocity_in_parent,
+            angular_velocity_in_parent,
+        }
+    }
+    pub fn stationary() -> Self {
+        Self::new(LinearVelocity3::zero(), AngularVelocity3::zero())
+    }
+    pub fn origin_velocity_in_parent(self) -> LinearVelocity3 {
+        self.origin_velocity_in_parent
+    }
+    pub fn angular_velocity_in_parent(self) -> AngularVelocity3 {
+        self.angular_velocity_in_parent
+    }
+}
+
+use crate::{AngularVelocity3, LinearVelocity3};
 use crate::{Direction3, Displacement3, LocalPosition, MathError, coordinates::arithmetic};
 use glam::{DQuat, DVec3};
 
