@@ -178,4 +178,39 @@ impl IntegrationWorkspace {
         );
         self.ready = false;
     }
+    pub(crate) fn restore(&mut self, states: &[BodyState]) -> Result<(), SimulationError> {
+        assert_eq!(
+            states.len(),
+            self.states.len(),
+            "snapshot topology belongs to branch"
+        );
+        self.ready = false;
+        for (position, state) in self.candidate_positions_m.iter_mut().zip(states) {
+            *position = state.center_in_system().metres();
+        }
+        evaluate_resolved_accelerations(
+            &self.masses_kg,
+            &self.candidate_positions_m,
+            &mut self.next_acceleration_m_s2,
+            self.fixed_step_s,
+        )?;
+        for (update, &state) in self.updates.iter_mut().zip(states) {
+            update.state = state;
+        }
+        self.ready = true;
+        Ok(())
+    }
+    pub(crate) fn publish_current(
+        &mut self,
+        system: &mut CelestialSystem,
+        instant: SimulationInstant,
+    ) -> Result<(), SimulationError> {
+        for (update, &state) in self.updates.iter_mut().zip(&self.states) {
+            update.state = state;
+        }
+        system.update_states(instant, &self.updates)?;
+        self.expected_revision = system.revision();
+        self.expected_time = instant;
+        Ok(())
+    }
 }

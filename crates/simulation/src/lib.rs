@@ -5,10 +5,13 @@
 
 mod diagnostics;
 mod gravity;
+mod history;
 mod integrator;
+mod runner;
 mod time;
 pub use diagnostics::*;
 pub use gravity::*;
 pub use integrator::*;
 pub use mundaris_math::SimulationInstant;
+pub use runner::*;
 pub use time::*;
