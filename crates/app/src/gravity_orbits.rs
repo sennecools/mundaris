@@ -250,10 +250,9 @@ impl GravityOrbitsDemo {
             }
             Command::Seek(tick) => {
                 self.runner.seek_tick(tick)?;
-                self.seeking = true;
-                if tick == self.runner.tick() {
-                    self.seed_trails();
-                    self.seeking = false;
+                self.seed_trails();
+                self.seeking = tick != self.runner.tick();
+                if !self.seeking {
                     self.sample_diagnostics()?;
                 }
             }
@@ -940,6 +939,24 @@ mod tests {
         demo.command(Command::Single(false)).unwrap();
         demo.update(Duration::ZERO);
         assert_eq!(demo.trails.retained_ticks(), [15]);
+    }
+    #[test]
+    fn seek_invalidates_trails_before_private_replay_and_cancel_retains_world() {
+        let mut demo = GravityOrbitsDemo::new().unwrap();
+        demo.command(Command::Load(GravityFixture::Circular))
+            .unwrap();
+        for _ in 0..16 {
+            demo.command(Command::Single(true)).unwrap();
+            demo.update(Duration::ZERO);
+        }
+        assert_eq!(demo.trails.sample_count(), 3);
+        let time = demo.system.sample_time();
+        let revision = demo.system.revision();
+        demo.command(Command::Seek(10000)).unwrap();
+        assert_eq!(demo.trails.retained_ticks(), [16]);
+        demo.command(Command::CancelSeek).unwrap();
+        assert_eq!(demo.system.sample_time(), time);
+        assert_eq!(demo.system.revision(), revision);
     }
     #[test]
     fn radius_edit_updates_only_geometry_and_camera_navigation_envelope() {

@@ -12,6 +12,8 @@ struct Maxima {
     l: f64,
     com: f64,
     phase: f64,
+    final_phase: f64,
+    final_time_s: f64,
     period: f64,
     oracle_crossing_interpolation_s: f64,
 }
@@ -60,9 +62,8 @@ fn run(e: f64, periods: f64, h: f64, boosted: bool) -> Maxima {
             let old = unwrapped;
             unwrapped += delta;
             previous_angle = angle;
-            max.phase = max
-                .phase
-                .max((unwrapped - std::f64::consts::TAU * (k as f64 * h / period())).abs());
+            max.final_phase = (unwrapped - std::f64::consts::TAU * (k as f64 * h / period())).abs();
+            max.phase = max.phase.max(max.final_phase);
             if unwrapped >= crossing {
                 let time = (k - 1) as f64 * h + h * (crossing - old) / delta;
                 if returns < 20 {
@@ -86,6 +87,7 @@ fn run(e: f64, periods: f64, h: f64, boosted: bool) -> Maxima {
             }
         }
     }
+    max.final_time_s = steps as f64 * h;
     eprintln!(
         "e={e} h={h} periods={periods} boosted={boosted} steps={steps} T={} maxima={max:?}",
         period()
@@ -114,15 +116,14 @@ fn boosted_straight_line_com_100_periods() {
 }
 #[test]
 fn second_order_phase_convergence() {
-    let coarse = run(0.0, 20.0, 10.0, false).phase;
+    let coarse = run(0.0, 20.0, 10.0, false);
     // Common final instant, no shortened step: fine run has exactly twice coarse ticks.
     let periods = ((20.0 * period() / 10.0).floor() * 10.0) / period();
-    let fine = run(0.0, periods, 5.0, false).phase;
-    assert!(
-        (0.20..=0.35).contains(&(fine / coarse)),
-        "ratio {}",
-        fine / coarse
-    );
+    let fine = run(0.0, periods, 5.0, false);
+    assert_eq!(coarse.final_time_s, fine.final_time_s);
+    let ratio = fine.final_phase / coarse.final_phase;
+    eprintln!("common endpoint phase ratio={ratio}");
+    assert!((0.20..=0.35).contains(&ratio), "ratio {}", ratio);
 }
 #[test]
 #[ignore = "focused release: 1000 orbital periods"]
