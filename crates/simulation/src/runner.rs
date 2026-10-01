@@ -235,6 +235,14 @@ impl FixedStepRunner {
             self.segment(self.clock.requested_time());
         }
         self.clock.set_rate(rate);
+        if self.overload && new.abs() < old.abs() {
+            self.overload = false;
+            self.status = if self.clock.paused() {
+                PlaybackStatus::Paused
+            } else {
+                PlaybackStatus::Playing
+            };
+        }
     }
     /// Overload resume retains admitted debt and fraction, distinct from paused Resume.
     pub fn resume_admission(&mut self) {
@@ -365,11 +373,11 @@ impl FixedStepRunner {
     /// Headless exact forward demand. Integration still respects fixed h and the
     /// work/admission ceilings; this is not a seek or an immediate world mutation.
     pub fn request_forward_to_tick(&mut self, target: u64) -> Result<(), SimulationError> {
-        if target < self.tick || self.replay.is_some() || self.seek.is_some() {
+        if self.suspended || target < self.tick || self.replay.is_some() || self.seek.is_some() {
             return Err(SimulationError::InvalidConfig);
         }
         let time = tick_time(self.epoch, self.config.fixed_step_s, target)?;
-        if target - self.tick > self.config.backlog_limit {
+        if self.overload || target - self.tick > self.config.backlog_limit {
             self.overload = true;
             self.status = PlaybackStatus::DemandHaltedOverload;
             self.rejected =

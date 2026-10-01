@@ -218,6 +218,16 @@ impl GravityOrbitsDemo {
         self.diagnostic_elapsed = Duration::ZERO;
         Ok(())
     }
+    fn refresh_report_metadata(&mut self) {
+        self.advance = SimulationAdvanceReport {
+            work_steps: self.advance.work_steps,
+            forward_steps: self.advance.forward_steps,
+            restored_steps: self.advance.restored_steps,
+            force_passes: self.advance.force_passes,
+            pair_evaluations: self.advance.pair_evaluations,
+            ..self.runner.report()
+        };
+    }
     fn command(&mut self, command: Command) -> Result<()> {
         let id = self.ids[self.selected];
         match command {
@@ -392,6 +402,7 @@ impl GravityOrbitsDemo {
         if !self.coherent {
             self.publish();
             if !self.coherent {
+                self.advance = self.runner.report();
                 return;
             }
         }
@@ -434,6 +445,16 @@ impl GravityOrbitsDemo {
             self.achieved_rate = None;
         }
         self.publish();
+        if self.coherent
+            && let Err(error) = self
+                .projection
+                .coherent_view(&self.system)
+                .map_err(anyhow::Error::new)
+                .and_then(|pair| self.camera.refresh_navigation_constraint(&pair))
+        {
+            self.runner.set_paused(true);
+            self.diagnostic = Some(error.to_string());
+        }
         self.diagnostic_elapsed = self.diagnostic_elapsed.saturating_add(elapsed);
         if (self.diagnostic_elapsed >= Duration::from_millis(250)
             || (self.runner.paused() && self.advance.work_steps > 0))
@@ -451,6 +472,7 @@ impl GravityOrbitsDemo {
             self.achieved_anchor_s = self.system.sample_time().seconds_since_epoch();
             self.achieved_elapsed = Duration::ZERO;
         }
+        self.refresh_report_metadata();
     }
     pub fn render(&mut self, renderer: &mut Renderer, width: u32, height: u32) -> Result<()> {
         if width == 0 || height == 0 {
@@ -545,6 +567,7 @@ impl GravityOrbitsDemo {
         let preparation_ms = started.elapsed().as_secs_f64() * 1000.0;
         if let Err(error) = prepared {
             self.runner.set_paused(true);
+            self.refresh_report_metadata();
             self.diagnostic = Some(format!(
                 "Render preparation failed; no partial celestial frame uploaded: {error}"
             ));
@@ -917,5 +940,39 @@ mod tests {
         demo.command(Command::Single(false)).unwrap();
         demo.update(Duration::ZERO);
         assert_eq!(demo.trails.retained_ticks(), [15]);
+    }
+    #[test]
+    fn radius_edit_updates_only_geometry_and_camera_navigation_envelope() {
+        let mut demo = GravityOrbitsDemo::new().unwrap();
+        demo.command(Command::Focus {
+            fixed: false,
+            fit: true,
+        })
+        .unwrap();
+        let state = *demo.system.body(demo.ids[1]).unwrap().state();
+        demo.command(Command::Radius(6.371e8)).unwrap();
+        demo.update(Duration::ZERO);
+        assert_eq!(*demo.system.body(demo.ids[1]).unwrap().state(), state);
+        assert!(demo.camera.distance_m() >= 1.05 * 6.371e8);
+        assert!(demo.projection.coherent_view(&demo.system).is_ok());
+    }
+    #[test]
+    fn projection_failure_suppresses_drawing_and_reports_actual_paused_clock() {
+        let mut demo = GravityOrbitsDemo::new().unwrap();
+        let wrong = CelestialSystem::new(NonZeroU64::new(99).unwrap(), SimulationInstant::ZERO);
+        demo.projection =
+            CelestialFrameProjection::build(&wrong, NonZeroU64::new(99).unwrap()).unwrap();
+        demo.command(Command::Pause(false)).unwrap();
+        demo.update(Duration::from_secs(1));
+        assert!(!demo.coherent);
+        assert!(demo.runner.paused());
+        assert!(demo.advance.forward_steps > 0);
+        assert_eq!(demo.advance.status, PlaybackStatus::Paused);
+        assert_eq!(demo.advance.requested_time, demo.system.sample_time());
+        let revision = demo.system.revision();
+        demo.command(Command::Rebuild).unwrap();
+        demo.update(Duration::ZERO);
+        assert!(demo.coherent);
+        assert_eq!(demo.system.revision(), revision);
     }
 }

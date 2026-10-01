@@ -43,6 +43,17 @@ pub struct IntegrationWorkspace {
     pub(crate) expected_time: SimulationInstant,
     ready: bool,
 }
+fn validate_spin_step(states: &[BodyState], step_s: f64) -> Result<(), SimulationError> {
+    for state in states {
+        let displacement =
+            crate::gravity::distance(state.angular_velocity_in_system().radians_per_second())
+                * step_s;
+        if !displacement.is_finite() {
+            return Err(MathError::NonFinite.into());
+        }
+    }
+    Ok(())
+}
 
 impl IntegrationWorkspace {
     pub fn new(system: &CelestialSystem, fixed_step_s: f64) -> Result<Self, SimulationError> {
@@ -55,6 +66,7 @@ impl IntegrationWorkspace {
             .map(|(_, b)| b.properties().mass_kg())
             .collect();
         let states: Vec<_> = system.bodies().map(|(_, b)| *b.state()).collect();
+        validate_spin_step(&states, fixed_step_s)?;
         let positions_m: Vec<_> = states
             .iter()
             .map(|s| s.center_in_system().metres())
@@ -185,6 +197,7 @@ impl IntegrationWorkspace {
             "snapshot topology belongs to branch"
         );
         self.ready = false;
+        validate_spin_step(states, self.fixed_step_s)?;
         for (position, state) in self.candidate_positions_m.iter_mut().zip(states) {
             *position = state.center_in_system().metres();
         }

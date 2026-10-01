@@ -336,7 +336,11 @@ impl CelestialModelDemo {
             self.diagnostic = None;
         }
         self.tick(delta);
-        let evaluation = self.fixture.projection.tree().evaluate();
+        let paired = self
+            .fixture
+            .projection
+            .coherent_view(&self.fixture.system)?;
+        let evaluation = paired.evaluation();
         let view = PreparedView::new(
             &evaluation,
             self.observer,

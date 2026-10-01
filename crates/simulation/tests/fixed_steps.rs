@@ -179,6 +179,13 @@ fn edit_preflight_rejects_without_changing_session_and_name_retains_history() {
     assert!(r.edit_state(&mut w, ids[1], coincident).is_err());
     let invalid_diagnostic = state(old[1].center_in_system().metres(), DVec3::X * 1e200);
     assert!(r.edit_state(&mut w, ids[1], invalid_diagnostic).is_err());
+    let invalid_spin = BodyState::new(
+        old[1].center_in_system(),
+        old[1].center_velocity_in_system(),
+        old[1].body_to_system(),
+        mundaris_math::AngularVelocity3::try_radians_per_second(DVec3::X * f64::MAX).unwrap(),
+    );
+    assert!(r.edit_state(&mut w, ids[1], invalid_spin).is_err());
     assert_eq!(states(&w), old);
     assert_eq!(w.revision(), revision);
     assert!(!r.paused());
@@ -353,6 +360,21 @@ fn direct_headless_ticks_append_staleness_and_small_history_cap() {
     drain(&mut r, &mut world);
     assert_eq!(r.tick(), 12);
     assert!(r.request_forward_to_tick(11).is_err());
+    r.request_forward_to_tick(40).unwrap();
+    assert_eq!(r.report().status, PlaybackStatus::DemandHaltedOverload);
+    r.request_forward_to_tick(13).unwrap();
+    assert_eq!(r.report().target_tick, 12);
+    r.resume_admission();
+    r.request_forward_to_tick(13).unwrap();
+    drain(&mut r, &mut world);
+    assert_eq!(r.tick(), 13);
+    r.set_rate(PlaybackRate::try_multiplier(1000.0).unwrap());
+    r.admit_wall_elapsed(Duration::from_secs(1)).unwrap();
+    assert_eq!(r.report().status, PlaybackStatus::DemandHaltedOverload);
+    let retained = r.report().requested_time;
+    r.set_rate(PlaybackRate::try_multiplier(1.0).unwrap());
+    assert_eq!(r.report().requested_time, retained);
+    assert_ne!(r.report().status, PlaybackStatus::DemandHaltedOverload);
     world
         .insert_body(
             "appended",

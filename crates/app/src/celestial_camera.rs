@@ -68,6 +68,28 @@ impl CelestialCamera {
     pub fn distance_m(&self) -> f64 {
         self.distance_m
     }
+    /// Property edits may change the navigation envelope while leaving physics
+    /// unchanged. Reapply it against the coherent current body radius.
+    pub fn refresh_navigation_constraint(
+        &mut self,
+        pair: &CoherentCelestialView<'_>,
+    ) -> Result<()> {
+        let id = match self.attachment {
+            CameraAttachment::System => return Ok(()),
+            CameraAttachment::Translating(id) | CameraAttachment::BodyFixed(id) => id,
+        };
+        let minimum = 1.05 * pair.system().body(id)?.properties().reference_radius_m();
+        ensure!(
+            minimum.is_finite(),
+            "unrepresentable camera navigation distance"
+        );
+        self.min_distance_m = minimum;
+        if self.distance_m < minimum {
+            self.distance_m = minimum;
+            self.update_pose(self.pose.position().frame())?;
+        }
+        Ok(())
+    }
     fn update_pose(&mut self, frame: FrameId) -> Result<()> {
         let rotation = self.orbit_basis.compose(UnitRotation::try_from_quaternion(
             DQuat::from_rotation_y(self.yaw) * DQuat::from_rotation_x(self.pitch),
