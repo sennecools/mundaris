@@ -3,3 +3,4 @@
 
 pub mod celestial_camera;
 pub mod gravity_fixtures;
+pub mod trails;
