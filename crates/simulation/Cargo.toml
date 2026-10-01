@@ -1,0 +1,8 @@
+[package]
+name = "mundaris_simulation"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[lints]
+workspace = true

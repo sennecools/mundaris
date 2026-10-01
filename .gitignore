@@ -1,0 +1,35 @@
+/target/
+*.log
+*.tmp
+*.temp
+*.dump
+*.dmp
+*.core
+*.profraw
+*.pprof
+*.trace
+*.capture
+/captures/
+/profiling/
+/benchmark-results/
+
+# Local environment and machine-specific configuration
+.env
+.env.*
+!.env.example
+*.local
+
+# Operating systems
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Rust analyzer/editor state
+.rust-analyzer/

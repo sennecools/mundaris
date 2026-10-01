@@ -1,0 +1,15 @@
+[package]
+name = "mundaris_app"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+mundaris_renderer = { path = "../renderer" }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+winit.workspace = true
+
+[lints]
+workspace = true

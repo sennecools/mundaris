@@ -1,0 +1,32 @@
+[workspace]
+members = [
+    "crates/app",
+    "crates/core",
+    "crates/math",
+    "crates/world",
+    "crates/simulation",
+    "crates/renderer",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1.0"
+egui = "0.33"
+egui-wgpu = "0.33"
+egui-winit = "0.33"
+glam = "0.30"
+pollster = "0.4"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wgpu = "27"
+winit = "0.30"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
