@@ -1,8 +1,14 @@
-//! Mathematical conventions and future reference-frame primitives for Mundaris.
+//! Checked reference-frame mathematics for Mundaris.
 //!
-//! Authoritative astronomical and simulation calculations are expected to use
-//! `f64` where precision matters. GPU-facing and observer-local render data should
-//! use `f32`, with conversions performed deliberately at the rendering boundary.
-//! Full coordinate and reference-frame APIs are intentionally not defined yet.
+//! Physical values use `f64`, metres, seconds and radians. Frames are right-handed
+//! and orthonormal; positive angles follow the right-hand rule. Column-vector
+//! composition applies the inner transform first. Camera forward is local `-Z`.
+//! Only the renderer narrows physical values to observer-relative `f32` data.
 
 #![forbid(unsafe_code)]
+
+mod coordinates;
+mod transform;
+
+pub use coordinates::*;
+pub use transform::*;

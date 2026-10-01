@@ -19,7 +19,6 @@ anyhow = "1.0"
 egui = "0.33"
 egui-wgpu = "0.33"
 egui-winit = { version = "0.33", default-features = false, features = ["wayland", "x11"] }
-# Selected for future math code; no crate needs mathematical operations yet.
 glam = "0.30"
 pollster = "0.4"
 thiserror = "2"
