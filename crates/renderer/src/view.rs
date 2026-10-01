@@ -162,6 +162,13 @@ pub struct PreparedRenderFrame<'a> {
     budget: RenderPrecisionBudget,
 }
 impl PreparedRenderFrame<'_> {
+    /// Camera-axis unit normal/direction; no origin or translation contribution.
+    pub fn view_direction(
+        &self,
+        direction: mundaris_math::Direction3,
+    ) -> Result<mundaris_math::Direction3, RenderPreparationError> {
+        Ok(self.camera_from_source.rotate_direction(direction)?)
+    }
     /// High-precision view displacement for CPU diagnostics/explicit range selection.
     pub fn view_displacement(
         &self,

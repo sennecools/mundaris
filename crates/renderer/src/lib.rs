@@ -5,8 +5,12 @@
 
 #![forbid(unsafe_code)]
 
+mod celestial;
+mod celestial_view;
 mod debug;
 mod view;
+pub use celestial::*;
+pub use celestial_view::*;
 pub use debug::{DebugFrame, DebugLine, DebugProjection, DebugStaging};
 pub use view::*;
 
@@ -56,6 +60,7 @@ pub struct Renderer {
     window: Arc<Window>,
     suspended: bool,
     debug: Option<debug::DebugRenderer>,
+    celestial: Option<celestial::CelestialRenderer>,
 }
 
 impl Renderer {
@@ -145,6 +150,7 @@ impl Renderer {
             window,
             suspended,
             debug: None,
+            celestial: None,
         })
     }
 
@@ -169,11 +175,14 @@ impl Renderer {
         if let Some(debug) = &mut self.debug {
             debug.resize(&self.device, width, height);
         }
+        if let Some(celestial) = &mut self.celestial {
+            celestial.resize(&self.device, width, height);
+        }
     }
 
     /// Clears and presents a frame containing UI supplied by the application.
     pub fn render(&mut self, ui: impl FnMut(&egui::Context)) -> Result<(), RendererError> {
-        self.render_frame(None, ui)
+        self.render_frame(None, None, ui)
     }
 
     /// Draws a completely validated, view-bound debug frame before application UI.
@@ -182,12 +191,22 @@ impl Renderer {
         frame: &DebugFrame<'_, '_, '_>,
         ui: impl FnMut(&egui::Context),
     ) -> Result<(), RendererError> {
-        self.render_frame(Some(frame), ui)
+        self.render_frame(Some(frame), None, ui)
+    }
+
+    pub fn render_celestial(
+        &mut self,
+        frame: &CelestialFrame<'_, '_, '_>,
+        ui: impl FnMut(&egui::Context),
+    ) -> Result<(), RendererError> {
+        frame.validate()?;
+        self.render_frame(None, Some(frame), ui)
     }
 
     fn render_frame(
         &mut self,
         debug_frame: Option<&DebugFrame<'_, '_, '_>>,
+        celestial_frame: Option<&CelestialFrame<'_, '_, '_>>,
         ui: impl FnMut(&egui::Context),
     ) -> Result<(), RendererError> {
         if self.suspended {
@@ -257,6 +276,18 @@ impl Renderer {
             });
             debug.draw(&self.device, &self.queue, &mut encoder, &view, frame)?;
         }
+        if let Some(frame) = celestial_frame {
+            let celestial = self.celestial.get_or_insert_with(|| {
+                celestial::CelestialRenderer::new(
+                    &self.device,
+                    &self.queue,
+                    self.surface_config.format,
+                    self.surface_config.width,
+                    self.surface_config.height,
+                )
+            });
+            celestial.draw(&self.device, &self.queue, &mut encoder, &view, frame)?;
+        }
 
         {
             let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -266,7 +297,7 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: if debug_frame.is_some() {
+                        load: if debug_frame.is_some() || celestial_frame.is_some() {
                             wgpu::LoadOp::Load
                         } else {
                             wgpu::LoadOp::Clear(wgpu::Color {
