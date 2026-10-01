@@ -48,7 +48,7 @@ impl CelestialCamera {
             attachment: CameraAttachment::System,
             anchor,
             orbit_basis: UnitRotation::identity(),
-            distance_m: 4.0 * extent_m,
+            distance_m: 2.5 * extent_m,
             yaw: 0.0,
             pitch: 0.0,
             min_distance_m: 0.1,

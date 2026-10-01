@@ -26,10 +26,11 @@ struct MundarisApp {
     redraw_schedule: redraw::RedrawSchedule,
     demo: Option<reference_frames::ReferenceFrameDemo>,
     celestial_demo: Option<celestial_model::CelestialModelDemo>,
+    gravity_demo: Option<mundaris_app::GravityOrbitsDemo>,
 }
 
 impl MundarisApp {
-    fn new(reference_frames: bool, celestial_model: bool) -> Result<Self> {
+    fn new(reference_frames: bool, celestial_model: bool, gravity_orbits: bool) -> Result<Self> {
         Ok(Self {
             window: None,
             renderer: None,
@@ -43,6 +44,11 @@ impl MundarisApp {
             },
             celestial_demo: if celestial_model {
                 Some(celestial_model::CelestialModelDemo::new()?)
+            } else {
+                None
+            },
+            gravity_demo: if gravity_orbits {
+                Some(mundaris_app::GravityOrbitsDemo::new()?)
             } else {
                 None
             },
@@ -101,9 +107,15 @@ impl ApplicationHandler for MundarisApp {
         if let Some(demo) = &mut self.celestial_demo {
             demo.reset_wall_tick();
         }
+        if let Some(demo) = &mut self.gravity_demo {
+            demo.reset_wall_capture();
+        }
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(demo) = &mut self.gravity_demo {
+            demo.set_lifecycle_drawable(false);
+        }
         // Release presentation resources before the native window on suspension.
         self.renderer = None;
         self.window = None;
@@ -142,6 +154,8 @@ impl ApplicationHandler for MundarisApp {
                     demo.render(renderer, size.width, size.height)
                 } else if let Some(demo) = &mut self.celestial_demo {
                     demo.render(renderer, size.width, size.height)
+                } else if let Some(demo) = &mut self.gravity_demo {
+                    demo.render(renderer, size.width, size.height)
                 } else {
                     renderer.render(bootstrap_ui).map_err(anyhow::Error::new)
                 };
@@ -159,6 +173,10 @@ impl ApplicationHandler for MundarisApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let drawable = self.drawable();
+        if let Some(demo) = &mut self.gravity_demo {
+            demo.set_lifecycle_drawable(drawable);
+        }
         let (control_flow, request_redraw) =
             self.redraw_schedule.update(Instant::now(), self.drawable());
         event_loop.set_control_flow(control_flow);
@@ -191,18 +209,33 @@ fn main() -> Result<()> {
     let event_loop = EventLoop::new().context("creating the native event loop")?;
     let mut reference_frames = false;
     let mut celestial_model = false;
+    let mut gravity_orbits = false;
     for argument in std::env::args().skip(1) {
-        if argument == "--reference-frames" && !reference_frames && !celestial_model {
+        if argument == "--reference-frames"
+            && !reference_frames
+            && !celestial_model
+            && !gravity_orbits
+        {
             reference_frames = true;
-        } else if argument == "--celestial-model" && !reference_frames && !celestial_model {
+        } else if argument == "--celestial-model"
+            && !reference_frames
+            && !celestial_model
+            && !gravity_orbits
+        {
             celestial_model = true;
+        } else if argument == "--gravity-orbits"
+            && !reference_frames
+            && !celestial_model
+            && !gravity_orbits
+        {
+            gravity_orbits = true;
         } else {
             anyhow::bail!(
-                "unknown, conflicting or duplicate argument: {argument}; usage: mundaris_app [--reference-frames | --celestial-model]"
+                "unknown, conflicting or duplicate argument: {argument}; usage: mundaris_app [--reference-frames | --celestial-model | --gravity-orbits]"
             );
         }
     }
-    let mut app = MundarisApp::new(reference_frames, celestial_model)?;
+    let mut app = MundarisApp::new(reference_frames, celestial_model, gravity_orbits)?;
     event_loop
         .run_app(&mut app)
         .context("running the native application event loop")?;

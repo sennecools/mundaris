@@ -3,4 +3,6 @@
 
 pub mod celestial_camera;
 pub mod gravity_fixtures;
+mod gravity_orbits;
+pub use gravity_orbits::GravityOrbitsDemo;
 pub mod trails;
