@@ -18,6 +18,58 @@ fn runner(world: &CelestialSystem, work: u32, debt: u64, slots: usize) -> FixedS
 fn states(world: &CelestialSystem) -> Vec<BodyState> {
     world.bodies().map(|(_, b)| *b.state()).collect()
 }
+
+#[test]
+fn caller_chunks_preserve_exact_states_history_and_callbacks() {
+    for chunks in [&[512][..], &[1, 8, 32][..]] {
+        let mut old = circular(0.0, DVec3::ZERO, DVec3::ZERO);
+        let mut new = circular(0.0, DVec3::ZERO, DVec3::ZERO);
+        let mut a = runner(&old, 512, 65536, 8);
+        let mut b = runner(&new, 512, 65536, 8);
+        let mut ac = Vec::new();
+        let mut bc = Vec::new();
+        a.request_forward_to_tick(3000).unwrap();
+        b.request_forward_to_tick(3000).unwrap();
+        while a.tick() < 3000 {
+            a.pump(&mut old, |tick, _| ac.push(tick)).unwrap();
+        }
+        let mut i = 0;
+        while b.tick() < 3000 {
+            b.pump_with_work_limit(&mut new, chunks[i % chunks.len()], |tick, _| bc.push(tick))
+                .unwrap();
+            i += 1;
+        }
+        assert_eq!(states(&old), states(&new));
+        assert_eq!(ac, bc);
+        assert_eq!(a.report().retained_ticks, b.report().retained_ticks);
+        for target in [2999, 123, 3000] {
+            a.seek_tick(target).unwrap();
+            b.seek_tick(target).unwrap();
+            drain(&mut a, &mut old);
+            loop {
+                let report = b
+                    .pump_with_work_limit(&mut new, chunks[i % chunks.len()], |_, _| {})
+                    .unwrap();
+                i += 1;
+                if report.backlog_ticks == 0 && report.replay_remaining.is_none() {
+                    break;
+                }
+            }
+            assert_eq!(states(&old), states(&new));
+            assert_eq!(a.report().retained_ticks, b.report().retained_ticks);
+        }
+        let revision = new.revision();
+        let report = b.report();
+        for limit in [0, 513] {
+            assert!(
+                b.pump_with_work_limit(&mut new, limit, |_, _| panic!("invalid budget callback"))
+                    .is_err()
+            );
+            assert_eq!(new.revision(), revision);
+            assert_eq!(b.report().status, report.status);
+        }
+    }
+}
 fn drain(r: &mut FixedStepRunner, w: &mut CelestialSystem) {
     loop {
         let report = r.pump(w, |_, _| {}).unwrap();

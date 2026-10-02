@@ -53,6 +53,9 @@ impl SimulationConfig {
     pub fn fixed_step_s(self) -> f64 {
         self.fixed_step_s
     }
+    pub fn work_limit(self) -> u32 {
+        self.work_limit
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -434,10 +437,26 @@ impl FixedStepRunner {
     pub fn pump(
         &mut self,
         system: &mut CelestialSystem,
+        after_commit: impl FnMut(u64, &CelestialSystem),
+    ) -> Result<SimulationAdvanceReport, SimulationPumpError> {
+        self.pump_with_work_limit(system, self.config.work_limit, after_commit)
+    }
+    /// Caller-controlled bounded scheduling, including restores and private replay.
+    /// Invalid limits leave world and runner untouched. Physical h/order never change.
+    pub fn pump_with_work_limit(
+        &mut self,
+        system: &mut CelestialSystem,
+        max_work_units: u32,
         mut after_commit: impl FnMut(u64, &CelestialSystem),
     ) -> Result<SimulationAdvanceReport, SimulationPumpError> {
+        if max_work_units == 0 || max_work_units > self.config.work_limit {
+            return Err(SimulationPumpError {
+                source: SimulationError::InvalidConfig,
+                report: Box::new(self.report()),
+            });
+        }
         let mut counters = [0u32; 4]; // work, forward, restores, force passes
-        let result = self.pump_inner(system, &mut after_commit, &mut counters);
+        let result = self.pump_inner(system, max_work_units, &mut after_commit, &mut counters);
         if let Err(source) = result {
             self.clock.set_paused(true);
             self.replay = None;
@@ -465,6 +484,7 @@ impl FixedStepRunner {
     fn pump_inner(
         &mut self,
         system: &mut CelestialSystem,
+        max_work_units: u32,
         after_commit: &mut impl FnMut(u64, &CelestialSystem),
         c: &mut [u32; 4],
     ) -> Result<(), SimulationError> {
@@ -481,7 +501,7 @@ impl FixedStepRunner {
             self.status = PlaybackStatus::OriginBoundary;
             return Ok(());
         }
-        while c[0] < self.config.work_limit {
+        while c[0] < max_work_units {
             if let Some(replay) = &mut self.replay {
                 if !replay.initialized {
                     self.replay_work.restore(&self.baseline)?;
