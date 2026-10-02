@@ -106,8 +106,16 @@ pub struct CelestialBody {
     pub(crate) name: String,
     pub(crate) properties: BodyProperties,
     pub(crate) state: BodyState,
+    pub(crate) terrain: Option<crate::terrain::TerrainDefinition>,
+    pub(crate) terrain_revision: crate::terrain::TerrainRevision,
 }
 impl CelestialBody {
+    pub fn terrain(&self) -> Option<&crate::terrain::TerrainDefinition> {
+        self.terrain.as_ref()
+    }
+    pub fn terrain_revision(&self) -> crate::terrain::TerrainRevision {
+        self.terrain_revision
+    }
     pub fn name(&self) -> &str {
         &self.name
     }

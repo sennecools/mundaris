@@ -20,6 +20,8 @@ pub enum CelestialSystemError {
     IncompleteTimeUpdate,
     #[error(transparent)]
     Property(#[from] BodyPropertyError),
+    #[error(transparent)]
+    Terrain(#[from] crate::terrain::TerrainError),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -100,6 +102,8 @@ impl CelestialSystem {
             name,
             properties,
             state,
+            terrain: None,
+            terrain_revision: Default::default(),
         });
         self.duplicate_flags.push(false);
         self.revision = revision;
@@ -118,6 +122,9 @@ impl CelestialSystem {
         let index = self.index(id)?;
         let name = name.into();
         validate_name(&name)?;
+        if let Some(terrain) = &self.bodies[index].terrain {
+            terrain.validate_radius(properties.reference_radius_m())?;
+        }
         let revision = self.next_revision()?;
         self.bodies[index].name = name;
         self.bodies[index].properties = properties;
@@ -130,6 +137,9 @@ impl CelestialSystem {
         properties: BodyProperties,
     ) -> Result<(), CelestialSystemError> {
         let index = self.index(id)?;
+        if let Some(terrain) = &self.bodies[index].terrain {
+            terrain.validate_radius(properties.reference_radius_m())?;
+        }
         let revision = self.next_revision()?;
         self.bodies[index].properties = properties;
         self.revision = revision;
@@ -137,6 +147,26 @@ impl CelestialSystem {
     }
     pub fn edit_state(&mut self, id: BodyId, state: BodyState) -> Result<(), CelestialSystemError> {
         self.update_states(self.sample_time, &[BodyStateUpdate { body: id, state }])
+    }
+    /// Terrain-only publication does not alter celestial revision, frames, sample
+    /// instant or simulation history. Equality is complete definition equality.
+    pub fn edit_terrain(
+        &mut self,
+        id: BodyId,
+        terrain: Option<crate::terrain::TerrainDefinition>,
+    ) -> Result<(), CelestialSystemError> {
+        let index = self.index(id)?;
+        let body = &mut self.bodies[index];
+        if let Some(definition) = &terrain {
+            definition.validate_radius(body.properties.reference_radius_m())?;
+        }
+        if body.terrain == terrain {
+            return Ok(());
+        }
+        let revision = body.terrain_revision.next()?;
+        body.terrain = terrain;
+        body.terrain_revision = revision;
+        Ok(())
     }
     /// Transactional O(U), allocation-free after insertion. Caller order is arbitrary.
     /// At a different time, all bodies must be supplied. At the same time subsets

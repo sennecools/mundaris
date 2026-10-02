@@ -7,9 +7,9 @@ publish = false
 [dependencies]
 mundaris_math = { path = "../math" }
 thiserror.workspace = true
+glam.workspace = true
 
 [dev-dependencies]
-glam.workspace = true
 criterion.workspace = true
 
 [[bench]]
@@ -18,6 +18,10 @@ harness = false
 
 [[bench]]
 name = "frame_projection"
+harness = false
+
+[[bench]]
+name = "terrain_generation"
 harness = false
 
 [lints]

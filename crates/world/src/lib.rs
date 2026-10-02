@@ -8,6 +8,7 @@
 mod body;
 mod frame_projection;
 mod system;
+pub mod terrain;
 
 pub use body::*;
 pub use frame_projection::*;
