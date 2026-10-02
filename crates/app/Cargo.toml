@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
+[features]
+surface-profile = ["mundaris_renderer/surface-profile"]
+
 [dependencies]
 anyhow.workspace = true
 egui.workspace = true

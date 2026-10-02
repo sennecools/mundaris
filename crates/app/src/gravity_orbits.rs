@@ -1049,7 +1049,11 @@ impl GravityOrbitsDemo {
             ClockInterval::Hidden => Duration::ZERO,
             ClockInterval::Discontinuity(gap) => gap,
         };
+        #[cfg(feature = "surface-profile")]
+        let update_started = Instant::now();
         self.update(elapsed);
+        #[cfg(feature = "surface-profile")]
+        let update_ms = update_started.elapsed().as_secs_f64() * 1000.0;
         if !self.coherent {
             let (info, controls) = self.ui_info(CelestialPreparationReport::default(), 0.0, 0.0);
             renderer.render(|ctx| draw_ui(ctx, controls, &info, &[]))?;
@@ -1351,9 +1355,26 @@ impl GravityOrbitsDemo {
             coarse_curves: self.coarse_curves,
         };
         let controls = &mut self.controls;
+        #[cfg(feature = "surface-profile")]
+        let render_started = Instant::now();
         renderer.render_celestial(&frame, |context| {
             draw_ui(context, controls, &info, frame.markers())
         })?;
+        #[cfg(feature = "surface-profile")]
+        tracing::debug!(
+            interval_ms = elapsed.as_secs_f64() * 1000.0,
+            update_ms,
+            pump_ms = self.pump_ms,
+            preparation_ms,
+            surface_ms = report.surface.profile.total.as_secs_f64() * 1000.0,
+            render_present_ms = render_started.elapsed().as_secs_f64() * 1000.0,
+            patches = report.surface.patches,
+            samples = report.surface.samples,
+            bytes = report.surface.uploaded_bytes,
+            draws = report.surface.draws,
+            dpi = scale,
+            "surface CPU/cadence probe (render includes UI/acquire/upload/submit/present, not GPU duration)"
+        );
         Ok(())
     }
     fn ui_info(
@@ -1911,6 +1932,62 @@ mod tests {
         assert_ne!(*demo.system.body(ids[1]).unwrap().state(), initial);
         assert_eq!(demo.camera.focused_body(), Some(ids[1]));
         assert!(demo.camera.clearance_m() < 2.001);
+        assert!(demo.diagnostic.is_none(), "{:?}", demo.diagnostic);
+    }
+    #[test]
+    fn near_surface_stall_and_hidden_duration_preserve_inspection_and_resume_cleanly() {
+        let mut demo = GravityOrbitsDemo::new().unwrap();
+        demo.start_surface_validation().unwrap();
+        for _ in 0..1750 {
+            demo.update(Duration::from_millis(32));
+        }
+        assert_eq!(demo.camera.mode(), CameraMode::SurfaceInspection);
+        assert!(demo.camera.clearance_m() < 2.001);
+        demo.validation_route = None;
+        demo.command(Command::Rate(1e6)).unwrap();
+        demo.command(Command::Pause(false)).unwrap();
+        demo.update(Duration::from_millis(100));
+        assert!(demo.advance.backlog_ticks > 0);
+        let revision = demo.system.revision();
+        let tick = demo.runner.tick();
+        let pose = demo.camera.pose();
+        let assert_inspection_pose = |actual: FramePose| {
+            assert_eq!(actual.position(), pose.position());
+            // Inspection reconstructs its normalized orientation even at zero
+            // navigation duration; compare within the existing basis envelope.
+            for (a, b) in actual
+                .orientation()
+                .quaternion()
+                .to_array()
+                .into_iter()
+                .zip(pose.orientation().quaternion().to_array())
+            {
+                assert!((a - b).abs() <= 1e-12);
+            }
+        };
+        demo.update(Duration::from_secs(36000));
+        assert_eq!(demo.system.revision(), revision);
+        assert_inspection_pose(demo.camera.pose());
+        assert_eq!(demo.runner.tick(), tick);
+        assert_eq!(demo.advance.backlog_ticks, 0);
+        assert!(demo.runner.paused());
+        assert!(demo.gap_diagnostic.is_some());
+        demo.set_lifecycle_drawable(false);
+        demo.update(Duration::from_secs(36000));
+        demo.set_lifecycle_drawable(true);
+        demo.update(Duration::ZERO);
+        assert_inspection_pose(demo.camera.pose());
+        assert_eq!(demo.system.revision(), revision);
+        assert_eq!(demo.camera.mode(), CameraMode::SurfaceInspection);
+        demo.command(Command::Rate(1.0)).unwrap();
+        demo.command(Command::Pause(false)).unwrap();
+        demo.update(Duration::ZERO);
+        assert_eq!(demo.runner.tick(), tick);
+        demo.command(Command::Single(true)).unwrap();
+        demo.update(Duration::ZERO);
+        assert_eq!(demo.runner.tick(), tick + 1);
+        assert_inspection_pose(demo.camera.pose());
+        assert!(demo.projection.coherent_view(&demo.system).is_ok());
         assert!(demo.diagnostic.is_none(), "{:?}", demo.diagnostic);
     }
     #[test]

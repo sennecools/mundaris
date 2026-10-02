@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
+[features]
+# Explicit diagnostic timing; ordinary preparation has no clock reads.
+surface-profile = []
+
 [dependencies]
 mundaris_math = { path = "../math" }
 glam.workspace = true
@@ -31,6 +35,11 @@ harness = false
 [[bench]]
 name = "planet_surface"
 harness = false
+
+[[bench]]
+name = "planet_surface_profile"
+harness = false
+required-features = ["surface-profile"]
 
 [lints]
 workspace = true

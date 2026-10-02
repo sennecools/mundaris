@@ -11,7 +11,11 @@ pub(crate) use bounds::projected_error as sphere_projected_error;
 pub use bounds::{PatchMetadata, SurfaceExtent};
 use cache::MetadataCache;
 pub(crate) use gpu::PlanetSurfaceRenderer;
+#[cfg(feature = "surface-profile")]
+pub use lod::LodProfile;
 pub use lod::{ActiveSurfacePatch, LodReport, LodSettings, SurfaceLodSession, SurfaceViewInput};
+#[cfg(feature = "surface-profile")]
+pub use prepare::SurfacePreparationProfile;
 pub(crate) use prepare::SurfaceStaging;
 pub use prepare::{SurfacePreparationReport, SurfaceStyle};
 pub use topology::{GRID_CELLS, GRID_SAMPLES, SurfaceTopology};

@@ -25,6 +25,25 @@ pub struct SurfacePreparationReport {
     pub max_component_error_m: f64,
     pub max_projected_error_pixels: f64,
     pub max_gpu_projection_error_pixels: f64,
+    #[cfg(feature = "surface-profile")]
+    pub profile: SurfacePreparationProfile,
+}
+/// Opt-in CPU stages. Sample work includes canonical keys, f64 evaluation,
+/// source conversion, normals, narrowing and shared-boundary lookup.
+#[cfg(feature = "surface-profile")]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SurfacePreparationProfile {
+    pub boundary: std::time::Duration,
+    pub setup: std::time::Duration,
+    pub samples: std::time::Duration,
+    pub proof: std::time::Duration,
+    pub packing: std::time::Duration,
+    pub grouping: std::time::Duration,
+    pub total: std::time::Duration,
+    pub whole_patch_proofs: usize,
+    pub clipped_patch_proofs: usize,
+    /// Number of owned vectors whose capacity grew, not allocator calls.
+    pub capacity_growths: usize,
 }
 #[derive(Default)]
 pub(crate) struct SurfaceStaging {
@@ -154,6 +173,12 @@ impl SurfaceStaging {
         topology: &SurfaceTopology,
         style: SurfaceStyle,
     ) -> Result<(), RenderPreparationError> {
+        #[cfg(feature = "surface-profile")]
+        let total_start = std::time::Instant::now();
+        #[cfg(feature = "surface-profile")]
+        let capacities = self.profile_capacities();
+        #[cfg(feature = "surface-profile")]
+        let stage_start = std::time::Instant::now();
         // Canonical tuples are shared within one source/radius batch. Another
         // body has the same unit tuples but different observer-relative samples.
         self.boundary_keys.clear();
@@ -205,6 +230,12 @@ impl SurfaceStaging {
         }
         self.boundary_samples.resize(write, ([0.0; 3], [0.0; 3]));
         self.boundary_ready.resize(write, false);
+        #[cfg(feature = "surface-profile")]
+        {
+            self.report.profile.boundary += stage_start.elapsed();
+        }
+        #[cfg(feature = "surface-profile")]
+        let stage_start = std::time::Instant::now();
         let source = body.body_fixed_frame;
         let radius = body.reference_radius_m;
         let color = body.color;
@@ -251,7 +282,13 @@ impl SurfaceStaging {
                 ));
             }
         }
+        #[cfg(feature = "surface-profile")]
+        {
+            self.report.profile.setup += stage_start.elapsed();
+        }
         for patch in patches {
+            #[cfg(feature = "surface-profile")]
+            let sample_start = std::time::Instant::now();
             if patch.stitch_mask > 15 {
                 return Err(RenderPreparationError::InvalidDebugGeometry);
             }
@@ -295,6 +332,12 @@ impl SurfaceStaging {
                 }
             }
             let indices = topology.indices(patch.stitch_mask);
+            #[cfg(feature = "surface-profile")]
+            {
+                self.report.profile.samples += sample_start.elapsed();
+            }
+            #[cfg(feature = "surface-profile")]
+            let proof_start = std::time::Instant::now();
             let mut fallback = false;
             // Convex interpolation cannot exceed the maximum vertex perturbation.
             // Front-of-near patches prove all clipped triangles at once using the
@@ -416,6 +459,14 @@ impl SurfaceStaging {
             } else {
                 color
             };
+            #[cfg(feature = "surface-profile")]
+            {
+                self.report.profile.proof += proof_start.elapsed();
+                self.report.profile.whole_patch_proofs += usize::from(whole_proof);
+                self.report.profile.clipped_patch_proofs += usize::from(!whole_proof);
+            }
+            #[cfg(feature = "surface-profile")]
+            let packing_start = std::time::Instant::now();
             if fallback {
                 for triangle in indices.as_chunks::<3>().0 {
                     let points = triangle.map(|i| positions[usize::from(i)]);
@@ -488,10 +539,16 @@ impl SurfaceStaging {
             } else {
                 let base = (self.samples.len() / 32) as u32;
                 for (p, n) in gpu_positions.into_iter().zip(gpu_normals) {
-                    pack_floats(
-                        &mut self.samples,
-                        [p[0], p[1], p[2], 1.0, n[0], n[1], n[2], 0.0],
-                    );
+                    // One bounded append per sample, rather than eight independent
+                    // vector length/capacity checks. The byte contract is unchanged.
+                    let mut sample = [0; 32];
+                    for (value, out) in [p[0], p[1], p[2], 1.0, n[0], n[1], n[2], 0.0]
+                        .into_iter()
+                        .zip(sample.as_chunks_mut::<4>().0)
+                    {
+                        out.copy_from_slice(&value.to_le_bytes());
+                    }
+                    self.samples.extend_from_slice(&sample);
                 }
                 let mut record = [0; 64];
                 for (value, out) in [
@@ -516,8 +573,15 @@ impl SurfaceStaging {
                 self.report.triangles += indices.len() / 3;
             }
             self.report.patches += 1;
+            #[cfg(feature = "surface-profile")]
+            {
+                self.report.profile.packing += packing_start.elapsed();
+            }
         }
-        self.records.sort_by_key(|r| r.0);
+        #[cfg(feature = "surface-profile")]
+        let grouping_start = std::time::Instant::now();
+        // The mask pass below is already a stable bucket grouping. Sorting first
+        // adds work and stable-sort scratch without changing the resulting order.
         self.instances.clear();
         let mut cursor = 0u32;
         for mask in 0..16 {
@@ -539,14 +603,36 @@ impl SurfaceStaging {
         self.report.boundary_bytes = self.report.boundary_bytes.max(
             self.boundary_keys.capacity() * 16
                 + self.boundary_samples.capacity() * 24
-                + self.boundary_ready.capacity().div_ceil(8),
+                + self.boundary_ready.capacity() * std::mem::size_of::<bool>(),
         );
         if self.report.allocated_staging_bytes > STAGING_CAP
             || self.report.boundary_bytes > 8 * 1024 * 1024
         {
             return Err(RenderPreparationError::InvalidBudget);
         }
+        #[cfg(feature = "surface-profile")]
+        {
+            self.report.profile.grouping += grouping_start.elapsed();
+            self.report.profile.capacity_growths += capacities
+                .into_iter()
+                .zip(self.profile_capacities())
+                .filter(|(before, after)| after > before)
+                .count();
+            self.report.profile.total += total_start.elapsed();
+        }
         Ok(())
+    }
+    #[cfg(feature = "surface-profile")]
+    fn profile_capacities(&self) -> [usize; 7] {
+        [
+            self.samples.capacity(),
+            self.instances.capacity(),
+            self.fallback.capacity(),
+            self.boundary_keys.capacity(),
+            self.boundary_samples.capacity(),
+            self.boundary_ready.capacity(),
+            self.records.capacity(),
+        ]
     }
 }
 fn pack_floats(bytes: &mut Vec<u8>, values: impl IntoIterator<Item = f32>) {
@@ -567,6 +653,132 @@ mod tests {
             metadata: super::super::PatchMetadata::build(address, topology).unwrap(),
             stitch_mask: 0,
             error_pixels: 0.0,
+        }
+    }
+    #[test]
+    fn sample_bytes_and_interleaved_masks_preserve_stable_bucket_order() {
+        let tree = FrameTree::new(NonZeroU64::new(17).unwrap());
+        let source = tree.root();
+        let view = PreparedView::new(
+            &tree.evaluate(),
+            FramePose::new(
+                FramePosition::new(
+                    source,
+                    LocalPosition::try_metres(DVec3::Z * 1000.0).unwrap(),
+                ),
+                UnitRotation::identity(),
+            ),
+            crate::RenderPrecisionBudget::near_debug(),
+        )
+        .unwrap();
+        let projection =
+            CelestialProjection::try_new(1280, 800, 60.0_f64.to_radians(), 0.1).unwrap();
+        let topology = SurfaceTopology::new();
+        let mut patches = [
+            patch(CubeFace::PositiveX, &topology),
+            patch(CubeFace::PositiveZ, &topology),
+            patch(CubeFace::NegativeX, &topology),
+        ];
+        patches[0].stitch_mask = 8;
+        patches[2].stitch_mask = 8;
+        let body = crate::CelestialRenderBody {
+            body_fixed_frame: source,
+            reference_radius_m: 10.0,
+            color: [0.2, 0.5, 1.0, 1.0],
+            unlit: false,
+            selected: true,
+        };
+        let mut storage = SurfaceStaging::default();
+        storage
+            .append(
+                &view,
+                projection,
+                body,
+                &patches,
+                &topology,
+                SurfaceStyle::default(),
+            )
+            .unwrap();
+        assert!(storage.fallback.is_empty());
+        assert_eq!(
+            storage.report.boundary_bytes,
+            storage.boundary_keys.capacity() * std::mem::size_of::<u128>()
+                + storage.boundary_samples.capacity() * std::mem::size_of::<([f32; 3], [f32; 3])>()
+                + storage.boundary_ready.capacity() * std::mem::size_of::<bool>()
+        );
+        assert_eq!(storage.buckets[0], 0..1);
+        assert_eq!(storage.buckets[8], 1..3);
+        let bases: Vec<_> = storage
+            .instances
+            .as_chunks::<64>()
+            .0
+            .iter()
+            .map(|r| u32::from_le_bytes(r[..4].try_into().unwrap()))
+            .collect();
+        assert_eq!(bases, [289, 0, 578]);
+        for (patch_index, patch) in patches.iter().enumerate() {
+            for index in 0..GRID_SAMPLES {
+                let unit = patch
+                    .address
+                    .sample_direction(index as u32 % 17, index as u32 / 17, 16)
+                    .unwrap()
+                    .unit();
+                let position = (unit * 10.0 - DVec3::Z * 1000.0).as_vec3().to_array();
+                let normal = unit.as_vec3().to_array();
+                let expected: Vec<_> = [
+                    position[0],
+                    position[1],
+                    position[2],
+                    1.0,
+                    normal[0],
+                    normal[1],
+                    normal[2],
+                    0.0,
+                ]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect();
+                let offset = (patch_index * GRID_SAMPLES + index) * 32;
+                assert_eq!(&storage.samples[offset..offset + 32], expected);
+            }
+        }
+        storage
+            .append(
+                &view,
+                projection,
+                body,
+                &patches,
+                &topology,
+                SurfaceStyle::default(),
+            )
+            .unwrap();
+        let bases: Vec<_> = storage
+            .instances
+            .as_chunks::<64>()
+            .0
+            .iter()
+            .map(|r| u32::from_le_bytes(r[..4].try_into().unwrap()))
+            .collect();
+        assert_eq!(bases, [289, 1156, 0, 578, 867, 1445]);
+        #[cfg(feature = "surface-profile")]
+        {
+            assert!(storage.report.profile.capacity_growths > 0);
+            storage.clear();
+            storage
+                .append(
+                    &view,
+                    projection,
+                    body,
+                    &patches,
+                    &topology,
+                    SurfaceStyle::default(),
+                )
+                .unwrap();
+            assert_eq!(storage.report.profile.capacity_growths, 0);
+            assert_eq!(storage.report.profile.whole_patch_proofs, 3);
+            assert_eq!(storage.report.profile.clipped_patch_proofs, 0);
+            let p = storage.report.profile;
+            assert!(p.boundary + p.setup + p.samples + p.proof + p.packing + p.grouping <= p.total);
         }
     }
     #[test]

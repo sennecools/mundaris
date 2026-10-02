@@ -5,6 +5,8 @@ use mundaris_math::{
     FrameId, FramePosition, LocalPosition,
     surface::{CubeFace, CubePatchAddress, PatchEdge},
 };
+#[cfg(feature = "surface-profile")]
+use std::time::{Duration, Instant};
 
 pub struct SurfaceViewInput<'view, 'tree> {
     pub view: &'view PreparedView<'tree>,
@@ -101,6 +103,36 @@ pub struct LodReport {
     pub scratch_bytes: usize,
     pub quality_pending: bool,
     pub settled: bool,
+    /// Opt-in coarse CPU timings and scratch-capacity observations for this update.
+    #[cfg(feature = "surface-profile")]
+    pub profile: LodProfile,
+}
+
+/// Coarse CPU-stage measurements collected only with the `surface-profile` feature.
+/// Stage durations are disjoint portions of `total`; they exclude source preparation
+/// and small setup/validation gaps between measured stages.
+#[cfg(feature = "surface-profile")]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LodProfile {
+    /// Merge candidate construction and sibling/balance eligibility decisions.
+    pub merge_decisions: Duration,
+    /// Requested splits, dependency metadata readiness, balancing and atomic commits.
+    pub split_ready_transactions: Duration,
+    /// Active visible-leaf selection and stitch-mask construction, including fallback.
+    pub visible_and_masks: Duration,
+    /// Root-based desired coverage traversal and its relevance/quality decisions.
+    pub desired_traversal: Duration,
+    /// Final report aggregation, culling counters and scratch accounting.
+    pub final_reporting: Duration,
+    /// Wall duration of the update body, from just after source preparation to return.
+    pub total: Duration,
+    /// Capacity beyond the current length for reusable address/request/visible buffers.
+    pub scratch_capacity_slack: usize,
+    /// Owned container capacity changes; not allocator calls.
+    pub capacity_growths: usize,
+    /// Explicit temporary dependency vectors created by refinement transactions.
+    pub dependency_vectors: usize,
+    pub dependency_bytes: usize,
 }
 #[derive(Debug, Clone, Copy)]
 pub struct ActiveSurfacePatch {
@@ -189,6 +221,10 @@ impl SurfaceLodSession {
         }
         let source = input.view.prepare_source(input.body_fixed_frame)?;
         let mut report = LodReport::default();
+        #[cfg(feature = "surface-profile")]
+        let total_started = Instant::now();
+        #[cfg(feature = "surface-profile")]
+        let capacities = self.profile_capacities();
         self.cache.reset_counters();
         self.pins.clear();
         self.pins.extend(self.cover.iter().copied());
@@ -215,6 +251,8 @@ impl SurfaceLodSession {
         }
         // Coarsening is also one complete sibling transaction. Deepest first frees
         // pins before approaching a different region of the same body.
+        #[cfg(feature = "surface-profile")]
+        let stage_started = Instant::now();
         self.merge_candidates.clear();
         self.merge_candidates
             .extend(self.cover.iter().filter_map(|p| p.parent()));
@@ -254,6 +292,12 @@ impl SurfaceLodSession {
             }
         }
         self.pins.extend(self.pending.iter().copied());
+        #[cfg(feature = "surface-profile")]
+        {
+            report.profile.merge_decisions = stage_started.elapsed();
+        }
+        #[cfg(feature = "surface-profile")]
+        let stage_started = Instant::now();
         self.requests.clear();
         for &p in &self.cover {
             let m = self.cache.get(p)?.expect("active metadata pinned");
@@ -297,6 +341,12 @@ impl SurfaceLodSession {
             }
             loop {
                 let dependencies: Vec<_> = self.pending.iter().copied().collect();
+                #[cfg(feature = "surface-profile")]
+                {
+                    report.profile.dependency_vectors += 1;
+                    report.profile.dependency_bytes +=
+                        dependencies.capacity() * std::mem::size_of::<CubePatchAddress>();
+                }
                 for p in dependencies {
                     self.pins.insert(p);
                     if self.cache.get(p)?.is_none() {
@@ -367,6 +417,12 @@ impl SurfaceLodSession {
                 break;
             }
         }
+        #[cfg(feature = "surface-profile")]
+        {
+            report.profile.split_ready_transactions = stage_started.elapsed();
+        }
+        #[cfg(feature = "surface-profile")]
+        let stage_started = Instant::now();
         visible_for(
             &mut self.cache,
             &self.cover,
@@ -391,12 +447,18 @@ impl SurfaceLodSession {
             report.budget_constrained = true;
             report.constrained_refinements += 1;
         }
+        #[cfg(feature = "surface-profile")]
+        {
+            report.profile.visible_and_masks = stage_started.elapsed();
+        }
         // Rebuild desired coverage from roots using previous quality splits and
         // readiness. Missing subdomains explicitly remain an incomplete estimate.
         self.desired.clear();
         self.stack.clear();
         self.stack
             .extend(CubeFace::ALL.into_iter().rev().map(CubePatchAddress::root));
+        #[cfg(feature = "surface-profile")]
+        let stage_started = Instant::now();
         while let Some(p) = self.stack.pop() {
             let m = self
                 .cache
@@ -424,6 +486,10 @@ impl SurfaceLodSession {
             }
             self.desired.insert(p);
         }
+        #[cfg(feature = "surface-profile")]
+        {
+            report.profile.desired_traversal = stage_started.elapsed();
+        }
         report.desired_patches = self.desired.len();
         report.balanced_patches = self.cover.len();
         report.active_patches = self.cover.len();
@@ -444,6 +510,8 @@ impl SurfaceLodSession {
         report.cache_hits = self.cache.hits;
         report.cache_misses = self.cache.misses;
         report.cache_evictions = self.cache.evictions;
+        #[cfg(feature = "surface-profile")]
+        let stage_started = Instant::now();
         for &p in &self.cover {
             let m = self.cache.get(p)?.expect("active metadata pinned");
             let (visible, _, horizon) = relevance(m, input, &source)?;
@@ -475,7 +543,43 @@ impl SurfaceLodSession {
         if report.scratch_bytes > 8 * 1024 * 1024 {
             return Err(RenderPreparationError::InvalidBudget);
         }
+        #[cfg(feature = "surface-profile")]
+        {
+            report.profile.final_reporting = stage_started.elapsed();
+            report.profile.scratch_capacity_slack =
+                self.stack.capacity().saturating_sub(self.stack.len())
+                    + self.requests.capacity().saturating_sub(self.requests.len())
+                    + self.visible.capacity().saturating_sub(self.visible.len())
+                    + self
+                        .visible_scratch
+                        .capacity()
+                        .saturating_sub(self.visible_scratch.len());
+            report.profile.total = total_started.elapsed();
+            report.profile.capacity_growths = capacities
+                .into_iter()
+                .zip(self.profile_capacities())
+                .filter(|(before, after)| after > before)
+                .count();
+        }
         Ok(report)
+    }
+    #[cfg(feature = "surface-profile")]
+    fn profile_capacities(&self) -> [usize; 13] {
+        [
+            self.cover.bytes(),
+            self.previous_splits.bytes(),
+            self.desired.bytes(),
+            self.proposal.bytes(),
+            self.pins.bytes(),
+            self.coarse.bytes(),
+            self.merge_candidates.bytes(),
+            self.pending.bytes(),
+            self.stack.capacity(),
+            self.requests.capacity(),
+            self.visible.capacity(),
+            self.visible_scratch.capacity(),
+            self.cache.bytes(),
+        ]
     }
 }
 fn visible_for(

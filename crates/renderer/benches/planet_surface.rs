@@ -95,7 +95,9 @@ fn benches(c: &mut Criterion) {
     let frame = tree.root();
     let radius = 6.4e6;
     let mut group = c.benchmark_group("planet_selection");
-    for clearance in [1e11, 8.3e7, 1e7, 1e6, 1e4, 100.0, 2.0] {
+    for clearance in [
+        1e11, 8.3e7, 1e7, 6.4e6, 1e6, 1e5, 1e4, 1e3, 100.0, 10.0, 2.0,
+    ] {
         let view = PreparedView::new(
             &tree.evaluate(),
             FramePose::new(
