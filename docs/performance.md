@@ -142,6 +142,13 @@ Fresh full-view selection/preparation medians were 1.3119/11.149 ms; at 2 m they
 were 574.19/106.24 µs. The full-view CPU review miss is reproduced, not resolved.
 These CPU runs add no GPU timestamp, allocation-profile or presentation-p95 evidence.
 
+### CPU closeout — 2026-10-02
+
+[Decomposed profiling](phase-4-profiling.md) records representative view counts,
+stage medians/tails, capacity/dependency-vector observations and packing/grouping
+before/after measurements. Full-view f64 sample conversion dominates; the~11ms
+review miss remains. Thresholds and architecture stay unchanged.
+
 ## Phase 1 baseline — 2026-10-01
 
 Host: AMD Ryzen 7 9800X3D, 8 reported cores/logical processors; Windows 11 Pro x86-64, build 26200. Rust 1.98.1 stable (`48a229cea`, LLVM 22.1.8), `x86_64-pc-windows-msvc`. Cargo's unmodified optimized bench profile; no native-CPU flags, custom allocators, parallel conversion, caching, LTO or unsafe project code. `glam 0.30.10` uses default/std features. Lockfile selections: Criterion 0.8.2 (default features disabled), naga 27.0.3, wgpu 27.0.1, egui 0.33.3, winit 0.30.13. Benchmark implementation is in the Phase 1 commits through `402a046`; app-only follow-up changes do not change timed library operations.

@@ -91,3 +91,10 @@ silently weaken thresholds, introduce draw distance, or discard physical precisi
 Full human control-feel/high-DPI/recovery, Linux native and implementation-revision
 remote-CI evidence remain open. Earlier prerequisite acceptance is not retroactively
 completed by the new Windows route.
+
+The [closeout profiling](../phase-4-profiling.md) decomposes ordinary full-view work:
+sample evaluation/source conversion dominates, not clipped proof or warm allocation.
+Sample packing and redundant pre-bucket sorting received narrow measured cleanup;
+no significant total speedup is claimed. Preserve/freeze the architecture and default
+thresholds; no structural redesign is justified before future field work. Remaining
+acceptance gates and the full-view CPU headroom risk are not silently waived.

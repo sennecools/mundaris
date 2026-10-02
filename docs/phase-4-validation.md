@@ -198,6 +198,122 @@ A separate normal startup/close check retained the process handle and confirmed
 exit0/empty stderr. Complete human controls/high-DPI/backend recovery acceptance
 still remains open.
 
+## CPU and acceptance closeout — 2026-10-02
+
+Recovered baseline `ef9ab84`/`5a7215c`; existing `.gitignore`, agent/workflow and
+script changes were preserved separately from engine work. The new
+[CPU profiling record](phase-4-profiling.md) identifies the exact11.143ms workload,
+existing-stage timings, all requested view classes, cold/steady differences,
+capacity/dependency observations and small packing/grouping before/after changes.
+No architectural or LOD-threshold change was made. The full-view review miss remains.
+
+### Fresh directed Windows route
+
+Optimized native Windows/Vulkan/RX9070XT viewer, initial1280×800 physical client,
+**DPI1.0**, opt-in CPU profiling enabled. The integrated production route ran from
+overview/focus/astronomical clearance through continuous approach and surface
+responsibility, bordered100km/10km/1km/100m/10m/2m checkpoints, co-rotating inspection,
+lateral movement, horizon, independent Solace/Luma observations, departure/overview
+and **completed the repeated approach back to2m**. Log confirms revision3→23,
+time0→1200s from twenty realh60 commits. Tall resize and minimize/restore executed;
+native wrapper retained the process handle and confirmed **exit0/empty stderr**.
+Captures of overview/approach, the listed altitude checkpoints, lateral/horizon,
+star/moon, completed repeat and restored window were inspected. No conspicuous
+holes, reversed patches or broken visible patch borders were seen in those captures.
+Near quality was0.0955px, tall-restored0.1016px, no constrained refinement.
+
+This is directed checkpoint evidence, not live human visual/control signoff. The
+capture named handoff still showed far responsibility before transfer; later approach
+showed surface responsibility, not an observed exact transition frame. Static
+captures cannot establish absence of temporal culling flicker, LOD oscillation,
+handoff pop or precision jitter. No exhaustive native edge/corner/high-orbit sweep,
+additional backend, direct-control/picking feel or forced device recovery is claimed.
+Moon/star captures show navigation observations near the horizon, not proof of
+simultaneous opaque mesh visibility. Earlier headless precision/handoff tests remain
+the quantitative evidence for those contracts.
+
+### Native CPU/cadence observations
+
+Build/run the optional probe:
+
+```powershell
+$env:MUNDARIS_PHASE4_VALIDATE='1'
+$env:RUST_LOG='info,mundaris_app::gravity_orbits=debug,wgpu_hal=warn'
+cargo run --locked --release -p mundaris_app --features surface-profile -- --gravity-orbits
+```
+
+14,228 accepted drawable samples in the directed route. Selected windows below are
+offsets from the first probe sample; times are median/p95 milliseconds. App update
+includes simulation/navigation/publication; preparation includes surfaces, guides,
+history/observations; surface is its subset. Render includes UI/acquisition/uploads/
+encoding/submission/present and possible FIFO wait, **not GPU execution duration**.
+Cadence is successive CPU update-start intervals, not compositor presentation timing.
+
+| Window | N / patches | Update | Preparation | Surface | Render/present call | Cadence |
+| --- | --- | --- | --- | --- | --- | --- |
+| Overview0.5–1.5s | 119 / 0 | 0.0060/0.0087 | 0.0474/0.0691 | 0/0 | 8.1196/8.4567 | 8.3392/8.7419 |
+| Approach14–18s | 448 / 46–388 | 0.0064/0.0068 | 5.0482/12.5247 | 4.2190/10.1503 | 3.2038/6.4269 | 8.3699/13.5189 |
+| 100km38–39s | 120 / 22 | 0.0061/0.0067 | 1.4087/1.4482 | 0.5766/0.5967 | 6.7603/7.1097 | 8.3413/8.7727 |
+| 2m53–54s | 120 / 3 | 0.0061/0.0068 | 1.5285/1.5770 | 0.0805/0.0843 | 6.6039/6.9610 | 8.3237/8.6904 |
+| Horizon62–64s | 240 / 40 | 0.0061/0.0068 | 2.7748/2.8373 | 1.1879/1.2086 | 5.3525/5.7329 | 8.3305/8.7276 |
+| Moon72–74s | 240 / 38 | 0.0062/0.0070 | 2.8287/2.8838 | 1.2734/1.2943 | 5.3064/5.6439 | 8.3272/8.7297 |
+
+The route is mainly paused plus twenty single steps: pump medians0.0003ms in these
+windows are not active high-warp throughput. Approach max preparation15.8930ms and
+cadence16.9073ms; route-wide maximum accepted interval55.1596ms near resize/repeat.
+Logging/instrumentation and UI are enabled, content is dock-excluded rather than the
+benchmark's1280×800, and the camera follows a tilted moving-body route. Do not compare
+native patch counts as if workload matched the independent radial benchmark. No GPU
+timestamp, compositor p95, or driver-allocation conclusion follows from these clocks.
+
+### Explicit open/dispositioned gates
+
+- High-DPI: native scale remained1.0; no global display settings changed. Manual
+  non100% scaling must verify physical LOD/viewport, UI/labels, picking, handoff and
+  diagnostics. Existing headless physical-resolution tests are not native DPI signoff.
+- Lifecycle: directed minimize/restore passes; a new headless near-surface regression
+  covers long accepted-gap cancellation, hidden duration, stable inspection pose,
+  zero debt after Resume and a subsequent real commit. This is simulated host duration,
+  **not actual OS sleep/resume**. OS sleep and long live-process stall remain manual.
+- Linux: Ubuntu WSL2 starts, but `cargo`, `rustc`, `gcc`, `pkg-config` are absent on
+  login PATH and common Cargo installation directories are absent. No Linux Cargo or
+  graphical check ran; no toolchain/VM/container infrastructure was installed.
+- Remote CI: `gh` unavailable; unauthenticated GitHub Actions REST request returned404.
+  No authenticated current status is available. Local HEAD is eight commits ahead of
+  `origin/main` at recovery, so remote-tracking history predates Phase4; no fetch/push
+  or CI configuration change was made. Linux quality/Windows compatibility/current-HEAD
+  pass cannot be asserted. Workflow remains Linux fmt/Clippy/tests and Windows check;
+  it supplies no native visual acceptance.
+- Allocations/presentation: owned-container/dependency events and CPU cadence now have
+  evidence; external heap/driver/GPU profiling and compositor/GPU timing remain open.
+- Architecture: **unchanged and ready to freeze**. No structural fix is required
+  before later field work; expensive full-view steady sampling and cold spikes remain
+  documented performance risks. Full Phase4 acceptance/Phase5 clearance is conditional
+  on completing or explicitly dispositioning the remaining gates, not automatically
+  granted by this profiling task. No Phase5 implementation started.
+
+### Closeout quality evidence
+
+Locked Windows workspace build/all-target-all-feature check, warnings-denied Clippy,
+workspace debug tests and focused five-crate all-feature release tests pass. Suite
+now contains124 runtime tests and seven compile-fail doctests (two ordinarily ignored
+orbital long runs executed separately). New tests cover complete sample bytes,
+stable mixed-mask/multi-batch ordering, boundary capacity accounting and near-surface
+stall/hidden-time recovery. The new inspection lifecycle test compares orientation
+within the existing1e-12 envelope because zero-duration inspection reconstructs a
+normalized quaternion; no existing tolerance was changed.
+
+Ignored optimized orbital tests retain circular energy1.1213311916402153e-11,
+eccentric3.628893073864288e-6 and hierarchy1.5336758750031128e-13 maxima.
+Warnings-denied Rustdoc and formatting pass. Both complete Phase4 CPU benchmark
+targets execute; raw distributions are retained outside tracked documentation.
+Final whitespace/UTF-8/LF/newline/local-document-link/fence checks are recorded
+separately from native evidence. Phases1–3.5 suites and world/simulation algorithms
+remain unchanged; no time, history, picking, navigation or precision tolerance weakened.
+All12 closeout files passed strict UTF-8/LF/final-newline/trailing-whitespace checks;
+the four changed Markdown documents have balanced fences and15 valid local links/
+anchors. Source milestone `3c79011` contains the validated closeout implementation.
+
 ## Files and milestones
 
 - Math: `surface.rs`, lib export, topology/tangent tests.
