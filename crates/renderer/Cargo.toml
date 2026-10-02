@@ -28,5 +28,9 @@ harness = false
 name = "celestial_preparation"
 harness = false
 
+[[bench]]
+name = "planet_surface"
+harness = false
+
 [lints]
 workspace = true

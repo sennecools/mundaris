@@ -162,6 +162,10 @@ pub struct PreparedRenderFrame<'a> {
     budget: RenderPrecisionBudget,
 }
 impl PreparedRenderFrame<'_> {
+    /// Read-only source-centred observer for body-local bounds and surface policy.
+    pub fn observer_in_source(&self) -> LocalPosition {
+        self.observer_in_source
+    }
     /// Camera-axis unit normal/direction; no origin or translation contribution.
     pub fn view_direction(
         &self,

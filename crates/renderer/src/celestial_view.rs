@@ -82,6 +82,29 @@ impl CelestialProjection {
     pub fn focal_pixels(self) -> f64 {
         self.height as f64 / (2.0 * self.tan_half)
     }
+    /// Conservative projection error for a sphere-shaped representation. Near/side
+    /// silhouette crossings use its full bound; centre-marker visibility is irrelevant.
+    pub fn sphere_error_pixels(
+        self,
+        center: DVec3,
+        radius: f64,
+        error_fraction: f64,
+    ) -> Result<f64, RenderPreparationError> {
+        if !center.is_finite()
+            || !radius.is_finite()
+            || radius <= 0.0
+            || !error_fraction.is_finite()
+            || error_fraction < 0.0
+        {
+            return Err(RenderPreparationError::InvalidDebugGeometry);
+        }
+        Ok(crate::planet_surface::sphere_projected_error(
+            error_fraction * radius,
+            center,
+            radius,
+            self,
+        ))
+    }
     pub fn gpu_bytes(self) -> [u8; 64] {
         let mut bytes = [0; 64];
         for (value, output) in self
@@ -96,6 +119,36 @@ impl CelestialProjection {
     }
     pub fn gpu_clip(self, view: [f32; 3]) -> [f32; 4] {
         (self.matrix * Vec4::new(view[0], view[1], view[2], 1.0)).to_array()
+    }
+    /// Inward normalized near/left/right/bottom/top planes, no far plane.
+    pub fn frustum_planes(self) -> [(DVec3, f64); 5] {
+        let tx = self.tan_half * self.width as f64 / self.height as f64;
+        [
+            (DVec3::NEG_Z, -self.near_m),
+            (DVec3::new(1.0, 0.0, -tx), 0.0),
+            (DVec3::new(-1.0, 0.0, -tx), 0.0),
+            (DVec3::new(0.0, 1.0, -self.tan_half), 0.0),
+            (DVec3::new(0.0, -1.0, -self.tan_half), 0.0),
+        ]
+        .map(|(n, d)| {
+            let length = n.length();
+            (n / length, d / length)
+        })
+    }
+    pub fn rejects_ball(
+        self,
+        center: DVec3,
+        radius_m: f64,
+    ) -> Result<bool, RenderPreparationError> {
+        if !center.is_finite() || !radius_m.is_finite() || radius_m < 0.0 {
+            return Err(RenderPreparationError::InvalidDebugGeometry);
+        }
+        let epsilon =
+            1e-7_f64.max(64.0 * f64::EPSILON * (center.length() + radius_m + self.near_m));
+        Ok(self
+            .frustum_planes()
+            .into_iter()
+            .any(|(n, d)| n.dot(center) + d < -radius_m - epsilon))
     }
     fn screen(self, p: DVec3) -> Result<[f64; 2], RenderPreparationError> {
         if !p.is_finite() || -p.z < self.near_m {

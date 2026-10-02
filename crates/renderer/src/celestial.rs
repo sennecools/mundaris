@@ -161,6 +161,7 @@ pub struct CelestialRenderBody {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SphereRepresentation {
     PhysicalSphere,
+    Surface,
     SubpixelMarker,
     RangeMarker,
     PrecisionMarker,
@@ -200,6 +201,7 @@ pub fn select_marker(markers: &[CelestialMarker], point: [f32; 2]) -> Option<usi
 
 #[derive(Default)]
 pub struct CelestialStaging {
+    surface: crate::planet_surface::SurfaceStaging,
     vertices: Vec<u8>,
     uniforms: Vec<u8>,
     lines: Vec<u8>,
@@ -210,6 +212,7 @@ pub struct CelestialStaging {
 }
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CelestialPreparationReport {
+    pub surface: crate::planet_surface::SurfacePreparationReport,
     pub triangles: usize,
     pub markers: usize,
     pub trail_segments: usize,
@@ -243,6 +246,7 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
         staging.draws.clear();
         staging.markers.clear();
         staging.centers.clear();
+        staging.surface.clear();
         Self {
             view,
             staging,
@@ -265,7 +269,10 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
         Ok(())
     }
     pub fn report(&self) -> CelestialPreparationReport {
-        self.report
+        CelestialPreparationReport {
+            surface: self.staging.surface.report,
+            ..self.report
+        }
     }
     pub fn markers(&self) -> &[CelestialMarker] {
         &self.staging.markers
@@ -274,7 +281,7 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
         &mut self,
         bodies: &[CelestialRenderBody],
     ) -> Result<(), RenderPreparationError> {
-        let result = self.bodies_checked(bodies);
+        let result = self.bodies_checked(bodies, &[]);
         if result.is_err() {
             self.failed = true;
         }
@@ -283,6 +290,7 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
     fn bodies_checked(
         &mut self,
         bodies: &[CelestialRenderBody],
+        surface_available: &[bool],
     ) -> Result<(), RenderPreparationError> {
         self.validate()?;
         for body in bodies {
@@ -316,7 +324,9 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
             if !diameter.is_finite() {
                 return Err(RenderPreparationError::InvalidDebugGeometry);
             }
-            let representation = if -center.z + radius <= self.projection.near_m() {
+            let representation = if surface_available.get(i).copied().unwrap_or(false) {
+                SphereRepresentation::Surface
+            } else if -center.z + radius <= self.projection.near_m() {
                 SphereRepresentation::Culled
             } else if distance - radius > self.range_m {
                 SphereRepresentation::RangeMarker
@@ -416,6 +426,43 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
             self.report.markers += usize::from(screen.is_some());
         }
         Ok(())
+    }
+    /// One dense observation/overlay identity mapping, with explicitly app-requested
+    /// opaque responsibility. Ready surfaces suppress only the corresponding sphere.
+    pub fn append_body_observations(
+        &mut self,
+        bodies: &[CelestialRenderBody],
+        surface_available: &[bool],
+    ) -> Result<(), RenderPreparationError> {
+        let result = if bodies.len() != surface_available.len() {
+            Err(RenderPreparationError::LengthMismatch {
+                input: bodies.len(),
+                output: surface_available.len(),
+            })
+        } else {
+            self.bodies_checked(bodies, surface_available)
+        };
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+    pub fn append_surface(
+        &mut self,
+        body: CelestialRenderBody,
+        patches: &[crate::planet_surface::ActiveSurfacePatch],
+        topology: &crate::planet_surface::SurfaceTopology,
+        style: crate::planet_surface::SurfaceStyle,
+    ) -> Result<(), RenderPreparationError> {
+        let result = self.validate().and_then(|()| {
+            self.staging
+                .surface
+                .append(self.view, self.projection, body, patches, topology, style)
+        });
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
     }
     pub fn append_historical_lines(
         &mut self,
@@ -527,6 +574,7 @@ fn pack(position: [f32; 3], normal: [f32; 3], bytes: &mut Vec<u8>, normal_w: f32
 }
 
 pub(crate) struct CelestialRenderer {
+    surface: crate::planet_surface::PlanetSurfaceRenderer,
     sphere_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
     polyline_pipeline: wgpu::RenderPipeline,
@@ -602,6 +650,12 @@ impl CelestialRenderer {
         }
         queue.write_buffer(&indices, 0, &bytes);
         Self {
+            surface: crate::planet_surface::PlanetSurfaceRenderer::new(
+                device,
+                queue,
+                format,
+                &projection_layout,
+            ),
             sphere_pipeline,
             line_pipeline,
             polyline_pipeline,
@@ -639,6 +693,7 @@ impl CelestialRenderer {
     ) -> Result<(), RenderPreparationError> {
         frame.validate()?;
         let storage = &frame.staging;
+        self.surface.upload(device, queue, &storage.surface)?;
         grow(
             device,
             &mut self.vertices,
@@ -724,6 +779,8 @@ impl CelestialRenderer {
             );
             pass.draw_indexed(0..3840, 0, 0..1);
         }
+        self.surface
+            .draw(&mut pass, &self.projection_group, &storage.surface);
         if !storage.lines.is_empty() {
             pass.set_pipeline(&self.line_pipeline);
             pass.set_vertex_buffer(0, self.lines.slice(..));

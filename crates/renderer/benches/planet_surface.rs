@@ -1,0 +1,98 @@
+use criterion::{Criterion, criterion_group, criterion_main};
+use glam::DVec3;
+use mundaris_math::{surface::*, *};
+use mundaris_renderer::{planet_surface::*, *};
+use std::{hint::black_box, num::NonZeroU64, time::Duration};
+fn benches(c: &mut Criterion) {
+    let topology = SurfaceTopology::new();
+    let mut group = c.benchmark_group("planet_metadata");
+    for level in [0, 5, 16, 30] {
+        let patch = CubePatchAddress::try_new(CubeFace::PositiveZ, level, 0, 0).unwrap();
+        group.bench_function(format!("grid16/all_stitches/level{level}/records1"), |b| {
+            b.iter(|| black_box(PatchMetadata::build(black_box(patch), &topology).unwrap()))
+        });
+    }
+    group.finish();
+    let tree = FrameTree::new(NonZeroU64::new(1).unwrap());
+    let frame = tree.root();
+    let radius = 6.4e6;
+    let mut group = c.benchmark_group("planet_selection");
+    for clearance in [1e11, 8.3e7, 1e7, 1e6, 1e4, 100.0, 2.0] {
+        let view = PreparedView::new(
+            &tree.evaluate(),
+            FramePose::new(
+                FramePosition::new(
+                    frame,
+                    LocalPosition::try_metres(DVec3::Z * (radius + clearance)).unwrap(),
+                ),
+                UnitRotation::identity(),
+            ),
+            RenderPrecisionBudget::near_debug(),
+        )
+        .unwrap();
+        let input = SurfaceViewInput {
+            view: &view,
+            body_fixed_frame: frame,
+            reference_radius_m: radius,
+            projection: CelestialProjection::try_new(1280, 800, 60.0_f64.to_radians(), 0.1)
+                .unwrap(),
+        };
+        let settings = LodSettings::default();
+        let mut session = SurfaceLodSession::default();
+        let mut r = LodReport::default();
+        for _ in 0..1000 {
+            r = session.update(&input, &settings).unwrap();
+            if !r.desired_estimate_incomplete || r.budget_constrained {
+                break;
+            }
+        }
+        assert!(!r.desired_estimate_incomplete && !r.budget_constrained);
+        let workload = format!(
+            "h{clearance}/cover{}/visible{}/level{}",
+            r.active_patches, r.visible_patches, r.max_level
+        );
+        group.bench_function(format!("warm/{workload}"), |b| {
+            b.iter(|| {
+                black_box(session.update(black_box(&input), &settings).unwrap());
+                black_box(&session);
+            })
+        });
+        group.bench_function(format!("cold/{workload}/new32"), |b| {
+            b.iter_batched(
+                SurfaceLodSession::default,
+                |mut session| {
+                    black_box(session.update(&input, &settings).unwrap());
+                    black_box(session);
+                },
+                criterion::BatchSize::SmallInput,
+            )
+        });
+        let sphere = Icosphere::new();
+        let mut staging = CelestialStaging::default();
+        let body = CelestialRenderBody {
+            body_fixed_frame: frame,
+            reference_radius_m: radius,
+            color: [0.2, 0.5, 1.0, 1.0],
+            unlit: false,
+            selected: true,
+        };
+        group.bench_function(format!("prepare/{workload}"), |b| {
+            b.iter(|| {
+                let mut frame = CelestialFrame::new(&view, &mut staging, input.projection, &sphere);
+                frame
+                    .append_surface(
+                        body,
+                        session.active_visible(),
+                        session.topology(),
+                        SurfaceStyle::default(),
+                    )
+                    .unwrap();
+                black_box(frame.report());
+                black_box(&frame);
+            })
+        });
+    }
+    group.finish();
+}
+criterion_group! {name=surface;config=Criterion::default().sample_size(20).warm_up_time(Duration::from_millis(100)).measurement_time(Duration::from_millis(500));targets=benches}
+criterion_main!(surface);
