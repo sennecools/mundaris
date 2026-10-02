@@ -4,6 +4,7 @@ mod query;
 pub use query::*;
 mod generator;
 pub use generator::*;
+mod erosion;
 
 /// Explicit authoring salt, not a runtime body handle or display name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -15,17 +16,21 @@ pub struct TerrainSeed(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TerrainGeneratorVersion {
     V1,
+    /// Body-fixed, feature-anchored gradient-feedback erosion.
+    V2,
 }
 impl TerrainGeneratorVersion {
     pub fn from_code(code: u32) -> Result<Self, TerrainError> {
         match code {
             1 => Ok(Self::V1),
+            2 => Ok(Self::V2),
             _ => Err(TerrainError::UnsupportedVersion(code)),
         }
     }
     pub fn code(self) -> u32 {
         match self {
             Self::V1 => 1,
+            Self::V2 => 2,
         }
     }
 }
@@ -123,7 +128,7 @@ impl TerrainBandConfig {
     }
 }
 
-/// Small immutable V1 controls; output remaps must preserve band envelopes.
+/// Shared broad-field controls; output remaps must preserve band envelopes.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TerrainControls {
     continent_bias: f64,
@@ -198,6 +203,41 @@ pub struct TerrainConfig {
     bands: [TerrainBandConfig; 5],
     controls: TerrainControls,
     absolute_height_bound_m: f64,
+    erosion: ErosionConfig,
+}
+
+/// Stateless mountain erosion hierarchy. The regional band's displacement budget
+/// is redistributed across these octaves rather than added to the old shaping.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ErosionConfig {
+    octaves: u8,
+    strength: f64,
+}
+impl ErosionConfig {
+    pub fn new(octaves: u8, strength: f64) -> Result<Self, TerrainError> {
+        if !(1..=5).contains(&octaves) || !strength.is_finite() || !(0.0..=1.0).contains(&strength)
+        {
+            return Err(TerrainError::InvalidConfig);
+        }
+        Ok(Self {
+            octaves,
+            strength: canonical_zero(strength),
+        })
+    }
+    pub fn octaves(self) -> u8 {
+        self.octaves
+    }
+    pub fn strength(self) -> f64 {
+        self.strength
+    }
+}
+impl Default for ErosionConfig {
+    fn default() -> Self {
+        Self {
+            octaves: 3,
+            strength: 1.0,
+        }
+    }
 }
 impl TerrainConfig {
     pub fn new(
@@ -232,6 +272,7 @@ impl TerrainConfig {
             bands,
             controls,
             absolute_height_bound_m: bound,
+            erosion: ErosionConfig::default(),
         })
     }
     pub fn band(&self, band: TerrainBand) -> TerrainBandConfig {
@@ -239,6 +280,14 @@ impl TerrainConfig {
     }
     pub fn controls(&self) -> TerrainControls {
         self.controls
+    }
+    /// V1 ignores this record; V2 includes it in exact generator/cache identity.
+    pub fn with_erosion(mut self, erosion: ErosionConfig) -> Self {
+        self.erosion = erosion;
+        self
+    }
+    pub fn erosion(&self) -> ErosionConfig {
+        self.erosion
     }
     pub fn absolute_height_bound_m(&self) -> f64 {
         self.absolute_height_bound_m

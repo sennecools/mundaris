@@ -1,4 +1,4 @@
-//! Concrete V1 landform composition. Bounds below are analytic global fallbacks,
+//! Landform composition and feature-anchored V2 erosion. Bounds are global fallbacks,
 //! not sampled extrema or a claim of tight regional interval subdivision.
 use super::*;
 use glam::{DMat3, DQuat, DVec3};
@@ -14,12 +14,13 @@ fn mix(mut x: u64) -> u64 {
     x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
     x ^ (x >> 31)
 }
-/// V1 ordered tagged salts: seed, identity, version, field, octave. Constants and
+/// Ordered tagged salts: seed, identity, frozen V1 base salt, field, octave. Constants and
 /// operation order are algorithm identity, never dependent on request order.
 fn salt(d: &TerrainDefinition, tag: u64, octave: u64) -> u64 {
     let s = mix(d.seed().0 ^ 0x9e3779b97f4a7c15);
     let s = mix(s ^ d.identity().0.wrapping_mul(0xd6e8feb86659fd93));
-    let s = mix(s ^ u64::from(d.version().code()).wrapping_mul(0xa5a3564e27f8862f));
+    // V2 intentionally retains V1 macro/range seeds for matched A/B landforms.
+    let s = mix(s ^ 1u64.wrapping_mul(0xa5a3564e27f8862f));
     mix(mix(s ^ tag) ^ octave.wrapping_mul(0x9e3779b185ebca87))
 }
 #[derive(Debug, Clone, Copy)]
@@ -205,6 +206,43 @@ struct Octave {
     effective_wavelength_m: f64,
     bound: Bound,
 }
+#[derive(Debug, Clone, Copy)]
+struct ErosionOctave {
+    seed: u64,
+    rotation: DMat3,
+    cell_m: f64,
+    amplitude_m: f64,
+    bound: Bound,
+    effective_m: f64,
+}
+const MEMO_SLOTS: usize = 256;
+#[derive(Clone, Copy)]
+struct ErosionState {
+    field: Value,
+    stack: f64,
+}
+#[derive(Clone, Copy)]
+struct MemoEntry {
+    key: [u64; 3],
+    count: usize,
+    state: ErosionState,
+}
+struct ErosionContext {
+    memo: [Option<MemoEntry>; MEMO_SLOTS],
+    noise_calls: usize,
+    features: usize,
+    feedback: bool,
+}
+impl ErosionContext {
+    fn new(feedback: bool) -> Self {
+        Self {
+            memo: [None; MEMO_SLOTS],
+            noise_calls: 0,
+            features: 0,
+            feedback,
+        }
+    }
+}
 #[derive(Debug, Clone)]
 pub struct TerrainGenerator {
     radius_m: f64,
@@ -213,6 +251,8 @@ pub struct TerrainGenerator {
     continent: [Domain; 3],
     mountains: [Domain; 2],
     global_height_m: f64,
+    erosion: [Option<ErosionOctave>; 5],
+    orientation_weights: [[f64; 4]; 5],
 }
 impl TerrainGenerator {
     pub fn new(definition: &TerrainDefinition, radius_m: f64) -> Result<Self, TerrainError> {
@@ -281,6 +321,9 @@ impl TerrainGenerator {
         let mut octaves = [[None; 4]; 5];
         for (i, band) in TerrainBand::ALL.into_iter().enumerate() {
             let cfg = d.config().band(band);
+            if band == TerrainBand::Regional && d.version() == TerrainGeneratorVersion::V2 {
+                continue;
+            }
             for o in 0..cfg.octaves() {
                 let f = frequency(cfg) * 2f64.powi(i32::from(o));
                 let domain = Domain::new(
@@ -335,11 +378,65 @@ impl TerrainGenerator {
                 });
             }
         }
+        let mut erosion = [None; 5];
+        if d.version() == TerrainGeneratorVersion::V2 {
+            let cfg = d.config().band(TerrainBand::Regional);
+            let TerrainScale::Metres {
+                longest_wavelength_m,
+            } = cfg.scale()
+            else {
+                return Err(TerrainError::InvalidConfig);
+            };
+            let e = d.config().erosion();
+            // Fixed sum < 2. Every octave consumes at most half the remaining
+            // regional budget, independent of selected octave count.
+            let budget = cfg.absolute_height_bound_m() * e.strength();
+            for o in 0..e.octaves() {
+                let cell_m = longest_wavelength_m / 4f64.powi(i32::from(o));
+                if cell_m < 8.0 || radius_m / cell_m >= 2_147_483_000.0 {
+                    return Err(TerrainError::InvalidConfig);
+                }
+                let pattern = Bound {
+                    a: 1.0,
+                    g: erosion::GRADIENT_BOUND_FACTOR * radius_m / cell_m,
+                    h: erosion::HESSIAN_BOUND_FACTOR * (radius_m / cell_m).powi(2),
+                };
+                let bound = mask.mul(pattern);
+                let effective_m = radius_m / bound.g.max(radius_m / cell_m);
+                if !bound.g.is_finite() || !bound.h.is_finite() || !effective_m.is_finite() {
+                    return Err(TerrainError::InvalidConfig);
+                }
+                erosion[o as usize] = Some(ErosionOctave {
+                    seed: salt(d, 0x45524f53494f4e, u64::from(o)),
+                    rotation: Domain::new(d, 0x45524f53494f4e, u64::from(o), 1.0, 0.0, false)
+                        .rotation,
+                    cell_m,
+                    amplitude_m: budget * 0.5f64.powi(i32::from(o) + 1),
+                    bound,
+                    effective_m,
+                });
+            }
+        }
+        let mut orientation_weights = [[0.0; 4]; 5];
+        for i in 0..2 {
+            for o in 0..4 {
+                if octaves[i][o].is_some_and(|x| x.amplitude != 0.0) {
+                    orientation_weights[i][o] = 1.0;
+                }
+            }
+        }
+        if erosion.iter().flatten().any(|x| x.amplitude_m != 0.0) {
+            orientation_weights[2][0] = 1.0; // request mask even with zero range amplitude
+        }
         let mut gradient_bound = 0.0;
         let mut hessian_bound = 0.0;
         for octave in octaves.iter().flatten().flatten() {
             gradient_bound = (gradient_bound + octave.amplitude * octave.bound.g).next_up();
             hessian_bound = (hessian_bound + octave.amplitude * octave.bound.h).next_up();
+        }
+        for x in erosion.iter().flatten() {
+            gradient_bound += x.amplitude_m * x.bound.g;
+            hessian_bound += x.amplitude_m * x.bound.h;
         }
         if !(gradient_bound * 1.0000000001).is_finite()
             || !(hessian_bound * 1.0000000001).is_finite()
@@ -353,6 +450,8 @@ impl TerrainGenerator {
             continent,
             mountains,
             global_height_m: d.config().absolute_height_bound_m(),
+            erosion,
+            orientation_weights,
         })
     }
     fn weights(&self, footprint: TerrainFootprint) -> Result<[[f64; 4]; 5], TerrainError> {
@@ -368,13 +467,12 @@ impl TerrainGenerator {
         }
         Ok(weights)
     }
-    fn evaluate(
+    fn base(
         &self,
-        location: SurfaceLocation,
+        n: DVec3,
         weights: &[[f64; 4]; 5],
         calls: &mut usize,
-    ) -> Result<TerrainSample, TerrainError> {
-        let n = location.direction().unit();
+    ) -> Result<(Value, Value), TerrainError> {
         let c = self.controls;
         let macro_active = weights[0].iter().any(|w| *w != 0.0);
         let mountain_active = weights[1..].iter().flatten().any(|w| *w != 0.0);
@@ -451,6 +549,122 @@ impl TerrainGenerator {
                 }
             }
         }
+        Ok((sum, mask))
+    }
+    fn erosion_weights(&self, footprint: TerrainFootprint) -> Result<[f64; 5], TerrainError> {
+        let mut weights = [0.0; 5];
+        for (i, x) in self.erosion.iter().enumerate() {
+            if let Some(x) = x
+                && x.amplitude_m != 0.0
+                && self.controls.mountain_coverage() != 0.0
+            {
+                weights[i] = footprint.octave_weight(x.effective_m)?;
+            }
+        }
+        Ok(weights)
+    }
+    fn erosion_term(
+        &self,
+        n: DVec3,
+        mask: Value,
+        level: usize,
+        context: &mut ErosionContext,
+    ) -> Result<Value, TerrainError> {
+        let Some(x) = self.erosion[level] else {
+            return Ok(Value::constant(0.0));
+        };
+        if x.amplitude_m == 0.0 || mask.v == 0.0 {
+            return Ok(Value::constant(0.0));
+        }
+        let pattern =
+            erosion::octave(x.seed, x.rotation * n * self.radius_m, x.cell_m, |anchor| {
+                context.features += 1;
+                let length = anchor.length();
+                if length == 0.0 {
+                    return Ok(erosion::ErosionValue {
+                        value: 0.0,
+                        gradient: DVec3::ZERO,
+                    });
+                }
+                let a = x.rotation.transpose() * (anchor / length);
+                let previous =
+                    self.orientation(a, if context.feedback { level } else { 0 }, context)?;
+                let tangent = previous.field.g - a * previous.field.g.dot(a);
+                Ok(erosion::ErosionValue {
+                    value: previous.stack,
+                    gradient: x.rotation * tangent / self.radius_m,
+                })
+            })?;
+        Ok(mask
+            .mul(Value {
+                v: pattern.value,
+                g: x.rotation.transpose() * pattern.gradient * self.radius_m,
+            })
+            .scale(x.amplitude_m))
+    }
+    fn orientation(
+        &self,
+        n: DVec3,
+        count: usize,
+        context: &mut ErosionContext,
+    ) -> Result<ErosionState, TerrainError> {
+        let key = [n.x.to_bits(), n.y.to_bits(), n.z.to_bits()];
+        let index = (mix(key[0] ^ key[1].rotate_left(21) ^ key[2].rotate_left(42) ^ count as u64)
+            as usize)
+            % MEMO_SLOTS;
+        if let Some(entry) = context.memo[index]
+            && entry.key == key
+            && entry.count == count
+        {
+            return Ok(entry.state);
+        }
+        let (base, mask) = self.base(n, &self.orientation_weights, &mut context.noise_calls)?;
+        let mut state = ErosionState {
+            field: base,
+            stack: 1.0,
+        };
+        for level in 0..count {
+            let term = self.erosion_term(n, mask, level, context)?;
+            state.field = state.field.add(term);
+            if let Some(x) = self.erosion[level]
+                && x.amplitude_m != 0.0
+            {
+                // Negative normalized incision preserves large ridges: subsequent
+                // features receive less amplitude inside existing deep creases.
+                state.stack *= 1.0 + 0.5 * (term.v / x.amplitude_m).clamp(-1.0, 0.0);
+            }
+        }
+        context.memo[index] = Some(MemoEntry { key, count, state });
+        Ok(state)
+    }
+    fn evaluate(
+        &self,
+        location: SurfaceLocation,
+        weights: &[[f64; 4]; 5],
+        erosion_weights: &[f64; 5],
+        calls: &mut usize,
+        features: &mut usize,
+        context: &mut ErosionContext,
+    ) -> Result<TerrainSample, TerrainError> {
+        let n = location.direction().unit();
+        let (mut sum, base_mask) = self.base(n, weights, calls)?;
+        if erosion_weights.iter().any(|w| *w != 0.0) {
+            let mask = if weights[1..].iter().flatten().any(|w| *w != 0.0) {
+                base_mask
+            } else {
+                self.base(n, &self.orientation_weights, calls)?.1
+            };
+            context.noise_calls = 0;
+            context.features = 0;
+            for (level, w) in erosion_weights.iter().copied().enumerate() {
+                if w == 0.0 {
+                    continue;
+                }
+                sum = sum.add(self.erosion_term(n, mask, level, context)?.scale(w));
+            }
+            *calls += context.noise_calls;
+            *features += context.features;
+        }
         let tangent = sum.g - n * sum.g.dot(n);
         if !sum.v.is_finite() || !tangent.is_finite() {
             return Err(TerrainError::NonFiniteResult);
@@ -458,7 +672,53 @@ impl TerrainGenerator {
         Ok(TerrainSample::from_parts(sum.v, tangent))
     }
     pub fn evaluate_point(&self, query: TerrainQuery) -> Result<TerrainSample, TerrainError> {
-        self.evaluate(query.location, &self.weights(query.footprint)?, &mut 0)
+        self.evaluate(
+            query.location,
+            &self.weights(query.footprint)?,
+            &self.erosion_weights(query.footprint)?,
+            &mut 0,
+            &mut 0,
+            &mut ErosionContext::new(true),
+        )
+    }
+    /// Diagnostic only: freeze later feature orientations to the broad field.
+    /// Production geometry always uses `evaluate_point`/`evaluate_batch` feedback.
+    pub fn evaluate_without_erosion_feedback(
+        &self,
+        query: TerrainQuery,
+    ) -> Result<TerrainSample, TerrainError> {
+        self.evaluate(
+            query.location,
+            &self.weights(query.footprint)?,
+            &self.erosion_weights(query.footprint)?,
+            &mut 0,
+            &mut 0,
+            &mut ErosionContext::new(false),
+        )
+    }
+    /// Optional inspection output; not stored in geometry or used by rendering.
+    pub fn erosion_diagnostics(
+        &self,
+        query: TerrainQuery,
+    ) -> Result<ErosionDiagnostics, TerrainError> {
+        let n = query.location.direction().unit();
+        let (base, _) = self.base(n, &self.weights(query.footprint)?, &mut 0)?;
+        let (_, mask) = self.base(n, &self.orientation_weights, &mut 0)?;
+        let mut output = [TerrainSample::default(); 1];
+        let report = self.evaluate_batch(&[query.location], query.footprint, &mut output)?;
+        let contribution_m = output[0].height_m() - base.v;
+        let budget: f64 = self.erosion.iter().flatten().map(|x| x.amplitude_m).sum();
+        Ok(ErosionDiagnostics {
+            contribution_m,
+            mountain_mask: mask.v,
+            crease: if budget == 0.0 {
+                0.0
+            } else {
+                (-contribution_m / budget).clamp(0.0, 1.0)
+            },
+            tangent_gradient_m: output[0].tangent_gradient_m_per_unit_direction(),
+            report,
+        })
     }
     pub fn evaluate_batch(
         &self,
@@ -470,9 +730,22 @@ impl TerrainGenerator {
             return Err(TerrainError::LengthMismatch);
         }
         let weights = self.weights(footprint)?;
+        let erosion_weights = self.erosion_weights(footprint)?;
         let mut primitive_calls = 0;
+        let mut erosion_features = 0;
+        // Fixed-anchor coefficients may be reused within one caller-owned batch.
+        // This temporary memo never survives the call or enters geometry/cache
+        // state; hits change work counts, not sample bits or generator truth.
+        let mut context = ErosionContext::new(true);
         for (location, sample) in locations.iter().zip(output) {
-            *sample = self.evaluate(*location, &weights, &mut primitive_calls)?;
+            *sample = self.evaluate(
+                *location,
+                &weights,
+                &erosion_weights,
+                &mut primitive_calls,
+                &mut erosion_features,
+                &mut context,
+            )?;
         }
         let cap = DirectionalCap::new(
             mundaris_math::Direction3::try_new(DVec3::X)
@@ -483,6 +756,14 @@ impl TerrainGenerator {
         Ok(TerrainEvaluationReport {
             sample_count: locations.len(),
             primitive_calls,
+            erosion_features,
+            active_erosion_octaves: erosion_weights.iter().filter(|w| **w == 1.0).count(),
+            faded_erosion_octaves: erosion_weights
+                .iter()
+                .filter(|w| **w > 0.0 && **w < 1.0)
+                .count(),
+            skipped_erosion_octaves: self.erosion.iter().flatten().count()
+                - erosion_weights.iter().filter(|w| **w != 0.0).count(),
             cartesian_height_gradient_bound_m: self.bounds_for_region(cap, footprint)?.gradient,
         })
     }
@@ -530,6 +811,23 @@ impl TerrainGenerator {
                 }
             }
         }
+        let ew = self.erosion_weights(footprint)?;
+        for (level, x) in self.erosion.iter().enumerate() {
+            if let Some(x) = x {
+                let w = ew[level];
+                represented = widen(represented + product(x.amplitude_m, w));
+                unresolved = widen(
+                    unresolved
+                        + if w == 1.0 {
+                            0.0
+                        } else {
+                            product(x.amplitude_m, (1.0 - w).next_up())
+                        },
+                );
+                gradient = widen(gradient + product(product(x.amplitude_m, w), x.bound.g));
+                hessian = widen(hessian + product(product(x.amplitude_m, w), x.bound.h));
+            }
+        }
         if ![represented, unresolved, gradient, hessian]
             .iter()
             .all(|v| v.is_finite())
@@ -549,9 +847,34 @@ impl TerrainGenerator {
 pub struct TerrainEvaluationReport {
     sample_count: usize,
     primitive_calls: usize,
+    erosion_features: usize,
+    active_erosion_octaves: usize,
+    faded_erosion_octaves: usize,
+    skipped_erosion_octaves: usize,
     cartesian_height_gradient_bound_m: f64,
 }
+/// Transient query diagnostics, deliberately independent of renderer resources.
+#[derive(Debug, Clone, Copy)]
+pub struct ErosionDiagnostics {
+    pub contribution_m: f64,
+    pub mountain_mask: f64,
+    pub crease: f64,
+    pub tangent_gradient_m: DVec3,
+    pub report: TerrainEvaluationReport,
+}
 impl TerrainEvaluationReport {
+    pub fn erosion_feature_evaluations(self) -> usize {
+        self.erosion_features
+    }
+    pub fn active_erosion_octaves(self) -> usize {
+        self.active_erosion_octaves
+    }
+    pub fn faded_erosion_octaves(self) -> usize {
+        self.faded_erosion_octaves
+    }
+    pub fn skipped_erosion_octaves(self) -> usize {
+        self.skipped_erosion_octaves
+    }
     pub fn sample_count(self) -> usize {
         self.sample_count
     }
