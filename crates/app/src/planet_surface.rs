@@ -100,6 +100,22 @@ impl PlanetSurfaceSession {
         input: &SurfaceViewInput<'_, '_>,
         settings: &LodSettings,
     ) -> Result<()> {
+        self.update_with_terrain_envelope(input, settings, 0.0)
+    }
+    /// Terrain-aware far representation error; geometry readiness remains app
+    /// orchestration, and the existing sphere selection policy is unchanged.
+    pub fn update_with_terrain_envelope(
+        &mut self,
+        input: &SurfaceViewInput<'_, '_>,
+        settings: &LodSettings,
+        absolute_height_m: f64,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            absolute_height_m.is_finite()
+                && absolute_height_m >= 0.0
+                && absolute_height_m <= 0.1 * input.reference_radius_m,
+            "invalid terrain handoff envelope"
+        );
         let center = input
             .view
             .prepare_source(input.body_fixed_frame)?
@@ -108,10 +124,18 @@ impl PlanetSurfaceSession {
                 LocalPosition::origin(),
             ))?
             .metres();
-        self.far_error_pixels =
+        self.far_error_pixels = if absolute_height_m == 0.0 {
             input
                 .projection
-                .sphere_error_pixels(center, input.reference_radius_m, 0.005)?;
+                .sphere_error_pixels(center, input.reference_radius_m, 0.005)?
+        } else {
+            input.projection.sphere_error_pixels(
+                center,
+                input.reference_radius_m + absolute_height_m,
+                (0.005 * input.reference_radius_m + absolute_height_m)
+                    / (input.reference_radius_m + absolute_height_m),
+            )?
+        };
         if self.state == SurfaceRepresentationState::Far && self.far_error_pixels < 0.05 {
             return Ok(());
         }
