@@ -11,6 +11,137 @@
 - Deterministic generation must remain reproducible while optimizing. Prefer explicit seeds/coordinates and deterministic local derivation over ambient random state.
 - Avoid hidden `O(n^2)` work in systems expected to scale. Make expected complexity visible and validate it against realistic input sizes.
 
+## Phase 4 baseline — 2026-10-02
+
+Windows11 Pro 10.0.26200, Ryzen7 9800X3D (8 logical processors), Rust1.98.1
+(`48a229cea`), LLVM22.1.8/MSVC, unmodified optimized bench profile, existing
+glam0.30.10/default-std, Criterion0.8.2/naga27.0.3/wgpu27.0.1. Native route selected
+Radeon RX9070XT/Vulkan/driver32.0.31041.1004. No unsafe, threads, compute generation,
+dependency upgrade or physics-method change. CPU targets ran with the viewer closed.
+
+```text
+cargo bench --locked -p mundaris_renderer --bench planet_surface
+cargo bench --locked -p mundaris_renderer --bench planet_surface -- warm
+cargo bench --locked -p mundaris_app --bench planet_surface_approach
+```
+
+20 samples, 100 ms warmup and requested 500 ms measurement; Criterion extends slow
+batches. Complete reports/staging are observed through `black_box`; window/device/
+shader startup is excluded. Raw distributions remain in ignored `target/criterion`.
+Full suite ran, then warm selection was rerun after correcting merge-query cost.
+Earlier measurements are retained as engineering comparisons, not current timings.
+
+R6.4e6 m, content1280×800/FOV60°/near0.1 m, grid16 and unchanged 0.125/0.0625 px
+thresholds. The actual app skips fine patch preparation for tiny far bodies.
+
+| Scenario | Complete cover / visible / max level | Warm selection central [95% CI] | f64 evaluate/prove/pack central [95% CI] |
+| --- | --- | --- | --- |
+| Tiny, h1e11 m (selector probe) | 6 / 5 / 0 | 2.859 [2.819,2.906] µs | 136.40 [134.90,137.58] µs |
+| ~100 px, h83,000 km | 84 / 62 / 2 | 116.02 [115.30,116.60] µs | 1.7525 [1.7409,1.7632] ms |
+| Large full planet, h10,000 km | 510 / 402 / 4 | 1.3624 [1.3493,1.3734] ms | 11.481 [11.345,11.684] ms |
+| Low orbit, h1,000 km | 351 / 98 / 6 | 814.85 [809.63,820.08] µs | 2.7931 [2.7693,2.8242] ms |
+| h10 km | 129 / 8 / 10 | 233.25 [232.39,234.25] µs | 223.08 [222.29,224.00] µs |
+| h100 m | 213 / 8 / 17 | 552.20 [549.42,555.57] µs | 222.19 [220.66,223.32] µs |
+| h2 m, down | 225 / 4 / 18 | 597.03 [593.27,599.89] µs | 110.77 [109.84,111.74] µs |
+
+Selected sample medians/bootstrap95% intervals verified against estimate files:
+full-view selection **1.346456 [1.332284,1.358268] ms**, preparation
+**11.379900 [11.301333,11.463983] ms**; 2 m selection
+**595.904 [587.172,599.806] µs**, preparation
+**110.552 [109.106,112.559] µs**. Full preparation had a high-severe outlier.
+There is no hardware-dependent timing assertion in correctness tests.
+
+Cold one-update selection (six-root setup excluded by batched setup; destruction
+included): roughly 0.38–0.40 ms for full/100px/low-orbit probes and 0.075–0.079 ms
+for close probes at the initial 32-record allowance. These are cold **first-update**
+timings, not cold convergence times. Compact bounds/error construction for one
+grid16 all-stitch record is 16.445 [16.207,16.807] µs at root,
+15.145 [15.071,15.268] µs at level5, 15.087 [15.028,15.159] µs at level16 and
+15.841 [15.706,15.995] µs at level30. The ~3% level5 change from the earlier short
+run is retained; the metadata algorithm was not changed by the merge optimization.
+
+Pure mapping comparisons (production remains grid16): grid8/81 samples
+1.6538 [1.6467,1.6619] µs, grid16/289 samples 5.9102 [5.8886,5.9341] µs,
+grid32/1089 samples 22.563 [22.383,22.864] µs. These measure canonical f64 sphere
+evaluation, not heterogeneous runtime topology. 768 same/cross-face neighbor
+queries: 4.2996 [4.1555,4.4500] µs. Per 192 cached records: ball scaling/extent
+1.4973 µs, horizon9.6016 µs and frustum3.7550 µs. Workload sizes accompany timings.
+
+Integrated real N3/h60 single commit + frame publication + body-fixed observation +
+surface selection/preparation + far-body observations/spheres, without guides/history:
+
+| Clearance | Cover / visible | Central complete CPU batch [95% CI] |
+| --- | --- | --- |
+| 10,000 km | 510 / 402 | 12.728 [12.642,12.827] ms |
+| 10 km | 129 / 8 | 515.58 [500.21,551.46] µs |
+| 100 m | 213 / 8 | 814.71 [810.07,819.76] µs |
+| 2 m | 225 / 4 | 760.10 [755.62,765.91] µs |
+
+### Investigated costs and review misses
+
+Initial per-triangle heap clipping measured ~61.5 ms for 402 visible patches. A
+conservative whole-patch convex interpolation/projection proof and fixed-size rare
+clipping scratch reduced it to ~10–11 ms while retaining the precision checks.
+Local ready closures fixed large-view cache pin/churn. An initial hypothetical
+merge implementation rescanned the whole cover and measured 5.23–6.44 ms; direct
+outside-edge queries reduced warm full/low-orbit selection to 1.36/0.815 ms.
+
+**Full-view CPU preparation still misses the 2 ms median/4 ms p95 review trigger.**
+402 patches mean 116,178 evaluated samples and **3,743,424 uploaded bytes**; sphere
+evaluation, source conversion/normal evaluation, precision proof and packing dominate,
+not N3 gravity. Near 2 m is ~0.71 ms for separated selector+preparation and ~0.76 ms
+integrated. Actual counts fit planning envelopes; no measured normal view reached
+the emergency 4,096 ceiling. Defaults were not weakened and no render distance was
+introduced. Review CPU evaluation/packing and conservative near-plane/error products
+before adding Phase 5 field cost. No universal FPS or native GPU timestamp result.
+
+### Accounted resources
+
+- Native mathematical address: 12 bytes; metadata/cache record: 88 bytes on this
+  target. Metadata cache allocated/accounted 360,512 bytes at 4,096 records;
+  app two 2,048-record sessions each account 180,288 bytes, aggregate360,576 bytes.
+- Shared CPU grid16 topology/union/ranges: **53,020 bytes**. Uploaded shared sixteen
+  index variants: **47,616 bytes**, plus CPU variant ranges. No unique patch mesh.
+- Packed samples: 9,248 bytes/visible patch; instances64 bytes/patch. Full-view
+  payload3,743,424 bytes; 2 m payload37,248 bytes. GPU growth rounds to 4 KiB under
+  default binding limits and the aggregate80 MiB cap, draining old use on growth.
+- CPU outgoing capacity is capped at64 MiB; canonical boundary scratch8 MiB. Shared
+  keys use exact compact values and reused arrays, with source/radius batches scoped
+  separately. A four-patch/two-body layout fixture accounts37,508 staging bytes and
+  2,459 boundary bytes. Clip scratch is fixed/bounded and reported separately.
+- Large-view reversal owned cover/history/pins/request/visible scratch peaks at
+  **159,088 bytes** in the recorded scenario, below8 MiB. Metadata visits/cache history
+  remain bounded; release/focus changes do not allocate regional tree nodes.
+- Maximum-policy payload planning is36.13 MiB samples +256 KiB instances at4,096
+  patches. This is a cap calculation, not a measured normal workload or a claim of
+  allocator/GPU-profiler evidence. Depth attachment memory is window-size dependent
+  and separate. Inspection/review supports reuse; no counting allocator was installed.
+
+Native draw/upload evidence, precision/depth results and remaining Linux/current CI/
+operator/GPU-timing criteria are in [Phase4 validation](phase-4-validation.md).
+
+### Continuation verification — 2026-10-02
+
+Both Phase 4 benchmark targets above were rerun on the same Windows host with the
+viewer closed, unchanged grid/thresholds and the current renderer at `d9707a4`.
+These are separate fresh measurements; the original baseline remains above.
+Workload counts were unchanged. Criterion central estimates and 95% intervals:
+
+| Workload | Cover / visible | Fresh central [95% CI] |
+| --- | --- | --- |
+| Warm full-view selection | 510 / 402 | 1.3146 [1.3045,1.3228] ms |
+| Full-view evaluation/proof/packing | 510 / 402 | 11.143 [11.086,11.208] ms |
+| Warm 2 m selection | 225 / 4 | 574.43 [571.50,577.23] µs |
+| 2 m evaluation/proof/packing | 225 / 4 | 106.98 [106.33,107.49] µs |
+| Integrated full view | 510 / 402 | 12.749 [12.660,12.848] ms |
+| Integrated 10 km | 129 / 8 | 489.90 [486.58,494.61] µs |
+| Integrated 100 m | 213 / 8 | 812.76 [805.64,820.92] µs |
+| Integrated 2 m | 225 / 4 | 734.53 [729.01,740.51] µs |
+
+Fresh full-view selection/preparation medians were 1.3119/11.149 ms; at 2 m they
+were 574.19/106.24 µs. The full-view CPU review miss is reproduced, not resolved.
+These CPU runs add no GPU timestamp, allocation-profile or presentation-p95 evidence.
+
 ## Phase 1 baseline — 2026-10-01
 
 Host: AMD Ryzen 7 9800X3D, 8 reported cores/logical processors; Windows 11 Pro x86-64, build 26200. Rust 1.98.1 stable (`48a229cea`, LLVM 22.1.8), `x86_64-pc-windows-msvc`. Cargo's unmodified optimized bench profile; no native-CPU flags, custom allocators, parallel conversion, caching, LTO or unsafe project code. `glam 0.30.10` uses default/std features. Lockfile selections: Criterion 0.8.2 (default features disabled), naga 27.0.3, wgpu 27.0.1, egui 0.33.3, winit 0.30.13. Benchmark implementation is in the Phase 1 commits through `402a046`; app-only follow-up changes do not change timed library operations.

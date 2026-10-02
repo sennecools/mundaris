@@ -1150,6 +1150,15 @@ A distant feature should refine into more detail rather than becoming a differen
 
 ## 19.2 Preferred surface partition direction
 
+The [Phase 4 design](MUNDARIS_PHASE_4_PLANET_SURFACE_REPRESENTATION_AND_LOD.md)
+now selects normalized radial cube mapping and computed balanced quadtrees for
+the first smooth-sphere implementation, after comparing alternate sphere charts.
+Its stitched topology, screen-error/readiness/handoff and body-local contracts
+are implementation choices with recorded numerical/native/performance evidence
+and outstanding complete acceptance, not new locked world or persistent-edit
+invariants. The discussion below retains
+the broader replaceability rationale.
+
 A cube-sphere with hierarchical patch subdivision is a strong candidate because it provides:
 
 - six manageable root faces;
@@ -2716,8 +2725,12 @@ Existing and next ADR responsibilities:
 0002 reference frame and precision model (implemented)
 0003 celestial domain, time and frame projection (implemented)
 0004 gravity, integration and playback (implemented, platform acceptance open)
-later planetary partition, terrain/edit, LOD, generation, persistence,
-      vegetation identity and CPU/GPU decisions receive numbers when concrete
+0005 celestial navigation, system overview and exact time warp (implemented,
+     complete operator/platform acceptance open)
+0006 planetary surface topology, LOD, cracks and handoff (implemented,
+     complete operator/platform and profiling acceptance open)
+later terrain/edit, generation, persistence,
+       vegetation identity and CPU/GPU decisions receive numbers when concrete
 ```
 
 An ADR should describe:
@@ -2894,15 +2907,16 @@ Approximate authority, larger automatic timesteps, adaptive/multi-rate mappings
 and preview remain future orbital-performance research. This phase introduces no
 terrain, LOD, spacecraft mechanics or Phase 4 implementation.
 
-## Phase 4 — Planet surface partition prototype
+## Phase 4 — Planet surface representation and LOD
 
 Goal:
 
-> validate the LOD topology before committing to terrain algorithms.
+> approach the same physically moving/rotating smooth body continuously from system scale to metre-scale clearance, validating topology and LOD before terrain generation.
 
-Likely experiment:
+The [Phase 4 implementation-ready design](MUNDARIS_PHASE_4_PLANET_SURFACE_REPRESENTATION_AND_LOD.md)
+selects:
 
-- cube-sphere roots;
+- normalized radial cube-sphere roots;
 - hierarchical patch addressing;
 - patch refinement;
 - neighbor constraints;
@@ -2912,7 +2926,17 @@ Likely experiment:
 - seam validation;
 - approach from orbit to surface.
 
-This phase should end with an ADR selecting or rejecting the approach.
+It additionally defines shared topology/batched preparation, stable surface
+locations distinct from render patches, readiness-based far-sphere handoff and
+explicit co-rotating surface inspection. Default geometry remains a perfect sphere
+at authoritative reference radius; procedural displacement begins in Phase 5.
+
+Implementation and directed Windows evidence are recorded in
+[Phase 4 validation](docs/phase-4-validation.md) and
+[ADR 0006](docs/adr/0006-planet-surface-topology-and-lod.md). Complete operator/Linux/
+remote-CI and profiling acceptance remain open. Full-planet CPU preparation misses
+the review target; measured revisiting must preserve topology, ownership and precision.
+Phase 5 has not begun.
 
 ## Phase 5 — Procedural base terrain
 

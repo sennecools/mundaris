@@ -2,7 +2,7 @@
 
 Mundaris is a native desktop world-building and planetary simulation project spanning astronomical and local surface scales. Checked reference frames, editable celestial state, deterministic Newtonian gravity, fixed-step orbital integration and minimal celestial debug rendering are implemented. Procedural worlds remain future work.
 
-**Status:** Phase 3.5 celestial explorer is implemented, with Windows headless/release, benchmark and directed native evidence. Complete human/high-DPI/sleep validation, Linux native acceptance and current-revision remote CI remain open. See [Phase 3.5 evidence](docs/phase-3-5-validation.md), [Phase 3 evidence](docs/phase-3-validation.md), [Phase 2 evidence](docs/phase-2-validation.md), and [Phase 1 evidence](docs/phase-1-validation.md). Decisions are recorded in [ADR 0005](docs/adr/0005-celestial-navigation-system-view-and-timewarp.md). Phase 4 has not begun.
+**Status:** Phase 4 smooth planetary surface LOD is implemented in the connected celestial explorer. Windows headless/release, CPU benchmarks and directed native approach/inspection evidence are recorded in [Phase 4 validation](docs/phase-4-validation.md) and [ADR 0006](docs/adr/0006-planet-surface-topology-and-lod.md). Complete operator/high-DPI/recovery, Linux and current-revision remote CI acceptance remain open. Full-planet CPU preparation misses the review target; see [performance](docs/performance.md). Earlier phase evidence remains preserved. Phase 5 has not begun.
 
 The initial native development targets are **Windows x86-64** and **Linux x86-64**.
 
@@ -53,8 +53,9 @@ collision-laid-out labels.
 | Free-flight speed | Logarithmic multiplier / wheel powers of two |
 
 Body zoom controls **clearance above the real reference sphere**, with a one-metre/
-ULP floor and smooth wall-time response. This does not promise metre-accurate terrain
-in the current debug mesh. Navigation uses one high-precision observer; moving or
+ULP floor and smooth wall-time response. Aurelia/Luma now use normalized cube-sphere,
+balanced stitched surface patches when projected curvature requires them. The surface
+is a smooth zero-height sphere. Navigation uses one high-precision observer; moving or
 focusing it changes no world state. Physical spheres, markers, labels and curves are
 separate products. Dashed curves are instantaneous two-body **orbit guides**, not
 full N-body predictions; solid age-fading curves are **actual committed history**.
@@ -82,6 +83,24 @@ and pauses until Resume, with a visible diagnostic. The session threshold is
 explicitly adjustable. There is no hidden sleep catch-up or approximate time-warp
 mode. Rate samples report their actual wall window and tick-limited quantization.
 
+## Planet surface inspection
+
+Focus Aurelia/Luma, open **Planet surface / inspection**, set astronomical or exact
+clearance targets, or run the continuous 30 s approach to 2 m. **I** explicitly
+attaches the same observer to the rotating fixed frame; right drag looks locally,
+WASD/QE move at clearance-scaled editor speed and **H** looks toward the tangent
+horizon. Look-at body controls and single physical steps observe the independent
+moon/star. The reference-sphere clearance guard is navigation, not collision/walking.
+
+Normal mode is a plain analytically shaded sphere. Optional borders/LOD/face/bounds
+views, pointer patch addressing and readiness/cache/quality counters expose the
+derived structure. Far/surface ownership is exclusive per BodyId; no scene switch.
+
+For a reproducible native route through the same implementation, set
+`$env:MUNDARIS_PHASE4_VALIDATE='1'` in PowerShell before running `--gravity-orbits`.
+Omit/unset it for normal paused startup. UI also exposes **Run integrated validation
+route**. No procedural terrain, noise, atmosphere or collision is implemented.
+
 ## Quality checks
 
 ```bash
@@ -95,7 +114,7 @@ CI uses `--locked` for Cargo compilation/lint/test commands to enforce the commi
 ## Workspace map
 
 - `mundaris_app` — process entry point, native event loop, logging, and composition.
-- `mundaris_renderer` — observer-relative precision, forward-depth debug lines, reverse-Z celestial spheres/trails, `wgpu` and `egui` integration.
+- `mundaris_renderer` — observer-relative precision, forward-depth debug lines, reverse-Z celestial spheres/surface patches/trails, `wgpu` and `egui` integration.
 - `mundaris_core` — reserved for small, genuinely shared foundations.
 - `mundaris_math` — finite SI coordinate/time values, rigid rotations/transforms, transactional frame trees, LCA conversions and instantaneous kinematics.
 - `mundaris_world` — authoritative append-only celestial bodies, coherent system state/time and disposable body-to-frame projection.
@@ -118,6 +137,8 @@ cargo bench --locked -p mundaris_renderer --bench celestial_preparation
 cargo bench --locked -p mundaris_app --bench trail_history
 cargo bench --locked -p mundaris_app --bench celestial_navigation
 cargo bench --locked -p mundaris_app --bench orbit_guides
+cargo bench --locked -p mundaris_renderer --bench planet_surface
+cargo bench --locked -p mundaris_app --bench planet_surface_approach
 ```
 
 Benchmarks are CPU-only, use Criterion, and stay outside normal CI. Large 512-step
@@ -126,7 +147,8 @@ time. Workloads, distributions and limitations are in [performance notes](docs/p
 Decisions are in [ADR 0002](docs/adr/0002-reference-frames-and-precision.md),
 [ADR 0003](docs/adr/0003-celestial-domain-and-time.md),
 [ADR 0004](docs/adr/0004-gravity-integration-and-playback.md), and
-[ADR 0005](docs/adr/0005-celestial-navigation-system-view-and-timewarp.md).
+[ADR 0005](docs/adr/0005-celestial-navigation-system-view-and-timewarp.md), and
+[ADR 0006](docs/adr/0006-planet-surface-topology-and-lod.md).
 
 ## Repository status
 

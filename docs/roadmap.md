@@ -7,7 +7,7 @@ These are exploratory phases, not promises or fixed delivery dates. Experiments,
 2. [Celestial model and simulation time](../MUNDARIS_PHASE_2_CELESTIAL_MODEL_AND_TIME.md)
 3. [Gravity, orbits and basic celestial rendering](../MUNDARIS_PHASE_3_GRAVITY_ORBITS_AND_CELESTIAL_RENDERING.md) (implemented; Linux/current CI acceptance open)
 3.5. [Celestial navigation, system view and exact time warp](../MUNDARIS_PHASE_3_5_CELESTIAL_NAVIGATION_SYSTEM_VIEW_AND_TIMEWARP.md) (implemented; complete operator/platform acceptance open)
-4. Planet surface partition/LOD prototype
+4. [Planet surface representation and LOD](../MUNDARIS_PHASE_4_PLANET_SURFACE_REPRESENTATION_AND_LOD.md) (implemented smooth-sphere baseline; complete operator/platform acceptance and performance review open)
 5. Procedural base terrain
 6. Terrain representation and sparse-edit prototype
 7. Atmosphere and ocean baseline
@@ -31,7 +31,7 @@ bounded reverse/seek replay, coherent world/projection views, minimal physical
 debug spheres, connected camera/navigation and actual-history trails. Windows
 debug/release/long-run checks, benchmarks and the operator-reported visual sequence
 are recorded in [Phase 3 validation](phase-3-validation.md). Linux native and
-current-revision CI remain open. Phase 4 has not begun.
+current-revision CI remain open. Phase 4 smooth-sphere implementation is recorded below.
 
 Phase 3.5 turns the validation viewer into a connected system explorer: geometric
 overview/subsystems, arbitrary BodyId picking, readable markers/labels, smooth
@@ -44,5 +44,15 @@ method remains baseline exact KDK/h; no preview or approximate authority exists.
 Later orbital-performance research may compare a validated timestep ladder,
 near-Kepler mappings, encounter-appropriate integrators and isolated preview at
 equal simulated horizon and error envelopes. These are separate future decisions,
-not rate-selected fallbacks. Phase 4 still concerns planetary surface partitioning
-and has not begun.
+not rate-selected fallbacks.
+
+Phase 4's reviewed design covers a smooth moving/rotating reference sphere from
+system scale to metre-scale clearance: normalized cube-sphere addressing, computed
+balanced patch coverage, screen-space curvature error, stitched edges, conservative
+culling, source-centred preparation and readiness-based celestial handoff. Explicit
+surface inspection keeps the same observer/body identity while looking toward space.
+Surface locations remain independent of render-LOD patches. Implementation and its
+platform/benchmark acceptance are recorded in [Phase4 evidence](phase-4-validation.md).
+The implemented zero-height sphere, exclusive far handoff and explicit fixed-frame
+inspection share the existing physical world. Full-planet CPU work needs review;
+Phase 5 terrain displacement has not begun.

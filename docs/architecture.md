@@ -115,7 +115,8 @@ Simultaneous relative history subtracts both bodies at each historical sample;
 today's projection only labels conversion sources. Clipping/narrowing/staging are
 renderer-owned. Failed frames cannot upload partial batches. The app library target
 supports headless session tests and history benchmarks in the existing package.
-Planet generation, terrain/LOD, persistence and general editor systems remain deferred.
+Procedural planet generation, displaced terrain, persistence and general editor
+systems remain deferred; smooth surface LOD is described below.
 
 The app supplies the bootstrap panel through a per-frame UI callback; the renderer owns only UI input and GPU integration. Native events and UI types stay at this app/renderer boundary. An `Arc<Window>` safely keeps the surface's native handle alive without leaks or shared mutable domain state. Presentation notifies `winit` before submitting the frame to the compositor.
 
@@ -158,3 +159,35 @@ Implemented decisions, API deviations and unresolved platform evidence are in
 [ADR 0005](adr/0005-celestial-navigation-system-view-and-timewarp.md) and
 [Phase 3.5 validation](phase-3-5-validation.md). Approximate authoritative
 propagation, preview, terrain and Phase 4 remain outside this milestone.
+
+## Phase 4 planetary surface boundary
+
+The [Phase 4 specification](../MUNDARIS_PHASE_4_PLANET_SURFACE_REPRESENTATION_AND_LOD.md)
+is implemented as the smooth-sphere CPU baseline. It selects normalized-cube surface charts and compact computed
+patch addresses, while body-fixed surface locations and future persistent layer
+identity remain independent of transient render leaves. Generic address/tangent
+math belongs in math; observer-dependent LOD, culling, ready coverage, metadata
+cache and GPU resources are renderer-derived state owned through app sessions.
+World retains the one authoritative BodyId/reference radius/state; no permanent
+terrain state is introduced by the smooth-sphere validation.
+
+Current clearance zoom already reaches 1 m above reference radius, but the fixed
+icosphere is not locally surface-accurate. Its all-vertex precision fallback and
+single-sphere draw constants require a separate patch representation. Infinite-far
+reverse-Z is reusable; surface and far bodies must share its depth ownership.
+Default orbit-centre look and system-stationary free flight need an explicit
+co-rotating inspection control for stable local look-around on a moving planet.
+The projection exposes no arbitrary regional-frame insertion; Phase 4
+uses body-fixed f64 inspection anchors without allocating a frame for each patch.
+
+Math supplies canonical dyadic samples, address/neighbor/tangent mathematics.
+Renderer sessions own complete sorted contiguous balanced covers, previous quality
+splits, pending local ready transactions and a bounded metadata LRU. Only visible
+leaves are evaluated/uploaded. Shared sixteen u16 stitch variants and sample32/
+instance64 storage drive at most sixteen instanced draws plus counted clipped
+fallback, in the existing celestial depth pass. App owns explicit BodyId capability,
+readiness/error handoff, one-observer co-rotating inspection and validation routes.
+Observations/labels/picking keep their dense body association even when sphere
+geometry is suppressed. No world/simulation functionality or dependency changes.
+See [ADR0006](adr/0006-planet-surface-topology-and-lod.md) and
+[evidence](phase-4-validation.md) for API choices, measurements and open acceptance.

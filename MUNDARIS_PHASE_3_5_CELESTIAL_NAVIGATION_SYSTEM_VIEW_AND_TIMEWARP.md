@@ -917,3 +917,30 @@ real OS sleep/high-DPI, Linux, remote CI, allocation-profiler and presentation-c
 evidence remains incomplete. Measured 16-body full-retention preparation misses
 the 4 ms goal. Numerical tolerances are retained. No approximate authoritative
 propagator, preview timeline or Phase 4 feature has been implemented or enabled.
+
+## 29. Phase 4 foundation audit — 2026-10-02
+
+The [Phase 4 design](MUNDARIS_PHASE_4_PLANET_SURFACE_REPRESENTATION_AND_LOD.md)
+audits the current implementation at `bf4c1f9`, rather than treating the historical
+Phase 3 baseline in Sections 3–4 as current behavior. Clearance zoom already
+reaches the 1 m/ULP floor; the remaining obstacle is surface representation and
+inspection control, not the old 1.05-radius body floor.
+
+Current sphere preparation validates all 642 vertices and can return a precision
+marker fallback due to offscreen/near-plane geometry. The apparent-diameter formula
+is a small-object approximation. Centre-dependent labels/rings/body-length axes
+and centre-look orbit controls are unsuitable once the planet fills the screen.
+Orbit drag also moves the observer by body-radius-scaled distances. Ordinary free
+flight is system-stationary and has no reference-sphere guard, so it cannot hold
+near a translating/rotating surface under committed physical motion. No explicit
+co-rotating free inspection or automatic regional frames are implemented.
+
+Marker fade currently keys specifically to `PhysicalSphere`; a ready surface
+representation must participate in that availability contract. Infinite-far reverse-Z
+is present, but existing depth tests do not establish simultaneous metre/horizon/
+moon/star ordering. Near policy ignores nonpositive body clearances and needs an
+explicit at/inside diagnostic policy. Coherent BodyId/state/frame publication and
+source-centred f64 preparation are suitable foundations for these extensions.
+
+These are documented integration constraints, not engine fixes performed by this
+audit. Phase 4 implementation and old unverified platform/operator acceptance remain open.
