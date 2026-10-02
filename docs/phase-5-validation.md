@@ -1,5 +1,239 @@
 # Phase 5 implementation and validation evidence
 
+## Phase 5.5 gradient-directed erosion checkpoint — 2026-10-02
+
+**Implementation exists; full Phase 5.5 visual acceptance is not established.**
+The [Phase 5.5 construction](../MUNDARIS_PHASE_5_5_GRADIENT_DIRECTED_EROSION.md)
+records the executable mathematical adaptation, rather than replacing this
+validation evidence with another specification. The generic stateless ridge/valley
+shaping below is **superseded as the primary mountain erosion model by Phase 5.5**
+in V2. V1 and its historical measurements remain intact.
+
+### Implemented architecture
+
+- `world/src/terrain/erosion.rs`: one bounded, analytic, feature-anchored straight
+  gully primitive, quintic partition blending, rounded Gaussian creases, regularized
+  slope fade and normalized [-1,0] incision. Fixed anchor coefficients avoid an
+  invalid frozen-query-gradient derivative approximation.
+- `world/src/terrain/generator.rs`: one-to-five recursive octaves. Each smaller
+  feature samples gradients modified by earlier erosion at its fixed body-space
+  anchor. Different seeded body-space rotations, no face axes or tangent charts.
+  Stack fading attenuates subsequent features in existing creases. A bounded
+  query/batch-local memo is discarded after evaluation; no persistent flow state.
+- V2 replaces the Regional ridge/valley contribution using its existing amplitude
+  budget, preserves V1 macro/range salts and domain transforms, and leaves Local
+  and Fine as separate additional relief. Definition equality includes erosion
+  count/strength and immutable generator version; old cached geometry cannot match.
+- Exactly-zero footprint weights skip erosion evaluation entirely. Feature
+  coefficients use the complete preceding field regardless of query footprint,
+  making the sum of omitted weighted amplitudes a valid residual bound. Complete
+  analytic gradients feed the unchanged radial-graph normal calculation.
+- The existing cache, readiness and renderer path are reused. Grid16 positions and
+  normals still consume 13,872 bytes. No per-patch erosion map is introduced.
+- Native opt-in preview uses V2; `MUNDARIS_PHASE55_AB=legacy` selects V1. The same
+  seed/body/camera route applies. Uniform covers remain restricted to levels 0–4;
+  that physical sampling suppresses the preset erosion hierarchy entirely.
+
+### Numerical validation and acceptance distinction
+
+The original geometry/error assertions remain unchanged. The 163,840-comparison
+suite now spans eight seeds, one-to-five erosion octaves, strengths 0/0.25/0.5/0.75/1,
+levels 0/4/10/18/30 and all sixteen stitch index variants. Its release rerun passed
+with no under-bound. Index-variant tests do not authorize mixed-LOD displaced drawing.
+
+New app tests compare V2 height/gradient and analytic normals at canonical same-face,
+cross-face, corner and parent/child shared directions, and prove version/config
+cache separation plus deterministic eviction/regeneration. The existing nine
+cache/readiness regressions also pass. World tests cover scalar/batch/chunk equality,
+full-minus-filtered residuals, axis/diagonal directions and gradient-feedback A/B.
+
+An initial centered-difference oracle used a minimum direction step of 1e-8. Its
+2 m footprint test failed even with erosion strength zero, from truncation in the
+existing fine-band field. The reference was improved to a centered Richardson
+step sweep (1e-9 through 1e-7), without changing runtime derivatives. The new
+derivative assertion is stricter than the initial experiment (1e-4 rather than 1%).
+Finite differences are test-only. No old assertion was relaxed.
+
+The final sweep contains 10,584 derivative references: maximum scaled error
+2.4066099448838917e-5, p95 2.206435503120489e-7, maximum absolute error
+0.06780838314443827 m/unit direction. Disabling earlier-octave feedback changes
+heights by up to 135.6195430522055 m in the directed comparison. These are numerical
+regressions, not a proof of branching morphology; the analytic construction and
+certificate derivation supply the mathematical contract.
+
+### Isolated CPU measurements
+
+Windows x86-64 MSVC, Ryzen 7 9800X3D, Rust 1.98.1, optimized bench profile.
+Criterion uses 20 samples, 100 ms warmup and requested 500 ms measurement.
+Tables use `new/estimates.json` median point estimates, not the console's slope
+estimates. Raw runs are `target/phase55-world-final.txt`,
+`target/phase55-patch-final.txt` and `target/phase55-live-preset-final.txt`.
+No concurrent benchmark runs, GPU timing or integrated-frame speedup is claimed.
+
+Two fixtures must not be conflated. The historical comparison uses identity 17,
+seed 0x5eed, R=6,371,000 m, band octave counts 3/3/3/3/2 and default erosion
+spacing 64/16/4 km. The actual live preset uses identity 0x415552454c4941,
+seed 17, counts 2/3/4/4/4 and spacing 128/32/8 km. All results include height,
+analytic derivative and normal; there is no V2 value-only evaluation path.
+
+Historical complete-field (zero footprint) configuration comparison:
+
+| Generator | Scalar µs | Batch32 ms | Batch289 ms |
+| --- | ---: | ---: | ---: |
+| V1 | 3.747 | 0.115441 | 1.036225 |
+| V2, 1 octave | 27.012 | 0.308243 | 2.443458 |
+| V2, 2 octaves | 57.940 | 1.019029 | 9.255733 |
+| V2, default 3 | 137.863 | 2.728291 | 27.529950 |
+| V2, 4 octaves | 332.713 | 6.846013 | 72.115650 |
+| V2, 5 octaves | 448.403 | 15.929150 | 175.899050 |
+
+Historical default-three footprint comparison:
+
+| Footprint | Scalar µs | Batch32 ms | Batch289 ms | Active/faded/skipped |
+| --- | ---: | ---: | ---: | --- |
+| 50 km | 2.500 | 0.075398 | 0.685564 | 0/0/3 |
+| 10 km | 3.045 | 0.093840 | 0.839843 | 0/0/3 |
+| 1 km | 3.036 | 0.092768 | 0.836693 | 0/0/3 |
+| 100 m | 57.907 | 1.007703 | 9.059633 | 2/0/1 |
+| 10 m | 138.597 | 2.731583 | 27.614650 | 3/0/0 |
+| 2 m | 138.920 | 2.732562 | 27.794300 | 3/0/0 |
+
+Actual live-preset default-three comparison:
+
+| Generator / footprint | Scalar µs | Batch32 ms | Batch289 ms | Active/faded/skipped |
+| --- | ---: | ---: | ---: | --- |
+| V1 complete | 3.864 | 0.117573 | 1.062392 | — |
+| V2 50 km | 2.523 | 0.076541 | 0.691545 | 0/0/3 |
+| V2 10 km | 2.857 | 0.085754 | 0.777934 | 0/0/3 |
+| V2 1 km | 24.611 | 0.197305 | 1.585532 | 0/1/2 |
+| V2 100 m | 119.418 | 2.320493 | 21.725850 | 2/1/0 |
+| V2 10 m | 119.830 | 2.334279 | 21.573550 | 3/0/0 |
+| V2 2 m | 119.669 | 2.315917 | 21.558650 | 3/0/0 |
+| V2 complete | 120.198 | 2.354548 | 21.660475 | 3/0/0 |
+
+Live-preset batch289 actual primitive/feature totals at 50 km, 10 km, 1 km,
+100 m, 10 m, 2 m and complete are respectively 10404/0, 11560/0, 21600/2312,
+260067/60624, 260645/60624, 261223/60624 and 261512/60624. This counts recursive
+anchor dependencies and memo reuse, not merely emitted octaves. Historical
+default-three per-sample batch averages are 36/0, 44/0, 44/0, 417.34/58.08,
+1207.75/233.80, 1209.75/233.80 and 1209.75/233.80. Zero features at coarse
+footprints verify genuine early rejection. Operation counts vary with spatial
+coherence, seed, domain transforms and direct-mapped memo collisions.
+
+Complete Grid16 cache misses include 289 geometry vertices, certificates, normals,
+queue/publication and cache destruction, with the actual default 8-vertex chunks.
+Cache setup is outside timing. They are not equivalent to arbitrary batch directions.
+
+| Level | Footprint m | Historical ms | Live preset ms |
+| --- | ---: | ---: | ---: |
+| 0 | 796375 | 0.506640 | 0.437406 |
+| 4 | 49773.438 | 0.731791 | 0.737861 |
+| 6 | 12443.359 | 0.889421 | 0.823050 |
+| 10 | 777.710 | 2.130275 | 1.755867 |
+| 13 | 97.214 | 3.567136 | 6.402850 |
+| 16 | 12.152 | 7.268625 | 6.508888 |
+| 18 | 3.038 | 7.399713 | 6.550200 |
+| 19 | 1.519 | 7.320350 | 6.589300 |
+
+Chunk measurements traverse 32 patches; median/worst are observed wall-clock
+durations, not deadline guarantees or Criterion estimates.
+
+| Vertices | Historical coarse µs | Historical fine µs | Live coarse µs | Live fine µs |
+| --- | ---: | ---: | ---: | ---: |
+| 8 | 19.6 / 53.7 | 198.3 / 416.6 | 19.7 / 46.6 | 175.7 / 795.2 |
+| 16 | 38.7 / 104.3 | 296.9 / 661.5 | 38.9 / 187.4 | 269.9 / 603.2 |
+| 32 | 77.1 / 94.0 | 494.6 / 934.6 | 77.4 / 156.0 | 457.6 / 802.0 |
+| 64 | 153.4 / 174.4 | 890.1 / 1203.3 | 154.6 / 196.8 | 834.0 / 1402.6 |
+
+### Scheduling and memory
+
+The measured recursive cost supports small chunks, not unrestricted synchronous
+generation. Live work uses 8 vertices per chunk, at most 64 below a 5 km footprint;
+coarse work retains the prior 1,156-vertex ceiling. The existing 2 ms cutoff is
+checked between chunks, so overshoot remains possible. No worker pool was added.
+Four/five-octave complete-field costs are a known scalability limitation, not the
+production default. No claim of a hard 2 ms generation deadline is made.
+
+Historical 4,096-entry traversal retained 4,096 patches and evicted 256. Resident
+and peak accounting were 58,954,756 bytes (56.22 MiB), versus the prior 56.12 MiB.
+The byte-cap traversal retained six entries at 250,660 bytes under a 262,144-byte
+quota. Aggregate budget remains 128 MiB; geometry payload remains 13,872 bytes.
+The live preset single-patch harness reports 153,972 resident/peak bytes including
+cache storage. Chunk accounting has median delta zero and worst delta 13,872 bytes
+at publication. These are cache-accounting deltas, not heap-allocation counts.
+The 256-slot memo is temporary stack-local storage; scalar/world batches allocate
+no heap memory by code inspection. No allocator profiler was run.
+
+### Final validation commands
+
+All completed successfully on Windows:
+
+```text
+cargo test --locked --workspace --all-features
+cargo check --locked --workspace --all-targets --all-features
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked -p mundaris_math -p mundaris_world -p mundaris_renderer -p mundaris_simulation -p mundaris_app --release --test terrain_noise --test terrain_generation --test terrain_bounds --test terrain_bands --test terrain_erosion --test terrain_error --test terrain_geometry --test terrain_identity --test planet_terrain --test terrain_geometry_error -- --nocapture
+cargo test --locked -p mundaris_simulation --release --test orbits long_run -- --ignored --nocapture
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --all-features --no-deps
+cargo fmt --all -- --check
+cargo bench --locked -p mundaris_world --bench terrain_erosion
+cargo bench --locked -p mundaris_app --bench planet_terrain_generation
+cargo bench --locked -p mundaris_app --bench planet_terrain_erosion
+```
+
+The focused release suite ran 37 tests; both ignored orbital long runs passed.
+Runtime validation preceded the separate live-preset benchmark addition; that
+benchmark itself compiled and ran successfully. Linux and remote CI were not run.
+The inherited ridge transform's behavior at extremely large accepted softness
+values has not been investigated here; this checkpoint does not certify that
+untested extreme configuration beyond the existing validation contract.
+
+### Visual evidence and retained limitations
+
+`app/examples/erosion_capture.rs` generates deterministic analytic CPU A/B views:
+planet, continent, range, mountain face, gully, peak, valley, cross-face direction,
+cube corner and the same mountain face at 1 km/100 m/2 m footprints. BMP outputs
+under `target/phase55-captures` can be converted to PNG for inspection. These use
+20x exaggerated normal lighting and are **not native displaced-mesh captures**.
+Final Gaussian inspection shows coherent elongated incisions and intersecting detail,
+with prominent local/fine noise; convincing hierarchical branching has not been
+demonstrated. Continuity and feedback tests alone do not
+establish the intended mountain morphology.
+
+Native Windows captures under `target/phase55-live` exercise V1/V2 through the
+existing Vulkan route. Timed-route screenshots are directed operational evidence,
+not a guaranteed identical camera snapshot or temporal quality acceptance. At the
+supported uniform footprint erosion is absent; these cannot establish live gully
+quality. Reference-sphere navigation can enter displaced terrain, producing
+uninformative filled close views. No visual seam/axis/peak/valley acceptance is
+claimed from those views.
+
+The committed [capture index](evidence/phase55/README.md) contains 24 exact-sample
+CPU A/B PNGs and two inspected native orbital PNGs, with parameters and explicit
+limitations. The initial periodic cosine prototype was rejected for worm-like
+stripes; only the final non-periodic Gaussian evidence is retained. The reused
+mountain mask has no explicit ocean exclusion. Pointwise peak preservation,
+valley quality, broader seed/pole/axis surveys and matched-camera live fine-terrain
+inspection remain open acceptance gates. No bypass of footprint filtering was
+introduced to manufacture live detail.
+
+### Checkpoint commits
+
+| Commit | Scope |
+| --- | --- |
+| `5a6b552` | Certified body-fixed gradient-feedback world implementation, tests and benchmarks |
+| `2066246` | App preview/config identity, bounded scheduling, seam/cache tests, benchmarks and capture example |
+
+Construction, measurement and capture documentation follows in a separate closeout
+commit. Nothing was pushed. Unrelated existing design/workflow changes remain
+excluded. This is a working, numerically validated but **not fully accepted**
+Phase 5.5 checkpoint; no subsequent LOD transition work was started.
+
+Mixed-LOD displaced stitching and common-refinement morphing remain unimplemented;
+replacement popping and the coarse horizon remain. Terrain certificates still do
+not fully drive adaptive selection. No Phase 4 redesign, worker-thread generation,
+true hydraulic simulation, per-patch erosion texture or budget increase is included.
+
 ## Displaced geometry/cache checkpoint — 2026-10-02
 
 **Implemented, with restricted live integration; not complete Phase 5 acceptance.**
