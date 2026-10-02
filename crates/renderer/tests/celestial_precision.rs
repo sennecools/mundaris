@@ -152,6 +152,8 @@ fn f64_trail_clipping_and_marker_selection() {
         depth_m: 1.0,
         occluded: false,
         representation: SphereRepresentation::SubpixelMarker,
+        apparent_diameter_pixels: 0.1,
+        center_in_view_m: DVec3::new(0.0, 0.0, -1.0),
     };
     let markers = [
         CelestialMarker {

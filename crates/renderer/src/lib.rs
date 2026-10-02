@@ -6,10 +6,12 @@
 #![forbid(unsafe_code)]
 
 mod celestial;
+mod celestial_lines;
 mod celestial_view;
 mod debug;
 mod view;
 pub use celestial::*;
+pub use celestial_lines::{CelestialLineStyle, CelestialPolyline, PolylinePreparationReport};
 pub use celestial_view::*;
 pub use debug::{DebugFrame, DebugLine, DebugProjection, DebugStaging};
 pub use view::*;
@@ -64,6 +66,9 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    pub fn pixels_per_point(&self) -> f32 {
+        self.egui_context.pixels_per_point()
+    }
     /// Creates a surface and GPU device for the supplied native window.
     pub fn new(window: Arc<Window>) -> Result<Self, RendererError> {
         pollster::block_on(Self::new_async(window))

@@ -174,6 +174,8 @@ pub struct CelestialMarker {
     pub depth_m: f64,
     pub occluded: bool,
     pub representation: SphereRepresentation,
+    pub apparent_diameter_pixels: f64,
+    pub center_in_view_m: DVec3,
 }
 /// Hit radius in physical pixels; ties: distance, f64 depth, stable request order.
 pub fn select_marker(markers: &[CelestialMarker], point: [f32; 2]) -> Option<usize> {
@@ -201,6 +203,7 @@ pub struct CelestialStaging {
     vertices: Vec<u8>,
     uniforms: Vec<u8>,
     lines: Vec<u8>,
+    polylines: Vec<u8>,
     draws: Vec<u32>,
     markers: Vec<CelestialMarker>,
     centers: Vec<(DVec3, f64)>,
@@ -210,6 +213,7 @@ pub struct CelestialPreparationReport {
     pub triangles: usize,
     pub markers: usize,
     pub trail_segments: usize,
+    pub polyline_segments: usize,
     pub subpixel_bodies: usize,
     pub culled_bodies: usize,
     pub precision_fallbacks: usize,
@@ -235,6 +239,7 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
         staging.vertices.clear();
         staging.uniforms.clear();
         staging.lines.clear();
+        staging.polylines.clear();
         staging.draws.clear();
         staging.markers.clear();
         staging.centers.clear();
@@ -405,6 +410,8 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
                 depth_m: -center.z,
                 occluded,
                 representation,
+                apparent_diameter_pixels: diameter,
+                center_in_view_m: center,
             });
             self.report.markers += usize::from(screen.is_some());
         }
@@ -420,6 +427,35 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
             self.failed = true;
         }
         result
+    }
+    /// Semantics belong to the app. These generic curves never enter history storage.
+    pub fn append_polylines(
+        &mut self,
+        lines: &[crate::CelestialPolyline<'_>],
+    ) -> Result<(), RenderPreparationError> {
+        let result = (|| {
+            self.validate()?;
+            crate::celestial_lines::prepare_polylines(
+                self.view,
+                self.projection,
+                lines,
+                &mut self.staging.polylines,
+            )
+        })();
+        match result {
+            Ok(report) => {
+                self.report.polyline_segments += report.segments;
+                self.report.max_projected_error_pixels = self
+                    .report
+                    .max_projected_error_pixels
+                    .max(report.max_projected_error_pixels);
+                Ok(())
+            }
+            Err(error) => {
+                self.failed = true;
+                Err(error)
+            }
+        }
     }
     fn lines_checked(
         &mut self,
@@ -493,6 +529,7 @@ fn pack(position: [f32; 3], normal: [f32; 3], bytes: &mut Vec<u8>, normal_w: f32
 pub(crate) struct CelestialRenderer {
     sphere_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
+    polyline_pipeline: wgpu::RenderPipeline,
     projection: wgpu::Buffer,
     projection_group: wgpu::BindGroup,
     uniform_layout: wgpu::BindGroupLayout,
@@ -503,6 +540,8 @@ pub(crate) struct CelestialRenderer {
     vertex_capacity: u64,
     lines: wgpu::Buffer,
     line_capacity: u64,
+    polylines: wgpu::Buffer,
+    polyline_capacity: u64,
     indices: wgpu::Buffer,
     depth: wgpu::TextureView,
 }
@@ -544,6 +583,13 @@ impl CelestialRenderer {
             include_str!("shaders/celestial_trails.wgsl"),
             true,
         );
+        let polyline_pipeline = pipeline(
+            device,
+            format,
+            &[],
+            include_str!("shaders/celestial_lines.wgsl"),
+            true,
+        );
         let indices = buffer(
             device,
             1280 * 3 * 4,
@@ -558,6 +604,7 @@ impl CelestialRenderer {
         Self {
             sphere_pipeline,
             line_pipeline,
+            polyline_pipeline,
             projection,
             projection_group,
             uniform_layout,
@@ -568,6 +615,13 @@ impl CelestialRenderer {
             vertex_capacity: 32,
             lines: buffer(device, 32, wgpu::BufferUsages::VERTEX, "Historical lines"),
             line_capacity: 32,
+            polylines: buffer(
+                device,
+                32,
+                wgpu::BufferUsages::VERTEX,
+                "Celestial styled curves",
+            ),
+            polyline_capacity: 32,
             indices,
             depth: depth(device, width, height),
         }
@@ -599,6 +653,13 @@ impl CelestialRenderer {
             storage.lines.len(),
             wgpu::BufferUsages::VERTEX,
         );
+        grow(
+            device,
+            &mut self.polylines,
+            &mut self.polyline_capacity,
+            storage.polylines.len(),
+            wgpu::BufferUsages::VERTEX,
+        );
         if storage.uniforms.len() as u64 > self.uniform_capacity {
             self.uniform_capacity = (storage.uniforms.len() as u64).next_power_of_two();
             self.uniforms = buffer(
@@ -613,6 +674,7 @@ impl CelestialRenderer {
         for (buffer, bytes) in [
             (&self.vertices, &storage.vertices),
             (&self.lines, &storage.lines),
+            (&self.polylines, &storage.polylines),
             (&self.uniforms, &storage.uniforms),
         ] {
             if !bytes.is_empty() {
@@ -646,6 +708,10 @@ impl CelestialRenderer {
             timestamp_writes: None,
             occlusion_query_set: None,
         });
+        let [x, y] = frame.projection.origin();
+        let [w, h] = frame.projection.viewport();
+        pass.set_viewport(x as f32, y as f32, w as f32, h as f32, 0.0, 1.0);
+        pass.set_scissor_rect(x, y, w, h);
         pass.set_pipeline(&self.sphere_pipeline);
         pass.set_bind_group(0, &self.projection_group, &[]);
         pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
@@ -662,6 +728,11 @@ impl CelestialRenderer {
             pass.set_pipeline(&self.line_pipeline);
             pass.set_vertex_buffer(0, self.lines.slice(..));
             pass.draw(0..(storage.lines.len() / 32) as u32, 0..1);
+        }
+        if !storage.polylines.is_empty() {
+            pass.set_pipeline(&self.polyline_pipeline);
+            pass.set_vertex_buffer(0, self.polylines.slice(..));
+            pass.draw(0..(storage.polylines.len() / 32) as u32, 0..1);
         }
         Ok(())
     }
@@ -788,12 +859,16 @@ fn pipeline(
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format,
-                blend: None,
+                blend: if lines {
+                    Some(wgpu::BlendState::ALPHA_BLENDING)
+                } else {
+                    None
+                },
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
         primitive: wgpu::PrimitiveState {
-            topology: if lines {
+            topology: if lines && !layouts.is_empty() {
                 wgpu::PrimitiveTopology::LineList
             } else {
                 wgpu::PrimitiveTopology::TriangleList

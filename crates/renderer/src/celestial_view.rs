@@ -4,6 +4,7 @@ use glam::{DVec3, Mat4, Vec4};
 
 #[derive(Debug, Clone, Copy)]
 pub struct CelestialProjection {
+    origin: [u32; 2],
     width: u32,
     height: u32,
     near_m: f64,
@@ -37,6 +38,7 @@ impl CelestialProjection {
             return Err(RenderPreparationError::InvalidProjection);
         }
         Ok(Self {
+            origin: [0, 0],
             width,
             height,
             near_m,
@@ -49,6 +51,33 @@ impl CelestialProjection {
     }
     pub fn viewport(self) -> [u32; 2] {
         [self.width, self.height]
+    }
+    /// Physical content rectangle shared by fitting, overlays, unprojection and GPU viewport.
+    pub fn with_origin(mut self, origin: [u32; 2]) -> Result<Self, RenderPreparationError> {
+        if origin[0].checked_add(self.width).is_none()
+            || origin[1].checked_add(self.height).is_none()
+        {
+            return Err(RenderPreparationError::InvalidProjection);
+        }
+        self.origin = origin;
+        Ok(self)
+    }
+    pub fn origin(self) -> [u32; 2] {
+        self.origin
+    }
+    pub fn vertical_fov_rad(self) -> f64 {
+        2.0 * self.tan_half.atan()
+    }
+    pub fn unproject_ray(self, pointer: [f64; 2]) -> Result<DVec3, RenderPreparationError> {
+        let ray = DVec3::new(
+            (pointer[0] - self.origin[0] as f64 - self.width as f64 * 0.5) / self.focal_pixels(),
+            -(pointer[1] - self.origin[1] as f64 - self.height as f64 * 0.5) / self.focal_pixels(),
+            -1.0,
+        );
+        if !ray.is_finite() {
+            return Err(RenderPreparationError::InvalidDebugGeometry);
+        }
+        Ok(ray.normalize())
     }
     pub fn focal_pixels(self) -> f64 {
         self.height as f64 / (2.0 * self.tan_half)
@@ -74,8 +103,8 @@ impl CelestialProjection {
         }
         let focal = self.focal_pixels();
         let screen = [
-            self.width as f64 * 0.5 + focal * (p.x / -p.z),
-            self.height as f64 * 0.5 - focal * (p.y / -p.z),
+            self.origin[0] as f64 + self.width as f64 * 0.5 + focal * (p.x / -p.z),
+            self.origin[1] as f64 + self.height as f64 * 0.5 - focal * (p.y / -p.z),
         ];
         if screen.iter().all(|x| x.is_finite()) {
             Ok(screen)
@@ -92,10 +121,10 @@ impl CelestialProjection {
             return Ok(None);
         }
         let screen = self.screen(p)?;
-        if screen[0] < 0.0
-            || screen[1] < 0.0
-            || screen[0] > self.width as f64
-            || screen[1] > self.height as f64
+        if screen[0] < self.origin[0] as f64
+            || screen[1] < self.origin[1] as f64
+            || screen[0] > (self.origin[0] + self.width) as f64
+            || screen[1] > (self.origin[1] + self.height) as f64
         {
             return Ok(None);
         }
