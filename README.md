@@ -28,6 +28,14 @@ cargo run --locked -p mundaris_app -- --celestial-model
 cargo run --locked -p mundaris_app -- --gravity-orbits
 ```
 
+Phase 5 has an opt-in **terrain checkpoint preview** in the surface panel of
+`--gravity-orbits`. Enable it there, or set `MUNDARIS_PHASE5_TERRAIN=1` before
+launching. It authors the deterministic fixture once, then renders cached f64
+displaced geometry; disabling the preview restores the Phase 4 sphere path.
+The interim display uses complete uniform covers through level 4: replacements
+can pop, mixed-LOD displaced stitching/morphing is not enabled, and close-range
+terrain navigation remains incomplete. See [checkpoint evidence](docs/phase-5-validation.md).
+
 Normal invocation opens the bootstrap panel. `--reference-frames` draws abstract axes and wire boxes attached to an analytically translating/rotating hierarchy, with source-centred rendering, precision diagnostics, pause/seek/reset, a `1e16 m` shared-offset stress mode, continuous approach, paused frame re-expression, and centimetre movement buttons. Begin approach while paused, then select Play. Re-expression and local movement are available while paused. This fixture contains no planet, terrain, or physics simulation.
 
 `--celestial-model` creates Solace, Aurelia and Luma at star/planet/moon-scale magnitudes. Their bounded `-600..600 s` prescribed motion is an analytic validation fixture, not orbital physics. The panel provides rate/reverse/pause, explicit seek/reset, body selection, translating/body-fixed focus and observer re-expression, projection rebuilding, and atomic name/mass/reference-radius edits. Body-local axes are drawn through the generic renderer; distant bodies have textual bearing/distance markers. Reset preserves body IDs, restores fixture properties/state, and selects Aurelia in body-fixed focus at `0 s`, `1x`, paused.
