@@ -420,6 +420,83 @@ mod tests {
     use mundaris_simulation::*;
     use std::{num::NonZeroU64, time::Duration};
     #[test]
+    fn display_keeps_committed_vertices_extrema_age_and_screen_tolerance() {
+        let mut world = GravityFixture::Circular
+            .create(NonZeroU64::new(1).unwrap())
+            .unwrap();
+        let id = world.bodies().nth(1).unwrap().0;
+        let mut runner =
+            FixedStepRunner::new(&world, SimulationConfig::try_new(10.0).unwrap()).unwrap();
+        let mut history = TrailHistory::new(&world, 1).unwrap();
+        runner.request_forward_to_tick(1000).unwrap();
+        while runner.tick() < 1000 {
+            runner
+                .pump(&mut world, |tick, w| history.record_committed(0, tick, w))
+                .unwrap();
+        }
+        let frames = CelestialFrameProjection::build(&world, NonZeroU64::new(1).unwrap()).unwrap();
+        let root = frames.tree().root();
+        let view = PreparedView::new(
+            &frames.tree().evaluate(),
+            mundaris_math::FramePose::new(
+                FramePosition::new(root, LocalPosition::try_metres(DVec3::Z * 1e8).unwrap()),
+                mundaris_math::UnitRotation::identity(),
+            ),
+            mundaris_renderer::RenderPrecisionBudget::near_debug(),
+        )
+        .unwrap();
+        let projection = CelestialProjection::try_new(1280, 800, 1.0, 0.1).unwrap();
+        let mut points = Vec::new();
+        let mut colors = Vec::new();
+        history
+            .display_points(&world, &frames, id, 8193, &mut points, &mut colors)
+            .unwrap();
+        let original = points.clone();
+        assert!((colors[0][3] - 0.15).abs() < 1e-7);
+        assert_eq!(colors.last().unwrap()[3], 1.0);
+        let mut scratch = TrailDisplayScratch::default();
+        assert!(
+            !scratch
+                .simplify(&view, projection, 1024, &mut points, &mut colors)
+                .unwrap()
+        );
+        assert_eq!(points.first(), original.first());
+        assert_eq!(points.last(), original.last());
+        assert!(points.iter().all(|p| original.contains(p)));
+        for axis in 0..3 {
+            for maximum in [false, true] {
+                let extreme = original
+                    .iter()
+                    .reduce(|a, b| {
+                        if (b.local().metres()[axis] > a.local().metres()[axis]) == maximum {
+                            b
+                        } else {
+                            a
+                        }
+                    })
+                    .unwrap();
+                assert!(points.contains(extreme));
+            }
+        }
+        let source = view.prepare_source(root).unwrap();
+        let project = |point: FramePosition| {
+            projection
+                .project_pixels(source.view_displacement(point).unwrap().metres())
+                .unwrap()
+                .unwrap()
+        };
+        for &point in &original {
+            let p = project(point);
+            let error = points
+                .windows(2)
+                .map(|pair| {
+                    crate::orbit_guides::screen_chord_error(project(pair[0]), project(pair[1]), p)
+                })
+                .fold(f64::MAX, f64::min);
+            assert!(error <= 0.5 + 1e-9);
+        }
+    }
+    #[test]
     fn all_committed_substeps_same_stride_eviction_direction_and_rebuild() {
         let mut expected = None;
         for slices in [1, 30, 144] {

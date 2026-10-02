@@ -43,6 +43,28 @@ impl SystemViewBounds {
         for &id in &included {
             system.body(id)?;
         }
+        if included.len() == 1
+            && history_points.is_empty()
+            && !guides.iter().any(|g| {
+                included.contains(&g.body)
+                    && g.reference.is_some_and(|r| {
+                        matches!(scope, OverviewScope::WholeSystem) || included.contains(&r)
+                    })
+                    && g.elements.is_some_and(|e| e.semi_major_axis_m().is_some())
+            })
+        {
+            let body = system.body(included[0])?;
+            let radius = body.properties().reference_radius_m();
+            return Ok(Self {
+                center_m: body.state().center_in_system().metres(),
+                radius_m: radius,
+                included,
+                body_radius_m: radius,
+                guide_radius_m: radius,
+                history_outside_fit: false,
+                history_radius_m: 0.0,
+            });
+        }
         let anchor = included.first().map_or(Ok(DVec3::ZERO), |&id| {
             system
                 .body(id)

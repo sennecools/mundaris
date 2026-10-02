@@ -31,12 +31,15 @@ fn caller_chunks_preserve_exact_states_history_and_callbacks() {
         a.request_forward_to_tick(3000).unwrap();
         b.request_forward_to_tick(3000).unwrap();
         while a.tick() < 3000 {
-            a.pump(&mut old, |tick, _| ac.push(tick)).unwrap();
+            a.pump(&mut old, |tick, world| ac.push((tick, states(world))))
+                .unwrap();
         }
         let mut i = 0;
         while b.tick() < 3000 {
-            b.pump_with_work_limit(&mut new, chunks[i % chunks.len()], |tick, _| bc.push(tick))
-                .unwrap();
+            b.pump_with_work_limit(&mut new, chunks[i % chunks.len()], |tick, world| {
+                bc.push((tick, states(world)))
+            })
+            .unwrap();
             i += 1;
         }
         assert_eq!(states(&old), states(&new));

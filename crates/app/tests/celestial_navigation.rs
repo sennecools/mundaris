@@ -88,6 +88,7 @@ fn clearance_zoom_reaches_metres_and_free_flight_has_no_inertia() {
     assert!((camera.clearance_m() - 1.25).abs() < 1e-7);
     assert!(camera.distance_m() > radius);
     camera.enter_free_flight(&pair).unwrap();
+    assert_eq!(camera.focused_body(), None);
     let before = camera.pose();
     camera
         .update_navigation(

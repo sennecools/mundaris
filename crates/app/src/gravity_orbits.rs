@@ -42,6 +42,7 @@ enum Command {
     Velocity(DVec3),
     Rename(String),
     TrailMode(bool),
+    TrailReference(BodyId),
 }
 struct Controls {
     pending: VecDeque<Command>,
@@ -517,6 +518,15 @@ impl GravityOrbitsDemo {
                     &self.system,
                 )?;
                 self.controls.relative_trails = relative;
+            }
+            Command::TrailReference(reference) => {
+                self.trails.set_mode(
+                    TrailMode::SimultaneousBodyRelative(reference),
+                    self.runner.branch_generation(),
+                    self.runner.tick(),
+                    &self.system,
+                )?;
+                self.controls.relative_trails = true;
             }
         }
         self.advance = self.runner.report();
@@ -1201,6 +1211,9 @@ fn draw_engineering_ui(
         ui.add(egui::Slider::new(&mut controls.manual_speed,1e-3..=1e3).logarithmic(true).text("Flight speed multiplier"));
         ui.small(format!("Navigation speed {} / wall s",compact_distance(info.camera.flight_speed_m_s())));
         ui.checkbox(&mut controls.markers,"Navigation markers");ui.checkbox(&mut controls.labels,"Labels");ui.checkbox(&mut controls.guide_visible,"Instantaneous orbit guides");ui.checkbox(&mut controls.trails,"Committed historical trails");
+        let guide_count=if controls.guide_visible{info.guides.iter().filter(|g|g.elements.is_some_and(|e|e.class()==ConicClass::Elliptic)&&g.reference.is_some()).count()}else{0};
+        ui.small(format!("{guide_count} available guides · sampled {:.3} simulation s",info.system.sample_time().seconds_since_epoch()));
+        ui.small("Coincident markers: repeat click to cycle every candidate.");
         let selected_id=info.ids[info.selected];
         let guide=info.guides.iter().find(|g|g.body==selected_id);
         if let Some(g)=guide {ui.small(format!("Guide {:?}; eta {:?}",g.elements.map(|e|e.class()),g.perturbation_ratio));if let Some(reason)=&g.diagnostic{ui.small(reason);}}
@@ -1210,6 +1223,10 @@ fn draw_engineering_ui(
             for &id in info.ids {if id!=selected_id && ui.button(info.system.body(id).expect("body").name()).clicked(){controls.pending.push_back(Command::GuideReference(OrbitGuideReference::Explicit(id)));}}
         });
         let mut relative=controls.relative_trails;if ui.checkbox(&mut relative,"History relative to selected body").changed(){controls.pending.push_back(Command::TrailMode(relative));}
+        egui::ComboBox::from_label("Historical reference").selected_text(match info.trail_mode{TrailMode::Inertial=>"System",TrailMode::SimultaneousBodyRelative(id)=>info.system.body(id).expect("recorded reference").name()}).show_ui(ui,|ui|{
+            if ui.button("Inertial system history").clicked(){controls.pending.push_back(Command::TrailMode(false));}
+            for &id in info.ids{if ui.button(info.system.body(id).expect("recorded body").name()).clicked(){controls.pending.push_back(Command::TrailReference(id));}}
+        });
         let mode=match info.trail_mode {TrailMode::Inertial=>"Inertial system history".into(),TrailMode::SimultaneousBodyRelative(id)=>format!("History relative to {} at each sample, displayed there now",info.system.body(id).expect("reference").name())};ui.small(mode);
         ui.small(format!("History: {} samples, span {:?} s{}",info.trail_count,info.trail_times,if info.trail_count<2{" · accumulating"}else{""}));
         if info.bounds.history_outside_fit {ui.colored_label(egui::Color32::YELLOW,"History extends outside fit (2× core cap)");}
@@ -1328,7 +1345,7 @@ fn draw_ui(
         });
         ui.horizontal(|ui|{
             ui.strong(format!("Requested {}×",info.runner.rate().multiplier()));
-            ui.strong(info.measurement.map_or_else(||"Achieved: warming / paused / replaying".into(),|m|format!("Achieved {:.1}× ({:.1}s{})",m.achieved_rate,m.window_s,if m.tick_limited{"; tick-limited"}else{""})));
+                ui.strong(info.measurement.map_or_else(||"Achieved: warming / paused / replaying".into(),|m|if m.tick_limited{format!("Achieved {:.1}× ({:.1}s; tick-limited), segment {:.2}× / {:.1}s",m.achieved_rate,m.window_s,m.segment_rate,m.segment_wall_s)}else{format!("Achieved {:.1}× ({:.1}s)",m.achieved_rate,m.window_s)}));
             ui.label(format!("{:?} · {:?}{}",info.advance.status,info.camera.mode(),if info.camera.transitioning(){" · transitioning"}else{""}));
         });
         ui.horizontal(|ui|{
@@ -1378,7 +1395,10 @@ fn draw_ui(
                     ui.painter().circle_stroke(p,radius,egui::Stroke::new(1.5/scale,color));
                 }
                 if controls.labels {
-                    let text=format!("{} · {}{}",info.system.body(id).expect("body").name(),compact_distance(marker.distance_m),if marker.occluded{" (overlay)"}else{""});
+                    let body=info.system.body(id).expect("body");
+                    let duplicate=info.system.bodies().filter(|(_,other)|other.name()==body.name()).count()>1;
+                    let name=if duplicate{format!("{} #{}",body.name(),marker.request_index)}else{body.name().into()};
+                    let text=format!("{} · {}{}",name,compact_distance(marker.distance_m),if marker.occluded{" (overlay)"}else{""});
                     let galley=ui.painter().layout_no_wrap(text,egui::FontId::proportional(13.0),color);
                     inputs.push(LabelInput{body:id,marker:[x as f64,y as f64],size:[(galley.size().x*scale+8.0) as f64,(galley.size().y*scale+6.0) as f64],selected,focused,hovered:false,diameter:marker.apparent_diameter_pixels,distance_m:marker.distance_m});
                     texts.push((id,galley,color));
@@ -1448,6 +1468,41 @@ fn draw_ui(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn egui_wheel_and_keyboard_route_to_one_observer() {
+        let mut demo = GravityOrbitsDemo::new().unwrap();
+        let id = demo.ids[1];
+        demo.camera
+            .focus(
+                &demo.projection.coherent_view(&demo.system).unwrap(),
+                id,
+                false,
+                true,
+            )
+            .unwrap();
+        let before = demo.camera.clearance_m();
+        let context = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            events: vec![
+                egui::Event::PointerMoved(egui::pos2(900.0, 500.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, 3.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        };
+        let (info, controls) = demo.ui_info(CelestialPreparationReport::default(), 0.1, 0.0);
+        let _ = context.run(raw, |ctx| draw_ui(ctx, controls, &info, &[]));
+        demo.update(Duration::from_millis(100));
+        assert!(demo.camera.clearance_m() < before);
+        assert_eq!(demo.camera.mode(), CameraMode::BodyOrbit);
+    }
     #[test]
     fn exact_requested_rate_matrix_sixty_accounted_seconds() {
         for fixture in [GravityFixture::Hierarchy, GravityFixture::Circular] {

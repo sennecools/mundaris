@@ -135,6 +135,50 @@ fn benches(c: &mut Criterion) {
         }
     }
     group.finish();
+    let mut group = c.benchmark_group("styled_polyline_clip_quad_pack");
+    for bodies in [3, 16] {
+        for samples in [1024, 8192] {
+            let points: Vec<Vec<_>> = (0..bodies)
+                .map(|body| {
+                    (0..samples)
+                        .map(|i| {
+                            FramePosition::new(
+                                root,
+                                LocalPosition::try_metres(DVec3::new(
+                                    (i as f64 * 0.01).cos() * 200.0,
+                                    (i as f64 * 0.01).sin() * 200.0,
+                                    body as f64,
+                                ))
+                                .unwrap(),
+                            )
+                        })
+                        .collect()
+                })
+                .collect();
+            let colors: Vec<_> = (0..samples)
+                .map(|i| [0.2, 0.6, 1.0, 0.15 + 0.85 * i as f32 / samples as f32])
+                .collect();
+            let lines: Vec<_> = points
+                .iter()
+                .map(|points| CelestialPolyline {
+                    points,
+                    colors: &colors,
+                    width_pixels: 1.5,
+                    style: CelestialLineStyle::Solid,
+                })
+                .collect();
+            let mut storage = CelestialStaging::default();
+            group.bench_function(format!("B{bodies}/vertices{samples}"), |b| {
+                b.iter(|| {
+                    let mut frame = CelestialFrame::new(&view, &mut storage, projection, &sphere);
+                    frame.append_polylines(black_box(&lines)).unwrap();
+                    black_box(frame.report());
+                    black_box(&frame);
+                })
+            });
+        }
+    }
+    group.finish();
 }
 criterion_group! {name=celestial;config=Criterion::default().sample_size(20).warm_up_time(Duration::from_millis(100)).measurement_time(Duration::from_millis(500));targets=benches}
 criterion_main!(celestial);

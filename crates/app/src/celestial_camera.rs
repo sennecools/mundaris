@@ -76,9 +76,10 @@ pub struct CelestialCamera {
     transition: Option<Transition>,
     zoom_target_log: f64,
     saved_bodies: Vec<(BodyId, f64, UnitRotation)>,
-    saved_system: Option<(LocalPosition, f64, UnitRotation)>,
+    saved_system: Option<(LocalPosition, f64, UnitRotation, SimulationInstant)>,
     carrier_center: Option<DVec3>,
     flight_speed_m_s: f64,
+    flight_log_scale: Option<f64>,
 }
 impl CelestialCamera {
     pub fn overview(
@@ -110,6 +111,7 @@ impl CelestialCamera {
             saved_system: None,
             carrier_center: None,
             flight_speed_m_s: 1.0,
+            flight_log_scale: None,
         };
         camera.update_pose(root)?;
         Ok(camera)
@@ -140,6 +142,9 @@ impl CelestialCamera {
         self.transition.is_some()
     }
     pub fn focused_body(&self) -> Option<BodyId> {
+        if self.mode == CameraMode::FreeFlight && self.transition.is_none() {
+            return None;
+        }
         match self
             .transition
             .as_ref()
@@ -158,12 +163,17 @@ impl CelestialCamera {
     pub fn cancel_transition(&mut self) {
         self.transition = None;
     }
-    fn save_view(&mut self) {
+    fn save_view(&mut self, pair: &CoherentCelestialView<'_>) {
         if self.transition.is_some() {
             return;
         }
         if self.mode == CameraMode::SystemOrbit {
-            self.saved_system = Some((self.anchor, self.distance_m, self.pose.orientation()));
+            self.saved_system = Some((
+                self.anchor,
+                self.distance_m,
+                self.pose.orientation(),
+                pair.system().sample_time(),
+            ));
         } else if self.mode == CameraMode::BodyOrbit
             && let Some(id) = self.focused_body()
         {
@@ -181,7 +191,7 @@ impl CelestialCamera {
         pair: &CoherentCelestialView<'_>,
         target: FocusTarget,
     ) -> Result<()> {
-        self.save_view();
+        self.save_view(pair);
         let (role, anchor, distance, radius, orientation) = match target {
             FocusTarget::Body(id) => {
                 let radius = pair.system().body(id)?.properties().reference_radius_m();
@@ -209,6 +219,10 @@ impl CelestialCamera {
                 distance_m,
             } => {
                 let orientation = self.saved_system.map_or(UnitRotation::identity(), |s| s.2);
+                let distance_m = self
+                    .saved_system
+                    .filter(|s| s.3 == pair.system().sample_time() && s.0.metres() == center_m)
+                    .map_or(distance_m, |s| s.1.max(distance_m));
                 (
                     CameraAttachment::System,
                     LocalPosition::try_metres(center_m)?,
@@ -324,7 +338,7 @@ impl CelestialCamera {
     }
     /// Explicit unfocus preserves pose, then uses system-stationary editor motion.
     pub fn enter_free_flight(&mut self, pair: &CoherentCelestialView<'_>) -> Result<()> {
-        self.save_view();
+        self.save_view(pair);
         self.transition = None;
         let root = pair.evaluation().root();
         // Keep a translating numerical carrier near a body; fixed spin is removed.
@@ -345,6 +359,7 @@ impl CelestialCamera {
         self.velocity = stationary.velocity();
         self.attachment = role;
         self.mode = CameraMode::FreeFlight;
+        self.flight_log_scale = None;
         self.carrier_center = match role {
             CameraAttachment::Translating(id) => {
                 Some(pair.system().body(id)?.state().center_in_system().metres())
@@ -487,7 +502,9 @@ impl CelestialCamera {
                 self.min_distance_m = if self.radius_m > 0.0 {
                     self.radius_m + minimum_clearance(self.radius_m)?
                 } else {
-                    0.1
+                    // Current 60-degree padded system fit is outside twice its
+                    // enclosing radius; keep system zoom outside the fitted core.
+                    0.5 * t.target_distance
                 };
                 self.zoom_target_log = (self.distance_m - self.radius_m).ln();
             }
@@ -579,7 +596,12 @@ impl CelestialCamera {
                 * DQuat::from_rotation_x(-input.drag[1] * 0.005),
         )?;
         let orientation = self.pose.orientation().compose(look);
-        self.flight_speed_m_s = (0.5 * scale).clamp(1.0, 1e12) * input.speed_multiplier;
+        let target_log = scale.max(1.0).ln();
+        let blended = self.flight_log_scale.map_or(target_log, |previous| {
+            target_log + (previous - target_log) * (-elapsed.as_secs_f64() / 0.15).exp()
+        });
+        self.flight_log_scale = Some(blended);
+        self.flight_speed_m_s = (0.5 * blended.exp()).clamp(1.0, 1e12) * input.speed_multiplier;
         let movement = if input.translation.length_squared() > 0.0 {
             input.translation.normalize()
         } else {

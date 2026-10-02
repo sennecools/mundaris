@@ -117,6 +117,24 @@ fn benches(c: &mut Criterion) {
         });
     }
     group.finish();
+    let mut group = c.benchmark_group("bounded_single_work_stress");
+    for n in [64, 256, 1024] {
+        let mut system = common::fixture(n);
+        let mut runner =
+            FixedStepRunner::new(&system, SimulationConfig::try_new(0.001).unwrap()).unwrap();
+        group.bench_function(format!("N{n}"), |b| {
+            b.iter(|| {
+                runner.request_forward_to_tick(runner.tick() + 1).unwrap();
+                black_box(
+                    runner
+                        .pump_with_work_limit(&mut system, 1, |_, _| {})
+                        .unwrap(),
+                );
+                black_box(&system);
+            })
+        });
+    }
+    group.finish();
 }
 criterion_group! {name=fixed;config=Criterion::default().sample_size(20).warm_up_time(Duration::from_millis(100)).measurement_time(Duration::from_millis(500));targets=benches}
 criterion_main!(fixed);

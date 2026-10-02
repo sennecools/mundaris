@@ -23,5 +23,13 @@ criterion.workspace = true
 name = "trail_history"
 harness = false
 
+[[bench]]
+name = "celestial_navigation"
+harness = false
+
+[[bench]]
+name = "orbit_guides"
+harness = false
+
 [lints]
 workspace = true

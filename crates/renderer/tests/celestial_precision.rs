@@ -182,3 +182,66 @@ fn f64_trail_clipping_and_marker_selection() {
     );
     assert!(frame.validate().is_err());
 }
+
+#[test]
+fn content_viewport_unprojection_and_styled_frame_poisoning() {
+    let projection = CelestialProjection::try_new(800, 600, 1.0, 0.1)
+        .unwrap()
+        .with_origin([250, 100])
+        .unwrap();
+    for point in [
+        DVec3::new(0.0, 0.0, -100.0),
+        DVec3::new(10.0, -20.0, -100.0),
+    ] {
+        let screen = projection.project_pixels(point).unwrap().unwrap();
+        let ray = projection.unproject_ray(screen).unwrap();
+        assert!((ray - point.normalize()).length() < 1e-12);
+    }
+    assert_eq!(
+        projection
+            .project_marker(DVec3::new(0.0, 0.0, -100.0))
+            .unwrap(),
+        Some([650.0, 400.0])
+    );
+    let tree = FrameTree::new(NonZeroU64::new(1).unwrap());
+    let root = tree.root();
+    let sphere = Icosphere::new();
+    let mut storage = CelestialStaging::default();
+    let view = PreparedView::new(
+        &tree.evaluate(),
+        FramePose::new(
+            FramePosition::new(root, LocalPosition::origin()),
+            UnitRotation::identity(),
+        ),
+        RenderPrecisionBudget::near_debug(),
+    )
+    .unwrap();
+    let points = [
+        DVec3::new(0.0, 0.0, 1.0),
+        DVec3::new(0.1, 0.0, -10.0),
+        DVec3::new(1e11, 0.0, -1e12),
+    ]
+    .map(|p| FramePosition::new(root, LocalPosition::try_metres(p).unwrap()));
+    let mut frame = CelestialFrame::new(&view, &mut storage, projection, &sphere);
+    frame
+        .append_polylines(&[CelestialPolyline {
+            points: &points,
+            colors: &[[1.0; 4]; 3],
+            width_pixels: 2.5,
+            style: CelestialLineStyle::Dashed,
+        }])
+        .unwrap();
+    assert!(frame.report().max_projected_error_pixels <= 0.05);
+    assert!(frame.report().polyline_segments > 0);
+    assert!(
+        frame
+            .append_polylines(&[CelestialPolyline {
+                points: &points,
+                colors: &[[f32::NAN; 4]; 3],
+                width_pixels: 2.5,
+                style: CelestialLineStyle::Solid
+            }])
+            .is_err()
+    );
+    assert!(frame.validate().is_err());
+}
