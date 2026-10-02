@@ -15,5 +15,9 @@ criterion.workspace = true
 name = "reference_frames"
 harness = false
 
+[[bench]]
+name = "terrain_noise"
+harness = false
+
 [lints]
 workspace = true

@@ -317,6 +317,33 @@ impl CubeSampleKey {
 /// Body-fixed spatial coordinate. No Hash/Eq encoding or persistence semantics.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SurfaceLocation(Direction3);
+/// Closed directional region independent of render charts and patch lifetime.
+#[derive(Debug, Clone, Copy)]
+pub struct DirectionalCap {
+    axis: Direction3,
+    half_angle_rad: f64,
+}
+impl DirectionalCap {
+    pub fn new(axis: Direction3, half_angle_rad: f64) -> Result<Self, SurfaceMathError> {
+        if !half_angle_rad.is_finite() || !(0.0..=std::f64::consts::PI).contains(&half_angle_rad) {
+            return Err(SurfaceMathError::InvalidDomain);
+        }
+        Ok(Self {
+            axis,
+            half_angle_rad: if half_angle_rad == 0.0 {
+                0.0
+            } else {
+                half_angle_rad
+            },
+        })
+    }
+    pub fn axis(self) -> Direction3 {
+        self.axis
+    }
+    pub fn half_angle_rad(self) -> f64 {
+        self.half_angle_rad
+    }
+}
 impl SurfaceLocation {
     pub fn new(direction: Direction3) -> Self {
         Self(direction)
