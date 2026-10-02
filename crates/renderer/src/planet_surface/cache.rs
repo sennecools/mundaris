@@ -1,8 +1,8 @@
 //! Contiguous bounded metadata LRU. Access sequence and address break eviction ties.
+use super::cover::AddressSet;
 use super::{PatchMetadata, SurfaceTopology};
 use crate::RenderPreparationError;
 use mundaris_math::surface::CubePatchAddress;
-use std::collections::BTreeSet;
 #[derive(Clone, Copy)]
 struct Record {
     address: CubePatchAddress,
@@ -63,7 +63,7 @@ impl MetadataCache {
         &mut self,
         address: CubePatchAddress,
         topology: &SurfaceTopology,
-        pins: &BTreeSet<CubePatchAddress>,
+        pins: &AddressSet,
     ) -> Result<bool, RenderPreparationError> {
         if self
             .records

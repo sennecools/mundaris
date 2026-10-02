@@ -86,12 +86,38 @@ pub enum SurfaceMathError {
 }
 
 /// Checked computed region; maximum representable level is 30, not required detail.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CubePatchAddress {
     face: CubeFace,
     level: u8,
     x: u32,
     y: u32,
+}
+impl Ord for CubePatchAddress {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.face
+            .cmp(&other.face)
+            .then_with(|| self.traversal_key().cmp(&other.traversal_key()))
+            .then(self.level.cmp(&other.level))
+    }
+}
+impl PartialOrd for CubePatchAddress {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl CubePatchAddress {
+    fn traversal_key(self) -> u64 {
+        fn spread(x: u32) -> u64 {
+            let mut x = u64::from(x);
+            x = (x | x << 16) & 0x0000ffff0000ffff;
+            x = (x | x << 8) & 0x00ff00ff00ff00ff;
+            x = (x | x << 4) & 0x0f0f0f0f0f0f0f0f;
+            x = (x | x << 2) & 0x3333333333333333;
+            (x | x << 1) & 0x5555555555555555
+        }
+        (spread(self.x) | (spread(self.y) << 1)) << (2 * (30 - self.level))
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EdgeNeighbor {
@@ -259,6 +285,28 @@ pub struct CubeSampleKey {
     exponent: u8,
 }
 impl CubeSampleKey {
+    /// Compact exact temporary sharing key. Encoding is intentionally not a
+    /// persistence format: two signed 37-bit numerators, exponent and fixed axis.
+    pub fn compact_key(self) -> u128 {
+        let denominator = 1i64 << self.exponent;
+        let axis = self
+            .xyz
+            .iter()
+            .position(|x| x.abs() == denominator)
+            .expect("cube has a fixed axis");
+        let fixed = axis * 2 + usize::from(self.xyz[axis] < 0);
+        let mut varying = self
+            .xyz
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| *i != axis)
+            .map(|(_, x)| x);
+        let mask = (1u128 << 37) - 1;
+        (varying.next().expect("first varying axis") as u128 & mask)
+            | ((varying.next().expect("second varying axis") as u128 & mask) << 37)
+            | (u128::from(self.exponent) << 74)
+            | ((fixed as u128) << 80)
+    }
     pub fn direction(self) -> Direction3 {
         let denominator = (1u64 << self.exponent) as f64;
         Direction3::try_new(DVec3::from_array(self.xyz.map(|x| x as f64 / denominator)))

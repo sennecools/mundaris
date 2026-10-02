@@ -319,8 +319,9 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
                 return Err(RenderPreparationError::InvalidDebugGeometry);
             }
             let screen = self.projection.project_marker(center)?;
-            let diameter = 2.0 * radius * self.projection.focal_pixels()
-                / (-center.z).max(self.projection.near_m());
+            let diameter = self
+                .projection
+                .sphere_apparent_diameter_pixels(center, radius)?;
             if !diameter.is_finite() {
                 return Err(RenderPreparationError::InvalidDebugGeometry);
             }

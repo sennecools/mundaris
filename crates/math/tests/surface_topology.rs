@@ -3,8 +3,13 @@ use mundaris_math::{Direction3, surface::*};
 
 #[test]
 fn checked_addresses_and_nested_canonical_samples() {
+    let mut compact = std::collections::BTreeMap::new();
     for face in CubeFace::ALL {
         let root = CubePatchAddress::root(face);
+        let children = root.children().unwrap();
+        let mut ordered = children;
+        ordered.sort();
+        assert_eq!(ordered, children);
         assert!(root.parent().is_none());
         assert!(CubePatchAddress::try_new(face, 31, 0, 0).is_err());
         for level in [0, 1, 5, 16, 30] {
@@ -14,6 +19,10 @@ fn checked_addresses_and_nested_canonical_samples() {
             for i in 0..=16 {
                 for j in 0..=16 {
                     let d = patch.sample_direction(i, j, 16).unwrap().unit();
+                    let key = patch.sample_key(i, j, 16).unwrap();
+                    if let Some(previous) = compact.insert(key.compact_key(), key) {
+                        assert_eq!(previous, key);
+                    }
                     assert!((d.length() - 1.0).abs() <= 2e-14);
                     assert!(((d * 6.4e6).length() - 6.4e6).abs() <= 32.0 * f64::EPSILON * 6.4e6);
                 }

@@ -68,7 +68,7 @@ fn radial_count_review_complete_balanced_readiness_and_stationary_determinism() 
         for _ in 0..1000 {
             report = session.update(&input, &settings).unwrap();
             assert_cover(&session);
-            if !report.desired_estimate_incomplete {
+            if !report.desired_estimate_incomplete && report.settled {
                 break;
             }
             if report.budget_constrained {
@@ -147,7 +147,9 @@ fn grazing_count_review_centres_edges_corners() {
             for _ in 0..300 {
                 report = session.update(&input, &LodSettings::default()).unwrap();
                 assert_cover(&session);
-                if !report.desired_estimate_incomplete || report.budget_constrained {
+                if (!report.desired_estimate_incomplete && report.settled)
+                    || report.budget_constrained
+                {
                     break;
                 }
             }
@@ -244,6 +246,205 @@ fn starvation_atomic_children_hysteresis_and_replay() {
         assert_eq!(report.splits, 0);
         assert_eq!(report.merges, 0);
         assert_eq!(a.covering_leaves().collect::<Vec<_>>(), before);
+    }
+}
+
+#[test]
+fn large_viewport_reversal_quota_converges_without_cache_dependency_churn() {
+    let tree = FrameTree::new(NonZeroU64::new(1).unwrap());
+    let source = tree.root();
+    let radius = 6.4e6;
+    let mut session = SurfaceLodSession::new(2048).unwrap();
+    for (radial, clearance, w, h) in [
+        (DVec3::Z, 3.0 * radius, 2250, 1290),
+        (DVec3::new(0.2, 0.3, 1.0).normalize(), 1.75e6, 2250, 1290),
+        (DVec3::new(-0.2, 0.4, 1.0).normalize(), 1.75e6, 2250, 1290),
+        (DVec3::Z, 2.0, 3840, 2160),
+        (DVec3::Z, 1e11, 1280, 800),
+    ] {
+        let orientation =
+            UnitRotation::try_from_quaternion(glam::DQuat::from_rotation_arc(DVec3::Z, radial))
+                .unwrap();
+        let view = PreparedView::new(
+            &tree.evaluate(),
+            FramePose::new(
+                FramePosition::new(
+                    source,
+                    LocalPosition::try_metres(radial * (radius + clearance)).unwrap(),
+                ),
+                orientation,
+            ),
+            RenderPrecisionBudget::near_debug(),
+        )
+        .unwrap();
+        let input = SurfaceViewInput {
+            view: &view,
+            body_fixed_frame: source,
+            reference_radius_m: radius,
+            projection: CelestialProjection::try_new(w, h, 60.0_f64.to_radians(), 0.1).unwrap(),
+        };
+        let mut r = LodReport::default();
+        let mut updates = 0;
+        for _ in 0..1000 {
+            updates += 1;
+            r = session
+                .update(
+                    &input,
+                    &LodSettings::default().with_limits(2048, 32768, 30).unwrap(),
+                )
+                .unwrap();
+            assert_cover(&session);
+            if r.settled && !r.desired_estimate_incomplete {
+                break;
+            }
+        }
+        eprintln!(
+            "quota2048 viewport={w}x{h} h={clearance} updates={updates} cover={} visible={} error={} cache={} evictions={} scratch={} constrained={}",
+            r.active_patches,
+            r.visible_patches,
+            r.max_error_pixels,
+            r.cache_records,
+            r.cache_evictions,
+            r.scratch_bytes,
+            r.budget_constrained
+        );
+        assert!(
+            !r.quality_pending && !r.desired_estimate_incomplete,
+            "{r:?}"
+        );
+        for _ in 0..10 {
+            let r = session.update(&input, &LodSettings::default()).unwrap();
+            assert_eq!(r.metadata_built, 0);
+            assert_eq!(r.cache_evictions, 0);
+        }
+    }
+}
+
+#[test]
+fn threshold_excursions_and_deadband_retain_previous_decisions() {
+    let tree = FrameTree::new(NonZeroU64::new(1).unwrap());
+    let frame = tree.root();
+    let radius = 6.4e6;
+    let projection = CelestialProjection::try_new(1280, 800, 60.0_f64.to_radians(), 0.1).unwrap();
+    let topology = SurfaceTopology::new();
+    let patch = CubePatchAddress::root(CubeFace::PositiveZ);
+    let metadata = PatchMetadata::build(patch, &topology).unwrap();
+    let (center, ball) = metadata
+        .ball(radius, SurfaceExtent::smooth(radius))
+        .unwrap();
+    let distance_for_error = |target: f64| {
+        let mut lo = radius * 2.0;
+        let mut hi = 1e12;
+        for _ in 0..100 {
+            let mid = (lo + hi) * 0.5;
+            let error = metadata.projected_error(center - DVec3::Z * mid, ball, radius, projection);
+            if error > target {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        (lo + hi) * 0.5
+    };
+    let mut session = SurfaceLodSession::default();
+    for (error, split) in [
+        (0.13, true),
+        (0.1, true),
+        (0.060, false),
+        (0.1, false),
+        (0.13, true),
+    ] {
+        let view = PreparedView::new(
+            &tree.evaluate(),
+            FramePose::new(
+                FramePosition::new(
+                    frame,
+                    LocalPosition::try_metres(DVec3::Z * distance_for_error(error)).unwrap(),
+                ),
+                UnitRotation::identity(),
+            ),
+            RenderPrecisionBudget::near_debug(),
+        )
+        .unwrap();
+        let input = SurfaceViewInput {
+            view: &view,
+            body_fixed_frame: frame,
+            reference_radius_m: radius,
+            projection,
+        };
+        for _ in 0..100 {
+            let r = session.update(&input, &LodSettings::default()).unwrap();
+            if r.settled {
+                break;
+            }
+        }
+        assert_eq!(!session.covering_leaves().any(|p| p == patch), split);
+        for _ in 0..1000 {
+            let r = session.update(&input, &LodSettings::default()).unwrap();
+            assert_eq!(r.splits, 0);
+            assert_eq!(r.merges, 0);
+        }
+    }
+}
+
+#[test]
+fn projected_error_bounds_independent_radial_discrepancy_across_fov_and_pixels() {
+    let radius = 6.4e6;
+    let topology = SurfaceTopology::new();
+    for (level, clearance) in [(2, 1e11), (8, 1e4), (10, 1e4), (18, 2.0)] {
+        let address = CubePatchAddress::try_new(
+            CubeFace::PositiveZ,
+            level,
+            1u32 << (level - 1),
+            1u32 << (level - 1),
+        )
+        .unwrap();
+        let metadata = PatchMetadata::build(address, &topology).unwrap();
+        let (center, ball) = metadata
+            .ball(radius, SurfaceExtent::smooth(radius))
+            .unwrap();
+        let observer = DVec3::Z * (radius + clearance);
+        for height in [600, 800, 2160] {
+            for fov in [30.0_f64, 60.0, 90.0] {
+                let projection =
+                    CelestialProjection::try_new(height * 2, height, fov.to_radians(), 0.1)
+                        .unwrap();
+                let bound = metadata.projected_error(center - observer, ball, radius, projection);
+                let doubled =
+                    CelestialProjection::try_new(height * 4, height * 2, fov.to_radians(), 0.1)
+                        .unwrap();
+                let doubled_bound =
+                    metadata.projected_error(center - observer, ball, radius, doubled);
+                if bound.is_finite() {
+                    assert!((doubled_bound / bound - 2.0).abs() <= 2e-12);
+                } else {
+                    assert!(bound.is_infinite() && doubled_bound.is_infinite());
+                }
+                for mask in 0..16 {
+                    for triangle in topology.indices(mask).as_chunks::<3>().0 {
+                        let [a, b, c] = triangle.map(|i| {
+                            address
+                                .sample_direction(u32::from(i % 17), u32::from(i / 17), 16)
+                                .unwrap()
+                                .unit()
+                                * radius
+                        });
+                        let point = a * 0.2 + b * 0.3 + c * 0.5;
+                        let analytic = point.normalize() * radius;
+                        if let (Some(p), Some(q)) = (
+                            projection.project_pixels(point - observer).unwrap(),
+                            projection.project_pixels(analytic - observer).unwrap(),
+                        ) {
+                            let error = (p[0] - q[0]).hypot(p[1] - q[1]);
+                            assert!(
+                                error <= bound + 1e-6,
+                                "level={level} h={height} fov={fov} error={error} bound={bound}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

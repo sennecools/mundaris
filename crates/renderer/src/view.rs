@@ -89,6 +89,8 @@ pub enum RenderPreparationError {
     InvalidDebugGeometry,
     #[error("debug frame contains a failed batch and cannot be submitted")]
     FailedDebugFrame,
+    #[error("GPU progress during bounded resource growth: {0}")]
+    GpuProgress(String),
 }
 
 /// Observer-centred view with camera-local axes (+X right, +Y up, -Z forward).

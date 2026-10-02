@@ -2,6 +2,7 @@
 //! Physical state and body capability remain outside this renderer module.
 mod bounds;
 mod cache;
+mod cover;
 mod gpu;
 mod lod;
 mod prepare;

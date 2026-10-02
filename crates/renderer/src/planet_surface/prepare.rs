@@ -2,8 +2,8 @@
 use super::{ActiveSurfacePatch, GRID_SAMPLES, SurfaceTopology};
 use crate::{CelestialProjection, PreparedView, RenderPreparationError};
 use glam::DVec3;
-use mundaris_math::{FramePosition, LocalPosition, surface::CubeSampleKey};
-use std::{collections::BTreeMap, ops::Range};
+use mundaris_math::{FramePosition, LocalPosition};
+use std::ops::Range;
 const STAGING_CAP: usize = 64 * 1024 * 1024;
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SurfaceStyle {
@@ -32,7 +32,10 @@ pub(crate) struct SurfaceStaging {
     pub instances: Vec<u8>,
     pub fallback: Vec<u8>,
     pub buckets: [Range<u32>; 16],
-    boundary: BTreeMap<CubeSampleKey, ([f32; 3], [f32; 3])>,
+    boundary_keys: Vec<u128>,
+    boundary_samples: Vec<([f32; 3], [f32; 3])>,
+    boundary_ready: Vec<bool>,
+    records: Vec<(u8, [u8; 64])>,
     pub report: SurfacePreparationReport,
     pub underside: bool,
 }
@@ -134,7 +137,10 @@ impl SurfaceStaging {
         self.samples.clear();
         self.instances.clear();
         self.fallback.clear();
-        self.boundary.clear();
+        self.boundary_keys.clear();
+        self.boundary_samples.clear();
+        self.boundary_ready.clear();
+        self.records.clear();
         self.buckets = std::array::from_fn(|_| 0..0);
         self.report = SurfacePreparationReport::default();
         self.underside = false;
@@ -148,6 +154,57 @@ impl SurfaceStaging {
         topology: &SurfaceTopology,
         style: SurfaceStyle,
     ) -> Result<(), RenderPreparationError> {
+        // Canonical tuples are shared within one source/radius batch. Another
+        // body has the same unit tuples but different observer-relative samples.
+        self.boundary_keys.clear();
+        let needed = patches.len() * 64;
+        if needed > self.boundary_keys.capacity() {
+            self.boundary_keys.reserve_exact(needed);
+        }
+        for patch in patches {
+            for index in 0..GRID_SAMPLES {
+                let i = index as u32 % 17;
+                let j = index as u32 / 17;
+                if i == 0 || i == 16 || j == 0 || j == 16 {
+                    self.boundary_keys.push(
+                        patch
+                            .address
+                            .sample_key(i, j, 16)
+                            .map_err(|_| RenderPreparationError::InvalidDebugGeometry)?
+                            .compact_key(),
+                    );
+                }
+            }
+        }
+        self.boundary_keys.sort_unstable();
+        // Store only keys shared by two patches. Unique boundary samples already
+        // have one evaluation. Raw keys ≤4096×64×16 bytes; shared values ≤half
+        // that count ×24 bytes, fitting the aggregate 8 MiB boundary cap.
+        let mut read = 0;
+        let mut write = 0;
+        while read < self.boundary_keys.len() {
+            let key = self.boundary_keys[read];
+            let mut end = read + 1;
+            while end < self.boundary_keys.len() && self.boundary_keys[end] == key {
+                end += 1;
+            }
+            if end - read > 1 {
+                self.boundary_keys[write] = key;
+                write += 1;
+            }
+            read = end;
+        }
+        self.boundary_keys.truncate(write);
+        self.boundary_samples.clear();
+        self.boundary_ready.clear();
+        if write > self.boundary_samples.capacity() {
+            self.boundary_samples.reserve_exact(write);
+        }
+        if write > self.boundary_ready.capacity() {
+            self.boundary_ready.reserve_exact(write);
+        }
+        self.boundary_samples.resize(write, ([0.0; 3], [0.0; 3]));
+        self.boundary_ready.resize(write, false);
         let source = body.body_fixed_frame;
         let radius = body.reference_radius_m;
         let color = body.color;
@@ -165,6 +222,16 @@ impl SurfaceStaging {
         if outgoing + regular > STAGING_CAP {
             return Err(RenderPreparationError::InvalidBudget);
         }
+        let needed_samples = self.samples.len() + patches.len() * GRID_SAMPLES * 32;
+        if needed_samples > self.samples.capacity() {
+            self.samples
+                .reserve_exact(needed_samples - self.samples.len());
+        }
+        let needed_instances = self.instances.len() + patches.len() * 64;
+        if needed_instances > self.instances.capacity() {
+            self.instances
+                .reserve_exact(needed_instances - self.instances.len());
+        }
         self.underside |= style.underside;
         let prepared = view.prepare_source(source)?;
         let mut positions = [DVec3::ZERO; GRID_SAMPLES];
@@ -173,11 +240,10 @@ impl SurfaceStaging {
         let mut gpu_normals = [[0.0; 3]; GRID_SAMPLES];
         // Instance buckets are appended as a complete batch. Rebucket aggregate
         // instances after appending; sample bases are unaffected by their order.
-        let mut records: Vec<(u8, [u8; 64])> =
-            Vec::with_capacity(self.instances.len() / 64 + patches.len());
+        self.records.clear();
         for mask in 0..16 {
             for i in self.buckets[mask].clone() {
-                records.push((
+                self.records.push((
                     mask as u8,
                     self.instances[i as usize * 64..(i as usize + 1) * 64]
                         .try_into()
@@ -186,6 +252,9 @@ impl SurfaceStaging {
             }
         }
         for patch in patches {
+            if patch.stitch_mask > 15 {
+                return Err(RenderPreparationError::InvalidDebugGeometry);
+            }
             for index in 0..GRID_SAMPLES {
                 let i = index as u32 % 17;
                 let j = index as u32 / 17;
@@ -201,18 +270,20 @@ impl SurfaceStaging {
                     ))?
                     .metres();
                 normals[index] = prepared.view_direction(direction)?.unit();
-                let packed = if i == 0 || i == 16 || j == 0 || j == 16 {
-                    *self.boundary.entry(key).or_insert_with(|| {
-                        (
-                            positions[index].as_vec3().to_array(),
-                            normals[index].as_vec3().to_array(),
-                        )
-                    })
+                let packed = (
+                    positions[index].as_vec3().to_array(),
+                    normals[index].as_vec3().to_array(),
+                );
+                let packed = if (i == 0 || i == 16 || j == 0 || j == 16)
+                    && let Ok(at) = self.boundary_keys.binary_search(&key.compact_key())
+                {
+                    if !self.boundary_ready[at] {
+                        self.boundary_samples[at] = packed;
+                        self.boundary_ready[at] = true;
+                    }
+                    self.boundary_samples[at]
                 } else {
-                    (
-                        positions[index].as_vec3().to_array(),
-                        normals[index].as_vec3().to_array(),
-                    )
+                    packed
                 };
                 gpu_positions[index] = packed.0;
                 gpu_normals[index] = packed.1;
@@ -353,7 +424,7 @@ impl SurfaceStaging {
                         continue;
                     }
                     let needed = (polygon.len() - 2) * 3 * 64;
-                    if self.samples.len() + records.len() * 64 + self.fallback.len() + needed
+                    if self.samples.len() + self.records.len() * 64 + self.fallback.len() + needed
                         > STAGING_CAP
                     {
                         return Err(RenderPreparationError::InvalidBudget);
@@ -440,18 +511,18 @@ impl SurfaceStaging {
                 {
                     out.copy_from_slice(&value.to_le_bytes());
                 }
-                records.push((patch.stitch_mask, record));
+                self.records.push((patch.stitch_mask, record));
                 self.report.samples += GRID_SAMPLES;
                 self.report.triangles += indices.len() / 3;
             }
             self.report.patches += 1;
         }
-        records.sort_by_key(|r| r.0);
+        self.records.sort_by_key(|r| r.0);
         self.instances.clear();
         let mut cursor = 0u32;
         for mask in 0..16 {
             let start = cursor;
-            for (_, record) in records.iter().filter(|r| r.0 == mask) {
+            for (_, record) in self.records.iter().filter(|r| r.0 == mask) {
                 self.instances.extend_from_slice(record);
                 cursor += 1;
             }
@@ -461,11 +532,15 @@ impl SurfaceStaging {
             + usize::from(!self.fallback.is_empty());
         self.report.uploaded_bytes =
             self.samples.len() + self.instances.len() + self.fallback.len();
-        self.report.allocated_staging_bytes =
-            self.samples.capacity() + self.instances.capacity() + self.fallback.capacity();
-        // BTreeMap nodes have private std layout; use a conservative 128-byte
-        // allocation envelope per entry including pointers/alignment, not payload only.
-        self.report.boundary_bytes = self.boundary.len() * 128;
+        self.report.allocated_staging_bytes = self.samples.capacity()
+            + self.instances.capacity()
+            + self.fallback.capacity()
+            + self.records.capacity() * std::mem::size_of::<(u8, [u8; 64])>();
+        self.report.boundary_bytes = self.report.boundary_bytes.max(
+            self.boundary_keys.capacity() * 16
+                + self.boundary_samples.capacity() * 24
+                + self.boundary_ready.capacity().div_ceil(8),
+        );
         if self.report.allocated_staging_bytes > STAGING_CAP
             || self.report.boundary_bytes > 8 * 1024 * 1024
         {
@@ -477,5 +552,196 @@ impl SurfaceStaging {
 fn pack_floats(bytes: &mut Vec<u8>, values: impl IntoIterator<Item = f32>) {
     for v in values {
         bytes.extend_from_slice(&v.to_le_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mundaris_math::{surface::*, *};
+    use std::num::NonZeroU64;
+    fn patch(face: CubeFace, topology: &SurfaceTopology) -> ActiveSurfacePatch {
+        let address = CubePatchAddress::root(face);
+        ActiveSurfacePatch {
+            address,
+            metadata: super::super::PatchMetadata::build(address, topology).unwrap(),
+            stitch_mask: 0,
+            error_pixels: 0.0,
+        }
+    }
+    #[test]
+    fn layouts_shared_edges_and_distinct_body_boundary_namespaces() {
+        let mut tree = FrameTree::new(NonZeroU64::new(1).unwrap());
+        let root = tree.root();
+        let a = tree
+            .insert(
+                root,
+                FrameState::stationary(RigidTransform::new(
+                    Displacement3::try_metres(DVec3::new(0.0, 0.0, -1000.0)).unwrap(),
+                    UnitRotation::identity(),
+                )),
+            )
+            .unwrap();
+        let b = tree
+            .insert(
+                root,
+                FrameState::stationary(RigidTransform::new(
+                    Displacement3::try_metres(DVec3::new(30.0, 0.0, -1500.0)).unwrap(),
+                    UnitRotation::identity(),
+                )),
+            )
+            .unwrap();
+        let view = PreparedView::new(
+            &tree.evaluate(),
+            FramePose::new(
+                FramePosition::new(root, LocalPosition::origin()),
+                UnitRotation::identity(),
+            ),
+            crate::RenderPrecisionBudget::near_debug(),
+        )
+        .unwrap();
+        let projection = CelestialProjection::try_new(1280, 800, 1.0, 0.1).unwrap();
+        let topology = SurfaceTopology::new();
+        let mut storage = SurfaceStaging::default();
+        let body = crate::CelestialRenderBody {
+            body_fixed_frame: a,
+            reference_radius_m: 10.0,
+            color: [0.2, 0.5, 1.0, 1.0],
+            unlit: false,
+            selected: false,
+        };
+        storage
+            .append(
+                &view,
+                projection,
+                body,
+                &[
+                    patch(CubeFace::PositiveX, &topology),
+                    patch(CubeFace::PositiveZ, &topology),
+                ],
+                &topology,
+                SurfaceStyle::default(),
+            )
+            .unwrap();
+        assert_eq!(storage.samples.len(), 2 * 289 * 32);
+        assert_eq!(storage.instances.len(), 2 * 64);
+        assert!(storage.fallback.is_empty());
+        assert!(storage.instances[32..64].iter().all(|&b| b == 0));
+        for j in 0..=16 {
+            let first = j * 17;
+            let second = 289 + j * 17 + 16;
+            assert_eq!(
+                &storage.samples[first * 32..(first + 1) * 32],
+                &storage.samples[second * 32..(second + 1) * 32]
+            );
+        }
+        let mut other = body;
+        other.body_fixed_frame = b;
+        other.reference_radius_m = 20.0;
+        storage
+            .append(
+                &view,
+                projection,
+                other,
+                &[
+                    patch(CubeFace::PositiveX, &topology),
+                    patch(CubeFace::PositiveZ, &topology),
+                ],
+                &topology,
+                SurfaceStyle::default(),
+            )
+            .unwrap();
+        let position = |index: usize| {
+            DVec3::from_array(std::array::from_fn(|axis| {
+                f64::from(f32::from_le_bytes(
+                    storage.samples[index * 32 + axis * 4..index * 32 + axis * 4 + 4]
+                        .try_into()
+                        .unwrap(),
+                ))
+            }))
+        };
+        assert_eq!(position(289 + 144), DVec3::new(0.0, 0.0, -990.0));
+        assert_eq!(position(3 * 289 + 144), DVec3::new(30.0, 0.0, -1480.0));
+        assert_eq!(storage.report.draws, 1);
+        assert!(storage.report.boundary_bytes <= 8 * 1024 * 1024);
+        eprintln!(
+            "topology CPU={} bytes; sample32 instance64; payload={} staging={} boundary={}",
+            topology.allocated_bytes(),
+            storage.report.uploaded_bytes,
+            storage.report.allocated_staging_bytes,
+            storage.report.boundary_bytes
+        );
+    }
+    #[test]
+    fn cold_coarse_parent_uses_bounded_clipped_triangles_and_bad_mask_rejects() {
+        let tree = FrameTree::new(NonZeroU64::new(1).unwrap());
+        let root = tree.root();
+        let radius = 6.4e6;
+        let topology = SurfaceTopology::new();
+        let address = CubePatchAddress::root(CubeFace::PositiveZ);
+        let [a, b, c] = topology.indices(0).as_chunks::<3>().0[272].map(|i| {
+            address
+                .sample_direction(u32::from(i % 17), u32::from(i / 17), 16)
+                .unwrap()
+                .unit()
+                * radius
+        });
+        let normal = (b - a).cross(c - a).normalize();
+        // Explicit below-reference-radius diagnostic: close to a coarse triangle
+        // interior, so endpoint rounding cannot prove its near-plane crossing.
+        let observer = (a + b + c) / 3.0 + normal * 0.11;
+        let orientation =
+            UnitRotation::try_from_quaternion(glam::DQuat::from_rotation_arc(DVec3::Z, normal))
+                .unwrap();
+        let view = PreparedView::new(
+            &tree.evaluate(),
+            FramePose::new(
+                FramePosition::new(root, LocalPosition::try_metres(observer).unwrap()),
+                orientation,
+            ),
+            crate::RenderPrecisionBudget::near_debug(),
+        )
+        .unwrap();
+        let projection =
+            CelestialProjection::try_new(1280, 800, 60.0_f64.to_radians(), 0.1).unwrap();
+        let mut storage = SurfaceStaging::default();
+        let body = crate::CelestialRenderBody {
+            body_fixed_frame: root,
+            reference_radius_m: radius,
+            color: [0.2, 0.5, 1.0, 1.0],
+            unlit: false,
+            selected: true,
+        };
+        storage
+            .append(
+                &view,
+                projection,
+                body,
+                &[patch(CubeFace::PositiveZ, &topology)],
+                &topology,
+                SurfaceStyle::default(),
+            )
+            .unwrap();
+        assert!(storage.report.fallback_triangles > 0);
+        assert_eq!(
+            storage.fallback.len(),
+            storage.report.fallback_triangles * 3 * 64
+        );
+        assert!(storage.report.max_projected_error_pixels <= 0.05);
+        assert!(storage.report.allocated_staging_bytes < 64 * 1024 * 1024);
+        let mut bad = patch(CubeFace::PositiveZ, &topology);
+        bad.stitch_mask = 16;
+        assert!(
+            storage
+                .append(
+                    &view,
+                    projection,
+                    body,
+                    &[bad],
+                    &topology,
+                    SurfaceStyle::default()
+                )
+                .is_err()
+        );
     }
 }

@@ -105,6 +105,30 @@ impl CelestialProjection {
             self,
         ))
     }
+    /// Exact tangent extents when the silhouette is fully forward. Near/inside
+    /// silhouettes use a bounded viewport-covering overlay size, never a fake radius.
+    pub fn sphere_apparent_diameter_pixels(
+        self,
+        center: DVec3,
+        radius: f64,
+    ) -> Result<f64, RenderPreparationError> {
+        if !center.is_finite() || !radius.is_finite() || radius <= 0.0 {
+            return Err(RenderPreparationError::InvalidDebugGeometry);
+        }
+        let depth = -center.z;
+        if depth <= radius + self.near_m {
+            return Ok(2.0 * (self.width as f64).hypot(self.height as f64));
+        }
+        let denominator = (depth - radius) * (depth + radius);
+        let extent = |component: f64| {
+            2.0 * self.focal_pixels() * radius * component.hypot(denominator.sqrt()) / denominator
+        };
+        let diameter = extent(center.x).max(extent(center.y));
+        if !diameter.is_finite() {
+            return Err(RenderPreparationError::InvalidDebugGeometry);
+        }
+        Ok(diameter)
+    }
     pub fn gpu_bytes(self) -> [u8; 64] {
         let mut bytes = [0; 64];
         for (value, output) in self

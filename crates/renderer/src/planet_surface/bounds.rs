@@ -16,11 +16,13 @@ pub struct SurfaceExtent {
     pub guaranteed_opaque_radius_m: f64,
 }
 impl SurfaceExtent {
-    pub fn smooth(radius_m: f64) -> Self {
+    /// Zero displacement. No independent opaque occluder is claimed here: the
+    /// chordal horizon path certifies its cached geometric plane envelope instead.
+    pub fn smooth(_reference_radius_m: f64) -> Self {
         Self {
             min_height_m: 0.0,
             max_height_m: 0.0,
-            guaranteed_opaque_radius_m: radius_m,
+            guaranteed_opaque_radius_m: 0.0,
         }
     }
 }

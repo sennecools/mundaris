@@ -129,6 +129,20 @@ impl PlanetSurfaceRenderer {
             return Err(RenderPreparationError::InvalidBudget);
         }
         let mut rebound = false;
+        if proposed
+            .iter()
+            .zip(self.capacities)
+            .any(|(&next, old)| next > old)
+        {
+            // Growth is rare. Complete earlier submissions before destroying old
+            // allocations, so in-flight generations cannot bypass the 80 MiB cap.
+            device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                })
+                .map_err(|e| RenderPreparationError::GpuProgress(e.to_string()))?;
+        }
         for (i, &size) in proposed.iter().enumerate() {
             if size > self.capacities[i] {
                 let target = match i {
@@ -136,6 +150,7 @@ impl PlanetSurfaceRenderer {
                     1 => &mut self.instances,
                     _ => &mut self.fallback,
                 };
+                target.destroy();
                 *target = buffer(
                     device,
                     size,

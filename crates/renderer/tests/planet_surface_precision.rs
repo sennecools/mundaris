@@ -81,7 +81,7 @@ fn source_centred_surface_preparation_extreme_ancestor_and_one_opaque_owner() {
         let mut r = LodReport::default();
         for _ in 0..1000 {
             r = session.update(&input, &LodSettings::default()).unwrap();
-            if !r.desired_estimate_incomplete {
+            if !r.desired_estimate_incomplete && !r.quality_pending {
                 break;
             }
         }
@@ -125,4 +125,112 @@ fn source_centred_surface_preparation_extreme_ancestor_and_one_opaque_owner() {
     )
     .validate(&module)
     .unwrap();
+}
+
+fn radial_hit(direction: DVec3, triangles: &[[DVec3; 3]]) -> f64 {
+    triangles
+        .iter()
+        .filter_map(|&[a, b, c]| {
+            let e1 = b - a;
+            let e2 = c - a;
+            let p = direction.cross(e2);
+            let determinant = e1.dot(p);
+            if determinant.abs() < 1e-20 {
+                return None;
+            }
+            let inverse = 1.0 / determinant;
+            let t = -a;
+            let u = t.dot(p) * inverse;
+            let q = t.cross(e1);
+            let v = direction.dot(q) * inverse;
+            if u < 0.0 || v < 0.0 || u + v > 1.0 {
+                return None;
+            }
+            let distance = e2.dot(q) * inverse;
+            (distance > 0.0).then_some(distance)
+        })
+        .fold(f64::MAX, f64::min)
+}
+
+#[test]
+fn matched_radial_handoff_displacement_stays_subpixel() {
+    let tree = FrameTree::new(NonZeroU64::new(1).unwrap());
+    let source = tree.root();
+    let radius = 6.4e6;
+    let observer = DVec3::Z * (radius + 4e8);
+    let view = PreparedView::new(
+        &tree.evaluate(),
+        FramePose::new(
+            FramePosition::new(source, LocalPosition::try_metres(observer).unwrap()),
+            UnitRotation::identity(),
+        ),
+        RenderPrecisionBudget::near_debug(),
+    )
+    .unwrap();
+    let projection = CelestialProjection::try_new(1280, 800, 60.0_f64.to_radians(), 0.1).unwrap();
+    let input = SurfaceViewInput {
+        view: &view,
+        body_fixed_frame: source,
+        reference_radius_m: radius,
+        projection,
+    };
+    let mut session = SurfaceLodSession::default();
+    for _ in 0..100 {
+        let r = session.update(&input, &LodSettings::default()).unwrap();
+        if !r.quality_pending && !r.desired_estimate_incomplete {
+            break;
+        }
+    }
+    let sphere = Icosphere::new();
+    let old: Vec<_> = sphere
+        .indices()
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|t| t.map(|i| sphere.vertices()[i as usize]))
+        .collect();
+    let mut new = Vec::new();
+    for patch in session.active_visible() {
+        let vertices: Vec<_> = (0..289)
+            .map(|i| {
+                patch
+                    .address
+                    .sample_direction(i % 17, i / 17, 16)
+                    .unwrap()
+                    .unit()
+            })
+            .collect();
+        new.extend(
+            session
+                .topology()
+                .indices(patch.stitch_mask)
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|t| t.map(|i| vertices[i as usize])),
+        );
+    }
+    let mut maximum: f64 = 0.0;
+    for i in 0..21 {
+        for j in 0..21 {
+            let direction =
+                DVec3::new(-0.95 + i as f64 * 0.095, -0.95 + j as f64 * 0.095, 1.0).normalize();
+            let a = radial_hit(direction, &old);
+            let b = radial_hit(direction, &new);
+            assert!(a <= 1.0 + 1e-14 && b <= 1.0 + 1e-14);
+            let old = projection
+                .project_pixels(direction * (radius * a) - observer)
+                .unwrap()
+                .unwrap();
+            let new = projection
+                .project_pixels(direction * (radius * b) - observer)
+                .unwrap()
+                .unwrap();
+            maximum = maximum.max((old[0] - new[0]).hypot(old[1] - new[1]));
+        }
+    }
+    eprintln!(
+        "handoff 441 matched radial directions: max exact projected displacement={maximum} px"
+    );
+    assert!(maximum <= 0.35);
 }
