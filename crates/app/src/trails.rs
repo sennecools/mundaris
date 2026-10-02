@@ -2,13 +2,112 @@
 use anyhow::{Result, ensure};
 use glam::DVec3;
 use mundaris_math::{FrameId, FramePosition, LocalPosition};
-use mundaris_renderer::DebugLine;
+use mundaris_renderer::{CelestialProjection, DebugLine, PreparedView};
 use mundaris_world::{BodyId, CelestialFrameProjection, CelestialSystem};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrailMode {
     Inertial,
     SimultaneousBodyRelative(BodyId),
+}
+/// Reused screen-space simplification scratch. Retains only existing vertices;
+/// endpoints and Cartesian extrema are mandatory, caps disclose missed tolerance.
+#[derive(Default)]
+pub struct TrailDisplayScratch {
+    screens: Vec<Option<[f64; 2]>>,
+    keep: Vec<bool>,
+    stack: Vec<(usize, usize)>,
+}
+impl TrailDisplayScratch {
+    pub fn simplify(
+        &mut self,
+        view: &PreparedView<'_>,
+        projection: CelestialProjection,
+        limit: usize,
+        points: &mut Vec<FramePosition>,
+        colors: &mut Vec<[f32; 4]>,
+    ) -> Result<bool> {
+        ensure!(
+            points.len() == colors.len() && limit >= 8,
+            "invalid trail display buffers/cap"
+        );
+        if points.len() < 3 {
+            return Ok(false);
+        }
+        let source = view.prepare_source(points[0].frame())?;
+        self.screens.clear();
+        for &point in points.iter() {
+            self.screens
+                .push(projection.project_pixels(source.view_displacement(point)?.metres())?);
+        }
+        self.keep.clear();
+        self.keep.resize(points.len(), false);
+        self.keep[0] = true;
+        self.keep[points.len() - 1] = true;
+        for axis in 0..3 {
+            let low = (0..points.len())
+                .min_by(|&a, &b| {
+                    points[a].local().metres()[axis].total_cmp(&points[b].local().metres()[axis])
+                })
+                .expect("nonempty");
+            let high = (0..points.len())
+                .max_by(|&a, &b| {
+                    points[a].local().metres()[axis].total_cmp(&points[b].local().metres()[axis])
+                })
+                .expect("nonempty");
+            self.keep[low] = true;
+            self.keep[high] = true;
+        }
+        self.stack.clear();
+        let mut previous = 0;
+        for (i, &keep) in self.keep.iter().enumerate().skip(1) {
+            if keep {
+                self.stack.push((previous, i));
+                previous = i;
+            }
+        }
+        let mut count = self.keep.iter().filter(|&&k| k).count();
+        let mut coarse = false;
+        while let Some((a, b)) = self.stack.pop() {
+            if b <= a + 1 {
+                continue;
+            }
+            let mut worst = 0.5;
+            let mut candidate = None;
+            for i in a + 1..b {
+                let error = match (self.screens[a], self.screens[b], self.screens[i]) {
+                    (Some(a), Some(b), Some(p)) => crate::orbit_guides::screen_chord_error(a, b, p),
+                    (None, None, None) => 0.0,
+                    _ => f64::INFINITY,
+                };
+                if error > worst {
+                    worst = error;
+                    candidate = Some(i);
+                }
+            }
+            if let Some(i) = candidate {
+                if count >= limit {
+                    coarse = true;
+                    continue;
+                }
+                self.keep[i] = true;
+                count += 1;
+                self.stack.push((a, i));
+                self.stack.push((i, b));
+            }
+        }
+        let mut write = 0;
+        for i in 0..points.len() {
+            if self.keep[i] {
+                points[write] = points[i];
+                colors[write] = colors[i];
+                write += 1;
+            }
+        }
+        points.truncate(write);
+        colors.truncate(write);
+        Ok(coarse)
+    }
 }
 #[derive(Clone, Copy, Default)]
 struct Sample {
@@ -117,8 +216,8 @@ impl TrailHistory {
     pub fn set_mode(
         &mut self,
         mode: TrailMode,
-        branch: u64,
-        tick: u64,
+        _branch: u64,
+        _tick: u64,
         system: &CelestialSystem,
     ) -> Result<()> {
         if let TrailMode::SimultaneousBodyRelative(id) = mode {
@@ -126,7 +225,7 @@ impl TrailHistory {
             ensure!(self.ids.contains(&id), "reference body not recorded");
         }
         self.mode = mode;
-        self.clear_and_seed(branch, tick, system);
+        // Reference/mode are presentation only; synchronized absolute records survive.
         Ok(())
     }
     /// Called for every successful public commit, including substeps. Only whole
@@ -242,6 +341,76 @@ impl TrailHistory {
             }
         }
         Ok(source)
+    }
+    /// Bounded display of existing committed vertices and the current endpoint.
+    /// Uniform subsampling is explicitly reported as capped, not a screen-error guarantee.
+    pub fn display_points(
+        &self,
+        system: &CelestialSystem,
+        projection: &CelestialFrameProjection,
+        body: BodyId,
+        limit: usize,
+        points: &mut Vec<FramePosition>,
+        colors: &mut Vec<[f32; 4]>,
+    ) -> Result<bool> {
+        ensure!(limit >= 2, "trail display needs two vertices");
+        let index = self
+            .ids
+            .iter()
+            .position(|&id| id == body)
+            .ok_or_else(|| anyhow::anyhow!("body not recorded"))?;
+        let (source, reference) = match self.mode {
+            TrailMode::Inertial => (projection.tree().root(), None),
+            TrailMode::SimultaneousBodyRelative(id) => (
+                projection.frames_for(id)?.translating,
+                self.ids.iter().position(|&b| b == id),
+            ),
+        };
+        points.clear();
+        colors.clear();
+        let count = self.len.min(limit - 1);
+        let first = self.samples[self.head].time_s;
+        let now = system.sample_time().seconds_since_epoch();
+        let span = (now - first).abs();
+        let color = crate::gravity_fixtures::body_color(index);
+        for sample in 0..count {
+            let ordinal = if count <= 1 {
+                0
+            } else {
+                sample * (self.len - 1) / (count - 1)
+            };
+            let slot = (self.head + ordinal) % self.capacity();
+            let values = &self.positions[slot * self.ids.len()..(slot + 1) * self.ids.len()];
+            let value = values[index] - reference.map_or(DVec3::ZERO, |r| values[r]);
+            points.push(FramePosition::new(
+                source,
+                LocalPosition::try_metres(value)?,
+            ));
+            let age = if span > 0.0 {
+                ((self.samples[slot].time_s - first).abs() / span).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            colors.push([color[0], color[1], color[2], (0.15 + 0.85 * age) as f32]);
+        }
+        let current = system.body(body)?.state().center_in_system().metres()
+            - if let Some(r) = reference {
+                system
+                    .body(self.ids[r])?
+                    .state()
+                    .center_in_system()
+                    .metres()
+            } else {
+                DVec3::ZERO
+            };
+        if self.samples[(self.head + self.len - 1) % self.capacity()].time_s != now {
+            points.push(FramePosition::new(
+                source,
+                LocalPosition::try_metres(current)?,
+            ));
+            colors.push(color);
+        }
+        Ok(self.len > limit - 1)
     }
 }
 #[cfg(test)]

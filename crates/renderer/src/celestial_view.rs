@@ -141,6 +141,18 @@ impl CelestialProjection {
         }
         Ok(Some(narrowed))
     }
+    /// Unbounded f64 screen query for derived tessellation/simplification. Behind-near
+    /// points are unavailable; only `project_marker` narrows bounded UI coordinates.
+    pub fn project_pixels(self, p: DVec3) -> Result<Option<[f64; 2]>, RenderPreparationError> {
+        if !p.is_finite() {
+            return Err(RenderPreparationError::InvalidDebugGeometry);
+        }
+        if -p.z < self.near_m {
+            Ok(None)
+        } else {
+            self.screen(p).map(Some)
+        }
+    }
     /// Compare actual vertex round trip in metres and physical pixels. Near-plane
     /// crossing vertices use the conservative near depth rather than divide by z.
     pub(crate) fn narrow(

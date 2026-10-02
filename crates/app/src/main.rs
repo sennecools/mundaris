@@ -104,6 +104,9 @@ impl ApplicationHandler for MundarisApp {
         info!("native window and renderer initialized");
         self.window = Some(window);
         self.renderer = Some(renderer);
+        if let Some(demo) = &mut self.demo {
+            demo.reset_wall_tick();
+        }
         if let Some(demo) = &mut self.celestial_demo {
             demo.reset_wall_tick();
         }
@@ -113,6 +116,12 @@ impl ApplicationHandler for MundarisApp {
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(demo) = &mut self.demo {
+            demo.set_lifecycle_drawable(false);
+        }
+        if let Some(demo) = &mut self.celestial_demo {
+            demo.set_lifecycle_drawable(false);
+        }
         if let Some(demo) = &mut self.gravity_demo {
             demo.set_lifecycle_drawable(false);
         }
@@ -170,10 +179,26 @@ impl ApplicationHandler for MundarisApp {
         if repaint && !self.occluded && window.is_minimized() != Some(true) {
             window.request_redraw();
         }
+        let drawable = self.drawable();
+        if let Some(demo) = &mut self.gravity_demo {
+            demo.set_lifecycle_drawable(drawable);
+        }
+        if let Some(demo) = &mut self.demo {
+            demo.set_lifecycle_drawable(drawable);
+        }
+        if let Some(demo) = &mut self.celestial_demo {
+            demo.set_lifecycle_drawable(drawable);
+        }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let drawable = self.drawable();
+        if let Some(demo) = &mut self.demo {
+            demo.set_lifecycle_drawable(drawable);
+        }
+        if let Some(demo) = &mut self.celestial_demo {
+            demo.set_lifecycle_drawable(drawable);
+        }
         if let Some(demo) = &mut self.gravity_demo {
             demo.set_lifecycle_drawable(drawable);
         }

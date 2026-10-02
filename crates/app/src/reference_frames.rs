@@ -2,6 +2,7 @@
 
 use anyhow::{Result, ensure};
 use glam::DVec3;
+use mundaris_app::interactive_clock::{ClockInterval, InteractiveClock};
 use mundaris_math::*;
 use mundaris_renderer::*;
 use std::{num::NonZeroU64, time::Instant};
@@ -335,6 +336,7 @@ pub(crate) struct ReferenceFrameDemo {
     residual: Residuals,
     diagnostic: Option<String>,
     pending: Option<Command>,
+    host_clock: InteractiveClock,
 }
 impl ReferenceFrameDemo {
     pub(crate) fn new() -> Result<Self> {
@@ -352,7 +354,18 @@ impl ReferenceFrameDemo {
             residual: Residuals::default(),
             diagnostic: None,
             pending: None,
+            host_clock: InteractiveClock::default(),
         })
+    }
+    pub(crate) fn set_lifecycle_drawable(&mut self, drawable: bool) {
+        self.host_clock.set_drawable(drawable);
+        if !drawable {
+            self.last_tick = Instant::now();
+        }
+    }
+    pub(crate) fn reset_wall_tick(&mut self) {
+        self.last_tick = Instant::now();
+        self.host_clock.reset_capture();
     }
     fn command(&mut self, command: Command) -> Result<()> {
         match command {
@@ -479,7 +492,19 @@ impl ReferenceFrameDemo {
             return Ok(());
         }
         let now = Instant::now();
-        let delta = now.duration_since(self.last_tick).as_secs_f64();
+        let elapsed = now.duration_since(self.last_tick);
+        let delta = match self.host_clock.classify(elapsed) {
+            ClockInterval::Accepted(elapsed) => elapsed.as_secs_f64(),
+            ClockInterval::Hidden => 0.0,
+            ClockInterval::Discontinuity(gap) => {
+                self.controls.playing = false;
+                self.diagnostic = Some(format!(
+                    "Interactive clock gap {:.3} s; no catch-up requested",
+                    gap.as_secs_f64()
+                ));
+                0.0
+            }
+        };
         self.last_tick = now;
         if let Some(command) = self.pending.take() {
             if let Err(error) = self.command(command) {
