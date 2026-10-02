@@ -44,3 +44,26 @@ debug rendering and committed-history trails. Numerical h never changes to catch
 up with playback; navigation aids never change physical size or state. Render/frame
 rebuilds cannot become authoritative. Generation, terrain/LOD and persistence
 remain deferred. Platform evidence is tracked separately from implementation.
+
+## Phase 3.5 navigation and time-warp invariants
+
+- Selection/focus identity is `BodyId`; a projection rebuild or renderer request
+  index cannot change it. Selection is distinct from camera tracking/focus.
+- Physical spheres retain authoritative radius. Markers, displaced labels,
+  selection rings, fitted bounds and navigation clearances are derived aids.
+- Historical trail means committed synchronized state history. An instantaneous
+  two-body orbit guide is separate derived geometry, never stored as fake past or
+  presented as authoritative future propagation.
+- Automatic guide references and subsystem scopes are disposable navigation data,
+  never N-body parents, persistent ownership or transform/spin ancestry.
+- Camera transitions and editor flight update the same high-precision observer;
+  they mutate no physical body state or global world origin. Numerical carriers
+  preserve the documented system-stationary free-flight policy.
+- High requested rate changes counts only. Exact baseline h/KDK/order remain
+  unchanged. Budget/count/admission limitations and achieved live rate are honest
+  separate measurements; private replay is not live playback advancement.
+- Hidden time and unacceptable interactive clock gaps cannot create silent enormous
+  simulation debt or navigation jumps. Excluded wall duration and cancelled demand
+  are visible, distinct from overload-rejected simulation demand.
+- Content projection/picking/GPU viewport agree; source-centred f64 conversion and
+  clipping precede GPU narrowing for spheres, guides and history alike.

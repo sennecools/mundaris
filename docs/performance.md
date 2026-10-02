@@ -321,3 +321,166 @@ Numerical precision/conservation and Windows visual evidence are in
 [Phase 3 validation](phase-3-validation.md). Linux timings and current-revision CI
 remain unverified. The N1024 result alone authorizes no Barnes-Hut/FMM/GPU/Rayon/job
 system or ECS/cache change; normal-workload thresholds remain those in ADR 0004.
+
+## Phase 3.5 baseline — 2026-10-02
+
+Same Windows 11 Pro 10.0.26200 / Ryzen 7 9800X3D host, 8 reported logical
+processors; Rust 1.98.1 stable (`48a229cea`), LLVM 22.1.8,
+x86_64-pc-windows-msvc, unmodified optimized bench profile. Existing glam
+0.30.10/default-std, Criterion 0.8.2, naga 27.0.3, wgpu 27.0.1 and lockfile are
+retained. No native-CPU tuning, LTO, parallelism, force approximation or allocator
+instrumentation. Timed groups ran sequentially with the native viewer closed.
+
+```text
+cargo bench --locked -p mundaris_app --bench celestial_navigation
+cargo bench --locked -p mundaris_app --bench orbit_guides
+cargo bench --locked -p mundaris_app --bench trail_history
+cargo bench --locked -p mundaris_renderer --bench celestial_preparation
+cargo bench --locked -p mundaris_renderer --bench celestial_preparation -- 'styled_polyline_clip_quad_pack/B16'
+cargo bench --locked -p mundaris_simulation --bench fixed_steps -- bounded_single_work_stress
+```
+
+The renderer run was interrupted after the three-body styled groups; its remaining
+16-body styled cases were then executed explicitly. Every newly registered target
+compiles and has been executed. Existing giant 512-step N1024 groups were retained
+as Phase 3 stress evidence, not rerun or substituted for normal workloads.
+New targets use 20 samples, 100 ms warm-up and requested 500 ms measurement;
+Criterion extends slow groups. Complete outputs use `black_box`. CPU-only timings
+exclude device/window/shader startup; warm staging and layout storage are reused.
+Raw sample/bootstrap distributions remain under ignored `target/criterion/`.
+
+### Exact physical workload and chunk overhead
+
+Real h60 hierarchy/spins at N3; deterministic plausible star/planet/short-moon
+fixtures at N8/16/20. Each operation commits **512 identical physical steps**,
+records full snapshots and stride64 history, then publishes frames once. It is not
+an unequal-h method comparison. History baseline setup/allocation is outside timing.
+
+| N / work chunks | Median [bootstrap 95% CI] per 512 commits | CPU-only steps/s / h60 rate |
+| --- | --- | --- |
+| 3 / 512 | 110.524 [109.712,111.556] µs | ≈4.63 M / 278 M× |
+| 3 / 32 | 111.104 [110.541,112.159] µs | ≈4.61 M / 276 M× |
+| 16 / 32 | 1.59847 [1.58956,1.60684] ms | ≈320 k / 19.2 M× |
+| 20 / 32 | 2.41589 [2.39438,2.43584] ms | ≈212 k / 12.7 M× |
+
+N3 chunk1 central estimate is 121.67 µs, versus 111.75/111.50 µs for chunk32/512.
+N8 chunk32 is 459.47 µs; N16 chunk1/512 are 1.6247/1.6079 ms; N20
+chunk1/512 are 2.4511/2.4254 ms (central estimates, not medians). Chunk32's small
+overhead preserves responsiveness checks without changing the physical trajectory.
+The old hierarchy batch median was 110.346 µs; current unsplit and split results
+are close to that baseline, without claiming an integration-kernel speedup.
+
+The application's opportunity cap and budget are separate from these CPU ceilings:
+at 60 opportunities/s, 512 work units cap h60 near 1,843,200x and h10 near 307,200x
+before CPU/rendering. A 1,000,000x h10 request can therefore overload even though
+the small force kernel is cheap. Actual native h60 requested/achieved windows are
+in [validation](phase-3-5-validation.md#directed-native-windows-evidence): debug and
+release each ran 60 active seconds at 100000x and 1000000x with zero pending ticks
+in the captured samples. Synthetic 60-accounted-second rate-matrix tests remain
+distinct from elapsed presentation measurements.
+
+Single-work stress central estimates: N64 44.664 µs [44.192,45.193], N256
+709.74 µs [704.02,714.61], N1024 **13.464 ms [13.382,13.541]**, h=0.001 s scale
+probes. One N1024 step alone exceeds the 4 ms interactive budget: chunking cannot
+preempt a kernel. The prior ~7-second pump is avoided by checking time after one
+initial unit; this is no promise of an interactive N1024 product.
+
+### Navigation, selection and labels
+
+1280×800 window, 960×662 content rectangle at physical origin (320,110), 60° FOV,
+scale factor 1. Inputs include spread/coincident markers, measured-style 100×20 px
+labels and selected priority. Layout measurements reuse hysteresis storage; picks
+are separate from target preparation and may allocate their small candidate result.
+Bounds include physical bodies/guide extrema and synthetic explicit display extents
+of 0/1024/8192 points. Synthetic extents do not enter recorded history.
+
+Representative central estimates/95% intervals (not medians):
+
+| N | Spread labels | Coincident labels | Spread / coincident picking | Bodies+guides fit |
+| --- | --- | --- | --- | --- |
+| 3 | 28.503 [28.361,28.626] ns | 28.768 [28.528,28.997] ns | 40.082 / 59.244 ns | 63.365 ns |
+| 16 | 0.77284 [0.76654,0.77855] µs | 0.45055 [0.44663,0.45400] µs | 0.14192 / 0.18591 µs | 0.28056 µs |
+| 64 | 18.996 [18.773,19.183] µs | 6.7028 [6.6630,6.7435] µs | 0.47359 / 0.52953 µs | 1.6115 µs |
+| 256 probe | 404.11 [399.14,408.36] µs | 32.516 [32.220,32.816] µs | 1.9076 / 1.7895 µs | 14.142 µs |
+
+Whole fit with 8192 displayed points is 17.179/17.410/18.587/31.291 µs at
+N3/16/64/256. AU-to-body transition setup + one 16 ms navigation sample + overview
+reset is about 0.375–0.377 µs for all counts; it is an actual checked conversion/
+transition workload, not an enum accessor. The faster dense layout case hides
+lower-priority labels after exhausting slots; compare output/count policy, not just
+time. This bounded few-dozen-body layout deliberately retains O(N²) collision checks.
+No spatial index follows from the N256 probe.
+
+### Guides and visualization
+
+Guide references/elements/tidal diagnostic evaluation is separate from ellipse
+sampling and projection-driven refinement. Eight conic diagnostic points are
+checked against all other bodies for every candidate: this straightforward
+candidate policy can reach O(N³), acceptable at the measured normal counts but
+explicitly expensive at the 256 probe. It is not a force-solver hierarchy.
+
+| N | Reference/elements/tides median [95% CI] | 64 / 512 tessellation central | Screen refinement central |
+| --- | --- | --- | --- |
+| 3 | 2.11017 [2.08698,2.13790] µs | 1.4625 / 11.164 µs | 6.5232 µs |
+| 16 | 79.9636 [78.9893,80.4108] µs | 10.372 / 78.994 µs | 45.693 µs |
+| 64 | 1.91276 [1.89712,1.92604] ms | 45.323 / 344.79 µs | 342.47 µs |
+| 256 probe | central 68.465 [68.247,68.691] ms | 186.28 µs / 1.4340 ms | 2.6474 ms |
+
+Pure circular/eccentric element query central estimates are 28.183/28.494 ns. The
+guide math never advances physical state. Cache/score optimizations require normal
+workload evidence; the 256 result is recorded rather than hidden.
+
+Updated unchanged physical sphere preparation central estimates: N3 133.66 µs,
+N16 697.00 µs, N64 2.8084 ms. Marker-heavy N256/N1024: 167.91 µs/2.0250 ms.
+No significant sphere/marker regression was detected. N16 source-only preparation
+had a broad 1.7525–2.2611 µs interval, unlike its stable complete sphere batch;
+the cause is not isolated. No numerical check was removed.
+
+### Bounded actual-history display versus full quad preparation
+
+The app display group uses synchronized **externally committed** curved samples
+to isolate presentation from KDK. It prepares all retained records in f64,
+simplifies only existing vertices, keeps endpoints/Cartesian extrema, caps display
+at 1024 (selected 2048 in app), fades age, then performs renderer clipping/narrowing/
+quad packing. Relative mode uses exact same-sample subtraction. These synthetic
+committed probes are not shown as orbital validation trajectories.
+
+| Bodies / retention / mode | Bounded display central | Selected recorded median [95% CI] |
+| --- | --- | --- |
+| 3 / 1024 / inertial | 194.36 µs | — |
+| 3 / 8192 / inertial | 1.7400 ms | 1.74586 [1.73870,1.77356] ms |
+| 3 / 8192 / relative | 958.33 µs | — |
+| 16 / 1024 / inertial | 1.0132 ms | — |
+| 16 / 8192 / inertial | 9.4233 ms | 9.42475 [9.37950,9.46463] ms |
+| 16 / 8192 / relative | 5.1635 ms | — |
+
+The renderer's separate **full visible unsimplified** styled-line probe measures
+1024/8192 vertices per body at widths 1.5 px and varying age opacity:
+
+| Bodies / vertices | Central time [95% CI] | Full 8192 median [95% CI] |
+| --- | --- | --- |
+| 3 / 1024 | 410.25 [406.67,413.72] µs | — |
+| 3 / 8192 | 3.3842 [3.2735,3.5749] ms | 3.29709 [3.25550,3.34064] ms |
+| 16 / 1024 | 2.1672 [2.1567,2.1793] ms | — |
+| 16 / 8192 | 17.523 [17.407,17.650] ms | 17.5119 [17.3239,17.6468] ms |
+
+Quads pack six 32-byte vertices/visible solid segment, versus two for the old
+native line list. Full N3×8192 needs up to 4,718,016 vertex bytes before clipping;
+full N16×8192 up to 25,162,752 bytes. Default simplification reduces uploads; no
+GPU upload bandwidth/time measurement is claimed. Full quads are intentionally
+more expensive than the prior N3 2.39 ms line baseline, in exchange for portable
+width/fade. The bounded N3 full-retention display + ordinary spheres/guides remains
+under the 4 ms CPU preparation goal in separated measurements. **N16 at full
+retention misses that goal**, even with bounded outgoing vertices; retained-record
+scan/simplification cost remains. N16 at 1024 retention is about 1.8 ms with spheres/
+guides from separated groups, not a complete GPU frame measurement.
+
+Outliers/confidence intervals are retained. Old sampling/request groups were also
+rerun: N3×8192 sample bookkeeping rose ~4.5%; N16×8192 compatibility request
+construction rose ~6.3%. These small retained-path differences are recorded, not
+attributed to physics or concealed by a best iteration. Force/commit algorithms are
+unchanged. Inspection supports reused numeric/staging/history buffers; guide
+candidate vectors, transactional camera copies, pick results and UI formatting can
+allocate. No allocator profile was collected, so no blanket zero-allocation claim
+is made. Native GPU/presentation timing, high-DPI profiling and Linux timing remain
+open. See the validation record for exact fidelity, clock policy and platform limits.

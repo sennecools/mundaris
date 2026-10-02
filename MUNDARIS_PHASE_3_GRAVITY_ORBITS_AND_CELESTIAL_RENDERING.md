@@ -10,6 +10,8 @@
 >
 > **Acceptance:** existing platform gaps remain open. Design is not implementation, benchmark or native-runtime evidence.
 
+> **UX audit baseline:** [Phase 3.5 navigation/system-view/time-warp contract](MUNDARIS_PHASE_3_5_CELESTIAL_NAVIGATION_SYSTEM_VIEW_AND_TIMEWARP.md) distinguishes the Phase 3 validation controls from the subsequent explorer implementation. The detailed UX limits below describe this Phase 3 baseline; current Phase 3.5 implementation and open acceptance are recorded in [its validation evidence](docs/phase-3-5-validation.md).
+
 ## 1. Outcome and decisions
 
 Phase 3 makes Mundaris a visible primitive solar-system simulator. A small connected celestial system evolves under mutual Newtonian gravity and displays physically sized debug spheres, navigation markers, selection/focus, actual historical trails and numerical diagnostics. The final gravity validation contains no prescribed orbital animation.
@@ -189,7 +191,7 @@ Overload is an admission latch, distinct from explicit pause. Clearing it opens 
 
 At h=60, 1000x requests 16.67 steps/s; 1,000,000x requests about 16,667. At 60 updates/s work cap permits at most 30,720 work units/s before CPU limits, not measured throughput. Slow CPUs show honest lag/overload.
 
-Minimize/occlusion/zero-size/OS suspension automatically suspends work/demand, clears debt with explicit lifecycle status, and resets host timestamp on restoration; hidden intervals are excluded. No background jobs. Surface timeout/lost-frame retries never repeat a committed step.
+Detected minimize/occlusion/zero-size/OS suspension automatically suspends work/demand, clears debt with explicit lifecycle status, and resets host timestamp on restoration; detected hidden intervals are excluded. No background jobs. Surface timeout/lost-frame retries never repeat a committed step. The current gravity app has no long-elapsed guard while nominally drawable: sleep, debugger pauses or stalls without a lifecycle event can still become requested fixed-step catch-up or overload. Phase 3.5 specifies the missing interactive clock-gap policy; this is not an enormous single physical timestep.
 
 ### 6.4 Controls
 
@@ -370,13 +372,15 @@ Planet/moon normal debug shading, e.g. color*(0.2+0.8*max(dot(normal,normalize(0
 
 ## 13. Camera/labels
 
-App owns one FramePose/observer velocity plus orbit parameters: target BodyId/frame role, distance/yaw/pitch. Selection differs from focus. Default root-frame overview fits initial physical bounds about initial COM; it never recentres universe as bodies move.
+App owns one FramePose/observer velocity plus orbit parameters: target BodyId/frame role, distance/yaw/pitch. Selection differs from focus. Default root-frame overview fits initial physical bounds about initial COM; it never recentres universe as bodies move. The implemented Overview button reuses that initial centre/extent, not current body/guide/trail bounds or a viewport-aware subsystem fit. Focus changes are immediate, not interpolated transitions. Arbitrary body focus works through the selected BodyId; selecting alone leaves the existing camera pivot unchanged. There is no free-flight control mode.
 
-Click marker or panel name; hit radius 8 physical pixels. Overlap resolution: screen distance, then nearest f64 depth, then stable request order. Ignore camera gestures consumed by egui. Focus deliberately attaches to selected translating frame; fit-to-body sets distance=4*radius. Keep useful existing zoom on ordinary focus, with minimum 4*radius. Optional body-fixed attachment inspects local axes/spin. Camera changes never mutate world.
+Click marker or panel name; hit radius 8 physical pixels. Overlap resolution: screen distance, then nearest f64 depth, then stable request order. Ignore camera gestures consumed by egui. Focus deliberately attaches to selected translating frame; fit-to-body sets distance=4*radius. Ordinary focus from system overview also sets 4*radius; when already body-attached it retains existing distance with a minimum 4*radius. Optional body-fixed attachment inspects local axes/spin. Camera changes never mutate world.
 
 Drag orbit, exponential wheel zoom, overview button, previous/next or Tab selection. Bound pitch away from poles and camera distance >=1.05*radius; navigation constraint, not collisions. No walking/spacecraft/gameplay. Re-expression action uses Phase 1 pose/kinematic conversion and preserves instantaneous state; focus/attachment deliberately changes control/velocity semantics. Rebuild remaps by BodyId/role. No disconnected scene load/global teleport.
 
 Renderer overlay preparation projects f64 relative centres with FOV/viewport, rejects behind-camera projections and handles zero distance; only bounded screen coordinates narrow to UI. Labels show name/distance/selection, selected panel mass/reference radius/system velocity/speed/position/orientation/spin. Existing egui is enough; labels/markers own no physics.
+
+Implementation limits: projected labels are painter text with no click rectangle or collision layout; only marker centres and panel name buttons select. Physical sphere area has no ray picking. Markers remain visible over large spheres without fading; occlusion is annotated in label text. The selected sphere flag is packed but not used by the sphere shading shader; selected rings/axes provide the actual highlight. Wheel zoom is already exponential in centre distance, with a 1.05-radius floor, rather than surface-clearance-relative zoom.
 
 ## 14. Actual trails
 
@@ -385,6 +389,8 @@ App TrailHistory stores synchronized sample tick/time and all recorded body cent
 Default stride circular=8 ticks (80 s), hierarchy=64 (3840 s); 8192 complete samples, total payload cap=8 MiB including ticks/positions. Checked accounting reduces capacity at larger N, report stride/retention. Three-body hierarchy retains ~one year/~82 points per lunar orbit. Seed epoch, draw current endpoint separately without changing stored cadence. Preallocated synchronized ring evicts oldest whole sample, no per-sample allocation.
 
 Default **inertial system-space history**. Planet focus also offers labelled `history relative to Aurelia at each sample`: subtract Aurelia's recorded position at that same historical tick, then render relative points in today's translating frame/system-aligned axes. This is real relative history, not parented motion or ideal ellipse. Today's planet minus yesterday's moon is not that mode. No predicted trajectories/conics.
+
+The implemented relative-trail control uses fixture body index 1 (Aurelia in hierarchy, Companion in circular), irrespective of current selection. Its current “selected fixture companion” checkbox wording does not describe arbitrary selected-body history. At paused startup only the epoch sample exists, so there is no segment; the separately derived current endpoint can form a segment after the first committed step before the next stride sample. Current lines have constant body color, native line-list width, no age fade/selected-trail styling, and may remain subpixel in overview. Orbit guides are not implemented; Phase 3.5 proposes them separately from actual history.
 
 For inertial history label recorded system coordinates with current projection root for conversion only: historical records do not claim all points physically exist at today's tick. Convert through current observer in f64. Relative mode uses translating frame and simultaneous historical deltas. Clip segments in f64 at view frustum/near plane before <=0.05-pixel narrowing, reuse GPU staging. Branch/direction/mode tags prevent joining different histories.
 

@@ -190,6 +190,35 @@ no pipeline/presentation failure and are not described as a warning-free driver 
 
 ## Remaining Definition of Done items
 
+### Current implementation audit clarification — 2026-10-02
+
+This clarification describes the Phase 3 baseline before the subsequent Phase 3.5
+implementation. [Phase 3.5 evidence](phase-3-5-validation.md) records the new
+explorer behavior and its remaining acceptance; it does not replace the historical
+Phase 3 operator evidence recorded here.
+
+The [Phase 3.5 design/audit](../MUNDARIS_PHASE_3_5_CELESTIAL_NAVIGATION_SYSTEM_VIEW_AND_TIMEWARP.md)
+preserves the Windows evidence above while distinguishing harness acceptance from
+explorer usability. Arbitrary body selection exists via panel/Tab/marker, with
+explicit focus buttons for any selected body. Focus is immediate and selection
+alone does not move the camera. Overview reuses
+initial COM/extent. Projected label clicking, sphere-area picking, label collision
+layout, free flight, smooth focus transitions and orbit guides are not implemented.
+The relative-history control always references fixture index 1, not current selection.
+Historical trails exist and are enabled; startup is paused with one epoch sample,
+and early overview arcs/planet-moon separation can be subpixel.
+
+Detected minimize/occlusion/suspend already excludes hidden demand and clears debt;
+the historical pre-implementation timing concern is not the current gravity path.
+Sleep/debugger/long drawable stalls without a lifecycle event remain unguarded.
+The reported native minimize/restore result and synthetic hidden-duration tests
+do not prove that additional clock-gap case. Requested/achieved reporting already
+exists, but its 250 ms samples can be tick-spiky or include control jumps. There is
+no 10000x UI preset although the rate API supports it. These are source-audit
+findings, not a new operator visual report or completed Phase 3.5 functionality.
+
+The existing outstanding acceptance items remain:
+
 1. **Linux x86-64:** native workspace build/check/Clippy/headless/Rustdoc, focused
    release/long-run envelopes, and full §19 desktop visual/lifecycle sequence with
    OS/GPU/backend/driver evidence. Available Ubuntu WSL2 reports kernel

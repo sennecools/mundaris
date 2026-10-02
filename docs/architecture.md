@@ -120,3 +120,41 @@ Planet generation, terrain/LOD, persistence and general editor systems remain de
 The app supplies the bootstrap panel through a per-frame UI callback; the renderer owns only UI input and GPU integration. Native events and UI types stay at this app/renderer boundary. An `Arc<Window>` safely keeps the surface's native handle alive without leaks or shared mutable domain state. Presentation notifies `winit` before submitting the frame to the compositor.
 
 The smoke app uses bounded continuous redraw to exercise presentation without adding an editor repaint scheduler. Its 16 ms deadline remains stable across input wakeups, skips catch-up frames, and stops timer wakeups while minimized, zero-sized, occluded, or suspended. FIFO presentation also provides GPU/display pacing. Suspension releases the renderer before the window; resume recreates them. This bootstrap cadence is not a future simulation timestep.
+
+## Phase 3.5 derived celestial explorer
+
+App headless modules own `SystemViewBounds`/scopes, validated BodyId selection,
+physical-sphere/marker/displaced-label picking, deterministic label layout,
+camera control policy, guide reference choices, history display, rolling playback
+metrics and `InteractiveClock`. All their physical inputs are immutable current
+world or coherent world/projection borrows. No guide or navigation grouping is
+stored in `BodyState`, changes force pairs, reparents frames or conveys spin.
+
+Simulation's checked `osculating_elements` derives an instantaneous relative
+two-body conic from position/velocity/pair masses. Only resolved elliptic geometry
+has a closed guide. App chooses conservative automatic or explicit references,
+evaluates differential external perturbations and supplies f64 frame-tagged
+derived curves. These are neither actual historical motion nor full N-body future
+predictions. Simultaneous relative history subtracts both recorded bodies at the
+same sample; display/reference changes retain absolute history.
+
+System Orbit, Body Orbit and scale-aware Free Flight operate on one Phase 1
+observer. Focus smoothing, clearance zoom, numerical carrier compensation and
+frame rebuilding update observer/navigation state only. Render preparation remains
+source-centred f64 before narrowing. The renderer's explicit content viewport drives
+projection, ray unprojection, overlays and GPU viewport/scissor. Generic pixel-width
+solid/dashed polylines use checked clipped clip-relative quads, alpha blending and
+reverse-Z/no writes; the app keeps guide/history/debug-axis semantics separate.
+
+Runner `pump_with_work_limit` preserves baseline fixed h, pair order, snapshots,
+rollback and replay. App work opportunities start with one unit, then at-most-32
+chunks/512 total, checking 4 ms between chunks. Achieved playback uses real public
+commit deltas and accounted active wall duration, excluding seek/reset/single/replay
+jumps. Long drawable gaps reject the entire elapsed interval, cancel demand and
+camera progression, and require Resume. Detected hidden time resets capture without
+background catch-up. The same host-clock classification is used by analytic modes.
+
+Implemented decisions, API deviations and unresolved platform evidence are in
+[ADR 0005](adr/0005-celestial-navigation-system-view-and-timewarp.md) and
+[Phase 3.5 validation](phase-3-5-validation.md). Approximate authoritative
+propagation, preview, terrain and Phase 4 remain outside this milestone.

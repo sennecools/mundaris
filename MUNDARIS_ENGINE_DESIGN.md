@@ -2873,6 +2873,27 @@ Topics:
 
 The [Phase 3 specification](MUNDARIS_PHASE_3_GRAVITY_ORBITS_AND_CELESTIAL_RENDERING.md) resolves gravity/integrator/time/history and debug rendering choices. Implementation and Windows numerical/native evidence are recorded in [Phase 3 validation](docs/phase-3-validation.md) and [ADR 0004](docs/adr/0004-gravity-integration-and-playback.md). Linux/current CI acceptance remains open. No terrain, planetary LOD, atmosphere, collision system or general lighting engine is included.
 
+## Phase 3.5 — Celestial navigation, system overview and exact time warp
+
+Goal:
+
+> make the same connected physical system immediately understandable and useful to explore.
+
+The [Phase 3.5 contract](MUNDARIS_PHASE_3_5_CELESTIAL_NAVIGATION_SYSTEM_VIEW_AND_TIMEWARP.md)
+adds current geometric framing, BodyId selection through sphere/marker/label/list,
+deterministic readable labels, one-observer smooth focus/orbit/clearance zoom/free
+flight, actual-history presentation and separate osculating two-body guides.
+Derived guide references/subsystem membership never become N-body ownership or
+frame/spin ancestry. Exact pumping is responsive and bounded; requested/achieved
+rate and clock discontinuities are explicit. All rates retain Phase 3 KDK and h.
+
+Implementation/measurements and open operator/platform acceptance are recorded in
+[Phase 3.5 validation](docs/phase-3-5-validation.md) and
+[ADR 0005](docs/adr/0005-celestial-navigation-system-view-and-timewarp.md).
+Approximate authority, larger automatic timesteps, adaptive/multi-rate mappings
+and preview remain future orbital-performance research. This phase introduces no
+terrain, LOD, spacecraft mechanics or Phase 4 implementation.
+
 ## Phase 4 — Planet surface partition prototype
 
 Goal:

@@ -2,7 +2,7 @@
 
 Mundaris is a native desktop world-building and planetary simulation project spanning astronomical and local surface scales. Checked reference frames, editable celestial state, deterministic Newtonian gravity, fixed-step orbital integration and minimal celestial debug rendering are implemented. Procedural worlds remain future work.
 
-**Status:** Phase 3 implemented and validated on Windows, including the operator-reported visual sequence. Linux native/release/interactive and current-revision remote CI acceptance remain open. See [Phase 3 evidence](docs/phase-3-validation.md), [Phase 2 evidence](docs/phase-2-validation.md), and [Phase 1 evidence](docs/phase-1-validation.md). Prerequisite evidence was deferred explicitly in [ADR 0004](docs/adr/0004-gravity-integration-and-playback.md).
+**Status:** Phase 3.5 celestial explorer is implemented, with Windows headless/release, benchmark and directed native evidence. Complete human/high-DPI/sleep validation, Linux native acceptance and current-revision remote CI remain open. See [Phase 3.5 evidence](docs/phase-3-5-validation.md), [Phase 3 evidence](docs/phase-3-validation.md), [Phase 2 evidence](docs/phase-2-validation.md), and [Phase 1 evidence](docs/phase-1-validation.md). Decisions are recorded in [ADR 0005](docs/adr/0005-celestial-navigation-system-view-and-timewarp.md). Phase 4 has not begun.
 
 The initial native development targets are **Windows x86-64** and **Linux x86-64**.
 
@@ -35,21 +35,52 @@ Normal invocation opens the bootstrap panel. `--reference-frames` draws abstract
 `--gravity-orbits` starts the mutual-gravity Solace/Aurelia/Luma hierarchy at `0 s`,
 fixed `h=60 s`, overview, Aurelia selected, `1000x` selected but paused. Resume
 explicitly; changing a rate alone does not unpause. The circular oracle is an
-explicit replacement fixture with `h=10 s`. Drag outside the panel to orbit,
-wheel to zoom, click markers/names or Tab to select, and focus/fit/overview to
-inspect the same connected system. Physical spheres, debug shading, selected axes,
-labels and navigation markers are derived and never change physical radius.
+explicit replacement fixture with `h=10 s`. Startup fits current physical structure
+and instantaneous guides in the dock-excluded viewport. All bodies remain at their
+true physical positions and radius; subpixel bodies have derived markers and
+collision-laid-out labels.
+
+| Action | Control |
+| --- | --- |
+| Select | Sphere/marker/displaced label/list; Tab or Shift+Tab |
+| Disambiguate coincident markers | Repeat click cycles every candidate; list remains available |
+| Smooth focus | F, double-click, Focus, Next/Previous Focus |
+| Whole-system overview | Home / Whole System |
+| Local overview | Selected Subsystem / Reference + Companions / explicit membership |
+| Body/System Orbit | Left drag; multiplicative wheel zoom |
+| Unfocus into Free Flight | Escape / Free Flight, preserving displayed pose |
+| Editor free movement | WASD, Q/E vertical, right-drag look; Shift temporary boost |
+| Free-flight speed | Logarithmic multiplier / wheel powers of two |
+
+Body zoom controls **clearance above the real reference sphere**, with a one-metre/
+ULP floor and smooth wall-time response. This does not promise metre-accurate terrain
+in the current debug mesh. Navigation uses one high-precision observer; moving or
+focusing it changes no world state. Physical spheres, markers, labels and curves are
+separate products. Dashed curves are instantaneous two-body **orbit guides**, not
+full N-body predictions; solid age-fading curves are **actual committed history**.
 
 The panel distinguishes requested/authoritative time, measured achieved rate,
-pending ticks/time, work per update, lag and overload. At most 512 work units run
-per update; exceeding the 65,536-tick admission cap halts new demand visibly while
+pending ticks/time, work per update, lag and overload in a prominent toolbar.
+Requested rate presets include 10000x and a finite custom rate. All rates remain
+baseline exact full N-body KDK with the configured physical step. At most 512 work
+units run per update in at-most-32-unit chunks, starting with one unit and checking
+a 4 ms interactive budget between chunks. Exceeding the 65,536-tick admission cap halts new demand visibly while
 retained debt drains at unchanged h. Pause cancels debt. Reverse restores bounded
 snapshots or privately replays positive steps from the branch baseline. Seek shows
 quantization before confirmation; replay can be cancelled without changing live
 state. Reset preserves IDs/edited baseline/focus; loading an original fixture is
 separate. Mass/radius/velocity edits start a paused new branch; names retain history.
 Trails are actual committed history, inertial or explicitly simultaneous
-body-relative history. They are cleared on branch/seek/direction/mode changes.
+body-relative history. They are cleared on branch/seek/direction/physical edits;
+presentation/reference switches preserve synchronized records. Automatic guide
+references are conservative derived relationships, with explicit pair overrides
+and honest unavailable/unbound diagnostics; they never change gravity or parenting.
+
+Minimize/occlusion/suspension excludes hidden demand. A drawable wall gap greater
+than the default 250 ms is rejected entirely, cancels debt/navigation progression,
+and pauses until Resume, with a visible diagnostic. The session threshold is
+explicitly adjustable. There is no hidden sleep catch-up or approximate time-warp
+mode. Rate samples report their actual wall window and tick-limited quantization.
 
 ## Quality checks
 
@@ -85,14 +116,17 @@ cargo bench --locked -p mundaris_simulation --bench gravity
 cargo bench --locked -p mundaris_simulation --bench fixed_steps
 cargo bench --locked -p mundaris_renderer --bench celestial_preparation
 cargo bench --locked -p mundaris_app --bench trail_history
+cargo bench --locked -p mundaris_app --bench celestial_navigation
+cargo bench --locked -p mundaris_app --bench orbit_guides
 ```
 
 Benchmarks are CPU-only, use Criterion, and stay outside normal CI. Large 512-step
 1024-body probes take several seconds per batch and extend Criterion's measurement
 time. Workloads, distributions and limitations are in [performance notes](docs/performance.md).
 Decisions are in [ADR 0002](docs/adr/0002-reference-frames-and-precision.md),
-[ADR 0003](docs/adr/0003-celestial-domain-and-time.md), and
-[ADR 0004](docs/adr/0004-gravity-integration-and-playback.md).
+[ADR 0003](docs/adr/0003-celestial-domain-and-time.md),
+[ADR 0004](docs/adr/0004-gravity-integration-and-playback.md), and
+[ADR 0005](docs/adr/0005-celestial-navigation-system-view-and-timewarp.md).
 
 ## Repository status
 
