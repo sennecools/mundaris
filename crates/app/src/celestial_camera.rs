@@ -420,11 +420,32 @@ impl CelestialCamera {
                 }
             };
             let direction = t.target.orientation().quaternion() * DVec3::Z;
+            let old_anchor = match t.source_role {
+                CameraAttachment::System => anchor,
+                CameraAttachment::Translating(id) | CameraAttachment::BodyFixed(id) => pair
+                    .evaluation()
+                    .convert_position(
+                        FramePosition::new(
+                            pair.projection().frames_for(id)?.translating,
+                            LocalPosition::origin(),
+                        ),
+                        target_frame,
+                    )?
+                    .local()
+                    .metres(),
+            };
+            let outgoing = if old_radius > 0.0 {
+                Direction3::try_new(start - old_anchor)?.unit()
+            } else {
+                direction
+            };
             let transit = separation
                 .max(4.0 * old_radius)
                 .max(4.0 * t.target_radius)
                 .max(t.target_distance);
-            let waypoint_a = start + direction * transit;
+            // Free-flight look can face away from the old body. Pull back along
+            // its actual outward radial direction, then transit outside the pair.
+            let waypoint_a = start + outgoing * transit;
             let waypoint_b = anchor + direction * (transit + t.target_distance);
             let smooth = |v: f64| v * v * (3.0 - 2.0 * v);
             let p = if separation < 0.01 * t.target_distance {
@@ -433,7 +454,18 @@ impl CelestialCamera {
             } else if u < 0.2 {
                 start.lerp(waypoint_a, smooth(u / 0.2))
             } else if u < 0.5 {
-                waypoint_a.lerp(waypoint_b, smooth((u - 0.2) / 0.3))
+                let center = old_anchor + (anchor - old_anchor) * 0.5;
+                let a = waypoint_a - center;
+                let b = waypoint_b - center;
+                let a_length = a.length();
+                let b_length = b.length();
+                let s = smooth((u - 0.2) / 0.3);
+                let rotation = DQuat::from_rotation_arc(
+                    Direction3::try_new(a)?.unit(),
+                    Direction3::try_new(b)?.unit(),
+                );
+                let radial = DQuat::IDENTITY.slerp(rotation, s) * (a / a_length);
+                center + radial * ((a_length.ln() * (1.0 - s) + b_length.ln() * s).exp())
             } else {
                 let s = smooth((u - 0.5) / 0.5);
                 let clearance = ((transit + t.target_distance - t.target_radius).ln() * (1.0 - s)
@@ -602,8 +634,8 @@ impl CelestialCamera {
         });
         self.flight_log_scale = Some(blended);
         self.flight_speed_m_s = (0.5 * blended.exp()).clamp(1.0, 1e12) * input.speed_multiplier;
-        let movement = if input.translation.length_squared() > 0.0 {
-            input.translation.normalize()
+        let movement = if input.translation != DVec3::ZERO {
+            Direction3::try_new(input.translation)?.unit()
         } else {
             DVec3::ZERO
         };
@@ -717,12 +749,25 @@ impl CelestialCamera {
         self.zoom_target_log = (distance - self.radius_m).ln();
         self.update_pose(self.pose.position().frame())
     }
-    /// Coordinate and instantaneous physical-velocity preservation, not attachment.
+    /// Instantaneous pose/physical-velocity preservation between the focused body's
+    /// translating/fixed debug roles. A new pivot uses Focus, not coordinate migration.
     pub fn reexpress(
         &mut self,
         pair: &CoherentCelestialView<'_>,
         attachment: CameraAttachment,
     ) -> Result<()> {
+        ensure!(
+            self.mode == CameraMode::BodyOrbit && !self.transitioning(),
+            "complete body focus before debug frame re-expression"
+        );
+        let target_body = match attachment {
+            CameraAttachment::Translating(id) | CameraAttachment::BodyFixed(id) => Some(id),
+            CameraAttachment::System => None,
+        };
+        ensure!(
+            target_body == self.focused_body(),
+            "debug frame re-expression must retain the focused BodyId; use Focus for a new pivot"
+        );
         let target = attachment.frame(pair.projection())?;
         let evaluation = pair.evaluation();
         let pose = evaluation.reexpress_pose(self.pose, target)?;
@@ -816,6 +861,16 @@ mod tests {
                 - velocity.relative().metres_per_second())
             .length()
                 < 1e-6
+        );
+        assert!(
+            camera
+                .reexpress(&pair, CameraAttachment::BodyFixed(ids[2]))
+                .is_err()
+        );
+        assert_eq!(camera.focused_body(), Some(ids[1]));
+        assert!(
+            (camera.pose().position().local().metres() - pose.position().local().metres()).length()
+                < 1e-7
         );
         camera.orbit_zoom([40.0, 30.0], 500.0).unwrap();
         assert!(camera.distance_m() >= 1.05 * 6.371e6);

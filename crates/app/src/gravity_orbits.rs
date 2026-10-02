@@ -683,6 +683,17 @@ impl GravityOrbitsDemo {
             .map(|m| m.achieved_rate);
         if self.coherent {
             let input = self.controls.navigation;
+            let envelope_adjustment = self.camera.mode() == CameraMode::BodyOrbit
+                && !self.camera.transitioning()
+                && self
+                    .camera
+                    .focused_body()
+                    .and_then(|id| self.system.body(id).ok())
+                    .is_some_and(|body| {
+                        let radius = body.properties().reference_radius_m();
+                        minimum_clearance(radius)
+                            .is_ok_and(|clearance| self.camera.distance_m() < radius + clearance)
+                    });
             if let Err(error) = self.camera.update_navigation(
                 &self
                     .projection
@@ -693,6 +704,8 @@ impl GravityOrbitsDemo {
             ) {
                 self.camera.cancel_transition();
                 self.diagnostic = Some(error.to_string());
+            } else if envelope_adjustment {
+                self.diagnostic=Some("Reference radius grew around the observer; only the observer was moved outward to the reference-sphere clearance envelope.".into());
             }
             self.controls.navigation.drag = [0.0; 2];
             self.controls.navigation.scroll_notches = 0.0;
@@ -856,9 +869,9 @@ impl GravityOrbitsDemo {
                 self.diagnostic = Some(error.to_string());
             }
         }
+        let started = Instant::now();
         self.prepare_visuals()?;
         let selected_index = self.selected_index();
-        let started = Instant::now();
         let pair = self.projection.coherent_view(&self.system)?;
         let view = PreparedView::new(
             &pair.evaluation(),
@@ -1323,7 +1336,10 @@ fn draw_engineering_ui(
         if let Some(error)=info.diagnostic {ui.colored_label(egui::Color32::LIGHT_RED,error);}
         ui.horizontal(|ui| {
             ui.add(egui::DragValue::new(&mut controls.gap_threshold_ms).range(1.0..=60000.0).suffix(" ms clock gap threshold"));
-            if ui.button("Apply session threshold").clicked() {controls.pending.push_back(Command::GapThreshold(Duration::from_secs_f64(controls.gap_threshold_ms/1000.0)));}
+            if ui.button("Apply session threshold").clicked() {
+                if controls.gap_threshold_ms.is_finite()&&(1.0..=60000.0).contains(&controls.gap_threshold_ms) {controls.pending.push_back(Command::GapThreshold(Duration::from_secs_f64(controls.gap_threshold_ms/1000.0)));}
+                else {ui.colored_label(egui::Color32::LIGHT_RED,"Clock threshold must be finite and within 1..60000 ms");}
+            }
         });
         });});
     });
@@ -1719,16 +1735,25 @@ mod tests {
     #[test]
     fn radius_edit_updates_only_geometry_and_camera_navigation_envelope() {
         let mut demo = GravityOrbitsDemo::new().unwrap();
-        demo.command(Command::Focus {
-            fixed: false,
-            fit: true,
-        })
-        .unwrap();
+        demo.camera
+            .focus(
+                &demo.projection.coherent_view(&demo.system).unwrap(),
+                demo.ids[1],
+                false,
+                true,
+            )
+            .unwrap();
         let state = *demo.system.body(demo.ids[1]).unwrap().state();
         demo.command(Command::Radius(6.371e8)).unwrap();
         demo.update(Duration::ZERO);
         assert_eq!(*demo.system.body(demo.ids[1]).unwrap().state(), state);
         assert!(demo.camera.distance_m() > 6.371e8);
+        assert!(
+            demo.diagnostic
+                .as_deref()
+                .unwrap()
+                .contains("only the observer")
+        );
         assert!(demo.projection.coherent_view(&demo.system).is_ok());
     }
     #[test]

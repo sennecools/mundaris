@@ -211,3 +211,42 @@ fn smooth_zoom_endpoint_independent_of_navigation_fps() {
         }
     }
 }
+
+#[test]
+fn refocus_from_free_flight_looking_away_avoids_old_body() {
+    let world = GravityFixture::Hierarchy
+        .create(NonZeroU64::new(1).unwrap())
+        .unwrap();
+    let frames = CelestialFrameProjection::build(&world, NonZeroU64::new(1).unwrap()).unwrap();
+    let pair = frames.coherent_view(&world).unwrap();
+    let ids: Vec<_> = world.bodies().map(|(id, _)| id).collect();
+    let mut camera = CelestialCamera::overview(&pair, DVec3::ZERO, 1.6e11).unwrap();
+    camera.focus(&pair, ids[1], false, true).unwrap();
+    camera.enter_free_flight(&pair).unwrap();
+    camera
+        .update_navigation(
+            &pair,
+            &NavigationInput {
+                drag: [std::f64::consts::PI / 0.005, 0.0],
+                ..Default::default()
+            },
+            Duration::ZERO,
+        )
+        .unwrap();
+    let before = camera.pose();
+    camera
+        .transition_to(&pair, FocusTarget::Body(ids[2]))
+        .unwrap();
+    assert_eq!(camera.pose(), before);
+    for _ in 0..60 {
+        camera
+            .update_navigation(
+                &pair,
+                &NavigationInput::default(),
+                Duration::from_millis(16),
+            )
+            .unwrap();
+    }
+    assert_eq!(camera.focused_body(), Some(ids[2]));
+    assert_eq!(camera.mode(), CameraMode::BodyOrbit);
+}
