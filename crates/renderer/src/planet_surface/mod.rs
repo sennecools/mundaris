@@ -6,6 +6,7 @@ mod cover;
 mod gpu;
 mod lod;
 mod prepare;
+mod terrain_geometry;
 mod topology;
 pub(crate) use bounds::projected_error as sphere_projected_error;
 pub use bounds::{PatchMetadata, SurfaceErrorContributions, SurfaceExtent};
@@ -18,4 +19,5 @@ pub use lod::{ActiveSurfacePatch, LodReport, LodSettings, SurfaceLodSession, Sur
 pub use prepare::SurfacePreparationProfile;
 pub(crate) use prepare::SurfaceStaging;
 pub use prepare::{SurfacePreparationReport, SurfaceStyle};
+pub use terrain_geometry::{GeneratedSurfacePatch, SurfaceGeometrySample};
 pub use topology::{GRID_CELLS, GRID_SAMPLES, SurfaceTopology};

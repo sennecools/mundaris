@@ -148,6 +148,56 @@ mod tests {
         );
         assert!(frame.staging.uniforms[24..].iter().all(|&b| b == 0));
     }
+    #[test]
+    fn generated_surface_missing_geometry_poisons_celestial_frame() {
+        use mundaris_math::surface::{CubeFace, CubePatchAddress};
+        use std::num::NonZeroU64;
+        let tree = FrameTree::new(NonZeroU64::new(1).unwrap());
+        let root = tree.root();
+        let view = PreparedView::new(
+            &tree.evaluate(),
+            FramePose::new(
+                FramePosition::new(root, LocalPosition::try_metres(DVec3::Z * 1000.0).unwrap()),
+                UnitRotation::identity(),
+            ),
+            crate::RenderPrecisionBudget::near_debug(),
+        )
+        .unwrap();
+        let topology = crate::planet_surface::SurfaceTopology::new();
+        let address = CubePatchAddress::root(CubeFace::PositiveZ);
+        let patch = crate::planet_surface::ActiveSurfacePatch {
+            address,
+            metadata: crate::planet_surface::PatchMetadata::build(address, &topology).unwrap(),
+            stitch_mask: 0,
+            error_pixels: 0.0,
+        };
+        let projection = CelestialProjection::try_new(1280, 800, 1.0, 0.1).unwrap();
+        let body = CelestialRenderBody {
+            body_fixed_frame: root,
+            reference_radius_m: 10.0,
+            color: [0.2, 0.5, 1.0, 1.0],
+            unlit: false,
+            selected: false,
+        };
+        let mut staging = CelestialStaging::default();
+        let sphere = Icosphere::new();
+        let mut frame = CelestialFrame::new(&view, &mut staging, projection, &sphere);
+        assert!(
+            frame
+                .append_generated_surface(
+                    body,
+                    &[patch],
+                    &[],
+                    &topology,
+                    crate::planet_surface::SurfaceStyle::default()
+                )
+                .is_err()
+        );
+        assert!(matches!(
+            frame.validate(),
+            Err(RenderPreparationError::FailedDebugFrame)
+        ));
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -459,6 +509,32 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
             self.staging
                 .surface
                 .append(self.view, self.projection, body, patches, topology, style)
+        });
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+    /// Appends borrowed, pre-generated body-fixed terrain through the same
+    /// source-centred precision and clipping path as smooth surface patches.
+    pub fn append_generated_surface(
+        &mut self,
+        body: CelestialRenderBody,
+        patches: &[crate::planet_surface::ActiveSurfacePatch],
+        geometry: &[&crate::planet_surface::GeneratedSurfacePatch],
+        topology: &crate::planet_surface::SurfaceTopology,
+        style: crate::planet_surface::SurfaceStyle,
+    ) -> Result<(), RenderPreparationError> {
+        let result = self.validate().and_then(|()| {
+            self.staging.surface.append_generated(
+                self.view,
+                self.projection,
+                body,
+                patches,
+                geometry,
+                topology,
+                style,
+            )
         });
         if result.is_err() {
             self.failed = true;

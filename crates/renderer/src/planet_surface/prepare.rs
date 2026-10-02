@@ -1,4 +1,5 @@
 //! CPU f64 evaluation, source subtraction, clipped precision proof and byte layouts.
+use super::GeneratedSurfacePatch;
 use super::{ActiveSurfacePatch, GRID_SAMPLES, SurfaceTopology};
 use crate::{CelestialProjection, PreparedView, RenderPreparationError};
 use glam::DVec3;
@@ -11,6 +12,8 @@ pub struct SurfaceStyle {
     pub lod_colors: bool,
     pub face_colors: bool,
     pub underside: bool,
+    /// Derived sample elevation diagnostic, never a shader terrain query.
+    pub elevation_colors: bool,
 }
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SurfacePreparationReport {
@@ -173,6 +176,41 @@ impl SurfaceStaging {
         topology: &SurfaceTopology,
         style: SurfaceStyle,
     ) -> Result<(), RenderPreparationError> {
+        self.append_inner(view, projection, body, patches, topology, style, None)
+    }
+    // Preserve the established append boundary; only borrowed geometry is added.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_generated(
+        &mut self,
+        view: &PreparedView<'_>,
+        projection: CelestialProjection,
+        body: crate::CelestialRenderBody,
+        patches: &[ActiveSurfacePatch],
+        geometry: &[&GeneratedSurfacePatch],
+        topology: &SurfaceTopology,
+        style: SurfaceStyle,
+    ) -> Result<(), RenderPreparationError> {
+        self.append_inner(
+            view,
+            projection,
+            body,
+            patches,
+            topology,
+            style,
+            Some(geometry),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn append_inner(
+        &mut self,
+        view: &PreparedView<'_>,
+        projection: CelestialProjection,
+        body: crate::CelestialRenderBody,
+        patches: &[ActiveSurfacePatch],
+        topology: &SurfaceTopology,
+        style: SurfaceStyle,
+        geometry: Option<&[&GeneratedSurfacePatch]>,
+    ) -> Result<(), RenderPreparationError> {
         #[cfg(feature = "surface-profile")]
         let total_start = std::time::Instant::now();
         #[cfg(feature = "surface-profile")]
@@ -246,6 +284,32 @@ impl SurfaceStaging {
         {
             return Err(RenderPreparationError::InvalidBudget);
         }
+        if let Some(geometry) = geometry
+            && (geometry.len() != patches.len()
+                || geometry
+                    .iter()
+                    .zip(patches)
+                    .any(|(g, p)| g.address() != p.address)
+                || geometry.first().is_some_and(|first| {
+                    geometry
+                        .iter()
+                        .any(|g| g.address().level() != first.address().level())
+                })
+                || geometry.iter().enumerate().any(|(i, g)| {
+                    geometry[..i]
+                        .iter()
+                        .any(|prior| prior.address() == g.address())
+                })
+                || geometry.iter().any(|g| g.reference_radius_m() != radius)
+                || geometry.first().is_some_and(|first| {
+                    geometry
+                        .iter()
+                        .any(|g| g.footprint_m() != first.footprint_m())
+                })
+                || patches.iter().any(|patch| patch.stitch_mask != 0))
+        {
+            return Err(RenderPreparationError::InvalidDebugGeometry);
+        }
         // Complete preflight includes pessimistic clipped polygons (up to 8 vertices,
         // 6 triangles per input). Do not grow power-of-two past the aggregate cap.
         let outgoing = self.samples.len() + self.instances.len() + self.fallback.len();
@@ -269,6 +333,7 @@ impl SurfaceStaging {
         let mut normals = [DVec3::ZERO; GRID_SAMPLES];
         let mut gpu_positions = [[0.0; 3]; GRID_SAMPLES];
         let mut gpu_normals = [[0.0; 3]; GRID_SAMPLES];
+        let mut elevations = [0.0f32; GRID_SAMPLES];
         // Instance buckets are appended as a complete batch. Rebucket aggregate
         // instances after appending; sample bases are unaffected by their order.
         self.records.clear();
@@ -286,7 +351,7 @@ impl SurfaceStaging {
         {
             self.report.profile.setup += stage_start.elapsed();
         }
-        for patch in patches {
+        for (patch_index, patch) in patches.iter().enumerate() {
             #[cfg(feature = "surface-profile")]
             let sample_start = std::time::Instant::now();
             if patch.stitch_mask > 15 {
@@ -299,14 +364,37 @@ impl SurfaceStaging {
                     .address
                     .sample_key(i, j, 16)
                     .map_err(|_| RenderPreparationError::InvalidDebugGeometry)?;
-                let direction = key.direction();
-                positions[index] = prepared
-                    .view_displacement(FramePosition::new(
-                        source,
-                        LocalPosition::try_metres(direction.unit() * radius)?,
-                    ))?
-                    .metres();
-                normals[index] = prepared.view_direction(direction)?.unit();
+                if let Some(geometry) = geometry {
+                    let sample = geometry[patch_index].samples()[index];
+                    if style.elevation_colors {
+                        let extent = geometry[patch_index].extent();
+                        let envelope = extent.min_height_m.abs().max(extent.max_height_m.abs());
+                        elevations[index] = if envelope == 0.0 {
+                            0.0
+                        } else {
+                            ((sample.position_body_m.length() - radius) / envelope).clamp(-1.0, 1.0)
+                                as f32
+                        };
+                    }
+                    positions[index] = prepared
+                        .view_displacement(FramePosition::new(
+                            source,
+                            LocalPosition::try_metres(sample.position_body_m)?,
+                        ))?
+                        .metres();
+                    normals[index] = prepared
+                        .view_direction(mundaris_math::Direction3::try_new(sample.normal_body)?)?
+                        .unit();
+                } else {
+                    let direction = key.direction();
+                    positions[index] = prepared
+                        .view_displacement(FramePosition::new(
+                            source,
+                            LocalPosition::try_metres(direction.unit() * radius)?,
+                        ))?
+                        .metres();
+                    normals[index] = prepared.view_direction(direction)?.unit();
+                }
                 let packed = (
                     positions[index].as_vec3().to_array(),
                     normals[index].as_vec3().to_array(),
@@ -523,12 +611,29 @@ impl SurfaceStaging {
                             pack_floats(
                                 &mut self.fallback,
                                 gpu.into_iter()
-                                    .chain([normal[0], normal[1], normal[2], 0.0])
+                                    .chain([
+                                        normal[0],
+                                        normal[1],
+                                        normal[2],
+                                        triangle
+                                            .iter()
+                                            .zip(v.weights.to_array())
+                                            .map(|(&j, t)| {
+                                                f64::from(elevations[usize::from(j)]) * t
+                                            })
+                                            .sum::<f64>()
+                                            as f32,
+                                    ])
                                     .chain(patch_color)
                                     .chain([
                                         uv[0] as f32,
                                         uv[1] as f32,
-                                        f32::from(style.borders),
+                                        (u32::from(style.borders)
+                                            | if style.elevation_colors && geometry.is_some() {
+                                                2
+                                            } else {
+                                                0
+                                            }) as f32,
                                         0.0,
                                     ]),
                             );
@@ -538,11 +643,13 @@ impl SurfaceStaging {
                 }
             } else {
                 let base = (self.samples.len() / 32) as u32;
-                for (p, n) in gpu_positions.into_iter().zip(gpu_normals) {
+                for ((p, n), elevation) in
+                    gpu_positions.into_iter().zip(gpu_normals).zip(elevations)
+                {
                     // One bounded append per sample, rather than eight independent
                     // vector length/capacity checks. The byte contract is unchanged.
                     let mut sample = [0; 32];
-                    for (value, out) in [p[0], p[1], p[2], 1.0, n[0], n[1], n[2], 0.0]
+                    for (value, out) in [p[0], p[1], p[2], 1.0, n[0], n[1], n[2], elevation]
                         .into_iter()
                         .zip(sample.as_chunks_mut::<4>().0)
                     {
@@ -555,7 +662,12 @@ impl SurfaceStaging {
                     base,
                     u32::from(patch.address.level()),
                     patch.address.face() as u32,
-                    u32::from(style.borders),
+                    u32::from(style.borders)
+                        | if style.elevation_colors && geometry.is_some() {
+                            2
+                        } else {
+                            0
+                        },
                 ]
                 .into_iter()
                 .zip(record[..16].as_chunks_mut::<4>().0)
@@ -882,6 +994,163 @@ mod tests {
             storage.report.uploaded_bytes,
             storage.report.allocated_staging_bytes,
             storage.report.boundary_bytes
+        );
+    }
+    #[test]
+    fn generated_flat_matches_sphere_and_displacement_changes_packed_samples() {
+        let tree = FrameTree::new(NonZeroU64::new(1).unwrap());
+        let root = tree.root();
+        let view = PreparedView::new(
+            &tree.evaluate(),
+            FramePose::new(
+                FramePosition::new(root, LocalPosition::try_metres(DVec3::Z * 1000.0).unwrap()),
+                UnitRotation::identity(),
+            ),
+            crate::RenderPrecisionBudget::near_debug(),
+        )
+        .unwrap();
+        let projection = CelestialProjection::try_new(1280, 800, 1.0, 0.1).unwrap();
+        let topology = SurfaceTopology::new();
+        let patch = patch(CubeFace::PositiveZ, &topology);
+        let address = patch.address;
+        let samples: Vec<_> = (0..GRID_SAMPLES)
+            .map(|index| {
+                let direction = address
+                    .sample_direction(index as u32 % 17, index as u32 / 17, 16)
+                    .unwrap()
+                    .unit();
+                super::super::SurfaceGeometrySample {
+                    position_body_m: direction * 10.0,
+                    normal_body: direction,
+                }
+            })
+            .collect();
+        let extent = super::super::SurfaceExtent::smooth(10.0);
+        let geometry = super::super::GeneratedSurfacePatch::new(
+            address,
+            10.0,
+            0.0,
+            samples.clone(),
+            extent,
+            Default::default(),
+        )
+        .unwrap();
+        let body = crate::CelestialRenderBody {
+            body_fixed_frame: root,
+            reference_radius_m: 10.0,
+            color: [0.2, 0.5, 1.0, 1.0],
+            unlit: false,
+            selected: false,
+        };
+        let mut sphere = SurfaceStaging::default();
+        sphere
+            .append(
+                &view,
+                projection,
+                body,
+                &[patch],
+                &topology,
+                SurfaceStyle::default(),
+            )
+            .unwrap();
+        let mut generated = SurfaceStaging::default();
+        generated
+            .append_generated(
+                &view,
+                projection,
+                body,
+                &[patch],
+                &[&geometry],
+                &topology,
+                SurfaceStyle::default(),
+            )
+            .unwrap();
+        assert_eq!(generated.samples, sphere.samples);
+        let mut mismatched_body = body;
+        mismatched_body.reference_radius_m = 10.0001;
+        assert!(
+            SurfaceStaging::default()
+                .append_generated(
+                    &view,
+                    projection,
+                    mismatched_body,
+                    &[patch],
+                    &[&geometry],
+                    &topology,
+                    SurfaceStyle::default(),
+                )
+                .is_err()
+        );
+        let raised: Vec<_> = samples
+            .into_iter()
+            .map(|mut sample| {
+                sample.position_body_m *= 1.05;
+                sample.normal_body = (sample.normal_body + DVec3::X * 0.1).normalize();
+                sample
+            })
+            .collect();
+        let raised_geometry = super::super::GeneratedSurfacePatch::new(
+            address,
+            10.0,
+            0.0,
+            raised,
+            super::super::SurfaceExtent {
+                min_height_m: -1.0,
+                max_height_m: 1.0,
+                guaranteed_opaque_radius_m: 0.0,
+            },
+            Default::default(),
+        )
+        .unwrap();
+        let mut displaced = SurfaceStaging::default();
+        displaced
+            .append_generated(
+                &view,
+                projection,
+                body,
+                &[patch],
+                &[&raised_geometry],
+                &topology,
+                SurfaceStyle::default(),
+            )
+            .unwrap();
+        assert_ne!(displaced.samples, sphere.samples);
+        assert_ne!(&displaced.samples[0..12], &sphere.samples[0..12]);
+        assert_ne!(&displaced.samples[16..28], &sphere.samples[16..28]);
+        let mut diagnostic = SurfaceStaging::default();
+        diagnostic
+            .append_generated(
+                &view,
+                projection,
+                body,
+                &[patch],
+                &[&raised_geometry],
+                &topology,
+                SurfaceStyle {
+                    elevation_colors: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(&diagnostic.samples[..28], &displaced.samples[..28]);
+        assert_eq!(
+            f32::from_le_bytes(diagnostic.samples[28..32].try_into().unwrap()),
+            0.5
+        );
+        let mut stitched = patch;
+        stitched.stitch_mask = 1;
+        assert!(
+            SurfaceStaging::default()
+                .append_generated(
+                    &view,
+                    projection,
+                    body,
+                    &[stitched],
+                    &[&geometry],
+                    &topology,
+                    SurfaceStyle::default(),
+                )
+                .is_err()
         );
     }
     #[test]
