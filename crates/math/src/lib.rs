@@ -9,6 +9,7 @@
 
 mod coordinates;
 mod frames;
+pub mod surface;
 mod time;
 mod transform;
 
