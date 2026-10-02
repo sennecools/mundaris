@@ -1,5 +1,176 @@
 # Phase 5 implementation and validation evidence
 
+## Phase 5.6 terrain lighting / depth checkpoint — 2026-10-03
+
+**Renderer implementation and directed GPU evidence exist. Broader mountain and
+Phase 5.5 morphology acceptance remain open.** Lighting does not repair the live
+preview's missing fine geometry, adaptive terrain selection or LOD transitions.
+The [implementation note](../MUNDARIS_PHASE_5_6_TERRAIN_LIGHTING.md) describes the
+narrow path; [capture index](evidence/phase56/README.md) links exact-camera evidence.
+
+### Model, spaces and colour
+
+For generated terrain only:
+
+```text
+N = interpolated analytic body-fixed normal / its length
+L = normalized body-fixed surface -> sun direction
+d = max(dot(N, L), 0)
+linear_rgb = srgb_decode(elevation_or_base_rgb) * (0.06 + 0.94 * d)
+```
+
+The fragment normal is renormalized with a squared-length floor of `1e-20`, so
+an accidental degenerate interpolation remains finite instead of producing NaNs.
+There is no normal exaggeration, screen-space gradient, patch-UV lighting, specular,
+occlusion, AO or terrain shadow evaluation. Ambient is a simple material-modulated
+constant, not an atmospheric model. Strengths are finite, individually in [0,1],
+with sum at most one. The default sun is `normalize(0.8, 0.3, 0.25)`, independent
+of camera orientation/translation. A body-fixed sun intentionally co-rotates with
+the body; it is not a physical moving star or an inertially fixed solar ephemeris.
+The same direction applies in each submitted terrain body's own fixed axes.
+
+`GeneratedSurfacePatch` already holds validated unit/outward radial-graph normals.
+Terrain staging now retains their **body-fixed** axes, while positions retain the
+existing source-centred f64 subtraction/rotation and checked f32 narrowing. Smooth
+Phase 4 surfaces keep view-space radial normals and their historical debug shading.
+Clipped terrain triangles barycentrically interpolate the same body-fixed analytic
+normals; both vertex routes use the same fragment lighting. No sign negation or
+new coordinate-position architecture was needed. Body-space normal debug colour
+`0.5*N+0.5` remains stable with camera motion.
+
+The existing presentation pipeline prefers a non-sRGB target and has no linear
+intermediate/tone mapper. Terrain's existing debug palette is treated as display-
+authored sRGB: decode before multiplication and explicitly encode for non-sRGB
+targets; sRGB targets instead perform hardware output encoding. Elevation-only
+preserves the palette without lighting. Normal colours use the conventional visible
+remap; diffuse shows linear `d` as grayscale through the same output transfer.
+Other debug geometry/UI retains its existing colour handling; this is not a
+renderer-wide colour-management or final-material implementation.
+
+### Controls, staging and cache
+
+- App-owned controls: Elevation, Lit (default), Normals, Diffuse; enable/disable;
+  editable body-fixed sun components; ambient/diffuse sliders and deterministic
+  Overhead/Side/Grazing/Terminator/Night presets. Preset names refer to the **+Z**
+  inspection direction, not the current camera. Elevation colours remain optional.
+- Environment: `MUNDARIS_PHASE5_TERRAIN=1`,
+  `MUNDARIS_TERRAIN_MODE=elevation|lit|normals|diffuse`,
+  `MUNDARIS_TERRAIN_SUN=overhead|side|grazing|terminator|night`.
+- One renderer-owned **32-byte frame uniform**, shared by regular/clipped shading;
+  one generated-terrain flag distinguishes body-space from legacy normals.
+  Modes/sun changes do not create or switch shader pipelines. The existing four
+  regular/clipped × backface/underside variants remain.
+- CPU payload unchanged: **289 × 48 = 13,872 bytes/patch**, f64 positions + normals.
+  GPU payload unchanged: samples32 × 289 + instance64 = **9,312 bytes/patch**;
+  clipped vertices remain 64 bytes. No new vertex attribute or duplicated normal.
+  Uniform cost is 32 bytes per renderer frame, not per patch.
+- The cache identity still consists of terrain truth/body/revision/radius/address/
+  deterministic footprint. Lighting has no world/cache dependency. A regression
+  changes sun, strengths and all modes, permits generation work, and verifies zero
+  generated vertices/completed patches, unchanged sample values and allocation
+  pointers; actual frame preparation is exercised too.
+- Existing orientation assertions are unchanged. Additional regular/clipped staging
+  regressions verify body-space normal bytes, camera-motion invariance, finite
+  interpolated normals and the terrain discriminator. Topology winding is unchanged.
+
+### Directed depth / Phase 5.5 inspection
+
+The 52 production-GPU images use seed17/V2, R=6,371,000 m, 768×512, 60° FOV,
+and identical geometry/camera/sun for every scene's four modes. This is actual
+indexed displaced geometry using `CelestialRenderer`, not the previous 20× CPU
+normal-lighting images. Camera/sun/footprint/counts are retained in
+`evidence/phase56/manifest.txt`.
+
+All ten requested categories are represented: range, oblique slope, valley, ridge,
+Phase 5.5 gully region, near terminator, overhead, grazing, uniform4 and night;
+additional face-boundary/corner/pole views are included. Full-planet views use the
+real complete level4 ready cover, **1,536 submitted patches / 443,904 samples /
+one draw**, footprint49,773.4375 m. Local same-level diagnostic windows use levels
+10/12/14 with footprints777.70996/194.42749/48.60687 m respectively. They generate
+through the real cache/filter and contain no mixed-level boundary or morph. These
+windows are **not a newly enabled live adaptive cover** and do not lift the live cap.
+
+Compared with elevation-only, lit planetary views show a clear day/night division,
+with nonzero ambient on the opposite hemisphere. Fine local shading is modest and
+dark at true scale; diffuse-only exposes coherent elongated relief/incisions much
+more clearly than the nearly uniform elevation ramp. This improves inspection but
+does **not** establish strongly readable mountain/ridge/valley form in the level4
+live preview. The represented local field is also shallow: dim true-scale lit crops
+must not be described as dramatic, accepted mountain morphology. Overhead light is
+less diagnostic than grazing light. Ridge/valley labels designate deterministic
+local broad-height extrema, not certified geomorphological features.
+
+No obvious chart-boundary normal discontinuity is visible in the directed debug
+views, and canonical seam/normal tests pass; broad temporal/seed/axis acceptance is
+not inferred from these limited images. Gullies are more inspectable where the mesh
+actually represents their scale, but convincing dendritic branching and broader
+peak/valley acceptance remain unproven. In the **live level4 preview**, erosion is
+absent because its physical mesh footprint filters it out, not because sun changes
+terrain generation. Diagnostic crops still filter the finest bands/octaves, and
+their appearance alone does not separate all remaining morphology/algorithm debt.
+
+Four additional native Vulkan captures exercise the connected app and its controls.
+Their host-timed approach clearances differ (9,986.07 / 9,775.78 / 9,509.72 /
+9,418.75 km for elevation/lit/normals/diffuse respectively); they are operational
+evidence, **not** the exact-camera A/B. The offscreen image pairs supply that A/B.
+
+### Matched renderer impact
+
+Windows x86-64, Ryzen 7 9800X3D, Radeon RX 9070 XT, optimized build. Measurements ran
+sequentially without concurrent benchmarks/native windows. Criterion: 20 samples,
+100 ms warmup, requested 0.5/1 s measurement; medians and 95% median intervals below
+come from `new/estimates.json`, not console slope estimates.
+
+At 1,280×800, 60° FOV, +Z clearance10,000 km, seed17/V2, identical uniform4 cover:
+
+| CPU workload | Elevation median ms (95%) | Lit median ms (95%) |
+| --- | ---: | ---: |
+| Renderer preparation | 23.7838 (23.5287–23.8494) | 23.5794 (23.5074–23.6997) |
+| App selection + readiness + lookup + preparation | 26.3063 (26.1813–26.4465) | 26.4940 (26.4288–26.5456) |
+
+Both paths submit 1,536 patches / 443,904 samples / one draw / 14,303,232 geometry
+bytes, use the same pipelines and generate zero steady-state samples. The final
+benchmark reports 144,384 cache hits, zero misses/evictions and 1,542 resident entries
+(including roots), 23,525,668 accounted bytes. No material CPU lighting overhead
+or speedup is established; small differences and overlapping intervals must not
+be interpreted as GPU cost. CPU preparation remains expensive; Phase4 performance
+debt is not solved by this checkpoint.
+
+The 768×512 actual GPU capture additionally measures host preparation/upload/encode
+for the same uniform4 scene (four warm frames then 20 samples per mode):
+
+| Host wall median ms | Elevation | Lit |
+| --- | ---: | ---: |
+| Preparation | 23.4457 | 23.4810 |
+| Upload + command encoding | 0.5765 | 0.5698 |
+| Paired preparation + encoding | 24.0391 | 24.0441 |
+
+This is terrain-only host frame work; it excludes submission, GPU completion,
+readback, UI/physics and readiness. It is not a complete native-frame/FPS benchmark.
+**GPU timestamps are unavailable in the current tooling; GPU frame cost was not
+measured.** Readback/presentation wall time is not substituted for GPU timing.
+Evidence summaries are retained in `evidence/phase56/performance.json` and the
+capture manifest. Criterion distributions remain under ignored `target/criterion`.
+
+### Validation and remaining scope
+
+Passed Windows checks: formatting, locked all-target/all-feature workspace check,
+workspace all-feature tests, final warnings-denied Clippy, warnings-denied Rustdoc,
+38 focused release Phase5/5.5/lighting tests, renderer tests, both ignored orbital
+long runs, the capture example, benchmark and native launch/capture/clean shutdown.
+The first Clippy pass found three new constant-chunk iterator lint issues; these
+were corrected, with no assertion weakened. Commands and final revision scope are
+listed in the implementation note. Linux and remote CI were not run.
+
+No self-shadowing, shadow maps, horizon tracing, AO, atmosphere, specular, textures,
+water or materials were added. Smooth/far representations retain legacy debug
+shading. Uniform live replacements can still pop; terrain-aware adaptive selection,
+mixed-LOD displaced stitching and common-refinement morphing remain unimplemented.
+Terrain navigation/picking remain reference-sphere approximations. Next geometry
+work remains adaptive terrain selection → displaced stitching → common refinement;
+none was started here. No new commit or push was requested/performed; unrelated
+design/workflow changes are preserved.
+
 ## Phase 5.5 gradient-directed erosion checkpoint — 2026-10-02
 
 **Implementation exists; full Phase 5.5 visual acceptance is not established.**

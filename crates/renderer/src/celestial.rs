@@ -318,6 +318,17 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
         self.range_m = range_m;
         Ok(())
     }
+
+    /// Sets renderer-only terrain shading for this frame. Directions and terrain
+    /// normals use body-fixed axes; this does not change reusable geometry.
+    pub fn set_terrain_lighting(&mut self, lighting: crate::planet_surface::TerrainLighting) {
+        self.staging.surface.lighting = lighting;
+    }
+
+    /// Content projection used for this frame, including viewport and origin.
+    pub fn projection(&self) -> CelestialProjection {
+        self.projection
+    }
     pub fn report(&self) -> CelestialPreparationReport {
         CelestialPreparationReport {
             surface: self.staging.surface.report,

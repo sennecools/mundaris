@@ -50,6 +50,7 @@ pub struct SurfacePreparationProfile {
 }
 #[derive(Default)]
 pub(crate) struct SurfaceStaging {
+    pub lighting: super::TerrainLighting,
     pub samples: Vec<u8>,
     pub instances: Vec<u8>,
     pub fallback: Vec<u8>,
@@ -166,6 +167,7 @@ impl SurfaceStaging {
         self.buckets = std::array::from_fn(|_| 0..0);
         self.report = SurfacePreparationReport::default();
         self.underside = false;
+        self.lighting = super::TerrainLighting::default();
     }
     pub fn append(
         &mut self,
@@ -382,9 +384,9 @@ impl SurfaceStaging {
                             LocalPosition::try_metres(sample.position_body_m)?,
                         ))?
                         .metres();
-                    normals[index] = prepared
-                        .view_direction(mundaris_math::Direction3::try_new(sample.normal_body)?)?
-                        .unit();
+                    // Terrain shading and normal diagnostics use body-fixed axes.
+                    // Position conversion remains source-centred and camera-relative.
+                    normals[index] = sample.normal_body;
                 } else {
                     let direction = key.direction();
                     positions[index] = prepared
@@ -633,7 +635,9 @@ impl SurfaceStaging {
                                                 2
                                             } else {
                                                 0
-                                            }) as f32,
+                                            }
+                                            | if geometry.is_some() { 4 } else { 0 })
+                                            as f32,
                                         0.0,
                                     ]),
                             );
@@ -667,7 +671,8 @@ impl SurfaceStaging {
                             2
                         } else {
                             0
-                        },
+                        }
+                        | if geometry.is_some() { 4 } else { 0 },
                 ]
                 .into_iter()
                 .zip(record[..16].as_chunks_mut::<4>().0)
@@ -1066,6 +1071,52 @@ mod tests {
             )
             .unwrap();
         assert_eq!(generated.samples, sphere.samples);
+        assert_eq!(
+            u32::from_le_bytes(generated.instances[12..16].try_into().unwrap()),
+            4
+        );
+        // Moving/rotating the observer changes positions, not body-fixed terrain
+        // normals or their interpretation in the normal diagnostic.
+        for rotation in [
+            glam::DQuat::from_rotation_z(0.7),
+            glam::DQuat::from_rotation_x(0.1),
+        ] {
+            let rotated_view = PreparedView::new(
+                &tree.evaluate(),
+                FramePose::new(
+                    FramePosition::new(
+                        root,
+                        LocalPosition::try_metres(DVec3::new(5.0, 0.0, 1000.0)).unwrap(),
+                    ),
+                    UnitRotation::try_from_quaternion(rotation).unwrap(),
+                ),
+                crate::RenderPrecisionBudget::near_debug(),
+            )
+            .unwrap();
+            let mut rotated = SurfaceStaging::default();
+            rotated
+                .append_generated(
+                    &rotated_view,
+                    projection,
+                    body,
+                    &[patch],
+                    &[&geometry],
+                    &topology,
+                    SurfaceStyle::default(),
+                )
+                .unwrap();
+            assert_eq!(rotated.samples.len(), generated.samples.len());
+            for (a, b) in rotated
+                .samples
+                .as_chunks::<32>()
+                .0
+                .iter()
+                .zip(generated.samples.as_chunks::<32>().0)
+            {
+                assert_eq!(&a[16..28], &b[16..28]);
+            }
+            assert_ne!(&rotated.samples[..12], &generated.samples[..12]);
+        }
         let mut mismatched_body = body;
         mismatched_body.reference_radius_m = 10.0001;
         assert!(
@@ -1210,6 +1261,49 @@ mod tests {
         );
         assert!(storage.report.max_projected_error_pixels <= 0.05);
         assert!(storage.report.allocated_staging_bytes < 64 * 1024 * 1024);
+        let geometry = super::super::GeneratedSurfacePatch::new(
+            address,
+            radius,
+            0.0,
+            (0..GRID_SAMPLES)
+                .map(|i| {
+                    let n = address
+                        .sample_direction(i as u32 % 17, i as u32 / 17, 16)
+                        .unwrap()
+                        .unit();
+                    super::super::SurfaceGeometrySample {
+                        position_body_m: n * radius,
+                        normal_body: n,
+                    }
+                })
+                .collect(),
+            super::super::SurfaceExtent::smooth(radius),
+            Default::default(),
+        )
+        .unwrap();
+        let mut terrain = SurfaceStaging::default();
+        terrain
+            .append_generated(
+                &view,
+                projection,
+                body,
+                &[patch(CubeFace::PositiveZ, &topology)],
+                &[&geometry],
+                &topology,
+                SurfaceStyle::default(),
+            )
+            .unwrap();
+        assert!(terrain.report.fallback_triangles > 0);
+        for vertex in terrain.fallback.as_chunks::<64>().0 {
+            let n = DVec3::new(
+                f32::from_le_bytes(vertex[16..20].try_into().unwrap()) as f64,
+                f32::from_le_bytes(vertex[20..24].try_into().unwrap()) as f64,
+                f32::from_le_bytes(vertex[24..28].try_into().unwrap()) as f64,
+            );
+            assert!(n.is_finite() && n.length() > 0.5);
+            assert!(n.z > 0.5, "clipped terrain normals must stay in body axes");
+            assert_eq!(f32::from_le_bytes(vertex[56..60].try_into().unwrap()), 4.0);
+        }
         let mut bad = patch(CubeFace::PositiveZ, &topology);
         bad.stitch_mask = 16;
         assert!(

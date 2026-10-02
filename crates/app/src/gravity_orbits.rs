@@ -55,6 +55,7 @@ enum Command {
 }
 struct Controls {
     terrain_preview: bool,
+    terrain_lighting: TerrainLighting,
     surface_bounds: bool,
     surface_style: SurfaceStyle,
     approach: Option<(f64, f64, Duration)>,
@@ -88,6 +89,7 @@ impl Controls {
     fn new(body: &CelestialBody) -> Self {
         Self {
             terrain_preview: false,
+            terrain_lighting: terrain_lighting_from_environment(),
             surface_bounds: false,
             surface_style: SurfaceStyle::default(),
             approach: None,
@@ -201,6 +203,45 @@ struct SurfaceValidationRoute {
     next: usize,
     physical_target: u64,
 }
+
+fn terrain_lighting_from_environment() -> TerrainLighting {
+    terrain_lighting_configuration(
+        std::env::var("MUNDARIS_TERRAIN_MODE").ok().as_deref(),
+        std::env::var("MUNDARIS_TERRAIN_SUN").ok().as_deref(),
+    )
+}
+
+fn terrain_lighting_configuration(mode: Option<&str>, sun: Option<&str>) -> TerrainLighting {
+    let mut lighting = TerrainLighting::default();
+    let preset = match sun {
+        Some("overhead") => Some(TerrainSunPreset::Overhead),
+        Some("side") => Some(TerrainSunPreset::Side),
+        Some("grazing") => Some(TerrainSunPreset::Grazing),
+        Some("terminator") => Some(TerrainSunPreset::Terminator),
+        Some("night") => Some(TerrainSunPreset::Night),
+        _ => None,
+    };
+    let sun = preset.map_or_else(
+        || lighting.sun_direction_body(),
+        |preset| preset.direction_body(),
+    );
+    let mode = match mode {
+        Some("elevation") => TerrainRenderMode::Elevation,
+        Some("lit") => TerrainRenderMode::Lit,
+        Some("normals") => TerrainRenderMode::Normals,
+        Some("diffuse") => TerrainRenderMode::Diffuse,
+        _ => lighting.mode(),
+    };
+    lighting = TerrainLighting::try_new(
+        sun,
+        lighting.ambient_strength(),
+        lighting.diffuse_strength(),
+        mode,
+    )
+    .unwrap_or_default();
+    lighting
+}
+
 impl GravityOrbitsDemo {
     pub fn new() -> Result<Self> {
         let mut demo = Self::create(GravityFixture::Hierarchy, 1, 1)?;
@@ -1253,6 +1294,7 @@ impl GravityOrbitsDemo {
             }
         }
         let mut frame = CelestialFrame::new(&view, &mut self.staging, projection, &self.sphere);
+        frame.set_terrain_lighting(self.controls.terrain_lighting);
         let prepared = (|| -> Result<()> {
             for session in &self.surfaces {
                 let index = self
@@ -1891,6 +1933,44 @@ fn draw_ui(
             if ui.checkbox(&mut preview,"Terrain checkpoint preview (uniform cover, popping)").changed() {controls.pending.push_back(Command::TerrainPreview(preview));}
             if controls.terrain_preview {
                 ui.checkbox(&mut controls.surface_style.elevation_colors,"Derived terrain elevation colours");
+                let mut enabled = controls.terrain_lighting.mode() == TerrainRenderMode::Lit;
+                if ui.checkbox(&mut enabled, "Terrain lighting enabled").changed() {
+                    controls.terrain_lighting = controls.terrain_lighting.with_mode(if enabled { TerrainRenderMode::Lit } else { TerrainRenderMode::Elevation });
+                }
+                egui::ComboBox::from_label("Terrain shading mode").selected_text(format!("{:?}", controls.terrain_lighting.mode())).show_ui(ui, |ui| {
+                    for mode in [TerrainRenderMode::Elevation, TerrainRenderMode::Lit, TerrainRenderMode::Normals, TerrainRenderMode::Diffuse] {
+                        if ui.selectable_label(controls.terrain_lighting.mode() == mode, format!("{mode:?}")).clicked() {
+                            controls.terrain_lighting = controls.terrain_lighting.with_mode(mode);
+                        }
+                    }
+                });
+                egui::ComboBox::from_label("Body-fixed sun preset").selected_text("Choose preset").show_ui(ui, |ui| {
+                    for (label, preset) in [("Overhead", TerrainSunPreset::Overhead), ("Side", TerrainSunPreset::Side), ("Grazing", TerrainSunPreset::Grazing), ("Terminator", TerrainSunPreset::Terminator), ("Night", TerrainSunPreset::Night)] {
+                        if ui.button(label).clicked() {
+                            let old = controls.terrain_lighting;
+                            if let Ok(value) = TerrainLighting::try_new(preset.direction_body(), old.ambient_strength(), old.diffuse_strength(), old.mode()) { controls.terrain_lighting = value; }
+                        }
+                    }
+                });
+                let mut sun = controls.terrain_lighting.sun_direction_body();
+                let mut sun_changed = false;
+                ui.horizontal(|ui| {
+                    for (label, component) in [("Sun X", &mut sun.x), ("Y", &mut sun.y), ("Z", &mut sun.z)] {
+                        sun_changed |= ui.add(egui::DragValue::new(component).speed(0.01).prefix(label)).changed();
+                    }
+                });
+                let lighting = controls.terrain_lighting;
+                if sun_changed && let Ok(value) = TerrainLighting::try_new(sun, lighting.ambient_strength(), lighting.diffuse_strength(), lighting.mode()) { controls.terrain_lighting = value; }
+                let mut ambient = controls.terrain_lighting.ambient_strength();
+                if ui.add(egui::Slider::new(&mut ambient, 0.0..=1.0).text("Ambient")).changed() {
+                    let value = controls.terrain_lighting;
+                    if let Ok(updated) = TerrainLighting::try_new(value.sun_direction_body(), ambient, value.diffuse_strength().min(1.0 - ambient), value.mode()) { controls.terrain_lighting = updated; }
+                }
+                let mut diffuse = controls.terrain_lighting.diffuse_strength();
+                if ui.add(egui::Slider::new(&mut diffuse, 0.0..=1.0).text("Diffuse")).changed() {
+                    let value = controls.terrain_lighting;
+                    if let Ok(updated) = TerrainLighting::try_new(value.sun_direction_body(), value.ambient_strength().min(1.0 - diffuse), diffuse, value.mode()) { controls.terrain_lighting = updated; }
+                }
                 let c=info.terrain_cache;let w=info.terrain_work;
                 ui.monospace(format!("Terrain: {} resident, {} pending; {} vertices / {} patches this frame, {:.3} ms; {:.2} MiB (peak {:.2}); evictions {}",c.resident_patches,w.pending_patches,w.vertices_generated,w.patches_completed,w.elapsed.as_secs_f64()*1000.0,c.resident_bytes as f64/1048576.0,c.peak_bytes as f64/1048576.0,c.evictions));
                 ui.label("Mixed-LOD displacement and morphing disabled. Coarse quality debt; reference-sphere picking/clearance.");
@@ -2051,6 +2131,31 @@ fn draw_ui(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terrain_runtime_options_select_deterministic_renderer_only_settings() {
+        use super::*;
+        assert_eq!(
+            terrain_lighting_configuration(None, None),
+            TerrainLighting::default()
+        );
+        assert_eq!(
+            terrain_lighting_configuration(Some("unknown"), Some("unknown")),
+            TerrainLighting::default()
+        );
+        for (name, mode) in [
+            ("elevation", TerrainRenderMode::Elevation),
+            ("lit", TerrainRenderMode::Lit),
+            ("normals", TerrainRenderMode::Normals),
+            ("diffuse", TerrainRenderMode::Diffuse),
+        ] {
+            let config = terrain_lighting_configuration(Some(name), Some("grazing"));
+            assert_eq!(config.mode(), mode);
+            assert_eq!(
+                config.sun_direction_body(),
+                TerrainSunPreset::Grazing.direction_body()
+            );
+        }
+    }
     use super::*;
     #[test]
     fn integrated_surface_route_keeps_body_identity_and_commits_real_steps() {

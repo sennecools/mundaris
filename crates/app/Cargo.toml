@@ -6,6 +6,7 @@ publish = false
 
 [features]
 surface-profile = ["mundaris_renderer/surface-profile"]
+terrain-capture = ["mundaris_renderer/terrain-capture"]
 
 [dependencies]
 anyhow.workspace = true
@@ -46,8 +47,16 @@ harness = false
 name = "planet_terrain_erosion"
 harness = false
 
+[[example]]
+name = "terrain_lighting_capture"
+required-features = ["terrain-capture"]
+
 [[bench]]
 name = "planet_terrain_view"
+harness = false
+
+[[bench]]
+name = "terrain_lighting"
 harness = false
 
 [lints]

@@ -16,6 +16,8 @@ pub(crate) struct PlanetSurfaceRenderer {
     indices: wgpu::Buffer,
     ranges: [Range<u32>; 16],
     index_bytes: u64,
+    lighting: wgpu::Buffer,
+    target_srgb: bool,
 }
 impl PlanetSurfaceRenderer {
     pub fn new(
@@ -26,11 +28,25 @@ impl PlanetSurfaceRenderer {
     ) -> Self {
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Planet samples / instances"),
-            entries: &[entry(0, 32), entry(1, 64)],
+            entries: &[
+                entry(0, 32),
+                entry(1, 64),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(32),
+                    },
+                    count: None,
+                },
+            ],
         });
         let samples = buffer(device, 32, wgpu::BufferUsages::STORAGE);
         let instances = buffer(device, 64, wgpu::BufferUsages::STORAGE);
-        let group = binding(device, &layout, &samples, &instances);
+        let lighting = buffer(device, 32, wgpu::BufferUsages::UNIFORM);
+        let group = binding(device, &layout, &samples, &instances, &lighting);
         let topology = SurfaceTopology::new();
         let mut bytes = Vec::new();
         let mut ranges = std::array::from_fn(|_| 0..0);
@@ -45,7 +61,7 @@ impl PlanetSurfaceRenderer {
         let indices = buffer(device, index_bytes, wgpu::BufferUsages::INDEX);
         queue.write_buffer(&indices, 0, &bytes);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Planet smooth surface"),
+            label: Some("Planet surface debug / terrain lighting"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/planet_surface.wgsl").into()),
         });
         let regular_pipeline = pipeline(
@@ -98,6 +114,8 @@ impl PlanetSurfaceRenderer {
             indices,
             ranges,
             index_bytes,
+            lighting,
+            target_srgb: format.is_srgb(),
         }
     }
     pub fn upload(
@@ -118,7 +136,7 @@ impl PlanetSurfaceRenderer {
                 self.capacities[i]
             }
         });
-        if proposed.iter().sum::<u64>() + self.index_bytes > 80 * 1024 * 1024
+        if proposed.iter().sum::<u64>() + self.index_bytes + 32 > 80 * 1024 * 1024
             || proposed[..2]
                 .iter()
                 .any(|&n| n > u64::from(device.limits().max_storage_buffer_binding_size))
@@ -165,8 +183,24 @@ impl PlanetSurfaceRenderer {
             }
         }
         if rebound {
-            self.group = binding(device, &self.layout, &self.samples, &self.instances);
+            self.group = binding(
+                device,
+                &self.layout,
+                &self.samples,
+                &self.instances,
+                &self.lighting,
+            );
         }
+        let mut bytes = [0u8; 32];
+        for (value, out) in staging
+            .lighting
+            .packed(self.target_srgb)
+            .into_iter()
+            .zip(bytes.as_chunks_mut::<4>().0)
+        {
+            out.copy_from_slice(&value.to_le_bytes());
+        }
+        queue.write_buffer(&self.lighting, 0, &bytes);
         for (buffer, bytes) in [
             (&self.samples, &staging.samples),
             (&self.instances, &staging.instances),
@@ -205,6 +239,8 @@ impl PlanetSurfaceRenderer {
             } else {
                 &self.clipped_pipeline
             });
+            pass.set_bind_group(0, projection, &[]);
+            pass.set_bind_group(1, &self.group, &[]);
             pass.set_vertex_buffer(0, self.fallback.slice(..));
             pass.draw(0..(staging.fallback.len() / 64) as u32, 0..1);
         }
@@ -235,6 +271,7 @@ fn binding(
     layout: &wgpu::BindGroupLayout,
     samples: &wgpu::Buffer,
     instances: &wgpu::Buffer,
+    lighting: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("Planet packed storage"),
@@ -247,6 +284,10 @@ fn binding(
             wgpu::BindGroupEntry {
                 binding: 1,
                 resource: instances.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: lighting.as_entire_binding(),
             },
         ],
     })
@@ -263,7 +304,7 @@ fn pipeline(
     let groups = [projection, storage];
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("Surface reverse-Z layout"),
-        bind_group_layouts: if clipped { &[] } else { &groups },
+        bind_group_layouts: &groups,
         push_constant_ranges: &[],
     });
     let attributes = wgpu::vertex_attr_array![0=>Float32x4,1=>Float32x4,2=>Float32x4,3=>Float32x4];

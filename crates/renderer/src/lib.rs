@@ -10,6 +10,8 @@ mod celestial_lines;
 mod celestial_view;
 mod debug;
 pub mod planet_surface;
+#[cfg(feature = "terrain-capture")]
+pub mod terrain_capture;
 mod view;
 pub use celestial::*;
 pub use celestial_lines::{CelestialLineStyle, CelestialPolyline, PolylinePreparationReport};

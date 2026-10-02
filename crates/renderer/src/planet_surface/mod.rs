@@ -1,9 +1,10 @@
-//! Disposable smooth-sphere topology and observer-dependent surface policy.
+//! Disposable planetary geometry, observer-dependent surface policy and shading.
 //! Physical state and body capability remain outside this renderer module.
 mod bounds;
 mod cache;
 mod cover;
 mod gpu;
+mod lighting;
 mod lod;
 mod prepare;
 mod terrain_geometry;
@@ -12,6 +13,7 @@ pub(crate) use bounds::projected_error as sphere_projected_error;
 pub use bounds::{PatchMetadata, SurfaceErrorContributions, SurfaceExtent};
 use cache::MetadataCache;
 pub(crate) use gpu::PlanetSurfaceRenderer;
+pub use lighting::{TerrainLighting, TerrainRenderMode, TerrainSunPreset};
 #[cfg(feature = "surface-profile")]
 pub use lod::LodProfile;
 pub use lod::{ActiveSurfacePatch, LodReport, LodSettings, SurfaceLodSession, SurfaceViewInput};
