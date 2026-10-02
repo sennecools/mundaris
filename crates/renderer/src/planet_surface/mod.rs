@@ -8,7 +8,7 @@ mod lod;
 mod prepare;
 mod topology;
 pub(crate) use bounds::projected_error as sphere_projected_error;
-pub use bounds::{PatchMetadata, SurfaceExtent};
+pub use bounds::{PatchMetadata, SurfaceErrorContributions, SurfaceExtent};
 use cache::MetadataCache;
 pub(crate) use gpu::PlanetSurfaceRenderer;
 #[cfg(feature = "surface-profile")]

@@ -5,6 +5,70 @@ use glam::DVec3;
 use mundaris_math::surface::{CubePatchAddress, SurfaceMathError};
 
 const FLOOR: f64 = 64.0 * f64::EPSILON;
+
+/// Domain-free metre contributions against full terrain, not just filtered
+/// samples. Values must already be conservative for the actual stitch/overlay
+/// topology. This record does not manufacture a certificate from sampled extrema.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SurfaceErrorContributions {
+    pub sphere_m: f64,
+    pub filtered_interpolation_m: f64,
+    pub unresolved_m: f64,
+    pub boundary_constraint_m: f64,
+    pub morph_remaining_m: f64,
+    pub numeric_m: f64,
+}
+impl SurfaceErrorContributions {
+    pub fn total_m(self) -> Result<f64, RenderPreparationError> {
+        let terms = [
+            self.sphere_m,
+            self.filtered_interpolation_m,
+            self.unresolved_m,
+            self.boundary_constraint_m,
+            self.morph_remaining_m,
+            self.numeric_m,
+        ];
+        if !terms.iter().all(|x| x.is_finite() && *x >= 0.0) {
+            return Err(RenderPreparationError::InvalidDebugGeometry);
+        }
+        let total = terms.into_iter().fold(
+            0.0,
+            |sum, x| {
+                if x == 0.0 { sum } else { (sum + x).next_up() }
+            },
+        );
+        if !total.is_finite() {
+            return Err(RenderPreparationError::InvalidDebugGeometry);
+        }
+        Ok(total)
+    }
+    /// M bounds the vector-valued displacement Hessian in the same face-domain
+    /// parameter used for triangle barycentrics. D bounds every allowed triangle's
+    /// diameter. A height-only or regular-grid-only M/D is not sufficient.
+    pub fn interpolation_bound_m(
+        vector_hessian_bound_m: f64,
+        triangle_diameter: f64,
+    ) -> Result<f64, RenderPreparationError> {
+        if !vector_hessian_bound_m.is_finite()
+            || vector_hessian_bound_m < 0.0
+            || !triangle_diameter.is_finite()
+            || triangle_diameter < 0.0
+        {
+            return Err(RenderPreparationError::InvalidDebugGeometry);
+        }
+        if vector_hessian_bound_m == 0.0 || triangle_diameter == 0.0 {
+            return Ok(0.0);
+        }
+        // Round each nonnegative operation outward, including subnormal results.
+        let bound = (0.5 * vector_hessian_bound_m).next_up();
+        let bound = (bound * triangle_diameter).next_up();
+        let bound = (bound * triangle_diameter).next_up();
+        if !bound.is_finite() {
+            return Err(RenderPreparationError::InvalidDebugGeometry);
+        }
+        Ok(bound)
+    }
+}
 pub(crate) fn angle(a: DVec3, b: DVec3) -> f64 {
     a.cross(b).length().atan2(a.dot(b))
 }
@@ -153,6 +217,25 @@ impl PatchMetadata {
         projection: CelestialProjection,
     ) -> f64 {
         projected_error(self.error * radius, center_view, ball_radius, projection)
+    }
+    /// Project a caller-certified complete terrain error using the existing
+    /// conservative projection and displaced/transition-expanded ball.
+    pub fn projected_total_error(
+        self,
+        error: SurfaceErrorContributions,
+        center_view: DVec3,
+        ball_radius: f64,
+        projection: CelestialProjection,
+    ) -> Result<f64, RenderPreparationError> {
+        if !center_view.is_finite() || !ball_radius.is_finite() || ball_radius < 0.0 {
+            return Err(RenderPreparationError::InvalidDebugGeometry);
+        }
+        Ok(projected_error(
+            error.total_m()?,
+            center_view,
+            ball_radius,
+            projection,
+        ))
     }
 }
 pub(crate) fn projected_error(

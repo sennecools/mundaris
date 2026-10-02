@@ -2,7 +2,7 @@
 
 Mundaris is a native desktop world-building and planetary simulation project spanning astronomical and local surface scales. Checked reference frames, editable celestial state, deterministic Newtonian gravity, fixed-step orbital integration and minimal celestial debug rendering are implemented. Procedural worlds remain future work.
 
-**Status:** Phase 4 smooth planetary surface LOD is implemented in the connected celestial explorer. Windows headless/release, CPU benchmarks and directed native approach/inspection evidence are recorded in [Phase 4 validation](docs/phase-4-validation.md) and [ADR 0006](docs/adr/0006-planet-surface-topology-and-lod.md). Complete operator/high-DPI/recovery, Linux and current-revision remote CI acceptance remain open. Full-planet CPU preparation misses the review target; see [performance](docs/performance.md). Earlier phase evidence remains preserved. Phase 5 has not begun.
+**Status:** Phase 4 smooth planetary surface LOD is implemented in the connected celestial explorer. Windows headless/release, CPU benchmarks and directed native approach/inspection evidence are recorded in [Phase 4 validation](docs/phase-4-validation.md) and [ADR 0006](docs/adr/0006-planet-surface-topology-and-lod.md). Complete operator/high-DPI/recovery, Linux and current-revision remote CI acceptance remain open. Full-planet CPU preparation misses the review target; see [performance](docs/performance.md). Earlier phase evidence remains preserved. Phase 5 foundations now include hashed gradient noise, world terrain identity, pure analytic queries and initial certificate support; [Phase 5 evidence](docs/phase-5-validation.md) distinguishes these from the still-unimplemented procedural bands/cache/live terrain path.
 
 The initial native development targets are **Windows x86-64** and **Linux x86-64**.
 
@@ -139,6 +139,8 @@ cargo bench --locked -p mundaris_app --bench celestial_navigation
 cargo bench --locked -p mundaris_app --bench orbit_guides
 cargo bench --locked -p mundaris_renderer --bench planet_surface
 cargo bench --locked -p mundaris_app --bench planet_surface_approach
+cargo bench --locked -p mundaris_math --bench terrain_noise
+cargo bench --locked -p mundaris_world --bench terrain_generation
 ```
 
 Benchmarks are CPU-only, use Criterion, and stay outside normal CI. Large 512-step
