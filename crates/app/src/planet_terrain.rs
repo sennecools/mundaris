@@ -12,10 +12,20 @@ use std::{
 pub const TERRAIN_CPU_CAP_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_TERRAIN_PATCHES: usize = 4096;
 pub const MAX_PENDING_PATCHES: usize = 256;
-pub const GENERATION_MICROBATCH: usize = 32;
+pub const GENERATION_MICROBATCH: usize = 8;
+/// Validation permits larger chunks without making them the live default.
+pub const MAX_GENERATION_BATCH: usize = 64;
 
 /// Checkpoint authoring preset, intentionally not an Earth shoreline model.
 pub fn checkpoint_terrain_definition(radius_m: f64) -> Result<TerrainDefinition> {
+    checkpoint_terrain_definition_version(radius_m, TerrainGeneratorVersion::V2)
+}
+
+/// Deterministic A/B authoring with identical macro/range seed and camera inputs.
+pub fn checkpoint_terrain_definition_version(
+    radius_m: f64,
+    version: TerrainGeneratorVersion,
+) -> Result<TerrainDefinition> {
     let bands = [
         TerrainBandConfig::new(
             radius_m * 0.0004,
@@ -56,7 +66,7 @@ pub fn checkpoint_terrain_definition(radius_m: f64) -> Result<TerrainDefinition>
     Ok(TerrainDefinition::new(
         TerrainIdentity(0x415552454c4941),
         TerrainSeed(17),
-        TerrainGeneratorVersion::V1,
+        version,
         TerrainConfig::new(
             bands,
             TerrainControls::new(-0.15, 2.0, 0.4, 0.85, 0.2, 0.15)?,
@@ -495,7 +505,7 @@ impl TerrainPatchCache {
         batch_size: usize,
         wall_budget: Option<Duration>,
     ) -> Result<TerrainWorkReport> {
-        if !(1..=GENERATION_MICROBATCH).contains(&batch_size) {
+        if !(1..=MAX_GENERATION_BATCH).contains(&batch_size) {
             bail!("invalid terrain microbatch size");
         }
         let start = Instant::now();
@@ -542,8 +552,8 @@ impl TerrainPatchCache {
                 TerrainFootprint::new(radius * 2.0 / (16.0 * (1u64 << address.level()) as f64))?;
             let generator = &builder.generator;
             let mut locations =
-                [SurfaceLocation::new(Direction3::try_new(glam::DVec3::X)?); GENERATION_MICROBATCH];
-            let mut output = [TerrainSample::default(); GENERATION_MICROBATCH];
+                [SurfaceLocation::new(Direction3::try_new(glam::DVec3::X)?); MAX_GENERATION_BATCH];
+            let mut output = [TerrainSample::default(); MAX_GENERATION_BATCH];
             for (offset, location) in locations[..count].iter_mut().enumerate() {
                 let index = first + offset;
                 *location = SurfaceLocation::new(

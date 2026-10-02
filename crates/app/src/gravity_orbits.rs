@@ -617,9 +617,17 @@ impl GravityOrbitsDemo {
                     let id = self.ids[1];
                     let body = self.system.body(id)?;
                     if body.terrain().is_none() {
-                        let definition = crate::planet_terrain::checkpoint_terrain_definition(
-                            body.properties().reference_radius_m(),
-                        )?;
+                        let version =
+                            if std::env::var("MUNDARIS_PHASE55_AB").as_deref() == Ok("legacy") {
+                                mundaris_world::terrain::TerrainGeneratorVersion::V1
+                            } else {
+                                mundaris_world::terrain::TerrainGeneratorVersion::V2
+                            };
+                        let definition =
+                            crate::planet_terrain::checkpoint_terrain_definition_version(
+                                body.properties().reference_radius_m(),
+                                version,
+                            )?;
                         self.system.edit_terrain(id, Some(definition))?;
                     }
                 }
@@ -1216,11 +1224,16 @@ impl GravityOrbitsDemo {
                     .map(|p| p.address.level())
                     .max()
                     .unwrap_or(0);
+                let footprint_m = body.reference_radius_m * 2.0
+                    / (16.0 * f64::from(1u32 << desired_level.min(4)));
+                // Retain coarse-cover throughput; fine work has a lower count
+                // ceiling as well as the wall cutoff checked every eight vertices.
+                let vertex_budget = if footprint_m >= 5_000.0 { 1156 } else { 64 };
                 self.terrain_work = self.terrain_cover.update(
                     &mut self.terrain_cache,
                     &identity,
                     desired_level,
-                    1156,
+                    vertex_budget,
                     Some(Duration::from_millis(2)),
                 )?;
                 let input = SurfaceViewInput {

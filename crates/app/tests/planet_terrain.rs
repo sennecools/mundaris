@@ -419,3 +419,94 @@ fn terrain_revision_invalidation_cancels_partial_work_before_publication() {
     complete(&mut cache, &new_key, address);
     assert!(cache.peek(&old_key, address).is_none());
 }
+
+#[test]
+fn erosion_version_and_configuration_separate_cached_geometry_and_regenerate() {
+    let old = identity(5, 8.0);
+    let eroded = |octaves| {
+        TerrainGeometryIdentity::new(
+            old.body,
+            TerrainDefinition::new(
+                old.definition.identity(),
+                old.definition.seed(),
+                TerrainGeneratorVersion::V2,
+                old.definition
+                    .config()
+                    .clone()
+                    .with_erosion(ErosionConfig::new(octaves, 1.0).unwrap()),
+            ),
+            old.revision,
+            old.radius_m,
+        )
+        .unwrap()
+    };
+    let a = eroded(1);
+    let b = eroded(3);
+    let address = CubePatchAddress::try_new(CubeFace::PositiveX, 18, 10, 10).unwrap();
+    let mut cache = cache(3);
+    for key in [&old, &a, &b] {
+        complete(&mut cache, key, address);
+    }
+    let expected = cache.peek(&b, address).unwrap().samples().to_vec();
+    assert_ne!(cache.peek(&old, address).unwrap().samples(), expected);
+    assert_ne!(cache.peek(&a, address).unwrap().samples(), expected);
+    cache.invalidate_body(&b);
+    assert!(cache.peek(&old, address).is_none());
+    assert!(cache.peek(&a, address).is_none());
+    let mut small = self::cache(1);
+    complete(&mut small, &b, address);
+    complete(&mut small, &b, CubePatchAddress::root(CubeFace::NegativeX));
+    complete(&mut small, &b, address);
+    assert_eq!(small.peek(&b, address).unwrap().samples(), expected);
+}
+
+#[test]
+fn eroded_height_gradient_and_normal_match_all_canonical_boundary_owners() {
+    let old = definition(7, 14, 8.0);
+    let definition = TerrainDefinition::new(
+        old.identity(),
+        old.seed(),
+        TerrainGeneratorVersion::V2,
+        old.config().clone(),
+    );
+    let generator = TerrainGenerator::new(&definition, RADIUS).unwrap();
+    let mut samples = Vec::new();
+    // Face edges/corners and same-face child edges use one complete profile.
+    for face in CubeFace::ALL {
+        let root = CubePatchAddress::root(face);
+        for address in [
+            root,
+            CubePatchAddress::try_new(face, 1, 0, 0).unwrap(),
+            CubePatchAddress::try_new(face, 1, 1, 0).unwrap(),
+        ] {
+            for t in 0..=16 {
+                for (i, j) in [(0, t), (16, t), (t, 0), (t, 16)] {
+                    let location =
+                        SurfaceLocation::new(address.sample_key(i, j, 16).unwrap().direction());
+                    let sample = generator
+                        .evaluate_point(TerrainQuery {
+                            location,
+                            footprint: TerrainFootprint::COMPLETE,
+                        })
+                        .unwrap();
+                    samples.push((
+                        location,
+                        sample,
+                        sample.normal_body(location, RADIUS).unwrap(),
+                    ));
+                }
+            }
+        }
+    }
+    let mut shared = 0;
+    for (index, (location, sample, normal)) in samples.iter().enumerate() {
+        for (other, other_sample, other_normal) in samples.iter().skip(index + 1) {
+            if location == other {
+                assert_eq!(sample, other_sample);
+                assert_eq!(normal, other_normal);
+                shared += 1;
+            }
+        }
+    }
+    assert!(shared > 100);
+}

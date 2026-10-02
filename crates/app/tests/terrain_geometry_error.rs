@@ -20,7 +20,13 @@ fn all_stitch_certificates_bound_full_field_against_filtered_triangle_geometry()
             base.identity(),
             TerrainSeed(seed),
             base.version(),
-            base.config().clone(),
+            base.config().clone().with_erosion(
+                ErosionConfig::new(
+                    [1, 2, 3, 4, 5, 3, 3, 3][seed as usize],
+                    [0.0, 0.25, 0.5, 0.75, 1.0, 1.0, 1.0, 1.0][seed as usize],
+                )
+                .unwrap(),
+            ),
         );
         let generator = TerrainGenerator::new(&definition, radius).unwrap();
         let identity =

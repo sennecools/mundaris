@@ -50,7 +50,7 @@ fn definition() -> TerrainDefinition {
     TerrainDefinition::new(
         TerrainIdentity(17),
         TerrainSeed(0x5eed),
-        TerrainGeneratorVersion::V1,
+        TerrainGeneratorVersion::V2,
         TerrainConfig::new(
             bands,
             TerrainControls::new(0.1, 2.0, 0.48, 0.8, 0.3, 0.08).unwrap(),
@@ -86,7 +86,8 @@ fn benches(c: &mut Criterion) {
     let identity =
         TerrainGeometryIdentity::new(body, definition(), TerrainRevision::default(), radius_m)
             .unwrap();
-    let addresses: Vec<_> = [0, 4, 10, 18]
+    let levels = [0, 4, 6, 10, 13, 16, 18, 19];
+    let addresses: Vec<_> = levels
         .into_iter()
         .map(|level| CubePatchAddress::try_new(CubeFace::PositiveX, level, 0, 0).unwrap())
         .collect();
@@ -96,7 +97,7 @@ fn benches(c: &mut Criterion) {
         .warm_up_time(Duration::from_millis(100))
         .measurement_time(Duration::from_millis(500));
     group.throughput(Throughput::Elements(289));
-    for (&level, &address) in [0, 4, 10, 18].iter().zip(&addresses) {
+    for (&level, &address) in levels.iter().zip(&addresses) {
         group.bench_function(
             format!("complete_cache_miss_geometry289_level{level}"),
             |b| {
@@ -112,7 +113,7 @@ fn benches(c: &mut Criterion) {
             },
         );
     }
-    let address = addresses[2];
+    let address = addresses[3];
     let mut ready = TerrainPatchCache::new(TERRAIN_CPU_CAP_BYTES, 8).unwrap();
     complete(&mut ready, &identity, address, 289);
     group.throughput(Throughput::Elements(1));
@@ -144,7 +145,7 @@ fn benches(c: &mut Criterion) {
         .sample_size(20)
         .warm_up_time(Duration::from_millis(100))
         .measurement_time(Duration::from_millis(500));
-    for budget in [1, 8, 16, 32] {
+    for budget in [8, 16, 32, 64] {
         chunks.bench_function(format!("generate_one_patch_batch{budget}"), |b| {
             b.iter_batched(
                 || {
@@ -168,14 +169,23 @@ fn benches(c: &mut Criterion) {
     }
     chunks.finish();
 
-    for budget in [1, 8, 16, 32] {
+    for (level, budget) in [4, 18]
+        .into_iter()
+        .flat_map(|level| [8, 16, 32, 64].map(|budget| (level, budget)))
+    {
         let mut diagnostic = TerrainPatchCache::new(TERRAIN_CPU_CAP_BYTES, 32).unwrap();
         let mut durations = Vec::new();
         let mut vertices = 0;
         let mut completed = 0;
         let mut max_delta = 0;
         for index in 0..32 {
-            let patch = CubePatchAddress::try_new(CubeFace::PositiveX, 18, index, 0).unwrap();
+            let patch = CubePatchAddress::try_new(
+                CubeFace::PositiveX,
+                level,
+                index % (1 << level),
+                index / (1 << level),
+            )
+            .unwrap();
             diagnostic.request(&identity, patch);
             while diagnostic.peek(&identity, patch).is_none() {
                 let start = Instant::now();
@@ -188,8 +198,8 @@ fn benches(c: &mut Criterion) {
         }
         durations.sort();
         eprintln!(
-            "chunk budget={budget}, level18 rho={:.6}m, chunks={}, vertices={vertices}, completed={completed}, median={:?}, worst={:?}, max_allocation_delta={max_delta}, cache={:?}",
-            radius_m * 2.0 / (16.0 * 262144.0),
+            "chunk budget={budget}, level{level} rho={:.6}m, chunks={}, vertices={vertices}, completed={completed}, median={:?}, worst={:?}, max_allocation_delta={max_delta}, cache={:?}",
+            radius_m * 2.0 / (16.0 * (1u64 << level) as f64),
             durations.len(),
             durations[durations.len() / 2],
             durations.last().unwrap(),

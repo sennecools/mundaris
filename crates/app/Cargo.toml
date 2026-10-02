@@ -43,6 +43,10 @@ name = "planet_terrain_generation"
 harness = false
 
 [[bench]]
+name = "planet_terrain_erosion"
+harness = false
+
+[[bench]]
 name = "planet_terrain_view"
 harness = false
 
