@@ -2,6 +2,8 @@
 
 mod query;
 pub use query::*;
+mod generator;
+pub use generator::*;
 
 /// Explicit authoring salt, not a runtime body handle or display name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -280,6 +282,10 @@ impl TerrainDefinition {
     }
     /// Combined radial-graph validation before an authoritative edit commits.
     pub fn validate_radius(&self, radius_m: f64) -> Result<(), TerrainError> {
+        self.validate_radius_envelope(radius_m)?;
+        TerrainGenerator::validate_definition(self, radius_m)
+    }
+    pub(super) fn validate_radius_envelope(&self, radius_m: f64) -> Result<(), TerrainError> {
         let envelope = self.config.absolute_height_bound_m();
         if !radius_m.is_finite()
             || radius_m <= 0.0

@@ -53,6 +53,12 @@ pub struct TerrainSample {
     tangent_gradient_m_per_unit_direction: DVec3,
 }
 impl TerrainSample {
+    pub(crate) fn from_parts(height_m: f64, gradient: DVec3) -> Self {
+        Self {
+            height_m,
+            tangent_gradient_m_per_unit_direction: gradient,
+        }
+    }
     pub fn height_m(self) -> f64 {
         self.height_m
     }
