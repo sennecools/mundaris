@@ -38,5 +38,13 @@ harness = false
 name = "planet_surface_approach"
 harness = false
 
+[[bench]]
+name = "planet_terrain_generation"
+harness = false
+
+[[bench]]
+name = "planet_terrain_view"
+harness = false
+
 [lints]
 workspace = true
