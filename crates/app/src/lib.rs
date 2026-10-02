@@ -8,6 +8,7 @@ pub mod gravity_fixtures;
 mod gravity_orbits;
 pub mod interactive_clock;
 pub mod orbit_guides;
+pub mod planet_surface;
 pub mod playback_metrics;
 pub mod system_view;
 pub use gravity_orbits::GravityOrbitsDemo;

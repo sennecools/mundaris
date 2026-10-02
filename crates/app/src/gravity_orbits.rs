@@ -1,4 +1,5 @@
 //! Composition of authoritative physics, coherent projection and disposable debug views.
+use crate::planet_surface::*;
 use crate::{celestial_camera::*, gravity_fixtures::*, trails::*};
 use crate::{
     celestial_labels::*, celestial_selection::*, interactive_clock::*, orbit_guides::*,
@@ -7,6 +8,7 @@ use crate::{
 use anyhow::Result;
 use glam::DVec3;
 use mundaris_math::*;
+use mundaris_renderer::planet_surface::*;
 use mundaris_renderer::*;
 use mundaris_simulation::*;
 use mundaris_world::*;
@@ -17,6 +19,12 @@ use std::{
 };
 
 enum Command {
+    ValidationRoute,
+    LookBody(BodyId),
+    SurfaceInspection,
+    SurfaceHorizon,
+    Clearance(f64),
+    Approach,
     Pause(bool),
     Rate(f64),
     ResumeAdmission,
@@ -45,6 +53,10 @@ enum Command {
     TrailReference(BodyId),
 }
 struct Controls {
+    surface_bounds: bool,
+    surface_style: SurfaceStyle,
+    approach: Option<(f64, f64, Duration)>,
+    clearance_target: f64,
     pending: VecDeque<Command>,
     seek_seconds: f64,
     name: String,
@@ -73,6 +85,10 @@ struct Controls {
 impl Controls {
     fn new(body: &CelestialBody) -> Self {
         Self {
+            surface_bounds: false,
+            surface_style: SurfaceStyle::default(),
+            approach: None,
+            clearance_target: 1e11,
             pending: VecDeque::new(),
             seek_seconds: 0.0,
             name: body.name().into(),
@@ -118,6 +134,10 @@ impl Controls {
 }
 
 pub struct GravityOrbitsDemo {
+    validation_route: Option<SurfaceValidationRoute>,
+    surfaces: Vec<PlanetSurfaceSession>,
+    surface_owners: Vec<bool>,
+    far_probe: CelestialStaging,
     system: CelestialSystem,
     runner: FixedStepRunner,
     projection: CelestialFrameProjection,
@@ -170,9 +190,38 @@ struct VisualCurve {
     style: CelestialLineStyle,
     relative: Vec<DVec3>,
 }
+struct SurfaceValidationRoute {
+    elapsed: Duration,
+    next: usize,
+    physical_target: u64,
+}
 impl GravityOrbitsDemo {
     pub fn new() -> Result<Self> {
-        Self::create(GravityFixture::Hierarchy, 1, 1)
+        let mut demo = Self::create(GravityFixture::Hierarchy, 1, 1)?;
+        if std::env::var("MUNDARIS_PHASE4_VALIDATE").as_deref() == Ok("1") {
+            demo.start_surface_validation()?;
+        }
+        Ok(demo)
+    }
+    /// Optional operator route through the same production controls and renderer.
+    pub fn start_surface_validation(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            self.ids.len() == 3,
+            "surface route requires the hierarchy fixture"
+        );
+        let physical_target = self
+            .runner
+            .tick()
+            .checked_add(20)
+            .ok_or_else(|| anyhow::anyhow!("validation tick overflow"))?;
+        self.controls.pending.push_back(Command::Pause(true));
+        self.controls.pending.push_back(Command::Overview);
+        self.validation_route = Some(SurfaceValidationRoute {
+            elapsed: Duration::ZERO,
+            next: 0,
+            physical_target,
+        });
+        Ok(())
     }
     fn create(
         scenario: GravityFixture,
@@ -212,7 +261,19 @@ impl GravityOrbitsDemo {
         let controls = Controls::new(system.body(ids[selected])?);
         let advance = runner.report();
         let trails = TrailHistory::new(&system, scenario.trail_stride())?;
+        let enabled = match scenario {
+            GravityFixture::Hierarchy => vec![ids[1], ids[2]],
+            GravityFixture::Circular => vec![ids[1]],
+        };
+        let surfaces = enabled
+            .into_iter()
+            .map(|id| PlanetSurfaceSession::new(id, 2048))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
+            validation_route: None,
+            surfaces,
+            surface_owners: Vec::new(),
+            far_probe: CelestialStaging::default(),
             system,
             runner,
             projection,
@@ -317,6 +378,36 @@ impl GravityOrbitsDemo {
             .selected()
             .ok_or_else(|| anyhow::anyhow!("no selected body"))?;
         match command {
+            Command::ValidationRoute => self.start_surface_validation()?,
+            Command::LookBody(target) => self
+                .camera
+                .look_at_body(&self.projection.coherent_view(&self.system)?, target)?,
+            Command::SurfaceInspection => {
+                anyhow::ensure!(
+                    self.surfaces.iter().any(|s| s.body() == id),
+                    "selected body has no surface capability"
+                );
+                self.camera
+                    .enter_surface_inspection(&self.projection.coherent_view(&self.system)?, id)?;
+                self.controls.approach = None;
+            }
+            Command::SurfaceHorizon => self.camera.look_surface_horizon()?,
+            Command::Clearance(clearance) => {
+                self.camera
+                    .target_clearance(&self.projection.coherent_view(&self.system)?, clearance)?;
+                self.controls.approach = None;
+            }
+            Command::Approach => {
+                anyhow::ensure!(
+                    self.camera.mode() == CameraMode::BodyOrbit && !self.camera.transitioning(),
+                    "complete focused body orbit before approach"
+                );
+                let start = self.camera.measured_clearance(
+                    &self.projection.coherent_view(&self.system)?,
+                    self.camera.focused_body().expect("body orbit"),
+                )?;
+                self.controls.approach = Some((start.max(2.0).ln(), 2.0_f64.ln(), Duration::ZERO));
+            }
             Command::Pause(paused) => {
                 self.runner.set_paused(paused);
                 self.seeking = false;
@@ -429,6 +520,7 @@ impl GravityOrbitsDemo {
                     || input.translation != DVec3::ZERO
                 {
                     self.auto_fit = false;
+                    self.controls.approach = None;
                 }
                 self.controls.navigation = input;
             }
@@ -550,6 +642,7 @@ impl GravityOrbitsDemo {
     }
     /// Host duration is explicit and captured once. Surface retries never reuse it.
     pub fn update(&mut self, elapsed: Duration) {
+        self.advance_surface_validation(elapsed);
         while let Some(command) = self.controls.pending.pop_front() {
             match self.command(command) {
                 Ok(()) => self.diagnostic = None,
@@ -562,6 +655,7 @@ impl GravityOrbitsDemo {
             self.metrics.reset();
             self.camera.cancel_transition();
             self.controls.navigation = NavigationInput::default();
+            self.controls.approach = None;
             self.gap_diagnostic = Some(format!(
                 "Interactive clock gap {:.3} wall s; no catch-up requested. Pending demand cancelled. Resume explicitly.",
                 elapsed.as_secs_f64()
@@ -682,6 +776,21 @@ impl GravityOrbitsDemo {
             )
             .map(|m| m.achieved_rate);
         if self.coherent {
+            if let Some((start, end, at)) = &mut self.controls.approach {
+                *at = at.saturating_add(elapsed);
+                let t = (at.as_secs_f64() / 30.0).clamp(0.0, 1.0);
+                let target = (*start * (1.0 - t) + *end * t).exp();
+                if let Err(error) = self.camera.target_clearance(
+                    &self
+                        .projection
+                        .coherent_view(&self.system)
+                        .expect("coherent"),
+                    target,
+                ) {
+                    self.diagnostic = Some(error.to_string());
+                    self.controls.approach = None;
+                }
+            }
             let input = self.controls.navigation;
             let envelope_adjustment = self.camera.mode() == CameraMode::BodyOrbit
                 && !self.camera.transitioning()
@@ -754,6 +863,112 @@ impl GravityOrbitsDemo {
             self.diagnostic = Some(error.to_string());
         }
         self.refresh_report_metadata();
+    }
+    fn advance_surface_validation(&mut self, elapsed: Duration) {
+        if self.hidden || elapsed > self.clock.threshold() {
+            return;
+        }
+        let Some(route) = &mut self.validation_route else {
+            return;
+        };
+        route.elapsed = route.elapsed.saturating_add(elapsed);
+        let actions = [
+            (2.0, "focus Aurelia", 0),
+            (4.0, "astronomical clearance", 1),
+            (6.0, "continuous approach", 2),
+            (37.0, "100 km", 3),
+            (40.0, "10 km", 4),
+            (43.0, "1 km", 5),
+            (46.0, "100 m", 6),
+            (49.0, "10 m", 7),
+            (52.0, "2 m", 8),
+            (55.0, "co-rotating inspection", 9),
+            (58.0, "local lateral movement", 10),
+            (60.0, "stop lateral movement", 11),
+            (61.0, "curved horizon", 12),
+            (64.0, "look toward Solace", 13),
+            (67.0, "twenty physical steps", 14),
+            (71.0, "look toward Luma", 15),
+            (74.0, "depart Body Orbit", 16),
+            (77.0, "whole system", 17),
+            (81.0, "repeat focus", 0),
+            (83.0, "repeat astronomical", 1),
+            (85.0, "repeat approach", 2),
+        ];
+        if route.next < actions.len() && route.elapsed.as_secs_f64() >= actions[route.next].0 {
+            let (_, label, action) = actions[route.next];
+            route.next += 1;
+            tracing::info!(
+                checkpoint = label,
+                world_revision = self.system.revision(),
+                sample_s = self.system.sample_time().seconds_since_epoch(),
+                "Phase 4 validation route"
+            );
+            let planet = self.ids[1];
+            match action {
+                0 => {
+                    self.controls.pending.push_back(Command::Select(planet));
+                    self.controls.pending.push_back(Command::Focus {
+                        fixed: false,
+                        fit: false,
+                    });
+                }
+                1 => self.controls.pending.push_back(Command::Clearance(1e11)),
+                2 => self.controls.pending.push_back(Command::Approach),
+                3..=8 => {
+                    self.controls.surface_style.borders = true;
+                    self.controls.pending.push_back(Command::Clearance(
+                        [1e5, 1e4, 1e3, 100.0, 10.0, 2.0][action - 3],
+                    ));
+                }
+                9 => {
+                    self.controls.surface_style.borders = false;
+                    self.controls.pending.push_back(Command::SurfaceInspection);
+                }
+                10 => self
+                    .controls
+                    .pending
+                    .push_back(Command::Navigation(NavigationInput {
+                        translation: DVec3::X,
+                        ..Default::default()
+                    })),
+                11 => self
+                    .controls
+                    .pending
+                    .push_back(Command::Navigation(NavigationInput::default())),
+                12 => self.controls.pending.push_back(Command::SurfaceHorizon),
+                13 => self
+                    .controls
+                    .pending
+                    .push_back(Command::LookBody(self.ids[0])),
+                14 => {}
+                15 => self
+                    .controls
+                    .pending
+                    .push_back(Command::LookBody(self.ids[2])),
+                16 => self.controls.pending.push_back(Command::Focus {
+                    fixed: false,
+                    fit: true,
+                }),
+                17 => self.controls.pending.push_back(Command::Overview),
+                _ => unreachable!("fixed validation route actions"),
+            }
+        }
+        // Distinct opportunities commit twenty real h60 steps. Twenty queued Single
+        // commands in one opportunity would only request the same next tick.
+        if (67.0..70.0).contains(&route.elapsed.as_secs_f64())
+            && self.runner.tick() < route.physical_target
+        {
+            self.controls.pending.push_back(Command::Single(true));
+        }
+        if (58.0..60.0).contains(&route.elapsed.as_secs_f64()) {
+            self.controls
+                .pending
+                .push_back(Command::Navigation(NavigationInput {
+                    translation: DVec3::X,
+                    ..Default::default()
+                }));
+        }
     }
     fn selected_index(&self) -> usize {
         self.ids
@@ -891,9 +1106,7 @@ impl GravityOrbitsDemo {
                 ))?
                 .metres();
             let surface = center.x.hypot(center.y).hypot(center.z) - radius;
-            if surface > 0.0 {
-                clearance = clearance.min(surface);
-            }
+            clearance = clearance.min(surface);
             self.requests.push(CelestialRenderBody {
                 body_fixed_frame: frames.body_fixed,
                 reference_radius_m: radius,
@@ -902,15 +1115,124 @@ impl GravityOrbitsDemo {
                 selected: index == selected_index,
             });
         }
-        let near = if clearance == f64::MAX {
+        let near = if clearance <= 64.0 * f64::EPSILON * 6.4e6 || clearance == f64::MAX {
             0.1
         } else {
             (0.01 * clearance).max(0.1)
         };
         let projection = self.content_projection(near)?;
+        self.surface_owners.clear();
+        self.surface_owners.resize(self.requests.len(), false);
+        let metadata_quota = 32 / self.surfaces.len().max(1);
+        for session in &mut self.surfaces {
+            let index = self
+                .ids
+                .iter()
+                .position(|&id| id == session.body())
+                .expect("surface capability body");
+            let body = self.requests[index];
+            let settings = LodSettings::default().with_limits(2048, 32768, 30)?;
+            let settings = settings.with_work_limit(metadata_quota)?;
+            session.update(
+                &SurfaceViewInput {
+                    view: &view,
+                    body_fixed_frame: body.body_fixed_frame,
+                    reference_radius_m: body.reference_radius_m,
+                    projection,
+                },
+                &settings,
+            )?;
+            if session.state() == SurfaceRepresentationState::Surface
+                && session.far_error_pixels < 0.05
+            {
+                let mut probe =
+                    CelestialFrame::new(&view, &mut self.far_probe, projection, &self.sphere);
+                probe.append_bodies(&[body])?;
+                session.return_to_far_if_ready(matches!(
+                    probe.markers()[0].representation,
+                    SphereRepresentation::PhysicalSphere
+                        | SphereRepresentation::SubpixelMarker
+                        | SphereRepresentation::Culled
+                ));
+            }
+            self.surface_owners[index] = session.state() == SurfaceRepresentationState::Surface;
+        }
         let mut frame = CelestialFrame::new(&view, &mut self.staging, projection, &self.sphere);
         let prepared = (|| -> Result<()> {
-            frame.append_bodies(&self.requests)?;
+            for session in &self.surfaces {
+                let index = self
+                    .ids
+                    .iter()
+                    .position(|&id| id == session.body())
+                    .expect("surface body");
+                if self.surface_owners[index] {
+                    frame.append_surface(
+                        self.requests[index],
+                        session.lod().active_visible(),
+                        session.lod().topology(),
+                        self.controls.surface_style,
+                    )?;
+                }
+            }
+            frame.append_body_observations(&self.requests, &self.surface_owners)?;
+            if self.controls.surface_bounds {
+                for session in &self.surfaces {
+                    let index = self
+                        .ids
+                        .iter()
+                        .position(|&id| id == session.body())
+                        .expect("surface body");
+                    let body = self.requests[index];
+                    for patch in session.lod().active_visible().iter().take(8) {
+                        let (center, radius) = patch.metadata.ball(
+                            body.reference_radius_m,
+                            SurfaceExtent::smooth(body.reference_radius_m),
+                        )?;
+                        let mut lines = Vec::with_capacity(49);
+                        for (a, b) in [
+                            (DVec3::X, DVec3::Y),
+                            (DVec3::Y, DVec3::Z),
+                            (DVec3::Z, DVec3::X),
+                        ] {
+                            for i in 0..16 {
+                                let endpoints = [i, i + 1].map(|k| {
+                                    let angle = k as f64 * std::f64::consts::TAU / 16.0;
+                                    center + radius * (a * angle.cos() + b * angle.sin())
+                                });
+                                lines.push(DebugLine {
+                                    endpoints: [
+                                        FramePosition::new(
+                                            body.body_fixed_frame,
+                                            LocalPosition::try_metres(endpoints[0])?,
+                                        ),
+                                        FramePosition::new(
+                                            body.body_fixed_frame,
+                                            LocalPosition::try_metres(endpoints[1])?,
+                                        ),
+                                    ],
+                                    color: [0.3, 0.9, 0.3, 1.0],
+                                });
+                            }
+                        }
+                        if let Some((axis, _, _)) = patch.metadata.normal_envelope() {
+                            lines.push(DebugLine {
+                                endpoints: [
+                                    FramePosition::new(
+                                        body.body_fixed_frame,
+                                        LocalPosition::try_metres(center)?,
+                                    ),
+                                    FramePosition::new(
+                                        body.body_fixed_frame,
+                                        LocalPosition::try_metres(center + axis * radius)?,
+                                    ),
+                                ],
+                                color: [1.0, 0.6, 0.1, 1.0],
+                            });
+                        }
+                        frame.append_historical_lines(body.body_fixed_frame, &lines)?;
+                    }
+                }
+            }
             for curve in &self.curves {
                 frame.append_polylines(&[CelestialPolyline {
                     points: &curve.points,
@@ -936,8 +1258,44 @@ impl GravityOrbitsDemo {
                     ][i],
                 })
             };
-            let lines = [line(0)?, line(1)?, line(2)?];
-            frame.append_historical_lines(source, &lines)?;
+            if self.camera.mode() != CameraMode::SurfaceInspection {
+                let lines = [line(0)?, line(1)?, line(2)?];
+                frame.append_historical_lines(source, &lines)?;
+            } else {
+                let observer = view.prepare_source(source)?.observer_in_source().metres();
+                let up = Direction3::try_new(observer)?;
+                let tangent = self
+                    .camera
+                    .inspection_tangent()
+                    .ok_or_else(|| anyhow::anyhow!("surface inspection has no tangent anchor"))?;
+                let origin = observer
+                    - up.unit()
+                        * self
+                            .camera
+                            .measured_clearance(&pair, self.ids[selected_index])?;
+                let lines = [
+                    tangent.east().unit(),
+                    tangent.up().unit(),
+                    tangent.north().unit(),
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(i, d)| {
+                    Ok(DebugLine {
+                        endpoints: [
+                            FramePosition::new(source, LocalPosition::try_metres(origin)?),
+                            FramePosition::new(source, LocalPosition::try_metres(origin + d)?),
+                        ],
+                        color: [
+                            [1.0, 0.1, 0.1, 1.0],
+                            [0.1, 1.0, 0.1, 1.0],
+                            [0.1, 0.3, 1.0, 1.0],
+                        ][i],
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+                frame.append_historical_lines(source, &lines)?;
+            }
             Ok(())
         })();
         let preparation_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -956,6 +1314,7 @@ impl GravityOrbitsDemo {
         // Split borrows retain the coherent world/projection and prepared tree view
         // until submission. UI queues commands; it never mutates that borrowed state.
         let info = UiInfo {
+            surfaces: &self.surfaces,
             system: &self.system,
             projection: &self.projection,
             runner: &self.runner,
@@ -1009,6 +1368,7 @@ impl GravityOrbitsDemo {
             .expect("valid content projection");
         (
             UiInfo {
+                surfaces: &self.surfaces,
                 system: &self.system,
                 projection: &self.projection,
                 runner: &self.runner,
@@ -1153,6 +1513,7 @@ impl GravityOrbitsDemo {
 }
 
 struct UiInfo<'a> {
+    surfaces: &'a [PlanetSurfaceSession],
     system: &'a CelestialSystem,
     projection: &'a CelestialFrameProjection,
     runner: &'a FixedStepRunner,
@@ -1351,6 +1712,50 @@ fn draw_ui(
     info: &UiInfo<'_>,
     markers: &[CelestialMarker],
 ) {
+    if info
+        .surfaces
+        .iter()
+        .any(|s| Some(s.body()) == info.camera.focused_body())
+    {
+        egui::Window::new("Planet surface / inspection").default_pos(egui::pos2(335.0,120.0)).default_width(360.0).vscroll(true).show(context,|ui| {
+            ui.label("Smooth sphere · zero terrain height · one connected body");
+            if ui.button("Run integrated validation route").clicked() {controls.pending.push_back(Command::ValidationRoute);}
+            let id=info.camera.focused_body().expect("focused surface");
+            let pair=info.projection.coherent_view(info.system).expect("coherent UI");
+            if let Ok(clearance)=info.camera.measured_clearance(&pair,id) {ui.label(format!("Actual signed clearance {}",compact_distance(clearance)));}
+            if info.camera.mode()==CameraMode::BodyOrbit&&!info.camera.transitioning() {
+                ui.add(egui::DragValue::new(&mut controls.clearance_target).speed(1.0).suffix(" m target clearance"));
+                if ui.button("Approach clearance target").clicked() {controls.pending.push_back(Command::Clearance(controls.clearance_target));}
+                if ui.button("Continuous 30 s approach to 2 m").clicked() {controls.pending.push_back(Command::Approach);}
+                ui.horizontal_wrapped(|ui| {for clearance in [1e11,1e5,1e4,1e3,100.0,10.0,2.0] {if ui.button(compact_distance(clearance)).clicked() {controls.pending.push_back(Command::Clearance(clearance));}}});
+                if ui.button("Surface inspection (I): co-rotating attachment").clicked() {controls.pending.push_back(Command::SurfaceInspection);}
+            }
+            if info.camera.mode()==CameraMode::SurfaceInspection {
+                ui.small("Co-rotating; zero relative simulation derivative. WASD/QE editor offsets, right-drag look; reference-sphere navigation clearance guard.");
+                if ui.button("Look tangent / horizon (H)").clicked() {controls.pending.push_back(Command::SurfaceHorizon);}
+                if ui.button("Depart to centre-look Body Orbit").clicked() {controls.pending.push_back(Command::Focus {fixed:false,fit:true});}
+                if ui.button("Single physical step +h").clicked() {controls.pending.push_back(Command::Single(true));}
+                ui.horizontal_wrapped(|ui| {for &target in info.ids {if target!=id&&ui.button(format!("Look at {}",info.system.body(target).expect("body").name())).clicked() {controls.pending.push_back(Command::LookBody(target));}}});
+            }
+            ui.checkbox(&mut controls.surface_style.borders,"Patch borders");ui.checkbox(&mut controls.surface_style.lod_colors,"LOD colours");ui.checkbox(&mut controls.surface_style.face_colors,"Face IDs / colours");ui.checkbox(&mut controls.surface_style.underside,"No-cull underside diagnostic");
+            ui.checkbox(&mut controls.surface_bounds,"Bounds / normal envelope axes (bounded)");
+            if let Some(pointer)=context.input(|i|i.pointer.hover_pos()) {
+                let pixels=[f64::from(pointer.x*context.pixels_per_point()),f64::from(pointer.y*context.pixels_per_point())];
+                if let Some(session)=info.surfaces.iter().find(|s|s.body()==id)&&let Ok(Some(patch))=session.hovered_patch(&pair,info.camera.pose(),info.celestial_projection,pixels) {ui.monospace(format!("Pointer patch {patch:?}"));}
+            }
+            for session in info.surfaces {let r=session.report;
+                ui.label(format!("{} {:?} · far error {:.4} px",info.system.body(session.body()).expect("body").name(),session.state(),session.far_error_pixels));
+                ui.small(format!("Desired {}{} / balanced {} / active {} / visible {} / level {} / error {:.4} px",r.desired_patches,if r.desired_estimate_incomplete {" (incomplete estimate)"}else{""},r.balanced_patches,r.active_patches,r.visible_patches,r.max_level,r.max_error_pixels));
+                ui.small(format!("Split {} merge {} balance {} · deferred {} constrained {}{}",r.splits,r.merges,r.balance_splits,r.deferred_transactions,r.constrained_refinements,if r.quality_pending {" · quality pending"}else{""}));
+                ui.small(format!("Cover/scratch {} bytes · sample time {:.3} s",r.scratch_bytes,info.system.sample_time().seconds_since_epoch()));
+                ui.small(format!("Horizon {} frustum {} · cache {} records / {} bytes, hit {} miss {} evict {}",r.horizon_culled,r.frustum_culled,r.cache_records,r.cache_bytes,r.cache_hits,r.cache_misses,r.cache_evictions));
+                if r.budget_constrained {ui.colored_label(egui::Color32::YELLOW,"Budget constrains requested quality; complete coarser cover retained");}
+                ui.push_id(session.body(),|ui|ui.collapsing("Bounded patch addresses / stitch masks",|ui| {for patch in session.lod().active_visible().iter().take(16) {ui.monospace(format!("{:?} mask {:04b} · {:.4} px",patch.address,patch.stitch_mask,patch.error_pixels));}}));
+            }
+            let r=info.report.surface;ui.small(format!("{} draws / {} samples / {} clipped fallback triangles / {} upload bytes",r.draws,r.samples,r.fallback_triangles,r.uploaded_bytes));
+            ui.small(format!("Narrowing {:.4e} px / GPU projection {:.4e} px · staging {} bytes",r.max_projected_error_pixels,r.max_gpu_projection_error_pixels,r.allocated_staging_bytes));
+        });
+    }
     egui::TopBottomPanel::top("exact playback and navigation").exact_height(110.0).show(context,|ui| {
         ui.horizontal(|ui|{
             ui.heading("Mundaris");
@@ -1403,10 +1808,10 @@ fn draw_ui(
                 let p=egui::pos2(x/scale,y/scale);
                 let color=if selected{egui::Color32::YELLOW}else if focused{egui::Color32::LIGHT_GREEN}else{egui::Color32::LIGHT_GRAY};
                 if controls.markers {
-                    let alpha=marker_opacity(marker.apparent_diameter_pixels,marker.representation==SphereRepresentation::PhysicalSphere);
+                    let alpha=marker_opacity(marker.apparent_diameter_pixels,matches!(marker.representation,SphereRepresentation::PhysicalSphere|SphereRepresentation::Surface));
                     ui.painter().circle_stroke(p,4.0/scale,egui::Stroke::new(1.3/scale,color.gamma_multiply(alpha)));
                 }
-                if selected||focused {
+                if (selected||focused)&&info.camera.mode()!=CameraMode::SurfaceInspection {
                     let radius=(marker.apparent_diameter_pixels as f32*0.5+5.0).clamp(8.0,2000.0)/scale;
                     ui.painter().circle_stroke(p,radius,egui::Stroke::new(1.5/scale,color));
                 }
@@ -1445,18 +1850,25 @@ fn draw_ui(
             }
         }
         if input.pointer.primary_released(){controls.gesture_start=None;}
-        let inside=input.pointer.hover_pos().is_some_and(|p|rect.contains(p));
-        let drag=if inside && ((info.camera.mode()!=CameraMode::FreeFlight&&controls.gesture_dragged&&input.pointer.primary_down())||(info.camera.mode()==CameraMode::FreeFlight&&input.pointer.secondary_down())) {input.pointer.delta()}else{egui::Vec2::ZERO};
+        let inside=input.pointer.hover_pos().is_some_and(|p|rect.contains(p)&&context.layer_id_at(p)==Some(ui.layer_id()));
+        let local_look=matches!(info.camera.mode(),CameraMode::FreeFlight|CameraMode::SurfaceInspection);
+        let drag=if inside && ((!local_look&&controls.gesture_dragged&&input.pointer.primary_down())||(local_look&&input.pointer.secondary_down())) {input.pointer.delta()}else{egui::Vec2::ZERO};
         let mut translation=DVec3::ZERO;
-        if !context.wants_keyboard_input()&&info.camera.mode()==CameraMode::FreeFlight {
+        if !context.wants_keyboard_input()&&local_look {
             for (key,axis) in [(egui::Key::W,-DVec3::Z),(egui::Key::S,DVec3::Z),(egui::Key::A,-DVec3::X),(egui::Key::D,DVec3::X),(egui::Key::Q,-DVec3::Y),(egui::Key::E,DVec3::Y)] {if input.key_down(key){translation+=axis;}}
         }
         let wheel=if inside{input.raw_scroll_delta.y as f64}else{0.0};
-        if info.camera.mode()==CameraMode::FreeFlight && wheel!=0.0 {controls.manual_speed=(controls.manual_speed*(wheel/50.0*2.0_f64.ln()).exp()).clamp(1e-3,1e3);}
-        controls.pending.push_back(Command::Navigation(NavigationInput{drag:[drag.x as f64,drag.y as f64],scroll_notches:if info.camera.mode()==CameraMode::FreeFlight{0.0}else{wheel/50.0},translation,speed_multiplier:controls.manual_speed*if input.modifiers.shift{4.0}else{1.0}}));
+        if local_look && wheel!=0.0 {controls.manual_speed=(controls.manual_speed*(wheel/50.0*2.0_f64.ln()).exp()).clamp(1e-3,1e3);}
+        controls.pending.push_back(Command::Navigation(NavigationInput{drag:[drag.x as f64,drag.y as f64],scroll_notches:if local_look{0.0}else{wheel/50.0},translation,speed_multiplier:controls.manual_speed*if input.modifiers.shift{4.0}else{1.0}}));
     });
     if !context.wants_keyboard_input() {
         context.input(|input| {
+            if input.key_pressed(egui::Key::I) {
+                controls.pending.push_back(Command::SurfaceInspection);
+            }
+            if input.key_pressed(egui::Key::H) {
+                controls.pending.push_back(Command::SurfaceHorizon);
+            }
             if input.key_pressed(egui::Key::Tab) {
                 let next = if input.modifiers.shift {
                     (info.selected + info.ids.len() - 1) % info.ids.len()
@@ -1484,6 +1896,23 @@ fn draw_ui(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn integrated_surface_route_keeps_body_identity_and_commits_real_steps() {
+        let mut demo = GravityOrbitsDemo::new().unwrap();
+        let ids = demo.ids.clone();
+        let initial = *demo.system.body(ids[1]).unwrap().state();
+        demo.start_surface_validation().unwrap();
+        for _ in 0..3750 {
+            demo.update(Duration::from_millis(32));
+        }
+        assert_eq!(demo.ids, ids);
+        assert_eq!(demo.runner.tick(), 20);
+        assert_eq!(demo.system.sample_time().seconds_since_epoch(), 1200.0);
+        assert_ne!(*demo.system.body(ids[1]).unwrap().state(), initial);
+        assert_eq!(demo.camera.focused_body(), Some(ids[1]));
+        assert!(demo.camera.clearance_m() < 2.001);
+        assert!(demo.diagnostic.is_none(), "{:?}", demo.diagnostic);
+    }
     #[test]
     fn egui_wheel_and_keyboard_route_to_one_observer() {
         let mut demo = GravityOrbitsDemo::new().unwrap();

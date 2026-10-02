@@ -10,6 +10,7 @@ pub enum CameraMode {
     SystemOrbit,
     BodyOrbit,
     FreeFlight,
+    SurfaceInspection,
 }
 #[derive(Debug, Clone, Copy)]
 pub enum FocusTarget {
@@ -80,6 +81,8 @@ pub struct CelestialCamera {
     carrier_center: Option<DVec3>,
     flight_speed_m_s: f64,
     flight_log_scale: Option<f64>,
+    inspection: Option<crate::planet_surface::SurfaceInspectionAnchor>,
+    navigation_envelope: bool,
 }
 impl CelestialCamera {
     pub fn overview(
@@ -112,12 +115,128 @@ impl CelestialCamera {
             carrier_center: None,
             flight_speed_m_s: 1.0,
             flight_log_scale: None,
+            inspection: None,
+            navigation_envelope: true,
         };
         camera.update_pose(root)?;
         Ok(camera)
     }
     pub fn pose(&self) -> FramePose {
         self.pose
+    }
+    /// The transported inspection basis also drives the local debug axes.
+    pub(crate) fn inspection_tangent(&self) -> Option<mundaris_math::surface::SurfaceTangentBasis> {
+        self.inspection.map(|anchor| anchor.tangent)
+    }
+    /// Explicit co-rotating attachment; orientation/position are re-expressed first.
+    /// Zero relative simulation derivative is a policy change, not velocity preservation.
+    pub fn enter_surface_inspection(
+        &mut self,
+        pair: &CoherentCelestialView<'_>,
+        body: BodyId,
+    ) -> Result<()> {
+        ensure!(
+            self.focused_body() == Some(body) && !self.transitioning(),
+            "complete focus before surface inspection"
+        );
+        let frame = pair.projection().frames_for(body)?.body_fixed;
+        let pose = pair.evaluation().reexpress_pose(self.pose, frame)?;
+        let radius = pair.system().body(body)?.properties().reference_radius_m();
+        let anchor = crate::planet_surface::SurfaceInspectionAnchor::new(
+            body,
+            pose.position().local().metres(),
+            radius,
+            None,
+        )?;
+        self.pose = pose;
+        self.velocity = FrameVelocity::new(frame, LinearVelocity3::zero());
+        self.mode = CameraMode::SurfaceInspection;
+        self.attachment = CameraAttachment::BodyFixed(body);
+        self.inspection = Some(anchor);
+        self.transition = None;
+        Ok(())
+    }
+    pub fn look_surface_horizon(&mut self) -> Result<()> {
+        ensure!(
+            self.mode == CameraMode::SurfaceInspection,
+            "enter surface inspection first"
+        );
+        let anchor = self.inspection.expect("inspection owns anchor");
+        self.pose = FramePose::new(self.pose.position(), anchor.body_from_regional.rotation());
+        Ok(())
+    }
+    /// Orient toward an independently simulated body without changing this observer's
+    /// position, attachment, selected identity or the target's authoritative state.
+    pub fn look_at_body(&mut self, pair: &CoherentCelestialView<'_>, target: BodyId) -> Result<()> {
+        let frame = self.pose.position().frame();
+        let target_frame = pair.projection().frames_for(target)?.translating;
+        let target = pair
+            .evaluation()
+            .convert_position(
+                FramePosition::new(target_frame, LocalPosition::origin()),
+                frame,
+            )?
+            .local();
+        let forward = Direction3::try_new(
+            target
+                .displacement_from(self.pose.position().local())?
+                .metres(),
+        )?
+        .unit();
+        let up = self
+            .inspection
+            .map_or(self.pose.orientation().quaternion() * DVec3::Y, |a| {
+                a.tangent.up().unit()
+            });
+        let mut right = forward.cross(up);
+        if right.length() < 1e-6 {
+            let previous = self.pose.orientation().quaternion() * DVec3::X;
+            right = previous - forward * previous.dot(forward);
+        }
+        let right = Direction3::try_new(right)?.unit();
+        let up = Direction3::try_new(right.cross(forward))?.unit();
+        let orientation = UnitRotation::try_from_quaternion(DQuat::from_mat3(
+            &glam::DMat3::from_cols(right, up, -forward),
+        ))?;
+        self.pose = FramePose::new(self.pose.position(), orientation);
+        Ok(())
+    }
+    pub fn measured_clearance(
+        &self,
+        pair: &CoherentCelestialView<'_>,
+        body: BodyId,
+    ) -> Result<f64> {
+        let frame = pair.projection().frames_for(body)?.body_fixed;
+        let p = pair
+            .evaluation()
+            .convert_position(self.pose.position(), frame)?
+            .local()
+            .metres();
+        Ok(p.length() - pair.system().body(body)?.properties().reference_radius_m())
+    }
+    /// Debug bypass only; this is a reference-sphere navigation guard, not collision.
+    pub fn set_navigation_envelope(&mut self, enabled: bool) {
+        self.navigation_envelope = enabled;
+    }
+    /// Repeatable approach target; admitted wall-time smoothing changes only observer state.
+    pub fn target_clearance(
+        &mut self,
+        pair: &CoherentCelestialView<'_>,
+        clearance: f64,
+    ) -> Result<()> {
+        ensure!(
+            self.mode == CameraMode::BodyOrbit && !self.transitioning(),
+            "complete body orbit focus before approach"
+        );
+        self.refresh_navigation_constraint(pair)?;
+        ensure!(
+            clearance.is_finite()
+                && clearance >= minimum_clearance(self.radius_m)?
+                && clearance + self.radius_m <= 1e15,
+            "invalid navigation clearance"
+        );
+        self.zoom_target_log = clearance.ln();
+        Ok(())
     }
     pub fn set_overview_direction(&mut self, normal: DVec3) -> Result<()> {
         let normal = Direction3::try_new(normal)?.unit();
@@ -359,6 +478,7 @@ impl CelestialCamera {
         self.velocity = stationary.velocity();
         self.attachment = role;
         self.mode = CameraMode::FreeFlight;
+        self.inspection = None;
         self.flight_log_scale = None;
         self.carrier_center = match role {
             CameraAttachment::Translating(id) => {
@@ -545,6 +665,9 @@ impl CelestialCamera {
         if self.mode == CameraMode::FreeFlight {
             return self.free_flight(pair, input, elapsed);
         }
+        if self.mode == CameraMode::SurfaceInspection {
+            return self.inspect_motion(pair, input, elapsed);
+        }
         self.refresh_navigation_constraint(pair)?;
         self.yaw = (self.yaw - input.drag[0] * 0.005).rem_euclid(std::f64::consts::TAU);
         self.pitch = (self.pitch - input.drag[1] * 0.005).clamp(-1.5, 1.5);
@@ -660,6 +783,80 @@ impl CelestialCamera {
         };
         self.velocity =
             FrameVelocity::new(frame, LinearVelocity3::try_metres_per_second(derivative)?);
+        if self.navigation_envelope {
+            for (id, body) in pair.system().bodies() {
+                let fixed = pair.projection().frames_for(id)?.body_fixed;
+                let local = pair.evaluation().reexpress_pose(self.pose, fixed)?;
+                let p = local.position().local().metres();
+                let radius = body.properties().reference_radius_m();
+                let minimum = radius + minimum_clearance(radius)?;
+                if p.length() < minimum {
+                    let guarded = FramePose::new(
+                        FramePosition::new(
+                            fixed,
+                            LocalPosition::try_metres(Direction3::try_new(p)?.unit() * minimum)?,
+                        ),
+                        local.orientation(),
+                    );
+                    self.pose = pair.evaluation().reexpress_pose(guarded, frame)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    fn inspect_motion(
+        &mut self,
+        pair: &CoherentCelestialView<'_>,
+        input: &NavigationInput,
+        elapsed: Duration,
+    ) -> Result<()> {
+        let mut anchor = self.inspection.expect("inspection owns anchor");
+        let radius = pair
+            .system()
+            .body(anchor.body)?
+            .properties()
+            .reference_radius_m();
+        let look = UnitRotation::try_from_quaternion(
+            DQuat::from_rotation_y(-input.drag[0] * 0.005)
+                * DQuat::from_rotation_x(-input.drag[1] * 0.005),
+        )?;
+        let orientation = self.pose.orientation().compose(look);
+        let clearance = self.pose.position().local().metres().length() - radius;
+        self.flight_speed_m_s = (0.5 * clearance).clamp(1.0, 1e12) * input.speed_multiplier;
+        let movement = if input.translation == DVec3::ZERO {
+            DVec3::ZERO
+        } else {
+            Direction3::try_new(input.translation)?.unit()
+        };
+        if movement != DVec3::ZERO {
+            let offset =
+                orientation.quaternion() * movement * self.flight_speed_m_s * elapsed.as_secs_f64();
+            let regional = anchor
+                .body_from_regional
+                .rotation()
+                .inverse()
+                .rotate_displacement(Displacement3::try_metres(offset)?)?;
+            anchor.observer_in_regional = anchor.observer_in_regional.displaced(regional)?;
+        }
+        let p = anchor.position()?.metres();
+        let minimum = radius + minimum_clearance(radius)?;
+        let guarded = if self.navigation_envelope && p.length() < minimum {
+            Direction3::try_new(p)?.unit() * minimum
+        } else {
+            p
+        };
+        if guarded != p || anchor.observer_in_regional.metres().length() > 1000.0 {
+            anchor = crate::planet_surface::SurfaceInspectionAnchor::new(
+                anchor.body,
+                guarded,
+                radius,
+                Some(anchor.tangent),
+            )?;
+        }
+        let frame = self.attachment.frame(pair.projection())?;
+        self.pose = FramePose::new(FramePosition::new(frame, anchor.position()?), orientation);
+        self.velocity = FrameVelocity::new(frame, LinearVelocity3::zero());
+        self.inspection = Some(anchor);
         Ok(())
     }
     /// Property edits may change the navigation envelope while leaving physics
@@ -672,7 +869,10 @@ impl CelestialCamera {
             CameraAttachment::System => return Ok(()),
             CameraAttachment::Translating(id) | CameraAttachment::BodyFixed(id) => id,
         };
-        if self.mode == CameraMode::FreeFlight || self.transition.is_some() {
+        if self.mode == CameraMode::FreeFlight
+            || self.mode == CameraMode::SurfaceInspection
+            || self.transition.is_some()
+        {
             return Ok(());
         }
         let radius = pair.system().body(id)?.properties().reference_radius_m();
@@ -832,6 +1032,38 @@ mod tests {
     use super::*;
     use crate::gravity_fixtures::GravityFixture;
     use std::num::NonZeroU64;
+    #[test]
+    fn inspection_debug_basis_matches_transported_horizon_after_reanchoring() {
+        let world = GravityFixture::Hierarchy
+            .create(NonZeroU64::new(1).unwrap())
+            .unwrap();
+        let projection =
+            CelestialFrameProjection::build(&world, NonZeroU64::new(1).unwrap()).unwrap();
+        let pair = projection.coherent_view(&world).unwrap();
+        let body = world.bodies().nth(1).unwrap().0;
+        let mut camera = CelestialCamera::overview(&pair, DVec3::ZERO, 1.6e11).unwrap();
+        camera.focus(&pair, body, true, true).unwrap();
+        assert!(camera.inspection_tangent().is_none());
+        camera.enter_surface_inspection(&pair, body).unwrap();
+        camera
+            .update_navigation(
+                &pair,
+                &NavigationInput {
+                    translation: DVec3::new(1.0, 1.0, 0.0),
+                    ..Default::default()
+                },
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        let tangent = camera.inspection_tangent().unwrap();
+        let static_basis = mundaris_math::surface::SurfaceTangentBasis::new(tangent.up());
+        assert!((tangent.east().unit() - static_basis.east().unit()).length() > 1e-6);
+        camera.look_surface_horizon().unwrap();
+        let rotation = camera.pose().orientation().quaternion();
+        assert!((rotation * DVec3::X - tangent.east().unit()).length() <= 1e-12);
+        assert!((rotation * DVec3::Y - tangent.up().unit()).length() <= 1e-12);
+        assert!((rotation * DVec3::NEG_Z - tangent.north().unit()).length() <= 1e-12);
+    }
     #[test]
     fn focus_navigation_reexpression_and_rebuild_preserve_world() {
         let world = GravityFixture::Hierarchy
