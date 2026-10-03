@@ -1,10 +1,20 @@
 # Mundaris
 
-Mundaris is a native desktop world-building and planetary simulation project spanning astronomical and local surface scales. Checked reference frames, editable celestial state, deterministic Newtonian gravity, fixed-step orbital integration and minimal celestial debug rendering are implemented. Procedural worlds remain future work.
+Mundaris is a native desktop world-building and planetary simulation project spanning astronomical and local surface scales. Checked reference frames, editable celestial state, deterministic Newtonian gravity, fixed-step orbital integration and adaptive procedural terrain are implemented as development checkpoints.
 
 **Status:** Phase 4 smooth planetary surface LOD is implemented in the connected celestial explorer. Windows headless/release, CPU benchmarks and directed native approach/inspection evidence are recorded in [Phase 4 validation](docs/phase-4-validation.md) and [ADR 0006](docs/adr/0006-planet-surface-topology-and-lod.md). Complete operator/high-DPI/recovery, Linux and current-revision remote CI acceptance remain open. Full-planet CPU preparation misses the review target; see [performance](docs/performance.md). Phase 5 now includes deterministic filtered terrain, analytic erosion/lighting, bounded CPU caching, adaptive displaced stitching and common-refinement morphs. [Phase 5 evidence](docs/phase-5-validation.md) distinguishes implementation from still-open morphology, quality convergence and interactive-performance acceptance; earlier evidence is preserved.
 
 The initial native development targets are **Windows x86-64** and **Linux x86-64**.
+
+**Phase 5.8 content:** ordinary launch opens a ten-body gameplay Solar System
+(Sun, all eight planets and Earth's Moon), with **400 km Earth radius / 800 km
+diameter**. Radius, gravity, rotation, terrain and orbital configuration remain
+independent; Earth-sized/larger engine regression capability is unchanged. See
+[scale/system implementation](MUNDARIS_PHASE_5_8_GAMEPLAY_SCALE_AND_SOLAR_SYSTEM.md)
+and [validation](docs/phase-5-validation.md). The inherited terrain performance,
+quality convergence, morphology and platform acceptance gaps remain open.
+The [Phase 5.8 capture index](docs/evidence/phase58/README.md) links retained scenes,
+exact manifests and the reproduction command.
 
 ## Prerequisites
 
@@ -23,13 +33,23 @@ The initial native development targets are **Windows x86-64** and **Linux x86-64
 ```bash
 cargo build --workspace
 cargo run -p mundaris_app
+cargo run --locked -p mundaris_app -- --solar-system
+cargo run --locked -p mundaris_app -- --real-solar-system
 cargo run --locked -p mundaris_app -- --reference-frames
 cargo run --locked -p mundaris_app -- --celestial-model
 cargo run --locked -p mundaris_app -- --gravity-orbits
 ```
 
-Phase 5 has an opt-in **terrain checkpoint preview** in the surface panel of
-`--gravity-orbits`. Enable it there, or set `MUNDARIS_PHASE5_TERRAIN=1` before
+Gameplay Solar System terrain is enabled by default for rocky bodies, but only
+the observer-local required body generates surface geometry. Distant system view
+does not generate terrain for all planets. Sun and gas/ice giants stay simple
+far-body spheres. Use Home for system overview, select any named body and Focus/
+Fit physical body for deterministic navigation; Earth, Moon and Mars have distinct
+terrain definitions. `--real-solar-system` uses near-real radii/orbital lengths
+through the same engine code (circular initial states, not an ephemeris).
+
+The original `--gravity-orbits` fixture retains an opt-in **terrain checkpoint
+preview** in the surface panel. Enable it there, or set `MUNDARIS_PHASE5_TERRAIN=1` before
 launching. It authors the deterministic fixture once, then renders cached f64
 displaced geometry; disabling the preview restores the Phase 4 sphere path.
 The preview uses balanced adaptive displaced covers and common-refinement morphs
@@ -39,7 +59,7 @@ and close-range terrain navigation remains incomplete. See
 [checkpoint evidence](docs/phase-5-validation.md) and
 [implementation](docs/phase-5-7-adaptive-terrain.md).
 
-Normal invocation opens the bootstrap panel. `--reference-frames` draws abstract axes and wire boxes attached to an analytically translating/rotating hierarchy, with source-centred rendering, precision diagnostics, pause/seek/reset, a `1e16 m` shared-offset stress mode, continuous approach, paused frame re-expression, and centimetre movement buttons. Begin approach while paused, then select Play. Re-expression and local movement are available while paused. This fixture contains no planet, terrain, or physics simulation.
+Normal invocation opens the paused gameplay Solar System overview. `--reference-frames` draws abstract axes and wire boxes attached to an analytically translating/rotating hierarchy, with source-centred rendering, precision diagnostics, pause/seek/reset, a `1e16 m` shared-offset stress mode, continuous approach, paused frame re-expression, and centimetre movement buttons. Begin approach while paused, then select Play. Re-expression and local movement are available while paused. This fixture contains no planet, terrain, or physics simulation.
 
 `--celestial-model` creates Solace, Aurelia and Luma at star/planet/moon-scale magnitudes. Their bounded `-600..600 s` prescribed motion is an analytic validation fixture, not orbital physics. The panel provides rate/reverse/pause, explicit seek/reset, body selection, translating/body-fixed focus and observer re-expression, projection rebuilding, and atomic name/mass/reference-radius edits. Body-local axes are drawn through the generic renderer; distant bodies have textual bearing/distance markers. Reset preserves body IDs, restores fixture properties/state, and selects Aurelia in body-fixed focus at `0 s`, `1x`, paused.
 
@@ -96,14 +116,16 @@ mode. Rate samples report their actual wall window and tick-limited quantization
 
 ## Planet surface inspection
 
-Focus Aurelia/Luma, open **Planet surface / inspection**, set astronomical or exact
+Focus Earth/Moon/Mars (or Aurelia/Luma in the legacy fixture), open **Planet surface / inspection**, set astronomical or exact
 clearance targets, or run the continuous 30 s approach to 2 m. **I** explicitly
 attaches the same observer to the rotating fixed frame; right drag looks locally,
 WASD/QE move at clearance-scaled editor speed and **H** looks toward the tangent
 horizon. Look-at body controls and single physical steps observe the independent
 moon/star. The reference-sphere clearance guard is navigation, not collision/walking.
 
-Normal mode is a plain analytically shaded sphere. Optional borders/LOD/face/bounds
+The legacy fixture without terrain uses a plain analytically shaded sphere;
+gameplay rocky bodies use generated terrain when observer-local demand admits it.
+Optional borders/LOD/face/bounds
 views, pointer patch addressing and readiness/cache/quality counters expose the
 derived structure. Far/surface ownership is exclusive per BodyId; no scene switch.
 

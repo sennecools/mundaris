@@ -10,21 +10,34 @@ use std::num::NonZeroU64;
 pub enum GravityFixture {
     Circular,
     Hierarchy,
+    GameplaySolarSystem,
+    RealSolarSystem,
 }
 impl GravityFixture {
     pub fn fixed_step_s(self) -> f64 {
         match self {
             Self::Circular => 10.0,
             Self::Hierarchy => 60.0,
+            Self::GameplaySolarSystem | Self::RealSolarSystem => 60.0,
         }
     }
     pub fn trail_stride(self) -> u64 {
         match self {
             Self::Circular => 8,
             Self::Hierarchy => 64,
+            Self::GameplaySolarSystem | Self::RealSolarSystem => 64,
         }
     }
     pub fn create(self, namespace: NonZeroU64) -> Result<CelestialSystem> {
+        match self {
+            Self::GameplaySolarSystem => {
+                return crate::solar_system::SolarSystemPreset::gameplay().create(namespace);
+            }
+            Self::RealSolarSystem => {
+                return crate::solar_system::SolarSystemPreset::real_scale().create(namespace);
+            }
+            _ => {}
+        }
         let mut system = CelestialSystem::new(namespace, SimulationInstant::ZERO);
         let (names, masses, radii, positions, velocities) = match self {
             Self::Circular => {
@@ -75,6 +88,9 @@ impl GravityFixture {
                     ],
                 )
             }
+            Self::GameplaySolarSystem | Self::RealSolarSystem => {
+                unreachable!("solar presets dispatched above")
+            }
         };
         for i in 0..masses.len() {
             let (orientation, omega) = if self == Self::Circular {
@@ -109,6 +125,16 @@ impl GravityFixture {
             )?;
         }
         Ok(system)
+    }
+}
+impl GravityFixture {
+    pub fn color(self, index: usize) -> [f32; 4] {
+        match self {
+            Self::GameplaySolarSystem | Self::RealSolarSystem => {
+                crate::solar_system::SOLAR_SYSTEM_CONTENT[index].color
+            }
+            _ => body_color(index),
+        }
     }
 }
 pub fn body_color(index: usize) -> [f32; 4] {

@@ -1,5 +1,154 @@
 # Phase 5 implementation and validation evidence
 
+## Phase 5.8 gameplay scale and authored Solar System — 2026-10-03
+
+**The 400 km-radius default Earth and ten-body development system are implemented.
+This is content/scale evidence, not interactive-performance, terrain morphology or
+complete Phase 5 acceptance.** The
+[implementation note](../MUNDARIS_PHASE_5_8_GAMEPLAY_SCALE_AND_SOLAR_SYSTEM.md)
+records the catalog, scaling, gravity, orbit and admission rules; the
+[capture index](evidence/phase58/README.md) retains 17 scene images/manifests, two
+LOD diagnostics and three clearly post-capture labelled overview derivatives.
+Earlier Phase 5.7 evidence below is unchanged.
+
+### Content, physics and regression boundaries
+
+Ordinary launch opens the paused gameplay system: Sun, Mercury, Venus, Earth,
+Moon, Mars, Jupiter, Saturn, Uranus and Neptune. The central catalog authors
+independent radius, gravity/mass, rotation, appearance, orbit and terrain inputs.
+Gameplay body and orbital scales initially both equal `400000 / 6371000`, but are
+separate preset fields. `--real-solar-system` uses unit scales, approximate real
+reference gravities and circular initial states, not an ephemeris. Original
+reference-frame, celestial-model and gravity-orbits fixtures remain available.
+
+Gameplay Earth uses `mu = g_surface * radius² = 1.569064e12 m³/s²`, reference
+gravity 9.80665 m/s² and escape speed 2800.94984 m/s. The ordinary Newtonian
+mutual-gravity kernel and fixed 60 s N-body KDK are unchanged. Initial circular
+velocities use the authored scaled masses/distances; Earth/Moon are composed about
+their inner barycenter before all states shift to the global inertial barycenter.
+Changing orbital distance recomputes speeds. Parent identity is not spin/frame
+ancestry. Rotation periods and local terrain length scales are independently authored.
+
+Mercury/Venus/Earth/Moon/Mars have distinct deterministic V2 identities/seeds.
+Sun and giants have no rocky terrain. A shared `TerrainPopulation` admits at most
+one observer-local rocky cover, rejects expanded offscreen spheres before admission,
+and retains far ownership until complete generated roots are ready. Transfer restores
+source far coverage, cancels source queued/partial work, unpins raw entries and
+releases derived cover/morph state; raw entries can be reused under LRU pressure.
+Inactive worlds do not generate terrain merely because they exist.
+
+New directed regressions cover catalog/scales/gravity/rotation, consistent orbital
+initialization and advancement, system zero-work, Earth→Moon→Mars→Earth transfer,
+cache reuse, return to system view and centimetre source-centred detail for multiple
+bodies at their real system positions and under a shared `1e16 m` offset. Radius
+fixtures exercise 50/100/400/1000/6371/12742 km; the real V1/V2 transition suite adds
+the actual gameplay Earth definition at 400 km without removing the 10 km and
+Earth-radius cases. These tests do not certify unlimited numerical range.
+
+### Captures and visual interpretation
+
+Windows x86-64/MSVC, Rust 1.98.1, AMD Radeon RX 9070 XT, 1152×768. Final captures
+were run sequentially without concurrent CPU-heavy validation:
+
+```text
+cargo run --locked --release -p mundaris_app --features terrain-capture,surface-profile --example solar_system_capture -- target/phase58-final all 800
+```
+
+The retained system/inner/Earth–Moon views use true physical scales and existing
+subpixel/precision markers. Their optional labels use existing app `LabelLayout`
+records and are post-capture annotations, not raw renderer frames or physical-size
+changes. Earth and Moon overlap at whole-system scale; labelled views make identity
+inspectable without inflating their physical spheres.
+
+Earth high/low orbit, high altitude, mountain and near-ground views retain curved
+horizons. Terrain is smooth/low-detail in these directed images, not convincing
+mountain/continent morphology. The near-ground horizon is nearly flat over its
+tiny local footprint, not an engine flattening change. Its initial nominal 20 m
+full-field clearance lay below ready filtered triangles; a capture-only ray/triangle
+probe adjusted the eye radially by 160.588596 m to 20 m above the drawn mesh. This
+is explicitly not terrain collision or accepted walking/navigation. Mars retains
+its identifying red base tint; Jupiter/Saturn/Neptune are simple tan/gold/blue
+spheres, without final materials, atmospheres or Saturn rings.
+
+Adaptive diagnostics show mixed ready LOD. The morph capture is an early cover at
+fraction 0.4266667, not a fully converged detailed surface. All active-terrain scene
+manifests remain `quality_pending=true` and `settled=false`; close conservative
+projected errors can be infinite. Finite rendered geometry and watertight regression
+tests do not imply requested-error convergence or horizon certification.
+
+The 600/800/1000 km comparison images change **Earth diameter**, not viewport size;
+orbital layout stays fixed and initialization recomputes coherent velocities. At
+matched 600 km terrain clearance they show the expected increasing angular size,
+but not enough local morphology/travel evidence to prefer another default. The
+requested 800 km baseline is retained provisionally, not declared qualitatively accepted.
+
+### Host performance, work and memory
+
+These are directed harness host distributions, **not native FPS or GPU times**.
+The update timing measures population/terrain work, not the full UI/event loop or
+N-body frame. Celestial preparation excludes submission, completion and readback;
+upload/encoding is recorded separately in manifests. GPU timestamps were unavailable.
+Headless generation uses 1156 samples/update without a wall cutoff; native generation
+still uses 64 samples, eight-sample microbatches and a 2 ms between-batch cutoff.
+Selector, full stitching and morph construction remain outside that cutoff.
+
+| Scene | Cover / visible | Cover levels | Steady update median / worst (ms) | Render preparation median / worst (ms) | Total draws | Cumulative generated samples / final pending |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| System | 0 / 0 | none | 0.0039 / 0.0039 | 0.0139 / 0.0498 | 1 | 0 / 0 |
+| Inner system | 0 / 0 | none | 0.0039 / 0.0039 | 0.0517 / 0.0529 | 2 | 0 / 0 |
+| High orbit, 600 km clearance | 690 / 690 | 3–4 | 3.9777 / 4.0208 | 10.6493 / 11.1098 | 9 | 265880 / 2 |
+| Low orbit | 693 / 219 | 1–10 | 5.3620 / 5.8322 | 3.3697 / 3.9391 | 9 | 266747 / 7 |
+| High altitude | 684 / 402 | 1–12 | 7.9053 / 8.1572 | 6.3361 / 6.4105 | 8 | 268192 / 2 |
+| Mountain | 693 / 571 | 1–10 | 5.1185 / 5.6367 | 9.0255 / 10.0499 | 9 | 266458 / 0 |
+| Near ground | 696 / 399 | 1–13 | 5.0645 / 5.3184 | 6.3432 / 7.0524 | 9 | 267614 / 0 |
+
+System view has ten far owners, no active terrain and no queued/generated work.
+Active surface views have one terrain owner and nine far owners (ownership counts
+are not visibility counts). Steady probes generate zero samples. High-orbit full
+stitch median/worst is 7.2086/14.8163 ms; ground is 9.3631/17.2285 ms. Ground
+convergence total update median/worst is 15.8203/58.3191 ms. Morph capture has nine
+cover patches, two regular visible patches and 1751 drawn morph triangles; its two
+constructions total 254.2307 ms, worst 203.1621 ms. It is not performance acceptance.
+
+Shared raw-cache bookkeeping without terrain is 2,200,620 bytes. High-orbit raw
+cache is 11,883,276 bytes; ground is 11,938,764 bytes. Ground peak aggregate
+accounting is 117,440,115 bytes and mountain 117,440,478, below the retained
+112 MiB admission quota (117,440,512 bytes) and unchanged 128 MiB ceiling.
+The prior conservative 16 MiB headroom and 72 MiB renderer staging reservation
+remain. Ten world-body struct payloads total 4080 bytes, excluding names/container
+capacity/projections/history; five lightweight handoff sessions share one raw cache
+and active cover. Accounting is not process RSS or total GPU memory.
+
+Phase 5.7 offscreen covers used the full 128 MiB quota, whereas this capture route
+retains native headroom. Radius, authored fields, camera and viewport also differ;
+smaller covers/timings here are **not like-for-like optimization evidence**. The
+previous 11–14.7 ms stitch medians, 152.8/736.4 ms production morph median/worst
+and 169.11 ms heavy-motion worst remain open debt.
+
+### Quality commands and remaining acceptance
+
+Final Windows quality validation uses the same locked commands listed for Phase
+5.7 below, plus the new focused solar/population tests. Debug and final release
+workspace tests each passed **208 tests, zero failures, two ignored across 56
+result suites including doctests**. The explicit release ignored-orbit filter
+then passed both long tests. App-only all-feature release validation passed 75
+tests. Counts sum each suite's result line once; the final full-workspace release
+output is retained locally at `target/phase58-final-release-tests.log`.
+Formatting, all-target/all-feature workspace check, full-workspace warnings-denied
+Clippy, warnings-denied Rustdoc and release app/all-example builds passed after the
+final capture helper changes. Focused solar/population and real-transition checks
+passed; compilation alone is not runtime acceptance. Annotation execution passed
+and preserved all three raw overview PNG SHA-256 hashes; local Markdown links resolve.
+
+Linux native, current remote CI, high-DPI/actual OS sleep recovery and complete
+human control/travel/morphology acceptance were not run. A supplementary native
+launch was closed through its owned window, but exact exit status and deterministic
+startup capture were not retained; it is excluded from accepted deterministic
+evidence. No earlier prerequisite is retroactively accepted. Terrain-aware
+navigation/collision, displaced-horizon certification and complete convergence
+remain open. Biomes, atmospheres, final materials, stellar rendering, self-shadowing,
+rings/belts and worker/GPU generation or stitch/morph optimization are deferred.
+
 ## Phase 5.7 adaptive displaced terrain — 2026-10-03
 
 **Adaptive stitching and common-refinement morphing are implemented and have

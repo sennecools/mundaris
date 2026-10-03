@@ -59,6 +59,10 @@ required-features = ["terrain-capture"]
 name = "terrain_transition_capture"
 required-features = ["terrain-capture"]
 
+[[example]]
+name = "solar_system_capture"
+required-features = ["terrain-capture"]
+
 [[bench]]
 name = "planet_terrain_view"
 harness = false

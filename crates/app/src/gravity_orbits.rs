@@ -55,6 +55,7 @@ enum Command {
 }
 struct Controls {
     terrain_preview: bool,
+    sun_from_star: bool,
     terrain_lighting: TerrainLighting,
     terrain_morph_ms: u64,
     surface_bounds: bool,
@@ -90,6 +91,7 @@ impl Controls {
     fn new(body: &CelestialBody) -> Self {
         Self {
             terrain_preview: false,
+            sun_from_star: false,
             terrain_lighting: terrain_lighting_from_environment(),
             terrain_morph_ms: std::env::var("MUNDARIS_TERRAIN_MORPH_MS")
                 .ok()
@@ -145,13 +147,11 @@ impl Controls {
 }
 
 pub struct GravityOrbitsDemo {
-    terrain_cache: crate::planet_terrain::TerrainPatchCache,
-    terrain_cover: crate::planet_terrain::AdaptiveTerrainCover,
-    terrain_work: crate::planet_terrain::TerrainWorkReport,
+    terrain: crate::terrain_population::TerrainPopulation,
+    scenario: GravityFixture,
     validation_route: Option<SurfaceValidationRoute>,
     surfaces: Vec<PlanetSurfaceSession>,
     surface_owners: Vec<bool>,
-    far_probe: CelestialStaging,
     system: CelestialSystem,
     runner: FixedStepRunner,
     projection: CelestialFrameProjection,
@@ -259,6 +259,17 @@ impl GravityOrbitsDemo {
         }
         Ok(demo)
     }
+    /// Ordinary development content; the original physical fixtures remain selectable.
+    pub fn solar_system(real_scale: bool) -> Result<Self> {
+        let scenario = if real_scale {
+            GravityFixture::RealSolarSystem
+        } else {
+            GravityFixture::GameplaySolarSystem
+        };
+        let mut demo = Self::create(scenario, 1, 1)?;
+        demo.command(Command::TerrainPreview(true))?;
+        Ok(demo)
+    }
     /// Optional operator route through the same production controls and renderer.
     pub fn start_surface_validation(&mut self) -> Result<()> {
         anyhow::ensure!(
@@ -311,31 +322,45 @@ impl GravityOrbitsDemo {
         let camera =
             CelestialCamera::overview(&projection.coherent_view(&system)?, center, extent)?;
         let ids: Vec<_> = system.bodies().map(|(id, _)| id).collect();
-        let selected = 1;
+        let selected = if matches!(
+            scenario,
+            GravityFixture::GameplaySolarSystem | GravityFixture::RealSolarSystem
+        ) {
+            3
+        } else {
+            1
+        };
         let mut selection = BodySelection::default();
         selection.select(&system, ids[selected])?;
-        let controls = Controls::new(system.body(ids[selected])?);
+        let mut controls = Controls::new(system.body(ids[selected])?);
+        if matches!(
+            scenario,
+            GravityFixture::GameplaySolarSystem | GravityFixture::RealSolarSystem
+        ) {
+            controls.terrain_preview = true;
+            controls.sun_from_star = std::env::var("MUNDARIS_TERRAIN_SUN").is_err();
+            controls.surface_style.elevation_colors = true;
+        }
         let advance = runner.report();
         let trails = TrailHistory::new(&system, scenario.trail_stride())?;
         let enabled = match scenario {
             GravityFixture::Hierarchy => vec![ids[1], ids[2]],
             GravityFixture::Circular => vec![ids[1]],
+            GravityFixture::GameplaySolarSystem | GravityFixture::RealSolarSystem => system
+                .bodies()
+                .filter_map(|(id, body)| body.terrain().map(|_| id))
+                .collect(),
         };
         let surfaces = enabled
             .into_iter()
             .map(|id| PlanetSurfaceSession::new(id, 2048))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            terrain_cache: crate::planet_terrain::TerrainPatchCache::new(
-                crate::planet_terrain::TERRAIN_CPU_CAP_BYTES - 16 * 1024 * 1024,
-                crate::planet_terrain::MAX_TERRAIN_PATCHES,
-            )?,
-            terrain_cover: crate::planet_terrain::AdaptiveTerrainCover::default(),
-            terrain_work: crate::planet_terrain::TerrainWorkReport::default(),
+            terrain: crate::terrain_population::TerrainPopulation::new()?,
+            scenario,
             validation_route: None,
             surfaces,
             surface_owners: Vec::new(),
-            far_probe: CelestialStaging::default(),
             system,
             runner,
             projection,
@@ -660,7 +685,12 @@ impl GravityOrbitsDemo {
             }
             Command::Rename(name) => self.runner.rename(&mut self.system, id, &name)?,
             Command::TerrainPreview(enabled) => {
-                if enabled {
+                if enabled
+                    && !matches!(
+                        self.scenario,
+                        GravityFixture::GameplaySolarSystem | GravityFixture::RealSolarSystem
+                    )
+                {
                     let id = self.ids[1];
                     let body = self.system.body(id)?;
                     if body.terrain().is_none() {
@@ -1198,12 +1228,12 @@ impl GravityOrbitsDemo {
             self.requests.push(CelestialRenderBody {
                 body_fixed_frame: frames.body_fixed,
                 reference_radius_m: radius,
-                color: body_color(index),
+                color: self.scenario.color(index),
                 unlit: index == 0,
                 selected: index == selected_index,
             });
         }
-        let near = if clearance <= 64.0 * f64::EPSILON * 6.4e6 || clearance == f64::MAX {
+        let near = if clearance <= 0.0 || clearance == f64::MAX {
             0.1
         } else {
             (0.01 * clearance).max(0.1)
@@ -1211,98 +1241,44 @@ impl GravityOrbitsDemo {
         let projection = self.content_projection(near)?;
         self.surface_owners.clear();
         self.surface_owners.resize(self.requests.len(), false);
-        let metadata_quota = 32 / self.surfaces.len().max(1);
-        for session in &mut self.surfaces {
-            let index = self
-                .ids
-                .iter()
-                .position(|&id| id == session.body())
-                .expect("surface capability body");
-            let body = self.requests[index];
-            let settings = LodSettings::default().with_limits(2048, 32768, 30)?;
-            let settings = settings.with_work_limit(metadata_quota)?;
-            let terrain_envelope = if self.controls.terrain_preview && index == 1 {
-                pair.system()
-                    .body(session.body())?
-                    .terrain()
-                    .map_or(0.0, |d| d.config().absolute_height_bound_m())
-            } else {
-                0.0
-            };
-            if !(self.controls.terrain_preview && index == 1) {
-                session.update_with_terrain_envelope(
-                    &SurfaceViewInput {
-                        view: &view,
-                        body_fixed_frame: body.body_fixed_frame,
-                        reference_radius_m: body.reference_radius_m,
-                        projection,
-                    },
-                    &settings,
-                    terrain_envelope,
-                )?;
-            }
-            if session.state() == SurfaceRepresentationState::Surface
-                && session.far_error_pixels < 0.05
-            {
-                let mut probe =
-                    CelestialFrame::new(&view, &mut self.far_probe, projection, &self.sphere);
-                probe.append_bodies(&[body])?;
-                session.return_to_far_if_ready(matches!(
-                    probe.markers()[0].representation,
-                    SphereRepresentation::PhysicalSphere
-                        | SphereRepresentation::SubpixelMarker
-                        | SphereRepresentation::Culled
-                ));
-            }
-            self.surface_owners[index] = session.state() == SurfaceRepresentationState::Surface;
-            if self.controls.terrain_preview && index == 1 {
-                let world_body = pair.system().body(session.body())?;
-                let definition = world_body
-                    .terrain()
-                    .ok_or_else(|| anyhow::anyhow!("terrain preview definition unavailable"))?;
-                let identity = crate::planet_terrain::TerrainGeometryIdentity::new(
-                    session.body(),
-                    definition.clone(),
-                    world_body.terrain_revision(),
-                    body.reference_radius_m,
-                )?;
-                // Fine requests can be admitted at any time in an adaptive cover.
-                // Preserve eight-vertex chunks and a between-chunk wall cutoff.
-                let vertex_budget = 64;
-                let input = SurfaceViewInput {
-                    view: &view,
-                    body_fixed_frame: body.body_fixed_frame,
-                    reference_radius_m: body.reference_radius_m,
-                    projection,
-                };
-                let terrain_settings = settings.with_limits(2048, 2048, 30)?;
-                self.terrain_cover
-                    .set_morph_duration(Duration::from_millis(self.controls.terrain_morph_ms))?;
-                self.terrain_work = self.terrain_cover.update_with_elapsed(
-                    &mut self.terrain_cache,
-                    &identity,
-                    &input,
-                    &terrain_settings,
-                    vertex_budget,
-                    Some(Duration::from_millis(2)),
-                    elapsed,
-                )?;
-                session.update_with_terrain_report(
-                    &input,
-                    terrain_envelope,
-                    self.terrain_cover.report,
-                )?;
-                for patch in self.terrain_cover.visible() {
-                    self.terrain_cache.get(&identity, patch.address)?;
-                }
-                // Far sphere remains sole owner until all six generated roots
-                // establish coverage. No sphere/terrain mixed leaf cover.
-                self.surface_owners[index] = session.state() == SurfaceRepresentationState::Surface
-                    && self.terrain_cover.ready();
-            }
+        self.terrain.update(
+            &pair,
+            &view,
+            projection,
+            &self.requests,
+            &mut self.surfaces,
+            &mut self.surface_owners,
+            &self.sphere,
+            self.controls.terrain_preview,
+            Duration::from_millis(self.controls.terrain_morph_ms),
+            64,
+            Some(Duration::from_millis(2)),
+            elapsed,
+        )?;
+        let mut lighting = self.controls.terrain_lighting;
+        if self.controls.sun_from_star
+            && let Some(active) = self.terrain.active_body()
+        {
+            let body = pair.system().body(active)?;
+            let star = pair.system().body(self.ids[0])?;
+            let direction = body
+                .state()
+                .body_to_system()
+                .inverse()
+                .rotate_direction(Direction3::try_new(
+                    star.state().center_in_system().metres()
+                        - body.state().center_in_system().metres(),
+                )?)?
+                .unit();
+            lighting = TerrainLighting::try_new(
+                direction,
+                lighting.ambient_strength(),
+                lighting.diffuse_strength(),
+                lighting.mode(),
+            )?;
         }
         let mut frame = CelestialFrame::new(&view, &mut self.staging, projection, &self.sphere);
-        frame.set_terrain_lighting(self.controls.terrain_lighting);
+        frame.set_terrain_lighting(lighting);
         let prepared = (|| -> Result<()> {
             for session in &self.surfaces {
                 let index = self
@@ -1311,24 +1287,37 @@ impl GravityOrbitsDemo {
                     .position(|&id| id == session.body())
                     .expect("surface body");
                 if self.surface_owners[index] {
-                    if self.controls.terrain_preview && index == 1 {
+                    if self.controls.terrain_preview
+                        && self.terrain.active_body() == Some(session.body())
+                    {
+                        let mut style = self.controls.surface_style;
+                        if matches!(
+                            self.scenario,
+                            GravityFixture::GameplaySolarSystem | GravityFixture::RealSolarSystem
+                        ) {
+                            style.elevation_colors &= crate::solar_system::SOLAR_SYSTEM_CONTENT
+                                [index]
+                                .terrain_elevation_diagnostic;
+                        }
                         frame.append_stitched_surface(
                             self.requests[index],
-                            self.terrain_cover.visible(),
-                            self.terrain_cover
+                            self.terrain.cover.visible(),
+                            self.terrain
+                                .cover
                                 .surface()
                                 .ok_or_else(|| anyhow::anyhow!("missing stitched terrain"))?,
-                            self.terrain_cover
+                            self.terrain
+                                .cover
                                 .topology()
                                 .ok_or_else(|| anyhow::anyhow!("missing terrain topology"))?,
-                            self.controls.surface_style,
+                            style,
                         )?;
-                        if let Some((mesh, fraction)) = self.terrain_cover.transition() {
+                        if let Some((mesh, fraction)) = self.terrain.cover.transition() {
                             frame.append_surface_transition(
                                 self.requests[index],
                                 mesh,
                                 fraction,
-                                self.controls.surface_style,
+                                style,
                             )?;
                         }
                     } else {
@@ -1481,9 +1470,11 @@ impl GravityOrbitsDemo {
         // Split borrows retain the coherent world/projection and prepared tree view
         // until submission. UI queues commands; it never mutates that borrowed state.
         let info = UiInfo {
-            terrain_cache: self.terrain_cache.report(),
-            terrain_cover: &self.terrain_cover,
-            terrain_work: self.terrain_work,
+            owned_surface_count: self.surface_owners.iter().filter(|&&owned| owned).count(),
+            terrain_body: self.terrain.active_body(),
+            terrain_cache: self.terrain.cache.report(),
+            terrain_cover: &self.terrain.cover,
+            terrain_work: self.terrain.work,
             surfaces: &self.surfaces,
             system: &self.system,
             projection: &self.projection,
@@ -1555,9 +1546,11 @@ impl GravityOrbitsDemo {
             .expect("valid content projection");
         (
             UiInfo {
-                terrain_cache: self.terrain_cache.report(),
-                terrain_cover: &self.terrain_cover,
-                terrain_work: self.terrain_work,
+                owned_surface_count: self.surface_owners.iter().filter(|&&owned| owned).count(),
+                terrain_body: self.terrain.active_body(),
+                terrain_cache: self.terrain.cache.report(),
+                terrain_cover: &self.terrain.cover,
+                terrain_work: self.terrain.work,
                 surfaces: &self.surfaces,
                 system: &self.system,
                 projection: &self.projection,
@@ -1692,7 +1685,7 @@ impl GravityOrbitsDemo {
                     curve
                         .points
                         .push(FramePosition::new(source, LocalPosition::try_metres(p)?));
-                    let mut color = body_color(i);
+                    let mut color = self.scenario.color(i);
                     color[3] = if selected == Some(id) { 0.85 } else { 0.45 };
                     curve.colors.push(color);
                 }
@@ -1703,6 +1696,8 @@ impl GravityOrbitsDemo {
 }
 
 struct UiInfo<'a> {
+    owned_surface_count: usize,
+    terrain_body: Option<BodyId>,
     terrain_cache: crate::planet_terrain::TerrainCacheReport,
     terrain_cover: &'a crate::planet_terrain::AdaptiveTerrainCover,
     terrain_work: crate::planet_terrain::TerrainWorkReport,
@@ -1835,9 +1830,10 @@ fn draw_engineering_ui(
             Err(error)=>{ui.colored_label(egui::Color32::LIGHT_RED,error.to_string());}
         }
         if ui.button("Reset branch baseline (IDs / focus retained)").clicked() {controls.pending.push_back(Command::Reset);}
-        ui.horizontal(|ui| {for (label,fixture) in [("Load original hierarchy",GravityFixture::Hierarchy),("Load circular oracle",GravityFixture::Circular)] {if ui.button(label).clicked() {controls.pending.push_back(Command::Load(fixture));}}});
+        ui.horizontal_wrapped(|ui| {for (label,fixture) in [("Gameplay Solar System",GravityFixture::GameplaySolarSystem),("Real-scale Solar reference",GravityFixture::RealSolarSystem),("Load original hierarchy",GravityFixture::Hierarchy),("Load circular oracle",GravityFixture::Circular)] {if ui.button(label).clicked() {controls.pending.push_back(Command::Load(fixture));}}});
         ui.separator();
         ui.label(format!("{} bodies / {} pairs / {} new force passes this update",info.system.body_count(),pair_count(info.system.body_count()).expect("valid count"),info.advance.force_passes));
+        ui.label(format!("{} far / {} surface owners · terrain active: {}",info.system.body_count()-info.owned_surface_count,info.owned_surface_count,info.terrain_body.and_then(|id|info.system.body(id).ok()).map_or("none",|body|body.name())));
         ui.label(format!("Diagnostic sample tick {} / {:.3} s",info.sampled_tick,info.diagnostics.sampled_time.seconds_since_epoch()));
         ui.label(format!("E {:.8e} J / drift {:.3e} J / normalized {:.3e}{}",info.diagnostics.total_energy_j(),info.drift.energy_j,info.drift.relative_energy,if info.drift.uses_near_zero_energy_scale {" (K0+|U0| scale)"} else {" (|E0| scale)"}));
         ui.label(format!("P drift {:.3e} kg m/s / P/Qp {:.3e}",info.drift.momentum_kg_m_s.length(),info.drift.normalized_momentum));
@@ -1851,7 +1847,7 @@ fn draw_engineering_ui(
             ui.label(format!("Moon relative: {distance:.6e} m / {speed:.6e} m/s / local Kepler {energy:.6e} J/kg (not conserved with third body)"));
         }
         ui.separator();
-        ui.horizontal(|ui| {for (i,&id) in info.ids.iter().enumerate() {if ui.selectable_label(i==info.selected,info.system.body(id).expect("fixture body").name()).clicked() {controls.pending.push_back(Command::Select(id));}}});
+        ui.horizontal_wrapped(|ui| {for (i,&id) in info.ids.iter().enumerate() {if ui.selectable_label(i==info.selected,info.system.body(id).expect("fixture body").name()).clicked() {controls.pending.push_back(Command::Select(id));}}});
         ui.horizontal_wrapped(|ui| {for (label,command) in [("Focus translating",Command::Focus {fixed:false,fit:false}),("Fit physical body",Command::Focus {fixed:false,fit:true}),("Inspect fixed spin",Command::Focus {fixed:true,fit:true}),("Overview",Command::Overview)] {if ui.button(label).clicked() {controls.pending.push_back(command);}}});
         ui.horizontal(|ui| {
             if ui.button("Re-express translating").clicked() {controls.pending.push_back(Command::Reexpress(false));}
@@ -1912,7 +1908,7 @@ fn draw_ui(
     {
         egui::Window::new("Planet surface / inspection").default_pos(egui::pos2(335.0,120.0)).default_width(360.0).vscroll(true).show(context,|ui| {
             ui.label(if controls.terrain_preview {"Procedural terrain checkpoint · adaptive ready cover"} else {"Smooth sphere · zero terrain height · one connected body"});
-            if ui.button("Run integrated validation route").clicked() {controls.pending.push_back(Command::ValidationRoute);}
+            if info.ids.len()==3 && ui.button("Run legacy integrated validation route").clicked() {controls.pending.push_back(Command::ValidationRoute);}
             let id=info.camera.focused_body().expect("focused surface");
             let pair=info.projection.coherent_view(info.system).expect("coherent UI");
             if let Ok(clearance)=info.camera.measured_clearance(&pair,id) {ui.label(format!("Actual signed clearance {}",compact_distance(clearance)));}
@@ -1935,6 +1931,7 @@ fn draw_ui(
             let mut preview=controls.terrain_preview;
             if ui.checkbox(&mut preview,"Adaptive terrain with stitched transitions").changed() {controls.pending.push_back(Command::TerrainPreview(preview));}
             if controls.terrain_preview {
+                ui.checkbox(&mut controls.sun_from_star,"Use central star direction (disable for lighting presets)");
                 ui.add(egui::Slider::new(&mut controls.terrain_morph_ms,0..=1000).text("Morph ms (0: static)").clamping(egui::SliderClamping::Always));
                 ui.checkbox(&mut controls.surface_style.elevation_colors,"Derived terrain elevation colours");
                 let mut enabled = controls.terrain_lighting.mode() == TerrainRenderMode::Lit;
@@ -2142,6 +2139,33 @@ fn draw_ui(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn solar_development_starts_paused_with_earth_selected_and_no_terrain_work() {
+        use super::*;
+        let demo = GravityOrbitsDemo::solar_system(false).unwrap();
+        assert_eq!(demo.system.body_count(), 10);
+        assert_eq!(
+            demo.system
+                .body(demo.selection.selected().unwrap())
+                .unwrap()
+                .name(),
+            "Earth"
+        );
+        assert_eq!(
+            demo.system
+                .body(demo.ids[3])
+                .unwrap()
+                .properties()
+                .reference_radius_m(),
+            400_000.0
+        );
+        assert_eq!(demo.surfaces.len(), 5);
+        assert!(demo.controls.terrain_preview);
+        assert!(demo.runner.paused());
+        assert_eq!(demo.camera.mode(), CameraMode::SystemOrbit);
+        assert_eq!(demo.terrain.active_body(), None);
+        assert_eq!(demo.terrain.cache.pending(), 0);
+    }
     #[test]
     fn terrain_runtime_options_select_deterministic_renderer_only_settings() {
         use super::*;

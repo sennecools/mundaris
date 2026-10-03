@@ -463,6 +463,17 @@ impl TerrainPatchCache {
     pub fn pending(&self) -> usize {
         self.requests.len() + usize::from(self.building.is_some())
     }
+    pub fn pending_for_body(&self, body: BodyId) -> usize {
+        self.requests
+            .iter()
+            .filter(|r| r.identity.body == body)
+            .count()
+            + usize::from(
+                self.building
+                    .as_ref()
+                    .is_some_and(|b| b.request.identity.body == body),
+            )
+    }
     /// Admit derived cover/transition capacity into the same aggregate CPU cap.
     /// Pressure only evicts unpinned entries; failure retains valid old coverage.
     pub fn reserve_external(&mut self, bytes: usize) -> bool {
@@ -485,6 +496,18 @@ impl TerrainPatchCache {
             if e.identity.body == body {
                 e.pinned = false;
             }
+        }
+    }
+    /// Stop inactive-body generation while retaining reusable unpinned raw patches.
+    pub fn cancel_body_work(&mut self, body: BodyId) {
+        self.unpin_body(body);
+        self.requests.retain(|r| r.identity.body != body);
+        if self
+            .building
+            .as_ref()
+            .is_some_and(|b| b.request.identity.body == body)
+        {
+            self.building = None;
         }
     }
     pub fn pin(&mut self, identity: &TerrainGeometryIdentity, address: CubePatchAddress) -> bool {

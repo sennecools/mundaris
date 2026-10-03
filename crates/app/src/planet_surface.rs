@@ -95,6 +95,36 @@ impl PlanetSurfaceSession {
     pub fn lod(&self) -> &SurfaceLodSession {
         &self.lod
     }
+    /// Refresh projected demand without selecting patches or generating geometry.
+    /// Population admission can then choose only the required observer-local body.
+    pub fn terrain_required(
+        &mut self,
+        input: &SurfaceViewInput<'_, '_>,
+        absolute_height_m: f64,
+    ) -> Result<bool> {
+        self.update_handoff_error(input, absolute_height_m)?;
+        let center = input
+            .view
+            .prepare_source(input.body_fixed_frame)?
+            .view_displacement(FramePosition::new(
+                input.body_fixed_frame,
+                LocalPosition::origin(),
+            ))?
+            .metres();
+        // The near-plane error bound can be infinite for a body behind the eye.
+        // Such a conservative bound is not a request to generate offscreen worlds.
+        Ok(!input
+            .projection
+            .rejects_ball(center, input.reference_radius_m + absolute_height_m)?
+            && self.far_error_pixels >= 0.05)
+    }
+    /// Population admission relinquishes a surface only after the far renderer
+    /// has prepared its replacement. No two opaque representations are published.
+    pub fn relinquish_to_far_if_ready(&mut self, far_ready: bool) {
+        if far_ready {
+            self.state = SurfaceRepresentationState::Far;
+        }
+    }
     pub fn update(
         &mut self,
         input: &SurfaceViewInput<'_, '_>,

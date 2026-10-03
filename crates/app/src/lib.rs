@@ -11,6 +11,8 @@ pub mod orbit_guides;
 pub mod planet_surface;
 pub mod planet_terrain;
 pub mod playback_metrics;
+pub mod solar_system;
 pub mod system_view;
+pub mod terrain_population;
 pub use gravity_orbits::GravityOrbitsDemo;
 pub mod trails;

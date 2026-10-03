@@ -72,6 +72,8 @@ fn seeded_v1_v2_filtered_corner_morphs_reproduce_endpoints_and_close() {
         (10_000.0, 7, 1, TerrainGeneratorVersion::V1),
         (10_000.0, 7, 17, TerrainGeneratorVersion::V2),
         (10_000.0, 7, 0x8b37_41f1, TerrainGeneratorVersion::V2),
+        (400_000.0, 9, 113, TerrainGeneratorVersion::V2),
+        (400_000.0, 9, 0x45415254, TerrainGeneratorVersion::V2),
         (6_371_000.0, 13, 113, TerrainGeneratorVersion::V2),
     ]
     .into_iter()
@@ -93,7 +95,16 @@ fn seeded_v1_v2_filtered_corner_morphs_reproduce_endpoints_and_close() {
                 ),
             )
             .unwrap();
-        let preset = checkpoint_terrain_definition_version(radius, version).unwrap();
+        let preset = if seed == 0x45415254 {
+            mundaris_app::solar_system::terrain_definition(
+                mundaris_app::solar_system::SolarBody::Earth,
+                radius,
+            )
+            .unwrap()
+            .unwrap()
+        } else {
+            checkpoint_terrain_definition_version(radius, version).unwrap()
+        };
         let definition = TerrainDefinition::new(
             preset.identity(),
             TerrainSeed(seed),

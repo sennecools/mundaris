@@ -30,7 +30,12 @@ struct MundarisApp {
 }
 
 impl MundarisApp {
-    fn new(reference_frames: bool, celestial_model: bool, gravity_orbits: bool) -> Result<Self> {
+    fn new(
+        reference_frames: bool,
+        celestial_model: bool,
+        gravity_orbits: bool,
+        solar_scale: Option<bool>,
+    ) -> Result<Self> {
         Ok(Self {
             window: None,
             renderer: None,
@@ -47,7 +52,9 @@ impl MundarisApp {
             } else {
                 None
             },
-            gravity_demo: if gravity_orbits {
+            gravity_demo: if let Some(real_scale) = solar_scale {
+                Some(mundaris_app::GravityOrbitsDemo::solar_system(real_scale)?)
+            } else if gravity_orbits {
                 Some(mundaris_app::GravityOrbitsDemo::new()?)
             } else {
                 None
@@ -232,35 +239,27 @@ fn main() -> Result<()> {
         .map_err(|error| anyhow!("initializing structured logging: {error}"))?;
 
     let event_loop = EventLoop::new().context("creating the native event loop")?;
-    let mut reference_frames = false;
-    let mut celestial_model = false;
-    let mut gravity_orbits = false;
-    for argument in std::env::args().skip(1) {
-        if argument == "--reference-frames"
-            && !reference_frames
-            && !celestial_model
-            && !gravity_orbits
-        {
-            reference_frames = true;
-        } else if argument == "--celestial-model"
-            && !reference_frames
-            && !celestial_model
-            && !gravity_orbits
-        {
-            celestial_model = true;
-        } else if argument == "--gravity-orbits"
-            && !reference_frames
-            && !celestial_model
-            && !gravity_orbits
-        {
-            gravity_orbits = true;
-        } else {
-            anyhow::bail!(
-                "unknown, conflicting or duplicate argument: {argument}; usage: mundaris_app [--reference-frames | --celestial-model | --gravity-orbits]"
-            );
-        }
-    }
-    let mut app = MundarisApp::new(reference_frames, celestial_model, gravity_orbits)?;
+    let arguments: Vec<_> = std::env::args().skip(1).collect();
+    let usage = "usage: mundaris_app [--solar-system | --real-solar-system | --reference-frames | --celestial-model | --gravity-orbits]";
+    anyhow::ensure!(
+        arguments.len() <= 1,
+        "conflicting or duplicate arguments; {usage}"
+    );
+    let (reference_frames, celestial_model, gravity_orbits, solar_scale) =
+        match arguments.first().map(String::as_str) {
+            None | Some("--solar-system") => (false, false, false, Some(false)),
+            Some("--real-solar-system") => (false, false, false, Some(true)),
+            Some("--reference-frames") => (true, false, false, None),
+            Some("--celestial-model") => (false, true, false, None),
+            Some("--gravity-orbits") => (false, false, true, None),
+            Some(argument) => anyhow::bail!("unknown argument: {argument}; {usage}"),
+        };
+    let mut app = MundarisApp::new(
+        reference_frames,
+        celestial_model,
+        gravity_orbits,
+        solar_scale,
+    )?;
     event_loop
         .run_app(&mut app)
         .context("running the native application event loop")?;
