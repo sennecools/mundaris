@@ -1,5 +1,116 @@
 # Phase 5 implementation and validation evidence
 
+## Phase 5.9 terrain readability and inspection — 2026-10-04
+
+**Diagnostic terrain colouring and displaced-surface inspection are implemented.
+The close-range disappearance mechanism has a controlled native reproduction and
+a bounded navigation correction. Complete terrain-morphology and interactive
+performance acceptance are not established.** Phase 5.8 was already committed at
+`7a9fda6` before this work. See the
+[implementation/root-cause note](../MUNDARIS_PHASE_5_9_TERRAIN_READABILITY_AND_INSPECTION.md)
+and [capture/measurement index](evidence/phase59/README.md). Earlier checkpoint
+evidence below is historical and is not overwritten by new acceptance claims.
+
+### Rendering and world boundaries
+
+Content-owned reference sea level is independent of terrain definitions/revision
+and cache keys. Earth uses +350 m; other rocky bodies zero. Readability combines
+blue below datum, green/brown/pale height bands and smooth grey rock from analytic
+8–16° slope, under existing linear-space ambient/diffuse lighting. Sea colour is
+not water geometry, and Moon/Mars blue does not imply liquid water. No biome,
+final material, self-shadowing or terrain-amplitude tuning is introduced.
+
+The four original shading mode values remain; Readability/Slope/SeaMask/RockWeight
+are additional modes. LOD uses twelve cyclic hues plus a numeric legend, not the
+terrain palette. Cached f64 samples, topology, stitching, certificates, filtering,
+world/simulation state and Newtonian integration are unchanged. GPU sample/clip/
+morph/uniform payloads are expanded to 48/80/80/64 bytes, under unchanged caps.
+Palette/datum/mode changes generate zero terrain geometry; pointer/sample and
+cache-state regressions cover that claim.
+
+### Close-range cause and corrections
+
+At the retained Earth direction, complete height is 205.185151 m. Original-priority
+ready mesh height was 347.631504 m. A legacy sphere-relative 100 m camera is inside
+complete terrain by 105.185 m and inside drawn geometry by 247.632 m despite ready
+coverage and surface ownership. Ordinary backface-cull images are blank; exact-
+camera no-cull intervention restores visible interior geometry. A separate ignored
+native regression holds ownership/geometry/near fixed: shell-inside-cull renders
+0 occupied pixels, inside-no-cull and outside-normal-cull each render 19,200/19,200.
+This isolates penetration/backface culling, not an unready cover or projection
+failure. Disabling culling is a diagnostic, not the runtime fix.
+
+App terrain-relative approaches query complete terrain in body-fixed axes. The
+panel separately reports signed complete and stitched/current-morph mesh clearance,
+explicit inside warnings, local patch/LOD/footprint, coverage, work, ownership and
+query cost. Optional 2/10/100 m guard pushes above the greater radius, preserves
+orientation and re-culls the published cover for the final pose/near without
+generation or duplicate morph advancement. It is not swept collision/gameplay
+physics. Terrain-under-camera query/probe is the minimum terrain-aware inspection
+path; displaced pointer-ray picking is still not implemented.
+
+Near plane accounts for both terrain and mesh clearance while retaining the 0.1 m floor
+and infinite reverse-Z. Captures hold 0.1 m fixed independently to reproduce the
+failure. A local-priority correction breaks infinite-error LOD ties by radial leaf,
+source-centred distance, then address; finite pending ordering is unchanged. It
+does not weaken error targets, balanced publication, resource limits or topology.
+
+### Evidence interpretation and acceptance debt
+
+The six-height unadjusted matrix spans 100 km/10 km/1 km/100 m/10 m/2 m, with matched
+Lit/Readability/Diffuse/LOD images, exact-camera no-cull and explicit guarded/legacy
+comparisons. Complete clearances match targets. Local Earth LOD is 5 at 100 km and 19
+below that (0.095367 m footprint); Moon/Mars 10 m views reach 16/18. Every view is
+ready but quality-pending, not settled. Screen-wide fine detail is not implied by
+the radial patch's level. Blue underwater close views and the first all-blue coast
+capture do not establish exposed-rock, shoreline or erosion morphology acceptance.
+
+CPU measurements, actual payload/cache accounting, complete slope/height statistics,
+filtered erosion activation and supplemental landform interpretation are in the
+evidence index. Matched preparation is not GPU cost/FPS, and sequential outliers
+prevent a shader-overhead conclusion. 10 m upload is 8,570,640 bytes; peak aggregate
+is 117,440,189 bytes against the 117,440,512-byte quota/128 MiB cap. Narrow headroom,
+synchronous morph cost and complete quality convergence remain open.
+
+Annotated images are manifest-derived copies, not interactive UI screenshots.
+Windows/MSVC/Rust 1.98.1/AMD RX 9070 XT native offscreen readback is the tested route.
+Linux, current remote CI, high-DPI/OS sleep and human navigation/control-feel
+acceptance were not run. Horizon certification, final materials/water/biomes,
+collision and unapplied worker/GPU-generation optimizations remain deferred.
+
+### Final quality results
+
+After the final capture-helper, visibility-refresh and centre-direction changes,
+the following passed on Windows/MSVC with Rust 1.98.1:
+
+```text
+cargo fmt --all -- --check
+cargo check --locked --workspace --all-targets --all-features
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo doc --locked --workspace --all-features --no-deps
+cargo test --locked --workspace --all-features
+cargo test --locked --release --workspace --all-features
+cargo test --locked --release -p mundaris_simulation --test orbits long_run -- --ignored --nocapture
+cargo test --locked --release -p mundaris_app --features terrain-capture --test native_close_surface -- --ignored --nocapture
+```
+
+Rustdoc ran with `RUSTDOCFLAGS="-D warnings"`. Debug and release each passed
+**215 tests, zero failures, three ignored across 59 result suites including
+doctests**. The ignored long-orbit filter then passed both tests, and the ignored
+native GPU regression passed separately with occupied-pixel counts 0/19200/19200.
+The full suites include terrain/erosion, generated error, real-field transitions,
+multi-body/precision, renderer/WGSL, palette/cache and inspection regressions.
+The focused post-guard re-culling regression also passed. The initial stale
+32-byte payload expectation failed, was corrected to 48 bytes and expanded to
+palette/datum cache-invariance cases; it is not counted as successful evidence.
+
+Local logs remain at `target/phase59-{check,clippy,rustdoc,debug-tests,release-tests,
+long-orbits,native-close-surface}.log`; these are validation artifacts, not portable
+CI logs. Local Markdown links in the five delivery documents resolved, and
+working/staged diff whitespace checks passed. Source, benchmark byte-accounting,
+inspection/camera, LOD priority, capture and documentation changes are checkpointed
+separately from unrelated pre-existing design/workflow changes. Nothing was pushed.
+
 ## Phase 5.8 gameplay scale and authored Solar System — 2026-10-03
 
 **The 400 km-radius default Earth and ten-body development system are implemented.

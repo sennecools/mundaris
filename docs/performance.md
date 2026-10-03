@@ -97,6 +97,14 @@ before adding Phase 5 field cost. No universal FPS or native GPU timestamp resul
 
 ### Accounted resources
 
+These are historical Phase 4 measurements. Phase 5.9 expands current GPU samples
+from 32 to 48 bytes (13,872 sample bytes + 64 instance bytes per regular grid16
+patch), clipped/morph vertices from 64 to 80 bytes, and lighting uniforms to 64
+bytes. At 4,096 patches the sample-only planning term is now 54.19 MiB; existing
+resource caps remain enforced. See the [current evidence](evidence/phase59/README.md)
+for actual staged payload/accounting; earlier timings are not a matched before/after
+measurement of this expansion.
+
 - Native mathematical address: 12 bytes; metadata/cache record: 88 bytes on this
   target. Metadata cache allocated/accounted 360,512 bytes at 4,096 records;
   app two 2,048-record sessions each account 180,288 bytes, aggregate360,576 bytes.

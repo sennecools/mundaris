@@ -116,12 +116,35 @@ mode. Rate samples report their actual wall window and tick-limited quantization
 
 ## Planet surface inspection
 
+**Phase 5.9:** gameplay terrain defaults to **Readability** (blue below the content
+sea datum, green lowlands, smooth grey rock by analytic slope), with the existing
+directional lighting. The shading menu retains Elevation/Lit/Normals/Diffuse and
+adds Slope/SeaMask/RockWeight. Earth uses a +350 m diagnostic sea datum; this is
+colour only, not water geometry or biomes. LOD colours have a numeric hue legend.
+
+The inspection panel separately reports signed **complete terrain clearance** and
+**drawn mesh clearance**, plus explicit inside warnings, local patch/LOD, mesh
+footprint, ready/pending counts and ownership. Clearance presets target displaced
+terrain. Optional **Disabled / 2 m / 10 m / 100 m** guard pushes above both terrain
+truth and the ready mesh; resource-constrained mesh quality can require extra
+clearance. This is developer navigation, not collision. See
+[Phase 5.9](MUNDARIS_PHASE_5_9_TERRAIN_READABILITY_AND_INSPECTION.md).
+
+Retained [Phase 5.9 captures and measurements](docs/evidence/phase59/README.md)
+separate complete readiness from quality convergence. Reproduce the native
+offscreen matrix with:
+
+```text
+cargo run --locked --release -p mundaris_app --features terrain-capture,surface-profile --example solar_system_capture -- target/phase59 phase59 400
+```
+
 Focus Earth/Moon/Mars (or Aurelia/Luma in the legacy fixture), open **Planet surface / inspection**, set astronomical or exact
 clearance targets, or run the continuous 30 s approach to 2 m. **I** explicitly
 attaches the same observer to the rotating fixed frame; right drag looks locally,
-WASD/QE move at clearance-scaled editor speed and **H** looks toward the tangent
+WASD/QE move at reference-altitude-scaled editor speed and **H** looks toward the tangent
 horizon. Look-at body controls and single physical steps observe the independent
-moon/star. The reference-sphere clearance guard is navigation, not collision/walking.
+moon/star. Smooth bodies retain the reference-sphere guard; terrain inspection has
+the optional displaced-surface guard. Neither is collision/walking.
 
 The legacy fixture without terrain uses a plain analytically shaded sphere;
 gameplay rocky bodies use generated terrain when observer-local demand admits it.
@@ -143,7 +166,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ```
 
-CI uses `--locked` for Cargo compilation/lint/test commands to enforce the committed `Cargo.lock`. Tests remain headless; they do not create windows or GPU devices. For interactive validation, run the app and check the panel, resize, minimize/restore, and clean exit. Compilation alone does not establish those runtime behaviors.
+CI uses `--locked` for Cargo compilation/lint/test commands to enforce the committed `Cargo.lock`. Default tests remain headless; native GPU readback regressions are explicitly ignored and require a graphics adapter when selected. For interactive validation, run the app and check the panel, resize, minimize/restore, and clean exit. Compilation alone does not establish those runtime behaviors.
 
 ## Workspace map
 

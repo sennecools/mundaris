@@ -50,6 +50,27 @@ const SCENES: &[&str] = &[
     "compare600",
     "compare800",
     "compare1000",
+    "phase59-100000",
+    "phase59-10000",
+    "phase59-1000",
+    "phase59-100",
+    "phase59-10",
+    "phase59-2",
+    "phase59-100-legacy",
+    "phase59-10-legacy",
+    "phase59-2-legacy",
+    "phase59-100-guarded",
+    "phase59-10-guarded",
+    "phase59-2-guarded",
+    "phase59-high-orbit",
+    "phase59-coastline",
+    "phase59-mars-10",
+    "phase59-moon-10",
+    "phase59-land-mountain",
+    "phase59-land-plain",
+    "phase59-land-ridge",
+    "phase59-land-gully",
+    "phase59-shoreline",
 ];
 
 fn bitmap(path: &Path, rgba: &[u8]) -> Result<()> {
@@ -182,6 +203,127 @@ fn scope_for(scene: &str, world: &CelestialSystem) -> Result<Option<(Vec<BodyId>
 
 type SceneObserver = (FramePose, Option<SolarBody>, String, Vec<String>);
 
+fn fibonacci_direction(index: usize, count: usize) -> DVec3 {
+    let z = 1.0 - 2.0 * (index as f64 + 0.5) / count as f64;
+    let angle = index as f64 * (std::f64::consts::PI * (3.0 - 5.0_f64.sqrt()));
+    DVec3::new(
+        (1.0 - z * z).sqrt() * angle.cos(),
+        (1.0 - z * z).sqrt() * angle.sin(),
+        z,
+    )
+}
+
+/// Fixed-order content selection, not geometry tuning. Names describe inspection
+/// targets; ridge/branching visual acceptance still requires reading the images.
+fn landform_direction(
+    scene: &str,
+    generator: &TerrainGenerator,
+    radius: f64,
+) -> Result<(DVec3, String)> {
+    let sea = mundaris_app::solar_system::GAMEPLAY_EARTH_SEA_LEVEL_M;
+    let mut best: Option<(f64, DVec3, String)> = None;
+    for index in 0..4096 {
+        let direction = fibonacci_direction(index, 4096);
+        let location = SurfaceLocation::new(Direction3::try_new(direction)?);
+        let query = TerrainQuery {
+            location,
+            footprint: TerrainFootprint::COMPLETE,
+        };
+        let sample = generator.evaluate_point(query)?;
+        let height = sample.height_m();
+        let slope = sample.slope_angle_rad(radius)?.to_degrees();
+        if height < sea + 60.0 {
+            continue;
+        }
+        let erosion = generator.erosion_diagnostics(query)?;
+        let score = match scene {
+            "phase59-land-mountain" => height,
+            "phase59-land-plain" => -slope,
+            "phase59-land-ridge" => slope,
+            "phase59-land-gully" => -erosion.contribution_m,
+            _ => anyhow::bail!("unknown landform scene"),
+        };
+        if best
+            .as_ref()
+            .is_none_or(|(previous, _, _)| score > *previous)
+        {
+            best = Some((
+                score,
+                direction,
+                format!(
+                    "landform_selection candidates=4096 order=fibonacci index={index} predicate=height_above_sea_plus_60m score={score} complete_height_m={height} complete_slope_degrees={slope} erosion={erosion:?}"
+                ),
+            ));
+        }
+    }
+    let (_, direction, description) =
+        best.ok_or_else(|| anyhow::anyhow!("no landform candidate"))?;
+    Ok((direction, description))
+}
+
+fn shoreline_direction(generator: &TerrainGenerator) -> Result<(DVec3, String)> {
+    let sea = mundaris_app::solar_system::GAMEPLAY_EARTH_SEA_LEVEL_M;
+    let footprint = TerrainFootprint::new(781.25)?;
+    let mut best: Option<(f64, DVec3, String)> = None;
+    for index in 0..4096 {
+        let direction = fibonacci_direction(index, 4096);
+        let sample = generator.evaluate_point(TerrainQuery {
+            location: SurfaceLocation::new(Direction3::try_new(direction)?),
+            footprint,
+        })?;
+        let gradient = sample.tangent_gradient_m_per_unit_direction();
+        if gradient.length_squared() == 0.0 {
+            continue;
+        }
+        let tangent = gradient.normalize();
+        let endpoints = [
+            (direction - tangent * 0.04).normalize(),
+            (direction + tangent * 0.04).normalize(),
+        ];
+        let mut complete = [0.0; 2];
+        let mut filtered = [0.0; 2];
+        for (end, point) in endpoints.iter().enumerate() {
+            let location = SurfaceLocation::new(Direction3::try_new(*point)?);
+            complete[end] = generator
+                .evaluate_point(TerrainQuery {
+                    location,
+                    footprint: TerrainFootprint::COMPLETE,
+                })?
+                .height_m();
+            filtered[end] = generator
+                .evaluate_point(TerrainQuery {
+                    location,
+                    footprint,
+                })?
+                .height_m();
+        }
+        if complete[0] >= sea - 5.0
+            || complete[1] <= sea + 5.0
+            || filtered[0] >= sea - 5.0
+            || filtered[1] <= sea + 5.0
+        {
+            continue;
+        }
+        let score = (sample.height_m() - sea).abs();
+        if best
+            .as_ref()
+            .is_none_or(|(previous, _, _)| score < *previous)
+        {
+            best = Some((
+                score,
+                direction,
+                format!(
+                    "shoreline_selection candidates=4096 order=fibonacci index={index} filtered_footprint_m=781.25 angular_half_span=0.04 center_filtered_height_m={} endpoints_body_fixed={endpoints:?} complete_endpoint_heights_m={complete:?} filtered_endpoint_heights_m={filtered:?} sea_level_m={sea} opposite_sides_margin_m=5",
+                    sample.height_m()
+                ),
+            ));
+        }
+    }
+    let (_, direction, description) =
+        best.ok_or_else(|| anyhow::anyhow!("no shoreline crossing candidate"))?;
+    Ok((direction, description))
+}
+
 fn observer_pose(
     scene: &str,
     pair: &CoherentCelestialView<'_>,
@@ -218,7 +360,8 @@ fn observer_pose(
     }
 
     let target = match scene {
-        "mars" => SolarBody::Mars,
+        "mars" | "phase59-mars-10" => SolarBody::Mars,
+        "phase59-moon-10" => SolarBody::Moon,
         "jupiter" => SolarBody::Jupiter,
         "saturn" => SolarBody::Saturn,
         "neptune" => SolarBody::Neptune,
@@ -249,8 +392,8 @@ fn observer_pose(
         )?
         .local()
         .unit();
-    let (direction, clearance, horizon) = match scene {
-        "high-orbit" => (star_direction, 600_000.0, false),
+    let (mut direction, clearance, horizon) = match scene {
+        "high-orbit" | "phase59-high-orbit" => (star_direction, 600_000.0, false),
         "adaptive" => (star_direction, 200_000.0, false),
         "low-orbit" => (star_direction, 40_000.0, false),
         "high-altitude" => (star_direction, 10_000.0, false),
@@ -260,10 +403,94 @@ fn observer_pose(
             false,
         ),
         "near-ground" => (star_direction, 20.0, true),
+        "phase59-100000" => (
+            DVec3::new(0.04592207301441123, 0.4595519490375417, 0.886962890625).normalize(),
+            100_000.0,
+            false,
+        ),
+        "phase59-10000" => (
+            DVec3::new(0.04592207301441123, 0.4595519490375417, 0.886962890625).normalize(),
+            10_000.0,
+            false,
+        ),
+        "phase59-1000" => (
+            DVec3::new(0.04592207301441123, 0.4595519490375417, 0.886962890625).normalize(),
+            1_000.0,
+            false,
+        ),
+        "phase59-100" | "phase59-100-legacy" | "phase59-100-guarded" => (
+            DVec3::new(0.04592207301441123, 0.4595519490375417, 0.886962890625).normalize(),
+            100.0,
+            false,
+        ),
+        "phase59-10" | "phase59-10-legacy" | "phase59-10-guarded" | "phase59-mars-10"
+        | "phase59-moon-10" => (
+            DVec3::new(0.04592207301441123, 0.4595519490375417, 0.886962890625).normalize(),
+            10.0,
+            true,
+        ),
+        "phase59-2" | "phase59-2-legacy" | "phase59-2-guarded" => (
+            DVec3::new(0.04592207301441123, 0.4595519490375417, 0.886962890625).normalize(),
+            2.0,
+            true,
+        ),
+        "phase59-coastline" => (
+            DVec3::new(0.04592207301441123, 0.4595519490375417, 0.886962890625).normalize(),
+            30_000.0,
+            false,
+        ),
+        "phase59-land-mountain" => (star_direction, 1_000.0, false),
+        "phase59-land-plain" => (star_direction, 100.0, false),
+        "phase59-land-ridge" => (star_direction, 30.0, false),
+        "phase59-land-gully" => (star_direction, 100.0, false),
+        "phase59-shoreline" => (star_direction, 60_000.0, false),
         "compare600" | "compare800" | "compare1000" => (star_direction, 600_000.0, false),
         "mars" | "jupiter" | "saturn" | "neptune" => (star_direction, radius * 2.0, false),
         _ => anyhow::bail!("unknown scene {scene}"),
     };
+    let mut selection_description = String::new();
+    if scene.starts_with("phase59-land-") || scene == "phase59-shoreline" {
+        let generator = TerrainGenerator::new(
+            body.terrain()
+                .ok_or_else(|| anyhow::anyhow!("landform body has no terrain"))?,
+            radius,
+        )?;
+        (direction, selection_description) = if scene == "phase59-shoreline" {
+            shoreline_direction(&generator)?
+        } else {
+            landform_direction(scene, &generator, radius)?
+        };
+    }
+    if scene == "phase59-coastline" {
+        let generator = TerrainGenerator::new(
+            body.terrain()
+                .ok_or_else(|| anyhow::anyhow!("coastline body has no terrain"))?,
+            radius,
+        )?;
+        let mut closest = (f64::INFINITY, direction);
+        for index in 0..256 {
+            let z = 1.0 - 2.0 * (index as f64 + 0.5) / 256.0;
+            let angle = index as f64 * (std::f64::consts::PI * (3.0 - 5.0_f64.sqrt()));
+            let candidate = DVec3::new(
+                (1.0 - z * z).sqrt() * angle.cos(),
+                (1.0 - z * z).sqrt() * angle.sin(),
+                z,
+            );
+            let height = generator
+                .evaluate_point(TerrainQuery {
+                    location: SurfaceLocation::new(Direction3::try_new(candidate)?),
+                    footprint: TerrainFootprint::COMPLETE,
+                })?
+                .height_m();
+            if (height - mundaris_app::solar_system::GAMEPLAY_EARTH_SEA_LEVEL_M).abs() < closest.0 {
+                closest = (
+                    (height - mundaris_app::solar_system::GAMEPLAY_EARTH_SEA_LEVEL_M).abs(),
+                    candidate,
+                );
+            }
+        }
+        direction = closest.1;
+    }
     let mut height_m = 0.0;
     if let Some(definition) = body.terrain() {
         let generator = TerrainGenerator::new(definition, radius)?;
@@ -274,13 +501,18 @@ fn observer_pose(
             })?
             .height_m();
     }
-    let target_point = direction * (radius + height_m);
+    let legacy_sphere_pose = scene.ends_with("-legacy");
+    let target_point = direction * (radius + if legacy_sphere_pose { 0.0 } else { height_m });
     let eye = target_point + direction * clearance;
     let off_nadir_degrees: f64 = match scene {
         "low-orbit" => 55.0,
         "high-altitude" => 70.0,
         "mountain" | "morph" => 78.0,
-        "near-ground" => 90.0,
+        "phase59-land-mountain" | "phase59-land-plain" => 45.0,
+        "near-ground" | "phase59-10" | "phase59-2" | "phase59-10-legacy" | "phase59-2-legacy"
+        | "phase59-10-guarded" | "phase59-2-guarded" | "phase59-mars-10" | "phase59-moon-10" => {
+            90.0
+        }
         _ => 0.0,
     };
     let back = if off_nadir_degrees > 0.0 {
@@ -311,7 +543,12 @@ fn observer_pose(
         pose,
         Some(target),
         format!(
-            "target={target:?} clearance_above_sampled_terrain_m={clearance} sampled_complete_height_m={height_m} eye_body_fixed_m={eye:?} look_horizon={horizon} off_nadir_degrees={off_nadir_degrees} configured_diameter_km={}",
+            "target={target:?} clearance_above_sampled_terrain_m={clearance} sampled_complete_height_m={height_m} eye_body_fixed_m={eye:?} camera_policy={} look_horizon={horizon} off_nadir_degrees={off_nadir_degrees} configured_diameter_km={}\n{selection_description}",
+            if legacy_sphere_pose {
+                "legacy-sphere-relative-unadjusted"
+            } else {
+                "analytic-terrain-relative-unadjusted"
+            },
             2.0 * radius / 1000.0
         ),
         vec![SOLAR_SYSTEM_CONTENT[index].name.to_owned()],
@@ -555,11 +792,43 @@ fn run_scene(
         }
     }
 
-    if scene == "near-ground" {
+    let guarded_pose = scene.ends_with("-guarded");
+    if scene == "near-ground" || guarded_pose {
         let direction = pose.position().local().metres().normalize();
         let drawn_radius = drawn_surface_radius(&population, direction)?;
         let old_eye_radius = pose.position().local().metres().length();
-        let eye_radius = old_eye_radius.max(drawn_radius + 20.0);
+        let requested_clearance = if guarded_pose {
+            match scene {
+                "phase59-100-guarded" => 100.0,
+                "phase59-10-guarded" => 10.0,
+                _ => 2.0,
+            }
+        } else {
+            20.0
+        };
+        let target_index =
+            body_index(target.ok_or_else(|| anyhow::anyhow!("guarded capture target missing"))?);
+        let target_body = world
+            .bodies()
+            .nth(target_index)
+            .ok_or_else(|| anyhow::anyhow!("guarded target body missing"))?
+            .1;
+        let full_radius = requests[target_index].reference_radius_m
+            + if let Some(definition) = target_body.terrain() {
+                TerrainGenerator::new(definition, requests[target_index].reference_radius_m)?
+                    .evaluate_point(TerrainQuery {
+                        location: SurfaceLocation::new(Direction3::try_new(direction)?),
+                        footprint: TerrainFootprint::COMPLETE,
+                    })?
+                    .height_m()
+            } else {
+                0.0
+            };
+        let eye_radius = if guarded_pose {
+            old_eye_radius.max(full_radius.max(drawn_radius) + requested_clearance)
+        } else {
+            old_eye_radius.max(drawn_radius + requested_clearance)
+        };
         pose = FramePose::new(
             FramePosition::new(
                 pose.position().frame(),
@@ -574,7 +843,7 @@ fn run_scene(
         )?;
         writeln!(
             scene_description,
-            "\ninspection_only_radial_adjustment_m={} drawn_surface_radius_m={drawn_radius} clearance_above_ready_mesh_m={}",
+            "\ninspection_only_radial_adjustment_m={} drawn_surface_radius_m={drawn_radius} full_terrain_radius_m={full_radius} requested_clearance_m={requested_clearance} clearance_above_ready_mesh_m={}",
             eye_radius - old_eye_radius,
             eye_radius - drawn_radius
         )?;
@@ -687,6 +956,23 @@ fn run_scene(
         "mixed_lod_active_cover={} generated_samples_new_during_capture={generated_total} morph_active_updates={morph_active_updates} morph_build_count={morph_builds}",
         levels.len() > 1
     )?;
+    writeln!(
+        manifest,
+        "terrain_lod_diagnostics={:?} active_patch_addresses={:?} visible_patch_addresses={:?}",
+        population.cover.report,
+        population
+            .cover
+            .active()
+            .iter()
+            .map(|patch| patch.address)
+            .collect::<Vec<_>>(),
+        population
+            .cover
+            .visible()
+            .iter()
+            .map(|patch| patch.address)
+            .collect::<Vec<_>>()
+    )?;
     let mut staging = CelestialStaging::default();
     let mut render_preparation_ms = Vec::new();
     let mut render_encode_ms = Vec::new();
@@ -718,12 +1004,52 @@ fn run_scene(
     } else {
         default_lighting
     };
+    let diagnostic_light = scene.starts_with("phase59-land-") || scene == "phase59-shoreline";
+    let lighting = if diagnostic_light {
+        let radial = pose.position().local().metres().normalize();
+        let tangent = radial
+            .cross(if radial.y.abs() < 0.9 {
+                DVec3::Y
+            } else {
+                DVec3::X
+            })
+            .normalize();
+        TerrainLighting::try_new(
+            radial * 0.55 + tangent * 0.8,
+            default_lighting.ambient_strength(),
+            default_lighting.diffuse_strength(),
+            TerrainRenderMode::Lit,
+        )?
+    } else {
+        lighting
+    };
+    let lighting = if let Some(active) = population.active_body() {
+        let index = world
+            .bodies()
+            .position(|(id, _)| id == active)
+            .ok_or_else(|| anyhow::anyhow!("active terrain body missing"))?;
+        if let Some(config) = mundaris_app::solar_system::terrain_readability_config(
+            SOLAR_SYSTEM_CONTENT[index].identity,
+            requests[index].reference_radius_m,
+        )? {
+            lighting.with_readability(config)
+        } else {
+            lighting
+        }
+    } else {
+        lighting
+    };
     writeln!(
         manifest,
-        "terrain_lighting_sun_body={:?} mode=Lit ambient={} diffuse={}",
+        "terrain_lighting_sun_body={:?} mode=Lit ambient={} diffuse={} lighting_source={}",
         lighting.sun_direction_body(),
         lighting.ambient_strength(),
-        lighting.diffuse_strength()
+        lighting.diffuse_strength(),
+        if diagnostic_light {
+            "diagnostic-local-side"
+        } else {
+            "authored-star"
+        }
     )?;
     for repetition in 0..8 {
         let start = Instant::now();
@@ -887,7 +1213,7 @@ fn run_scene(
         &output.join(&filename),
         &image.ok_or_else(|| anyhow::anyhow!("capture was not rendered"))?,
     )?;
-    if matches!(scene, "adaptive" | "morph") {
+    if matches!(scene, "adaptive" | "morph") || scene.starts_with("phase59-") {
         let frame = build_frame(
             &view,
             &mut staging,
@@ -907,6 +1233,327 @@ fn run_scene(
             &output.join(format!("{scene}-lod.bmp")),
             &capture.render(&frame)?,
         )?;
+    }
+    if scene.starts_with("phase59-") {
+        let cache_before_modes = population.cache.report();
+        let mut mode_specs = vec![
+            ("lit", TerrainRenderMode::Lit, SurfaceStyle::default()),
+            (
+                "readability",
+                TerrainRenderMode::Readability,
+                SurfaceStyle::default(),
+            ),
+            (
+                "diffuse",
+                TerrainRenderMode::Diffuse,
+                SurfaceStyle::default(),
+            ),
+            (
+                "lod",
+                TerrainRenderMode::Elevation,
+                SurfaceStyle {
+                    lod_colors: true,
+                    borders: true,
+                    ..Default::default()
+                },
+            ),
+        ];
+        if scene.starts_with("phase59-land-") || scene == "phase59-shoreline" {
+            mode_specs.extend([
+                ("slope", TerrainRenderMode::Slope, SurfaceStyle::default()),
+                (
+                    "sea-mask",
+                    TerrainRenderMode::SeaMask,
+                    SurfaceStyle::default(),
+                ),
+                (
+                    "rock-weight",
+                    TerrainRenderMode::RockWeight,
+                    SurfaceStyle::default(),
+                ),
+            ]);
+        }
+        let cache_generation_snapshot = (
+            cache_before_modes.misses,
+            cache_before_modes.evictions,
+            cache_before_modes.resident_patches,
+            cache_before_modes.resident_bytes,
+        );
+        for (suffix, mode, style) in mode_specs {
+            let mut prepare_samples_ms = Vec::with_capacity(20);
+            for _ in 0..20 {
+                let started = Instant::now();
+                let frame = build_frame(
+                    &view,
+                    &mut staging,
+                    projection,
+                    &sphere,
+                    &requests,
+                    &owners,
+                    &population,
+                    lighting.with_mode(mode),
+                    style,
+                )?;
+                std::hint::black_box(frame.report());
+                prepare_samples_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            prepare_samples_ms.sort_by(f64::total_cmp);
+            writeln!(
+                manifest,
+                "matched_mode_prepare mode={suffix} repeats=20 median_cpu_ms={} mean_cpu_ms={} worst_cpu_ms={} gpu_capture_excluded=true",
+                prepare_samples_ms[10],
+                prepare_samples_ms.iter().sum::<f64>() / 20.0,
+                prepare_samples_ms[19]
+            )?;
+            let frame = build_frame(
+                &view,
+                &mut staging,
+                projection,
+                &sphere,
+                &requests,
+                &owners,
+                &population,
+                lighting.with_mode(mode),
+                style,
+            )?;
+            bitmap(
+                &output.join(format!("{scene}-{suffix}.bmp")),
+                &capture.render(&frame)?,
+            )?;
+        }
+        // Exact-camera backface intervention: neither readiness, geometry, near
+        // plane, nor ownership changes when the underside diagnostic is enabled.
+        let frame = build_frame(
+            &view,
+            &mut staging,
+            projection,
+            &sphere,
+            &requests,
+            &owners,
+            &population,
+            lighting.with_mode(TerrainRenderMode::Readability),
+            SurfaceStyle {
+                underside: true,
+                ..Default::default()
+            },
+        )?;
+        bitmap(
+            &output.join(format!("{scene}-no-cull.bmp")),
+            &capture.render(&frame)?,
+        )?;
+        writeln!(
+            manifest,
+            "exact_camera_no_cull_intervention=true unchanged_near_m={} unchanged_geometry=true unchanged_ownership=true",
+            projection.near_m()
+        )?;
+        let cache_after_modes = population.cache.report();
+        ensure!(
+            cache_generation_snapshot
+                == (
+                    cache_after_modes.misses,
+                    cache_after_modes.evictions,
+                    cache_after_modes.resident_patches,
+                    cache_after_modes.resident_bytes
+                ),
+            "mode-only frame preparation changed terrain cache geometry state"
+        );
+        writeln!(
+            manifest,
+            "matched_mode_cover_identical=true mode_capture_cache_before={cache_before_modes:?} mode_capture_cache_after={cache_after_modes:?} mode_capture_cache_miss_delta={} mode_capture_eviction_delta={}",
+            cache_after_modes
+                .misses
+                .saturating_sub(cache_before_modes.misses),
+            cache_after_modes
+                .evictions
+                .saturating_sub(cache_before_modes.evictions)
+        )?;
+        if let Some(active) = population.active_body() {
+            let index = world
+                .bodies()
+                .position(|(id, _)| id == active)
+                .ok_or_else(|| anyhow::anyhow!("active body missing"))?;
+            let body = world.body(active)?;
+            let radius = body.properties().reference_radius_m();
+            let eye = pose.position().local().metres();
+            let direction = eye.normalize();
+            let generator = TerrainGenerator::new(
+                body.terrain()
+                    .ok_or_else(|| anyhow::anyhow!("active terrain definition missing"))?,
+                radius,
+            )?;
+            let sample = generator.evaluate_point(TerrainQuery {
+                location: SurfaceLocation::new(Direction3::try_new(direction)?),
+                footprint: TerrainFootprint::COMPLETE,
+            })?;
+            let ready_radius = drawn_surface_radius(&population, direction)?;
+            let center_distance = eye.length();
+            let location = SurfaceLocation::new(Direction3::try_new(direction)?);
+            let ready_probe =
+                mundaris_app::surface_probe::ready_mesh_probe(&population.cover, location)?;
+            let local_patch =
+                mundaris_app::surface_probe::patch_at_location(&population.cover, location);
+            for footprint_m in [
+                1562.5,
+                781.25,
+                195.3125,
+                24.4140625,
+                3.0517578125,
+                0.3814697265625,
+                0.0,
+            ] {
+                let footprint = TerrainFootprint::new(footprint_m)?;
+                let query = TerrainQuery {
+                    location,
+                    footprint,
+                };
+                let represented = generator.evaluate_point(query)?;
+                let erosion = generator.erosion_diagnostics(query)?;
+                writeln!(
+                    manifest,
+                    "filtered_query footprint_m={footprint_m} height_m={} slope_degrees={} erosion={erosion:?}",
+                    represented.height_m(),
+                    represented.slope_angle_rad(radius)?.to_degrees()
+                )?;
+            }
+            let query_directions: Vec<_> = (0..1024)
+                .map(|index| {
+                    let z = 1.0 - 2.0 * (index as f64 + 0.5) / 1024.0;
+                    let angle = index as f64 * (std::f64::consts::PI * (3.0 - 5.0_f64.sqrt()));
+                    DVec3::new(
+                        (1.0 - z * z).sqrt() * angle.cos(),
+                        (1.0 - z * z).sqrt() * angle.sin(),
+                        z,
+                    )
+                })
+                .collect();
+            let query_locations: Vec<_> = query_directions
+                .iter()
+                .map(|d| {
+                    SurfaceLocation::new(Direction3::try_new(*d).expect("unit Fibonacci direction"))
+                })
+                .collect();
+            let query_started = Instant::now();
+            for location in &query_locations {
+                std::hint::black_box(generator.evaluate_point(TerrainQuery {
+                    location: *location,
+                    footprint: TerrainFootprint::COMPLETE,
+                })?);
+            }
+            let direct_query_ms = query_started.elapsed().as_secs_f64() * 1000.0;
+            let construction_started = Instant::now();
+            for location in &query_locations {
+                let fresh = TerrainGenerator::new(
+                    body.terrain()
+                        .ok_or_else(|| anyhow::anyhow!("terrain missing"))?,
+                    radius,
+                )?;
+                std::hint::black_box(fresh.evaluate_point(TerrainQuery {
+                    location: *location,
+                    footprint: TerrainFootprint::COMPLETE,
+                })?);
+            }
+            let construct_query_ms = construction_started.elapsed().as_secs_f64() * 1000.0;
+            let mut heights = Vec::with_capacity(query_locations.len());
+            let mut slopes = Vec::with_capacity(query_locations.len());
+            let mut below_sea = 0usize;
+            let mut steep_12 = 0usize;
+            let mut steep_35 = 0usize;
+            let mut steep_8 = 0usize;
+            let mut steep_16 = 0usize;
+            for location in &query_locations {
+                let s = generator.evaluate_point(TerrainQuery {
+                    location: *location,
+                    footprint: TerrainFootprint::COMPLETE,
+                })?;
+                heights.push(s.height_m());
+                let slope = s.slope_angle_rad(radius)?.to_degrees();
+                slopes.push(slope);
+                below_sea += usize::from(
+                    s.height_m()
+                        < mundaris_app::solar_system::reference_sea_level_m(
+                            SOLAR_SYSTEM_CONTENT[index].identity,
+                        )
+                        .unwrap_or(0.0),
+                );
+                steep_12 += usize::from(slope >= 12.0);
+                steep_35 += usize::from(slope >= 35.0);
+                steep_8 += usize::from(slope >= 8.0);
+                steep_16 += usize::from(slope >= 16.0);
+            }
+            heights.sort_by(f64::total_cmp);
+            slopes.sort_by(f64::total_cmp);
+            writeln!(
+                manifest,
+                "terrain_query_cost_direct_1024_ms={direct_query_ms} including_generator_construction_1024_ms={construct_query_ms} morphology_samples=1024 height_quantiles_m={:?} slope_quantiles_degrees={:?} water_fraction_at_sea_datum={} slope_fraction_ge_12={} slope_fraction_ge_35={}",
+                [
+                    heights[25],
+                    heights[256],
+                    heights[512],
+                    heights[768],
+                    heights[998]
+                ],
+                [
+                    slopes[25],
+                    slopes[256],
+                    slopes[512],
+                    slopes[768],
+                    slopes[998]
+                ],
+                below_sea as f64 / 1024.0,
+                steep_12 as f64 / 1024.0,
+                steep_35 as f64 / 1024.0
+            )?;
+            writeln!(
+                manifest,
+                "content_palette sea_level_m={} slope_blend_degrees=8..16 fraction_ge_8={} fraction_ge_16={}",
+                mundaris_app::solar_system::reference_sea_level_m(
+                    SOLAR_SYSTEM_CONTENT[index].identity
+                )
+                .unwrap_or(0.0),
+                steep_8 as f64 / 1024.0,
+                steep_16 as f64 / 1024.0
+            )?;
+            let (body_index, body_owner) = owners
+                .iter()
+                .copied()
+                .enumerate()
+                .find(|(_, owns)| *owns)
+                .unwrap_or((index, false));
+            writeln!(
+                manifest,
+                "phase59_clearance center_distance_m={center_distance} sphere_altitude_m={} terrain_height_m={} terrain_slope_degrees={} analytic_clearance_m={} ready_mesh_clearance_m={} inside_analytic_terrain={} inside_ready_mesh={} ready_mesh_radius_m={ready_radius} direction_body_fixed={direction:?} cover={} visible={} ready={} pending={} morph_active={} levels={levels:?} visible_levels={visible_levels:?} quality_pending={} settled={} all_finite={}",
+                eye.length() - radius,
+                sample.height_m(),
+                sample.slope_angle_rad(radius)?.to_degrees(),
+                eye.length() - radius - sample.height_m(),
+                eye.length() - ready_radius,
+                eye.length() < radius + sample.height_m(),
+                eye.length() < ready_radius,
+                population.cover.active().len(),
+                population.cover.visible().len(),
+                population.cover.ready(),
+                population.cache.pending(),
+                population.cover.transition().is_some(),
+                population.cover.report.quality_pending,
+                population.cover.report.settled,
+                center_distance.is_finite()
+                    && eye.is_finite()
+                    && radius.is_finite()
+                    && sample.height_m().is_finite()
+                    && ready_radius.is_finite()
+            )?;
+            writeln!(
+                manifest,
+                "terrain_under_camera patch={local_patch:?} ready_probe={ready_probe:?} ownership_body_index={body_index} owns_surface={body_owner} min_visible_level={:?} max_visible_level={:?} frustum_culled={} horizon_culled={} max_projected_error_pixels={} ready_mesh_clearance_m={} near_plane_m={}",
+                visible_levels.keys().next(),
+                visible_levels.keys().next_back(),
+                population.cover.report.frustum_culled,
+                population.cover.report.horizon_culled,
+                population.cover.report.max_error_pixels,
+                eye.length() - ready_radius,
+                projection.near_m()
+            )?;
+        }
     }
     fs::write(output.join(format!("{scene}-manifest.txt")), &manifest)?;
     println!("{scene}: captured {filename}\n{manifest}");
@@ -935,6 +1582,38 @@ fn main() -> Result<()> {
     fs::create_dir_all(&output)?;
     let selected_scenes: Vec<_> = if selected == "all" {
         SCENES.to_vec()
+    } else if selected == "phase59" {
+        vec![
+            "phase59-100000",
+            "phase59-10000",
+            "phase59-1000",
+            "phase59-100",
+            "phase59-10",
+            "phase59-2",
+            "phase59-100-legacy",
+            "phase59-10-legacy",
+            "phase59-2-legacy",
+            "phase59-100-guarded",
+            "phase59-10-guarded",
+            "phase59-2-guarded",
+            "phase59-mars-10",
+            "phase59-moon-10",
+            "phase59-high-orbit",
+            "phase59-coastline",
+            "phase59-land-mountain",
+            "phase59-land-plain",
+            "phase59-land-ridge",
+            "phase59-land-gully",
+            "phase59-shoreline",
+        ]
+    } else if selected == "phase59-landforms" {
+        vec![
+            "phase59-land-mountain",
+            "phase59-land-plain",
+            "phase59-land-ridge",
+            "phase59-land-gully",
+            "phase59-shoreline",
+        ]
     } else {
         ensure!(
             SCENES.contains(&selected.as_str()),
