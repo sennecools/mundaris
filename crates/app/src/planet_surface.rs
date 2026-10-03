@@ -110,6 +110,34 @@ impl PlanetSurfaceSession {
         settings: &LodSettings,
         absolute_height_m: f64,
     ) -> Result<()> {
+        self.update_handoff_error(input, absolute_height_m)?;
+        if self.state == SurfaceRepresentationState::Far && self.far_error_pixels < 0.05 {
+            return Ok(());
+        }
+        self.report = self.lod.update(input, settings)?;
+        self.commit_handoff();
+        Ok(())
+    }
+    /// Adaptive terrain owns a separate ready selector; its quality report, not
+    /// smooth-sphere desirability, controls this body's representation handoff.
+    pub fn update_with_terrain_report(
+        &mut self,
+        input: &SurfaceViewInput<'_, '_>,
+        absolute_height_m: f64,
+        report: LodReport,
+    ) -> Result<()> {
+        self.update_handoff_error(input, absolute_height_m)?;
+        self.report = report;
+        if self.state != SurfaceRepresentationState::Far || self.far_error_pixels >= 0.05 {
+            self.commit_handoff();
+        }
+        Ok(())
+    }
+    fn update_handoff_error(
+        &mut self,
+        input: &SurfaceViewInput<'_, '_>,
+        absolute_height_m: f64,
+    ) -> Result<()> {
         anyhow::ensure!(
             absolute_height_m.is_finite()
                 && absolute_height_m >= 0.0
@@ -136,10 +164,9 @@ impl PlanetSurfaceSession {
                     / (input.reference_radius_m + absolute_height_m),
             )?
         };
-        if self.state == SurfaceRepresentationState::Far && self.far_error_pixels < 0.05 {
-            return Ok(());
-        }
-        self.report = self.lod.update(input, settings)?;
+        Ok(())
+    }
+    fn commit_handoff(&mut self) {
         if self.state == SurfaceRepresentationState::Far {
             self.state = SurfaceRepresentationState::Prewarm;
         }
@@ -151,7 +178,6 @@ impl PlanetSurfaceSession {
         {
             self.state = SurfaceRepresentationState::Surface;
         }
-        Ok(())
     }
     /// Return is committed only after the far sphere's own preparation is ready.
     pub fn return_to_far_if_ready(&mut self, far_ready: bool) {

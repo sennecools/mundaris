@@ -1,5 +1,8 @@
 //! Complete flat cover with hysteresis and atomic local balancing transactions.
-use super::{MetadataCache, PatchMetadata, SurfaceExtent, SurfaceTopology, cover::AddressSet};
+use super::{
+    MetadataCache, PatchMetadata, SurfaceErrorContributions, SurfaceExtent, SurfaceTopology,
+    cover::AddressSet,
+};
 use crate::{CelestialProjection, PreparedRenderFrame, PreparedView, RenderPreparationError};
 use mundaris_math::{
     FrameId, FramePosition, LocalPosition,
@@ -13,6 +16,28 @@ pub struct SurfaceViewInput<'view, 'tree> {
     pub body_fixed_frame: FrameId,
     pub reference_radius_m: f64,
     pub projection: CelestialProjection,
+}
+
+/// App-supplied, domain-free terrain bounds, error certificates, and geometry readiness.
+pub trait SurfaceGeometryPolicy {
+    fn certificate(
+        &mut self,
+        address: CubePatchAddress,
+        metadata: PatchMetadata,
+        radius_m: f64,
+    ) -> Result<(SurfaceExtent, SurfaceErrorContributions), RenderPreparationError>;
+    /// Record/request geometry for `address`, returning whether it is ready.
+    fn request_ready(&mut self, address: CubePatchAddress) -> bool;
+    /// Freeze topology replacement while an external transition is in progress.
+    fn allow_replacement(&self) -> bool {
+        true
+    }
+    /// Called after one complete balanced replacement is published.
+    fn replacement_committed(&mut self) {}
+    /// Resource preflight for the complete proposed covering surface.
+    fn admit_replacement(&mut self, _cover_patches: usize) -> bool {
+        true
+    }
 }
 #[derive(Debug, Clone, Copy)]
 pub struct LodSettings {
@@ -216,6 +241,22 @@ impl SurfaceLodSession {
         input: &SurfaceViewInput<'_, '_>,
         settings: &LodSettings,
     ) -> Result<LodReport, RenderPreparationError> {
+        self.update_inner(input, settings, None)
+    }
+    pub fn update_with_policy(
+        &mut self,
+        input: &SurfaceViewInput<'_, '_>,
+        settings: &LodSettings,
+        policy: &mut dyn SurfaceGeometryPolicy,
+    ) -> Result<LodReport, RenderPreparationError> {
+        self.update_inner(input, settings, Some(policy))
+    }
+    fn update_inner(
+        &mut self,
+        input: &SurfaceViewInput<'_, '_>,
+        settings: &LodSettings,
+        mut policy: Option<&mut dyn SurfaceGeometryPolicy>,
+    ) -> Result<LodReport, RenderPreparationError> {
         if !input.reference_radius_m.is_finite() || input.reference_radius_m <= 0.0 {
             return Err(RenderPreparationError::InvalidDebugGeometry);
         }
@@ -239,7 +280,8 @@ impl SurfaceLodSession {
         if let Some(parent) = self.pending_parent {
             let relevant = self.cover.contains(&parent)
                 && self.cache.get(parent)?.is_some_and(|m| {
-                    relevance(m, input, &source).is_ok_and(|(v, e, _)| v && e > settings.split_px)
+                    relevance(parent, m, input, &source, &mut policy)
+                        .is_ok_and(|(v, e, _)| v && e > settings.split_px)
                 });
             if !relevant {
                 self.pending.clear();
@@ -269,17 +311,26 @@ impl SurfaceLodSession {
                 continue;
             }
             let m = self.cache.get(parent)?.expect("active ancestors pinned");
-            let (visible, error, _) = relevance(m, input, &source)?;
+            let (visible, error, _) = relevance(parent, m, input, &source, &mut policy)?;
             if visible && error >= settings.merge_px {
                 continue;
             }
-            if merge_neighbors_valid(parent, &self.cover) {
+            if merge_neighbors_valid(parent, &self.cover)
+                && policy.as_deref_mut().is_none_or(|p| {
+                    p.allow_replacement()
+                        && p.admit_replacement(self.cover.len() - 3)
+                        && p.request_ready(parent)
+                })
+            {
                 for child in children {
                     self.cover.remove(&child);
                 }
                 self.cover.insert(parent);
                 self.previous_splits.remove(&parent);
                 report.merges += 1;
+                if let Some(p) = policy.as_deref_mut() {
+                    p.replacement_committed();
+                }
             }
         }
         self.pins.clear();
@@ -301,7 +352,7 @@ impl SurfaceLodSession {
         self.requests.clear();
         for &p in &self.cover {
             let m = self.cache.get(p)?.expect("active metadata pinned");
-            let (visible, error, _) = relevance(m, input, &source)?;
+            let (visible, error, _) = relevance(p, m, input, &source, &mut policy)?;
             if visible && error > settings.split_px {
                 if p.level() < settings.max_level {
                     self.requests.push((p, error));
@@ -325,6 +376,9 @@ impl SurfaceLodSession {
             if !self.cover.contains(&parent) {
                 continue;
             }
+            if policy.as_deref().is_some_and(|p| !p.allow_replacement()) {
+                continue;
+            }
             let children = parent
                 .children()
                 .map_err(|_| RenderPreparationError::InvalidDebugGeometry)?;
@@ -340,7 +394,33 @@ impl SurfaceLodSession {
                 self.pending.insert(child);
             }
             loop {
+                balance_violations(&self.proposal, &mut self.coarse);
+                if !self.coarse.is_empty() {
+                    if self.proposal.len() + 3 * self.coarse.len() > settings.cover_limit {
+                        ready = false;
+                        report.budget_constrained = true;
+                        break;
+                    }
+                    for &p in &self.coarse {
+                        let children = p
+                            .children()
+                            .map_err(|_| RenderPreparationError::InvalidDebugGeometry)?;
+                        self.proposal.remove(&p);
+                        self.proposal.extend(children);
+                        self.pending.extend(children);
+                        forced += 1;
+                    }
+                }
                 let dependencies: Vec<_> = self.pending.iter().copied().collect();
+                if self.proposal.len() > settings.cover_limit
+                    || policy
+                        .as_deref_mut()
+                        .is_some_and(|p| !p.admit_replacement(self.proposal.len()))
+                {
+                    ready = false;
+                    report.budget_constrained = true;
+                    break;
+                }
                 #[cfg(feature = "surface-profile")]
                 {
                     report.profile.dependency_vectors += 1;
@@ -349,6 +429,9 @@ impl SurfaceLodSession {
                 }
                 for p in dependencies {
                     self.pins.insert(p);
+                    if let Some(policy) = policy.as_deref_mut() {
+                        ready &= policy.request_ready(p);
+                    }
                     if self.cache.get(p)?.is_none() {
                         if report.metadata_built < settings.new_metadata {
                             if self.cache.build(p, &self.topology, &self.pins)? {
@@ -362,26 +445,8 @@ impl SurfaceLodSession {
                         }
                     }
                 }
-                if !ready {
-                    break;
-                }
-                balance_violations(&self.proposal, &mut self.coarse);
                 if self.coarse.is_empty() {
                     break;
-                }
-                if self.proposal.len() + 3 * self.coarse.len() > settings.cover_limit {
-                    ready = false;
-                    report.budget_constrained = true;
-                    break;
-                }
-                for &p in &self.coarse {
-                    let children = p
-                        .children()
-                        .map_err(|_| RenderPreparationError::InvalidDebugGeometry)?;
-                    self.proposal.remove(&p);
-                    self.proposal.extend(children);
-                    self.pending.extend(children);
-                    forced += 1;
                 }
             }
             if ready {
@@ -391,6 +456,7 @@ impl SurfaceLodSession {
                     input,
                     &source,
                     &mut self.visible_scratch,
+                    &mut policy,
                 )?;
                 if self.proposal.len() <= settings.cover_limit
                     && self.visible_scratch.len() <= settings.visible_limit
@@ -399,6 +465,9 @@ impl SurfaceLodSession {
                     self.previous_splits.insert(parent);
                     report.splits += 1;
                     report.balance_splits += forced;
+                    if let Some(p) = policy.as_deref_mut() {
+                        p.replacement_committed();
+                    }
                     self.pending.clear();
                     self.pending_parent = None;
                 } else {
@@ -429,21 +498,26 @@ impl SurfaceLodSession {
             input,
             &source,
             &mut self.visible,
+            &mut policy,
         )?;
         if self.visible.len() > settings.visible_limit {
-            self.cover.clear();
-            self.cover
-                .extend(CubeFace::ALL.into_iter().map(CubePatchAddress::root));
-            self.previous_splits.clear();
-            self.pending.clear();
-            self.pending_parent = None;
-            visible_for(
-                &mut self.cache,
-                &self.cover,
-                input,
-                &source,
-                &mut self.visible,
-            )?;
+            // Displaced ownership cannot fall back to metadata-only roots.
+            if policy.is_none() {
+                self.cover.clear();
+                self.cover
+                    .extend(CubeFace::ALL.into_iter().map(CubePatchAddress::root));
+                self.previous_splits.clear();
+                self.pending.clear();
+                self.pending_parent = None;
+                visible_for(
+                    &mut self.cache,
+                    &self.cover,
+                    input,
+                    &source,
+                    &mut self.visible,
+                    &mut policy,
+                )?;
+            }
             report.budget_constrained = true;
             report.constrained_refinements += 1;
         }
@@ -464,7 +538,7 @@ impl SurfaceLodSession {
                 .cache
                 .get(p)?
                 .expect("desired traversal enters ready children");
-            let (visible, error, _) = relevance(m, input, &source)?;
+            let (visible, error, _) = relevance(p, m, input, &source, &mut policy)?;
             let split = if self.previous_splits.contains(&p) {
                 error >= settings.merge_px
             } else {
@@ -478,6 +552,7 @@ impl SurfaceLodSession {
                 for child in children {
                     ready &= self.cache.get(child)?.is_some();
                 }
+                // Desirability remains distinct from geometry availability.
                 if ready && self.desired.len() + self.stack.len() + 4 <= settings.cover_limit {
                     self.stack.extend(children.into_iter().rev());
                     continue;
@@ -514,7 +589,7 @@ impl SurfaceLodSession {
         let stage_started = Instant::now();
         for &p in &self.cover {
             let m = self.cache.get(p)?.expect("active metadata pinned");
-            let (visible, _, horizon) = relevance(m, input, &source)?;
+            let (visible, _, horizon) = relevance(p, m, input, &source, &mut policy)?;
             if !visible {
                 if horizon {
                     report.horizon_culled += 1;
@@ -588,11 +663,12 @@ fn visible_for(
     input: &SurfaceViewInput<'_, '_>,
     source: &PreparedRenderFrame<'_>,
     output: &mut Vec<ActiveSurfacePatch>,
+    policy: &mut Option<&mut dyn SurfaceGeometryPolicy>,
 ) -> Result<(), RenderPreparationError> {
     output.clear();
     for &p in cover {
         let metadata = cache.get(p)?.expect("ready covering leaf");
-        let (visible, error, _) = relevance(metadata, input, source)?;
+        let (visible, error, _) = relevance(p, metadata, input, source, policy)?;
         if visible {
             let mut mask = 0;
             for edge in PatchEdge::ALL {
@@ -678,13 +754,25 @@ fn merge_neighbors_valid(parent: CubePatchAddress, cover: &AddressSet) -> bool {
     true
 }
 fn relevance(
+    address: CubePatchAddress,
     m: PatchMetadata,
     input: &SurfaceViewInput<'_, '_>,
     source: &PreparedRenderFrame<'_>,
+    policy: &mut Option<&mut dyn SurfaceGeometryPolicy>,
 ) -> Result<(bool, f64, bool), RenderPreparationError> {
     let radius = input.reference_radius_m;
-    let extent = SurfaceExtent::smooth(radius);
-    if m.horizon_reject(source.observer_in_source().metres(), radius, extent) {
+    let (extent, error) = if let Some(policy) = policy.as_deref_mut() {
+        policy.certificate(address, m, radius)?
+    } else {
+        (
+            SurfaceExtent::smooth(radius),
+            SurfaceErrorContributions::default(),
+        )
+    };
+    error.total_m()?;
+    if (policy.is_none() || extent.guaranteed_opaque_radius_m > 0.0)
+        && m.horizon_reject(source.observer_in_source().metres(), radius, extent)
+    {
         return Ok((false, 0.0, true));
     }
     let (center, r) = m.ball(radius, extent)?;
@@ -699,7 +787,11 @@ fn relevance(
     }
     Ok((
         true,
-        m.projected_error(center, r, radius, input.projection),
+        if policy.is_some() {
+            m.projected_total_error(error, center, r, input.projection)?
+        } else {
+            m.projected_error(center, r, radius, input.projection)
+        },
         false,
     ))
 }

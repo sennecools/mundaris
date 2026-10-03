@@ -552,6 +552,55 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
         }
         result
     }
+    /// Adaptive terrain accepts only geometry reconciled against a complete
+    /// ready cover, so visibility cannot accidentally omit a boundary owner.
+    pub fn append_stitched_surface(
+        &mut self,
+        body: CelestialRenderBody,
+        patches: &[crate::planet_surface::ActiveSurfacePatch],
+        surface: &crate::planet_surface::StitchedSurface,
+        topology: &crate::planet_surface::SurfaceTopology,
+        style: crate::planet_surface::SurfaceStyle,
+    ) -> Result<(), RenderPreparationError> {
+        let result = self.validate().and_then(|()| {
+            self.staging.surface.append_stitched(
+                self.view,
+                self.projection,
+                body,
+                patches,
+                surface,
+                topology,
+                style,
+            )
+        });
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+    /// Draws a compatible overlay, not unrelated interpolated grid arrays.
+    pub fn append_surface_transition(
+        &mut self,
+        body: CelestialRenderBody,
+        transition: &crate::planet_surface::SurfaceTransition,
+        fraction: f64,
+        style: crate::planet_surface::SurfaceStyle,
+    ) -> Result<(), RenderPreparationError> {
+        let result = self.validate().and_then(|()| {
+            self.staging.surface.append_transition(
+                self.view,
+                self.projection,
+                body,
+                transition,
+                fraction,
+                style,
+            )
+        });
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
     pub fn append_historical_lines(
         &mut self,
         source: FrameId,

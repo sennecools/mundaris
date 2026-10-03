@@ -51,6 +51,14 @@ harness = false
 name = "terrain_lighting_capture"
 required-features = ["terrain-capture"]
 
+[[example]]
+name = "terrain_adaptive_capture"
+required-features = ["terrain-capture"]
+
+[[example]]
+name = "terrain_transition_capture"
+required-features = ["terrain-capture"]
+
 [[bench]]
 name = "planet_terrain_view"
 harness = false

@@ -842,6 +842,55 @@ impl TerrainGenerator {
             hessian,
         })
     }
+
+    /// Outward bound on the height difference between two footprint-filtered
+    /// profiles at the same direction.
+    pub fn profile_difference_bound_m(
+        &self,
+        a: TerrainFootprint,
+        b: TerrainFootprint,
+    ) -> Result<f64, TerrainError> {
+        let wa = self.weights(a)?;
+        let wb = self.weights(b)?;
+        let ea = self.erosion_weights(a)?;
+        let eb = self.erosion_weights(b)?;
+        let mut total = 0.0;
+        let product = |x: f64, y: f64| {
+            if x == 0.0 || y == 0.0 {
+                0.0
+            } else {
+                (x * y).next_up()
+            }
+        };
+        let widen = |x: f64| {
+            if x == 0.0 {
+                0.0
+            } else {
+                (x + x * 1024.0 * f64::EPSILON).next_up()
+            }
+        };
+        for (i, band) in self.octaves.iter().enumerate() {
+            for (o, octave) in band.iter().enumerate() {
+                if let Some(x) = octave {
+                    let delta = (wa[i][o] - wb[i][o]).abs();
+                    let delta = if delta == 0.0 { 0.0 } else { delta.next_up() };
+                    total = widen(total + product(x.amplitude, delta));
+                }
+            }
+        }
+        for (i, octave) in self.erosion.iter().enumerate() {
+            if let Some(x) = octave {
+                let delta = (ea[i] - eb[i]).abs();
+                let delta = if delta == 0.0 { 0.0 } else { delta.next_up() };
+                total = widen(total + product(x.amplitude_m, delta));
+            }
+        }
+        if total.is_finite() {
+            Ok(total)
+        } else {
+            Err(TerrainError::InvalidConfig)
+        }
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TerrainEvaluationReport {

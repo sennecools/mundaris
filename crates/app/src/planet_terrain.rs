@@ -9,12 +9,85 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod certificate;
+pub use certificate::terrain_surface_certificate;
+mod adaptive;
+pub use adaptive::{AdaptiveTerrainCover, TerrainSelectionPolicy};
+
 pub const TERRAIN_CPU_CAP_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_TERRAIN_PATCHES: usize = 4096;
 pub const MAX_PENDING_PATCHES: usize = 256;
 pub const GENERATION_MICROBATCH: usize = 8;
 /// Validation permits larger chunks without making them the live default.
 pub const MAX_GENERATION_BATCH: usize = 64;
+
+#[cfg(test)]
+mod publication_pin_tests {
+    use super::*;
+    use mundaris_math::*;
+    use mundaris_world::{BodyProperties, BodyState, CelestialSystem};
+    use std::num::NonZeroU64;
+
+    #[test]
+    fn completed_siblings_are_pinned_before_the_next_builder_admission() {
+        let mut world = CelestialSystem::new(NonZeroU64::new(81).unwrap(), SimulationInstant::ZERO);
+        let body = world
+            .insert_body(
+                "publication pin fixture",
+                BodyProperties::new(1.0, 1000.0).unwrap(),
+                BodyState::new(
+                    LocalPosition::origin(),
+                    LinearVelocity3::zero(),
+                    UnitRotation::identity(),
+                    AngularVelocity3::zero(),
+                ),
+            )
+            .unwrap();
+        let definition = checkpoint_terrain_definition(1000.0).unwrap();
+        world.edit_terrain(body, Some(definition.clone())).unwrap();
+        let identity = TerrainGeometryIdentity::new(
+            body,
+            definition,
+            world.body(body).unwrap().terrain_revision(),
+            1000.0,
+        )
+        .unwrap();
+        let mut cache = TerrainPatchCache::new(TERRAIN_CPU_CAP_BYTES, 4).unwrap();
+        let siblings = CubePatchAddress::root(CubeFace::PositiveZ)
+            .children()
+            .unwrap();
+        let extra = CubePatchAddress::root(CubeFace::PositiveX);
+        for address in siblings.into_iter().chain([extra]) {
+            assert!(cache.request_pinned(&identity, address));
+        }
+        let before = cache.resident_bytes();
+        let work = cache
+            .generate(5 * GRID_SAMPLES, GENERATION_MICROBATCH, None)
+            .unwrap();
+        assert_eq!(work.patches_completed, 4);
+        assert_eq!(
+            work.allocation_delta_bytes,
+            cache.resident_bytes() as isize - before as isize
+        );
+        assert_eq!(cache.report().pinned_patches, 4);
+        assert_eq!(cache.report().evictions, 0);
+        assert!(
+            siblings
+                .iter()
+                .all(|&address| cache.peek(&identity, address).is_some())
+        );
+        assert!(cache.peek(&identity, extra).is_none());
+        assert_eq!(cache.pending(), 1);
+        cache.unpin_all();
+        let work = cache
+            .generate(GRID_SAMPLES, GENERATION_MICROBATCH, None)
+            .unwrap();
+        assert_eq!(work.patches_completed, 1);
+        assert_eq!(cache.report().evictions, 1);
+        assert!(cache.peek(&identity, extra).is_some());
+        assert!(cache.report().peak_aggregate_bytes <= TERRAIN_CPU_CAP_BYTES);
+    }
+}
 
 /// Checkpoint authoring preset, intentionally not an Earth shoreline model.
 pub fn checkpoint_terrain_definition(radius_m: f64) -> Result<TerrainDefinition> {
@@ -285,6 +358,10 @@ pub struct TerrainCacheReport {
     pub resident_patches: usize,
     pub resident_bytes: usize,
     pub peak_bytes: usize,
+    pub pinned_patches: usize,
+    pub pinned_bytes: usize,
+    pub external_bytes: usize,
+    pub peak_aggregate_bytes: usize,
 }
 struct Entry {
     identity: TerrainGeometryIdentity,
@@ -296,6 +373,7 @@ struct Entry {
 struct Request {
     identity: TerrainGeometryIdentity,
     address: CubePatchAddress,
+    pin_when_ready: bool,
 }
 struct Builder {
     request: Request,
@@ -310,6 +388,7 @@ pub struct TerrainPatchCache {
     requests: Vec<Request>,
     building: Option<Builder>,
     cap_bytes: usize,
+    external_bytes: usize,
     max_entries: usize,
     sequence: u64,
     report: TerrainCacheReport,
@@ -330,6 +409,7 @@ impl TerrainPatchCache {
             requests: Vec::with_capacity(MAX_PENDING_PATCHES),
             building: None,
             cap_bytes,
+            external_bytes: 0,
             max_entries,
             sequence: 0,
             report: TerrainCacheReport::default(),
@@ -342,6 +422,9 @@ impl TerrainPatchCache {
     }
     pub fn resident_bytes(&self) -> usize {
         size_of::<Self>()
+            // Fixed resumed-query/location/output and certificate stack allowance.
+            // Charge it even while idle so generation cannot bypass admission.
+            + 64 * 1024
             + self.entries.capacity() * size_of::<Entry>()
             + self.requests.capacity() * size_of::<Request>()
             + self.topology.allocated_bytes()
@@ -357,16 +440,40 @@ impl TerrainPatchCache {
     }
     fn record_peak(&mut self) {
         self.report.peak_bytes = self.report.peak_bytes.max(self.resident_bytes());
+        self.report.peak_aggregate_bytes = self
+            .report
+            .peak_aggregate_bytes
+            .max(self.resident_bytes() + self.external_bytes);
     }
     pub fn report(&self) -> TerrainCacheReport {
         TerrainCacheReport {
             resident_patches: self.entries.len(),
             resident_bytes: self.resident_bytes(),
+            pinned_patches: self.entries.iter().filter(|e| e.pinned).count(),
+            pinned_bytes: self
+                .entries
+                .iter()
+                .filter(|e| e.pinned)
+                .map(|e| size_of::<Entry>() + e.patch.resident_heap_bytes())
+                .sum(),
+            external_bytes: self.external_bytes,
             ..self.report
         }
     }
     pub fn pending(&self) -> usize {
         self.requests.len() + usize::from(self.building.is_some())
+    }
+    /// Admit derived cover/transition capacity into the same aggregate CPU cap.
+    /// Pressure only evicts unpinned entries; failure retains valid old coverage.
+    pub fn reserve_external(&mut self, bytes: usize) -> bool {
+        while self.resident_bytes().saturating_add(bytes) > self.cap_bytes {
+            if !self.evict_one() {
+                return false;
+            }
+        }
+        self.external_bytes = bytes;
+        self.record_peak();
+        true
     }
     pub fn unpin_all(&mut self) {
         for e in &mut self.entries {
@@ -478,8 +585,32 @@ impl TerrainPatchCache {
         self.requests.push(Request {
             identity: identity.clone(),
             address,
+            pin_when_ready: false,
         });
         true
+    }
+    /// Replacement dependencies are pinned at publication, not only at the next
+    /// frame boundary. A long generation opportunity cannot evict a sibling it
+    /// just completed while allocating the next sibling under pressure.
+    fn request_pinned(
+        &mut self,
+        identity: &TerrainGeometryIdentity,
+        address: CubePatchAddress,
+    ) -> bool {
+        let admitted = self.request(identity, address);
+        self.pin(identity, address);
+        for request in &mut self.requests {
+            if request.identity == *identity && request.address == address {
+                request.pin_when_ready = true;
+            }
+        }
+        if let Some(builder) = &mut self.building
+            && builder.request.identity == *identity
+            && builder.request.address == address
+        {
+            builder.request.pin_when_ready = true;
+        }
+        admitted
     }
     fn evict_one(&mut self) -> bool {
         let victim = self
@@ -520,11 +651,13 @@ impl TerrainPatchCache {
                 }
                 let bytes = GRID_SAMPLES * size_of::<SurfaceGeometrySample>();
                 while self.entries.len() >= self.max_entries
-                    || self.resident_bytes() + bytes > self.cap_bytes
+                    || self.resident_bytes() + self.external_bytes + bytes > self.cap_bytes
                 {
                     if !self.evict_one() {
                         work.pending_patches = self.pending();
                         work.elapsed = start.elapsed();
+                        work.allocation_delta_bytes =
+                            self.resident_bytes() as isize - before as isize;
                         return Ok(work);
                     }
                 }
@@ -572,56 +705,7 @@ impl TerrainPatchCache {
             work.vertices_generated += count;
             if builder.samples.len() == GRID_SAMPLES {
                 let metadata = PatchMetadata::build(address, &self.topology)?;
-                let (axis, alpha) = metadata.cap();
-                let certificate = generator.bounds_for_region(
-                    DirectionalCap::new(Direction3::try_new(axis)?, alpha)?,
-                    footprint,
-                )?;
-                let interval = certificate.height_interval_m();
-                // Independently valid interval fallback for displacement-vector
-                // interpolation: range(h) + H_abs * max direction chord. The
-                // all-stitch four-step chart diameter is conservative.
-                let diameter = 4.0 * 2.0 / (16.0 * (1u64 << address.level()) as f64);
-                let represented = certificate.represented_height_bound_m();
-                // Normalized radial map on each cube face has ||Dn||<=1 and
-                // ||D²n||<=3 (unnormalized face point has norm >=1). Chain and
-                // product rules for F=h(n)n give M<=H+5G+3A, L<=G+A.
-                let gradient = certificate.cartesian_height_gradient_bound_m();
-                let hessian = certificate.cartesian_height_hessian_bound_m();
-                let interval_error =
-                    (2.0 * represented + represented * diameter.min(2.0)).next_up();
-                let lipschitz_error = ((gradient + represented).next_up() * diameter).next_up();
-                let vector_hessian =
-                    (hessian + (5.0 * gradient).next_up() + (3.0 * represented).next_up())
-                        .next_up();
-                let curvature_error =
-                    SurfaceErrorContributions::interpolation_bound_m(vector_hessian, diameter)?;
-                // Certify the same face-domain barycentric correspondence used
-                // in full-field stress tests, not only closest radial distance.
-                let sphere_correspondence = SurfaceErrorContributions::interpolation_bound_m(
-                    (3.0 * radius).next_up(),
-                    diameter,
-                )?;
-                let error = SurfaceErrorContributions {
-                    sphere_m: (radius * metadata.error_unit())
-                        .next_up()
-                        .max(sphere_correspondence),
-                    filtered_interpolation_m: interval_error
-                        .min(lipschitz_error)
-                        .min(curvature_error),
-                    unresolved_m: certificate.unresolved_height_bound_m(),
-                    boundary_constraint_m: 0.0,
-                    morph_remaining_m: 0.0,
-                    numeric_m: (512.0
-                        * f64::EPSILON
-                        * (radius + interval[1].abs().max(interval[0].abs())))
-                    .next_up(),
-                };
-                let extent = SurfaceExtent {
-                    min_height_m: interval[0],
-                    max_height_m: interval[1],
-                    guaranteed_opaque_radius_m: 0.0,
-                };
+                let (extent, error) = terrain_surface_certificate(generator, address, metadata)?;
                 let builder = self
                     .building
                     .take()
@@ -647,7 +731,7 @@ impl TerrainPatchCache {
                         identity: builder.request.identity,
                         patch,
                         access: self.sequence,
-                        pinned: false,
+                        pinned: builder.request.pin_when_ready,
                         metadata,
                     },
                 );

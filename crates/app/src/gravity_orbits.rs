@@ -56,6 +56,7 @@ enum Command {
 struct Controls {
     terrain_preview: bool,
     terrain_lighting: TerrainLighting,
+    terrain_morph_ms: u64,
     surface_bounds: bool,
     surface_style: SurfaceStyle,
     approach: Option<(f64, f64, Duration)>,
@@ -90,6 +91,11 @@ impl Controls {
         Self {
             terrain_preview: false,
             terrain_lighting: terrain_lighting_from_environment(),
+            terrain_morph_ms: std::env::var("MUNDARIS_TERRAIN_MORPH_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(150)
+                .min(1000),
             surface_bounds: false,
             surface_style: SurfaceStyle::default(),
             approach: None,
@@ -140,7 +146,7 @@ impl Controls {
 
 pub struct GravityOrbitsDemo {
     terrain_cache: crate::planet_terrain::TerrainPatchCache,
-    terrain_cover: crate::planet_terrain::TerrainReadyCover,
+    terrain_cover: crate::planet_terrain::AdaptiveTerrainCover,
     terrain_work: crate::planet_terrain::TerrainWorkReport,
     validation_route: Option<SurfaceValidationRoute>,
     surfaces: Vec<PlanetSurfaceSession>,
@@ -324,7 +330,7 @@ impl GravityOrbitsDemo {
                 crate::planet_terrain::TERRAIN_CPU_CAP_BYTES - 16 * 1024 * 1024,
                 crate::planet_terrain::MAX_TERRAIN_PATCHES,
             )?,
-            terrain_cover: crate::planet_terrain::TerrainReadyCover::default(),
+            terrain_cover: crate::planet_terrain::AdaptiveTerrainCover::default(),
             terrain_work: crate::planet_terrain::TerrainWorkReport::default(),
             validation_route: None,
             surfaces,
@@ -1223,16 +1229,18 @@ impl GravityOrbitsDemo {
             } else {
                 0.0
             };
-            session.update_with_terrain_envelope(
-                &SurfaceViewInput {
-                    view: &view,
-                    body_fixed_frame: body.body_fixed_frame,
-                    reference_radius_m: body.reference_radius_m,
-                    projection,
-                },
-                &settings,
-                terrain_envelope,
-            )?;
+            if !(self.controls.terrain_preview && index == 1) {
+                session.update_with_terrain_envelope(
+                    &SurfaceViewInput {
+                        view: &view,
+                        body_fixed_frame: body.body_fixed_frame,
+                        reference_radius_m: body.reference_radius_m,
+                        projection,
+                    },
+                    &settings,
+                    terrain_envelope,
+                )?;
+            }
             if session.state() == SurfaceRepresentationState::Surface
                 && session.far_error_pixels < 0.05
             {
@@ -1258,39 +1266,39 @@ impl GravityOrbitsDemo {
                     world_body.terrain_revision(),
                     body.reference_radius_m,
                 )?;
-                let desired_level = session
-                    .lod()
-                    .active_visible()
-                    .iter()
-                    .map(|p| p.address.level())
-                    .max()
-                    .unwrap_or(0);
-                let footprint_m = body.reference_radius_m * 2.0
-                    / (16.0 * f64::from(1u32 << desired_level.min(4)));
-                // Retain coarse-cover throughput; fine work has a lower count
-                // ceiling as well as the wall cutoff checked every eight vertices.
-                let vertex_budget = if footprint_m >= 5_000.0 { 1156 } else { 64 };
-                self.terrain_work = self.terrain_cover.update(
-                    &mut self.terrain_cache,
-                    &identity,
-                    desired_level,
-                    vertex_budget,
-                    Some(Duration::from_millis(2)),
-                )?;
+                // Fine requests can be admitted at any time in an adaptive cover.
+                // Preserve eight-vertex chunks and a between-chunk wall cutoff.
+                let vertex_budget = 64;
                 let input = SurfaceViewInput {
                     view: &view,
                     body_fixed_frame: body.body_fixed_frame,
                     reference_radius_m: body.reference_radius_m,
                     projection,
                 };
+                let terrain_settings = settings.with_limits(2048, 2048, 30)?;
                 self.terrain_cover
-                    .prepare_visible(&self.terrain_cache, &identity, &input)?;
+                    .set_morph_duration(Duration::from_millis(self.controls.terrain_morph_ms))?;
+                self.terrain_work = self.terrain_cover.update_with_elapsed(
+                    &mut self.terrain_cache,
+                    &identity,
+                    &input,
+                    &terrain_settings,
+                    vertex_budget,
+                    Some(Duration::from_millis(2)),
+                    elapsed,
+                )?;
+                session.update_with_terrain_report(
+                    &input,
+                    terrain_envelope,
+                    self.terrain_cover.report,
+                )?;
                 for patch in self.terrain_cover.visible() {
                     self.terrain_cache.get(&identity, patch.address)?;
                 }
                 // Far sphere remains sole owner until all six generated roots
                 // establish coverage. No sphere/terrain mixed leaf cover.
-                self.surface_owners[index] &= self.terrain_cover.ready();
+                self.surface_owners[index] = session.state() == SurfaceRepresentationState::Surface
+                    && self.terrain_cover.ready();
             }
         }
         let mut frame = CelestialFrame::new(&view, &mut self.staging, projection, &self.sphere);
@@ -1304,33 +1312,25 @@ impl GravityOrbitsDemo {
                     .expect("surface body");
                 if self.surface_owners[index] {
                     if self.controls.terrain_preview && index == 1 {
-                        let world_body = pair.system().body(session.body())?;
-                        let identity = crate::planet_terrain::TerrainGeometryIdentity::new(
-                            session.body(),
-                            world_body
-                                .terrain()
-                                .ok_or_else(|| anyhow::anyhow!("missing terrain"))?
-                                .clone(),
-                            world_body.terrain_revision(),
-                            self.requests[index].reference_radius_m,
-                        )?;
-                        let geometry = self
-                            .terrain_cover
-                            .visible()
-                            .iter()
-                            .map(|p| {
-                                self.terrain_cache
-                                    .peek(&identity, p.address)
-                                    .ok_or_else(|| anyhow::anyhow!("missing ready terrain"))
-                            })
-                            .collect::<Result<Vec<_>>>()?;
-                        frame.append_generated_surface(
+                        frame.append_stitched_surface(
                             self.requests[index],
                             self.terrain_cover.visible(),
-                            &geometry,
-                            session.lod().topology(),
+                            self.terrain_cover
+                                .surface()
+                                .ok_or_else(|| anyhow::anyhow!("missing stitched terrain"))?,
+                            self.terrain_cover
+                                .topology()
+                                .ok_or_else(|| anyhow::anyhow!("missing terrain topology"))?,
                             self.controls.surface_style,
                         )?;
+                        if let Some((mesh, fraction)) = self.terrain_cover.transition() {
+                            frame.append_surface_transition(
+                                self.requests[index],
+                                mesh,
+                                fraction,
+                                self.controls.surface_style,
+                            )?;
+                        }
                     } else {
                         frame.append_surface(
                             self.requests[index],
@@ -1482,6 +1482,7 @@ impl GravityOrbitsDemo {
         // until submission. UI queues commands; it never mutates that borrowed state.
         let info = UiInfo {
             terrain_cache: self.terrain_cache.report(),
+            terrain_cover: &self.terrain_cover,
             terrain_work: self.terrain_work,
             surfaces: &self.surfaces,
             system: &self.system,
@@ -1555,6 +1556,7 @@ impl GravityOrbitsDemo {
         (
             UiInfo {
                 terrain_cache: self.terrain_cache.report(),
+                terrain_cover: &self.terrain_cover,
                 terrain_work: self.terrain_work,
                 surfaces: &self.surfaces,
                 system: &self.system,
@@ -1702,6 +1704,7 @@ impl GravityOrbitsDemo {
 
 struct UiInfo<'a> {
     terrain_cache: crate::planet_terrain::TerrainCacheReport,
+    terrain_cover: &'a crate::planet_terrain::AdaptiveTerrainCover,
     terrain_work: crate::planet_terrain::TerrainWorkReport,
     surfaces: &'a [PlanetSurfaceSession],
     system: &'a CelestialSystem,
@@ -1930,8 +1933,9 @@ fn draw_ui(
             ui.checkbox(&mut controls.surface_style.borders,"Patch borders");ui.checkbox(&mut controls.surface_style.lod_colors,"LOD colours");ui.checkbox(&mut controls.surface_style.face_colors,"Face IDs / colours");ui.checkbox(&mut controls.surface_style.underside,"No-cull underside diagnostic");
             ui.checkbox(&mut controls.surface_bounds,"Bounds / normal envelope axes (bounded)");
             let mut preview=controls.terrain_preview;
-            if ui.checkbox(&mut preview,"Terrain checkpoint preview (uniform cover, popping)").changed() {controls.pending.push_back(Command::TerrainPreview(preview));}
+            if ui.checkbox(&mut preview,"Adaptive terrain with stitched transitions").changed() {controls.pending.push_back(Command::TerrainPreview(preview));}
             if controls.terrain_preview {
+                ui.add(egui::Slider::new(&mut controls.terrain_morph_ms,0..=1000).text("Morph ms (0: static)").clamping(egui::SliderClamping::Always));
                 ui.checkbox(&mut controls.surface_style.elevation_colors,"Derived terrain elevation colours");
                 let mut enabled = controls.terrain_lighting.mode() == TerrainRenderMode::Lit;
                 if ui.checkbox(&mut enabled, "Terrain lighting enabled").changed() {
@@ -1973,7 +1977,14 @@ fn draw_ui(
                 }
                 let c=info.terrain_cache;let w=info.terrain_work;
                 ui.monospace(format!("Terrain: {} resident, {} pending; {} vertices / {} patches this frame, {:.3} ms; {:.2} MiB (peak {:.2}); evictions {}",c.resident_patches,w.pending_patches,w.vertices_generated,w.patches_completed,w.elapsed.as_secs_f64()*1000.0,c.resident_bytes as f64/1048576.0,c.peak_bytes as f64/1048576.0,c.evictions));
-                ui.label("Mixed-LOD displacement and morphing disabled. Coarse quality debt; reference-sphere picking/clearance.");
+                let cover=info.terrain_cover;
+                if cover.transition_deferred {ui.colored_label(egui::Color32::YELLOW,"Transition reservation cannot fit replacement; complete source retained. Reset terrain or explicitly change morph duration to retry.");}
+                ui.small(format!("Accounted aggregate {:.2} MiB / peak {:.2} MiB; {} pinned. Selector {:.3} ms / stitching {:.3} ms / morph construction {:.3} ms",(c.resident_bytes+c.external_bytes) as f64/1048576.0,c.peak_aggregate_bytes as f64/1048576.0,c.pinned_patches,cover.selection_preparation.as_secs_f64()*1000.0,cover.stitch_preparation.as_secs_f64()*1000.0,cover.morph_preparation.as_secs_f64()*1000.0));
+                if let Some((mesh,fraction))=cover.transition() {
+                    ui.small(format!("One synchronized morph: {:.1}% / {} overlay triangles; source {} / target {} changed leaves; remaining displacement {:.3} m",fraction*100.0,mesh.triangles().len(),mesh.affected_old().len(),mesh.affected_new().len(),mesh.max_displacement_m()*(1.0-fraction)));
+                }
+                ui.small(format!("Published source cover {} / visible regular {}; selector counts below refer to target readiness",cover.active().len(),cover.visible().len()));
+                ui.label("Adaptive displaced stitching and configurable common-refinement transitions. Reference-sphere picking/clearance remains approximate.");
             }
             if let Some(pointer)=context.input(|i|i.pointer.hover_pos()) {
                 let pixels=[f64::from(pointer.x*context.pixels_per_point()),f64::from(pointer.y*context.pixels_per_point())];
@@ -1988,7 +1999,7 @@ fn draw_ui(
                 if r.budget_constrained {ui.colored_label(egui::Color32::YELLOW,"Budget constrains requested quality; complete coarser cover retained");}
                 ui.push_id(session.body(),|ui|ui.collapsing("Bounded patch addresses / stitch masks",|ui| {for patch in session.lod().active_visible().iter().take(16) {ui.monospace(format!("{:?} mask {:04b} · {:.4} px",patch.address,patch.stitch_mask,patch.error_pixels));}}));
             }
-            let r=info.report.surface;ui.small(format!("{} draws / {} samples / {} clipped fallback triangles / {} upload bytes",r.draws,r.samples,r.fallback_triangles,r.uploaded_bytes));
+            let r=info.report.surface;ui.small(format!("{} draws / {} samples / {} clipped fallback + {} morph triangles / {} upload bytes",r.draws,r.samples,r.fallback_triangles,r.morph_triangles,r.uploaded_bytes));
             ui.small(format!("Narrowing {:.4e} px / GPU projection {:.4e} px · staging {} bytes",r.max_projected_error_pixels,r.max_gpu_projection_error_pixels,r.allocated_staging_bytes));
         });
     }

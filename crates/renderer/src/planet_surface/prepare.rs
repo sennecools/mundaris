@@ -21,6 +21,8 @@ pub struct SurfacePreparationReport {
     pub samples: usize,
     pub triangles: usize,
     pub fallback_triangles: usize,
+    /// Temporary common-refinement triangles, not precision fallbacks.
+    pub morph_triangles: usize,
     pub draws: usize,
     pub uploaded_bytes: usize,
     pub allocated_staging_bytes: usize,
@@ -156,6 +158,153 @@ fn physical_budget(p: DVec3) -> f64 {
     }
 }
 impl SurfaceStaging {
+    fn allocated_outgoing_bytes(&self) -> usize {
+        self.samples.capacity()
+            + self.instances.capacity()
+            + self.fallback.capacity()
+            + self.records.capacity() * std::mem::size_of::<(u8, [u8; 64])>()
+    }
+    fn reserve_fallback(&mut self, required: usize) -> Result<(), RenderPreparationError> {
+        let other = self.allocated_outgoing_bytes() - self.fallback.capacity();
+        let needed = self.fallback.len().saturating_add(required);
+        if other.saturating_add(self.fallback.capacity().max(needed)) > STAGING_CAP {
+            return Err(RenderPreparationError::InvalidBudget);
+        }
+        if needed > self.fallback.capacity() {
+            self.fallback.reserve_exact(required);
+        }
+        if self.allocated_outgoing_bytes() > STAGING_CAP {
+            return Err(RenderPreparationError::InvalidBudget);
+        }
+        Ok(())
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_transition(
+        &mut self,
+        view: &PreparedView<'_>,
+        projection: CelestialProjection,
+        body: crate::CelestialRenderBody,
+        mesh: &super::SurfaceTransition,
+        fraction: f64,
+        style: SurfaceStyle,
+    ) -> Result<(), RenderPreparationError> {
+        if !fraction.is_finite()
+            || !(0.0..=1.0).contains(&fraction)
+            || !body.color.iter().all(|c| c.is_finite())
+        {
+            return Err(RenderPreparationError::InvalidDebugGeometry);
+        }
+        let source = view.prepare_source(body.body_fixed_frame)?;
+        self.underside |= style.underside;
+        for triangle in mesh.triangles() {
+            let mut positions = [DVec3::ZERO; 3];
+            let mut normals = [DVec3::ZERO; 3];
+            let mut elevations = [0.0; 3];
+            let mut colors = [body.color; 3];
+            for (i, vertex) in triangle.iter().enumerate() {
+                let sample = vertex.sample(fraction)?;
+                positions[i] = source
+                    .view_displacement(FramePosition::new(
+                        body.body_fixed_frame,
+                        LocalPosition::try_metres(sample.position_body_m)?,
+                    ))?
+                    .metres();
+                normals[i] = sample.normal_body;
+                elevations[i] =
+                    vertex.old_elevation + (vertex.new_elevation - vertex.old_elevation) * fraction;
+                if style.lod_colors {
+                    let level = vertex.old_reference.address.level() as f64
+                        + (vertex.new_reference.address.level() as f64
+                            - vertex.old_reference.address.level() as f64)
+                            * fraction;
+                    let t = level as f32 / 20.0;
+                    colors[i] = [0.2 + t * 0.6, 0.6 - t * 0.3, 1.0 - t * 0.7, 1.0];
+                }
+            }
+            let polygon = clip_triangle(positions, projection);
+            if polygon.len() < 3 {
+                continue;
+            }
+            let required = (polygon.len() - 2) * 3 * 64;
+            self.reserve_fallback(required)?;
+            for i in 1..polygon.len() - 1 {
+                for v in [polygon[0], polygon[i], polygon[i + 1]] {
+                    let f = projection.focal_pixels();
+                    let [w, h] = projection.viewport();
+                    let clip = [
+                        v.position.x * f * 2.0 / w as f64,
+                        v.position.y * f * 2.0 / h as f64,
+                        projection.near_m(),
+                        -v.position.z,
+                    ];
+                    let packed = clip.map(|c| c as f32);
+                    let expected = screen(projection, v.position);
+                    let actual = [
+                        f64::from(packed[0]) / f64::from(packed[3]) * w as f64 * 0.5,
+                        f64::from(packed[1]) / f64::from(packed[3]) * h as f64 * 0.5,
+                    ];
+                    let error = (expected[0] - actual[0]).hypot(expected[1] - actual[1]);
+                    if !packed.iter().all(|c| c.is_finite()) || !error.is_finite() || error > 0.05 {
+                        return Err(RenderPreparationError::PrecisionBudgetExceeded {
+                            error_m: error,
+                            limit_m: 0.05,
+                        });
+                    }
+                    self.report.max_projected_error_pixels =
+                        self.report.max_projected_error_pixels.max(error);
+                    let normal = normals[0] * v.weights.x
+                        + normals[1] * v.weights.y
+                        + normals[2] * v.weights.z;
+                    let elevation = elevations[0] * v.weights.x
+                        + elevations[1] * v.weights.y
+                        + elevations[2] * v.weights.z;
+                    let color = std::array::from_fn::<_, 4, _>(|i| {
+                        colors[0][i] * v.weights.x as f32
+                            + colors[1][i] * v.weights.y as f32
+                            + colors[2][i] * v.weights.z as f32
+                    });
+                    pack_floats(
+                        &mut self.fallback,
+                        packed
+                            .into_iter()
+                            .chain([
+                                normal.x as f32,
+                                normal.y as f32,
+                                normal.z as f32,
+                                elevation as f32,
+                            ])
+                            .chain(color)
+                            .chain([
+                                0.5,
+                                0.5,
+                                (4 | if style.elevation_colors && !style.lod_colors {
+                                    2
+                                } else {
+                                    0
+                                }) as f32,
+                                0.0,
+                            ]),
+                    );
+                }
+                self.report.morph_triangles += 1;
+            }
+        }
+        self.report.patches += mesh.affected_new().len();
+        self.report.draws = self.buckets.iter().filter(|r| !r.is_empty()).count()
+            + usize::from(!self.fallback.is_empty());
+        self.report.uploaded_bytes =
+            self.samples.len() + self.instances.len() + self.fallback.len();
+        self.report.allocated_staging_bytes = self.samples.capacity()
+            + self.instances.capacity()
+            + self.fallback.capacity()
+            + self.records.capacity() * std::mem::size_of::<(u8, [u8; 64])>();
+        if self.report.allocated_staging_bytes > STAGING_CAP
+            || self.report.boundary_bytes > 8 * 1024 * 1024
+        {
+            return Err(RenderPreparationError::InvalidBudget);
+        }
+        Ok(())
+    }
     pub fn clear(&mut self) {
         self.samples.clear();
         self.instances.clear();
@@ -192,6 +341,18 @@ impl SurfaceStaging {
         topology: &SurfaceTopology,
         style: SurfaceStyle,
     ) -> Result<(), RenderPreparationError> {
+        // Raw cache grids are not reconciled. Keep their diagnostic route uniform;
+        // the production adaptive route requires a validated complete cover.
+        if patches.iter().any(|p| p.stitch_mask != 0)
+            || geometry.first().is_some_and(|first| {
+                geometry.iter().any(|g| {
+                    g.address().level() != first.address().level()
+                        || g.footprint_m() != first.footprint_m()
+                })
+            })
+        {
+            return Err(RenderPreparationError::InvalidDebugGeometry);
+        }
         self.append_inner(
             view,
             projection,
@@ -200,6 +361,43 @@ impl SurfaceStaging {
             topology,
             style,
             Some(geometry),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_stitched(
+        &mut self,
+        view: &PreparedView<'_>,
+        projection: CelestialProjection,
+        body: crate::CelestialRenderBody,
+        patches: &[ActiveSurfacePatch],
+        surface: &super::StitchedSurface,
+        topology: &SurfaceTopology,
+        style: SurfaceStyle,
+    ) -> Result<(), RenderPreparationError> {
+        if self.report.patches.saturating_add(patches.len()) > 4096 {
+            return Err(RenderPreparationError::InvalidBudget);
+        }
+        let geometry = patches
+            .iter()
+            .map(|p| {
+                let index = surface
+                    .patches()
+                    .binary_search_by_key(&p.address, GeneratedSurfacePatch::address)
+                    .map_err(|_| RenderPreparationError::InvalidDebugGeometry)?;
+                if surface.stitch_mask(index) != Some(p.stitch_mask) {
+                    return Err(RenderPreparationError::InvalidDebugGeometry);
+                }
+                Ok(&surface.patches()[index])
+            })
+            .collect::<Result<Vec<_>, RenderPreparationError>>()?;
+        self.append_inner(
+            view,
+            projection,
+            body,
+            patches,
+            topology,
+            style,
+            Some(&geometry),
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -213,6 +411,9 @@ impl SurfaceStaging {
         style: SurfaceStyle,
         geometry: Option<&[&GeneratedSurfacePatch]>,
     ) -> Result<(), RenderPreparationError> {
+        if self.report.patches.saturating_add(patches.len()) > 4096 {
+            return Err(RenderPreparationError::InvalidBudget);
+        }
         #[cfg(feature = "surface-profile")]
         let total_start = std::time::Instant::now();
         #[cfg(feature = "surface-profile")]
@@ -292,42 +493,41 @@ impl SurfaceStaging {
                     .iter()
                     .zip(patches)
                     .any(|(g, p)| g.address() != p.address)
-                || geometry.first().is_some_and(|first| {
-                    geometry
-                        .iter()
-                        .any(|g| g.address().level() != first.address().level())
-                })
                 || geometry.iter().enumerate().any(|(i, g)| {
                     geometry[..i]
                         .iter()
                         .any(|prior| prior.address() == g.address())
                 })
-                || geometry.iter().any(|g| g.reference_radius_m() != radius)
-                || geometry.first().is_some_and(|first| {
-                    geometry
-                        .iter()
-                        .any(|g| g.footprint_m() != first.footprint_m())
-                })
-                || patches.iter().any(|patch| patch.stitch_mask != 0))
+                || geometry.iter().any(|g| g.reference_radius_m() != radius))
         {
             return Err(RenderPreparationError::InvalidDebugGeometry);
         }
         // Complete preflight includes pessimistic clipped polygons (up to 8 vertices,
         // 6 triangles per input). Do not grow power-of-two past the aggregate cap.
-        let outgoing = self.samples.len() + self.instances.len() + self.fallback.len();
-        let regular = patches.len() * (GRID_SAMPLES * 32 + 64);
-        if outgoing + regular > STAGING_CAP {
+        let needed_samples = self.samples.len() + patches.len() * GRID_SAMPLES * 32;
+        let needed_instances = self.instances.len() + patches.len() * 64;
+        let needed_records = self.instances.len() / 64 + patches.len();
+        let allocated = self.samples.capacity().max(needed_samples)
+            + self.instances.capacity().max(needed_instances)
+            + self.fallback.capacity()
+            + self.records.capacity().max(needed_records) * std::mem::size_of::<(u8, [u8; 64])>();
+        if allocated > STAGING_CAP {
             return Err(RenderPreparationError::InvalidBudget);
         }
-        let needed_samples = self.samples.len() + patches.len() * GRID_SAMPLES * 32;
         if needed_samples > self.samples.capacity() {
             self.samples
                 .reserve_exact(needed_samples - self.samples.len());
         }
-        let needed_instances = self.instances.len() + patches.len() * 64;
         if needed_instances > self.instances.capacity() {
             self.instances
                 .reserve_exact(needed_instances - self.instances.len());
+        }
+        if needed_records > self.records.capacity() {
+            self.records
+                .reserve_exact(needed_records - self.records.len());
+        }
+        if self.allocated_outgoing_bytes() > STAGING_CAP {
+            return Err(RenderPreparationError::InvalidBudget);
         }
         self.underside |= style.underside;
         let prepared = view.prepare_source(source)?;
@@ -368,7 +568,7 @@ impl SurfaceStaging {
                     .map_err(|_| RenderPreparationError::InvalidDebugGeometry)?;
                 if let Some(geometry) = geometry {
                     let sample = geometry[patch_index].samples()[index];
-                    if style.elevation_colors {
+                    if style.elevation_colors && !style.lod_colors {
                         let extent = geometry[patch_index].extent();
                         let envelope = extent.min_height_m.abs().max(extent.max_height_m.abs());
                         elevations[index] = if envelope == 0.0 {
@@ -565,11 +765,7 @@ impl SurfaceStaging {
                         continue;
                     }
                     let needed = (polygon.len() - 2) * 3 * 64;
-                    if self.samples.len() + self.records.len() * 64 + self.fallback.len() + needed
-                        > STAGING_CAP
-                    {
-                        return Err(RenderPreparationError::InvalidBudget);
-                    }
+                    self.reserve_fallback(needed)?;
                     for i in 1..polygon.len() - 1 {
                         for v in [polygon[0], polygon[i], polygon[i + 1]] {
                             let f = projection.focal_pixels();
@@ -631,7 +827,10 @@ impl SurfaceStaging {
                                         uv[0] as f32,
                                         uv[1] as f32,
                                         (u32::from(style.borders)
-                                            | if style.elevation_colors && geometry.is_some() {
+                                            | if style.elevation_colors
+                                                && !style.lod_colors
+                                                && geometry.is_some()
+                                            {
                                                 2
                                             } else {
                                                 0
@@ -667,7 +866,7 @@ impl SurfaceStaging {
                     u32::from(patch.address.level()),
                     patch.address.face() as u32,
                     u32::from(style.borders)
-                        | if style.elevation_colors && geometry.is_some() {
+                        | if style.elevation_colors && !style.lod_colors && geometry.is_some() {
                             2
                         } else {
                             0
@@ -771,6 +970,24 @@ mod tests {
             stitch_mask: 0,
             error_pixels: 0.0,
         }
+    }
+    #[test]
+    fn retained_capacities_and_records_are_preflighted_before_fallback_growth() {
+        let mut storage = SurfaceStaging {
+            samples: Vec::with_capacity(STAGING_CAP - 1024),
+            records: Vec::with_capacity(4),
+            ..Default::default()
+        };
+        let remaining = STAGING_CAP - storage.allocated_outgoing_bytes();
+        storage.reserve_fallback(remaining).unwrap();
+        assert!(storage.allocated_outgoing_bytes() <= STAGING_CAP);
+        let before = storage.fallback.capacity();
+        assert!(matches!(
+            storage.reserve_fallback(remaining + 1),
+            Err(RenderPreparationError::InvalidBudget)
+        ));
+        assert_eq!(storage.fallback.capacity(), before);
+        assert!(storage.samples.is_empty() && storage.records.is_empty());
     }
     #[test]
     fn sample_bytes_and_interleaved_masks_preserve_stable_bucket_order() {
