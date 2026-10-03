@@ -173,7 +173,7 @@ pub struct SurfaceLodSession {
     previous_splits: AddressSet,
     visible: Vec<ActiveSurfacePatch>,
     stack: Vec<CubePatchAddress>,
-    requests: Vec<(CubePatchAddress, f64)>,
+    requests: Vec<(CubePatchAddress, f64, bool, f64)>,
     desired: AddressSet,
     proposal: AddressSet,
     pins: AddressSet,
@@ -355,20 +355,31 @@ impl SurfaceLodSession {
             let (visible, error, _) = relevance(p, m, input, &source, &mut policy)?;
             if visible && error > settings.split_px {
                 if p.level() < settings.max_level {
-                    self.requests.push((p, error));
+                    let observer = source.observer_in_source().metres();
+                    let local = address_contains_observer_direction(p, observer);
+                    let (center, _) = m.ball(
+                        input.reference_radius_m,
+                        SurfaceExtent::smooth(input.reference_radius_m),
+                    )?;
+                    self.requests
+                        .push((p, error, local, (center - observer).length()));
                 } else {
                     report.precision_floor = true;
                 }
             }
         }
-        self.requests
-            .sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-        if let Some(parent) = self.pending_parent
+        self.requests.sort_by(compare_request_priority);
+        // Preserve the previous finite-error dependency completion policy. Only
+        // uncertifiably infinite work needs the camera-local urgency tie-break.
+        if self.requests.first().is_none_or(|r| !r.1.is_infinite())
+            && let Some(parent) = self.pending_parent
             && let Some(index) = self.requests.iter().position(|r| r.0 == parent)
         {
             let request = self.requests.remove(index);
             self.requests.insert(0, request);
         }
+        // Do not let a retained dependency transaction leapfrog newly observed
+        // infinite-error work; the ordinary deterministic priority order selects it.
         // Highest-error local closures allow progress without simultaneously pinning
         // two whole global covers. All balancing dependencies activate atomically.
         for index in 0..self.requests.len() {
@@ -612,7 +623,7 @@ impl SurfaceLodSession {
         .map(|s| s.bytes())
         .sum::<usize>()
             + self.stack.capacity() * std::mem::size_of::<CubePatchAddress>()
-            + self.requests.capacity() * std::mem::size_of::<(CubePatchAddress, f64)>()
+            + self.requests.capacity() * std::mem::size_of::<(CubePatchAddress, f64, bool, f64)>()
             + (self.visible.capacity() + self.visible_scratch.capacity())
                 * std::mem::size_of::<ActiveSurfacePatch>();
         if report.scratch_bytes > 8 * 1024 * 1024 {
@@ -795,9 +806,81 @@ fn relevance(
         false,
     ))
 }
+
+fn address_contains_observer_direction(address: CubePatchAddress, observer: glam::DVec3) -> bool {
+    // A camera at the exact body centre has no radial leaf. Keep diagnostics
+    // renderable and use the distance/address fallback rather than rejecting it.
+    let Ok(direction) = mundaris_math::Direction3::try_new(observer) else {
+        return false;
+    };
+    let (face, uv) = mundaris_math::surface::SurfaceLocation::new(direction).face_uv();
+    address_contains_direction(address, face, uv)
+}
+
+fn address_contains_direction(
+    address: CubePatchAddress,
+    face: mundaris_math::surface::CubeFace,
+    uv: [f64; 2],
+) -> bool {
+    if address.face() != face {
+        return false;
+    }
+    address
+        .patch_local(uv)
+        .is_ok_and(|st| st[0] >= 0.0 && st[0] <= 1.0 && st[1] >= 0.0 && st[1] <= 1.0)
+}
+
+fn compare_request_priority(
+    a: &(CubePatchAddress, f64, bool, f64),
+    b: &(CubePatchAddress, f64, bool, f64),
+) -> std::cmp::Ordering {
+    b.1.total_cmp(&a.1).then_with(|| {
+        if a.1.is_infinite() && b.1.is_infinite() {
+            b.2.cmp(&a.2)
+                .then_with(|| a.3.total_cmp(&b.3))
+                .then(a.0.cmp(&b.0))
+        } else {
+            a.0.cmp(&b.0)
+        }
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn infinite_error_priority_prefers_observer_local_then_distance_then_address() {
+        let local = CubePatchAddress::try_new(CubeFace::PositiveX, 2, 1, 1).unwrap();
+        let other = CubePatchAddress::try_new(CubeFace::PositiveX, 2, 3, 1).unwrap();
+        assert!(!address_contains_observer_direction(
+            local,
+            glam::DVec3::ZERO
+        ));
+        assert!(address_contains_direction(
+            local,
+            CubeFace::PositiveX,
+            [0.0, 0.0]
+        ));
+        assert!(!address_contains_direction(
+            other,
+            CubeFace::PositiveX,
+            [0.0, 0.0]
+        ));
+        let mut requests: [(CubePatchAddress, f64, bool, f64); 2] = [
+            (other, f64::INFINITY, false, 2.0),
+            (local, f64::INFINITY, true, 9.0),
+        ];
+        requests.sort_by(compare_request_priority);
+        assert_eq!(requests[0].0, local);
+        requests[0].2 = false;
+        requests[0].3 = 1.0;
+        requests[1].3 = 3.0;
+        requests.sort_by(compare_request_priority);
+        assert_eq!(requests[0].0, local);
+        requests[0].3 = 4.0;
+        requests[1].3 = 4.0;
+        requests.sort_by(compare_request_priority);
+        assert_eq!(requests[0].0, local.min(other));
+    }
     #[test]
     fn adversarial_corner_closure_to_level_twenty_is_complete_and_finite() {
         for face in CubeFace::ALL {
