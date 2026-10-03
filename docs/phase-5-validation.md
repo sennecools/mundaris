@@ -1,5 +1,221 @@
 # Phase 5 implementation and validation evidence
 
+## Phase 5.7 adaptive displaced terrain — 2026-10-03
+
+**Adaptive stitching and common-refinement morphing are implemented and have
+focused CPU/GPU evidence. Interactive performance and complete Phase 5 acceptance
+are not established.** Phase 5.6 was committed independently as `22f4577` before
+these changes. The [implementation note](phase-5-7-adaptive-terrain.md) documents
+contracts, resource reservations and deviations; the
+[capture index](evidence/phase57/README.md) includes retained PNGs and raw manifests.
+
+### Preserved boundaries and ready coverage
+
+The normalized radial cube mapping, computed addresses, grid16/16 variants,
+one-level edge balance, default 0.125/0.0625-pixel split/merge thresholds,
+source-centred f64 conversion, celestial motion and reverse-Z ownership remain.
+World filtering/erosion and Phase 5.6 body-fixed lighting are unchanged. Terrain
+certificates/readiness enter renderer selection through a domain-free policy;
+renderer has no world/generator dependency. No asynchronous worker, GPU generation,
+skirts, shadows, atmosphere or materials were introduced.
+
+The production preview no longer uses the uniform level-4 restriction. Static
+reconciliation uses all incident ready leaves before culling and copies the
+coarsest canonical edge/corner position/normal; the first two interior rows absorb
+the profile correction. Replacements wait for the complete balanced geometry
+closure. Newly completed dependencies are pinned immediately, not only next frame.
+Old visible coverage remains until replacement readiness/morph completion.
+
+The overlay captures the actual old/new stitched triangle surfaces, including
+unchanged-address mask/owner changes. Checked reduced `i128` rational clipping
+constructs the common domain refinement. Positions, analytic shading normal fields
+and elevation diagnostics are barycentric endpoint captures. A shared fraction
+drives the whole group. The fragment shader renormalizes the affine normal field
+after interpolation. One body-group runs at a time; reversal finishes it before
+accepting a new target. Live duration is 150 ms linear, configurable/zero-disable,
+not the design's suggested 250 ms eased setting. Admitted navigation time drives
+progress; hidden/unacceptable clock gaps do not advance it by unobserved time.
+
+### CPU correctness evidence
+
+- Static `terrain_stitching`: 96 deterministic mixed complete covers, all stitch
+  variants observed, cross-face/coarse ownership, identical shared position/normal
+  values, collapsed odd vertices unreferenced and globally oriented two-manifold
+  drawn edge incidence. Incomplete, overlapping and unsupported covers are rejected.
+- `terrain_transitions`: six-face split/reverse, multi-face refinement and all eight
+  cube corners with three incident face-pairs each, both directions. At fractions
+  0/.125/.5/.875/1, overlay plus unchanged geometry has opposite two-sided incidence,
+  outward winding and shared normal-field agreement. Barycentric old/new reference
+  positions/normals reproduce captured endpoints within `1e-9` at fixture radius
+  1000 m. Spatial incidence uses `1e-7` quantization, not a claim of an exhaustive
+  symbolic proof. Invalid fractions, inward/zero blends, tiny budgets and two-level
+  replacement jumps are rejected.
+- App adaptive tests exercise delayed roots/siblings, finite outward V2 cached
+  normals, bounded alternating views, zero-work readiness, complete-source retention,
+  finish-current reversal, obsolete pin retirement and identity invalidation during
+  a morph. Shared raw cache samples remain disposable and observer-independent.
+- `terrain_real_transitions` complements the analytic fixtures with four seeded
+  V1/V2 filtered-field corner changes: radius 10 km at levels 7/8, and Earth radius
+  at levels 13/14. Captured endpoints match source triangles within
+  `max(1e-9,256*EPSILON*R)` metres, analytic normal fields within `1e-9`; five
+  fractions stay finite/outward, and fraction .5 plus unchanged geometry passes
+  oriented global edge incidence at `1e-7` quantization. These directed seeds are
+  not broad randomized field acceptance.
+- A four-entry cache pressure regression generates sibling replacements and an
+  extra request in one opportunity: four completed siblings are immediately pinned,
+  the extra builder waits without eviction, then proceeds after pins are released.
+- A forced tiny overlay-budget regression retains the complete source surface,
+  freezes the unpublished selector target, reports quality/resource debt and
+  resumes publication only after an explicit static-debug duration change. A
+  production transition-budget rejection is therefore not a partial cover or a
+  native-frame failure; permanently insufficient headroom is still a limitation.
+- World profile-difference tests exercise conservative filtering-profile allowances;
+  legacy terrain/cache/error/lighting and smooth LOD tests remain regression gates.
+- Staging's retained-capacity test charges empty-but-retained sample/record buffers
+  before fallback growth. Regular and morph/fallback routes use bounded explicit
+  capacity growth; morph triangle counts are separate from precision fallbacks.
+
+These focused fixtures do not replace broad real-seed transition fuzzing, exhaustive
+normal-field orientation proofs, independent displaced-horizon certificates or
+human seam/corner traversal.
+
+### Directed static selection and performance
+
+Windows x86-64/MSVC, Rust 1.98.1, AMD Radeon RX 9070 XT. Offscreen viewport 768×512,
+seed 17/V2 checkpoint, radius 6,371,000 m. Runs are sequential directed probes, not
+Criterion confidence intervals or native FPS. Headless convergence uses a generous
+1156-new-sample update budget with no wall cutoff; live generation remains 64
+samples/eight-sample microbatches/2 ms between-batch cutoff. Steady probes generate
+zero samples. CPU upload/encoding excludes GPU submission, completion and readback;
+GPU timestamps were unavailable.
+
+All four final static ready covers remain mixed and have adjacent delta at most one.
+They are **quality-pending**, not successful requested-quality convergence:
+
+| Scene | Ready / visible patches | Levels | Steady selector median / worst (ms) | Full stitch median / worst (ms) | Lit transform/proof/pack (ms) | Upload bytes |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| Planet, 10,000 km clearance | 1065 / 1065 | 3–5 | 5.96 / 6.60 | 11.23 / 22.91 | 18.22 | 9,917,280 |
+| Mountain, 20 km clearance | 1071 / 578 | 1–13 | 7.58 / 8.14 | 14.66 / 26.10 | 9.53 | 5,382,336 |
+| Face seam, 100 km clearance | 1071 / 663 | 2–10 | 6.73 / 7.16 | 13.68 / 29.06 | 10.96 | 6,173,856 |
+| Three-face corner, 100 km clearance | 1071 / 649 | 2–10 | 6.47 / 6.60 | 12.97 / 35.33 | 11.36 | 6,043,488 |
+
+Separate generation medians were 2.93/13.08/6.96/3.81 ms in planet/mountain/face/
+corner convergence; weighted per-new-sample costs were 2.43/9.57/4.84/4.40 µs.
+Refinement selector medians were 2.76/3.38/2.84/2.72 ms. Full stitched surfaces are
+rebuilt after each ready transaction; no incremental derived reuse is implemented.
+The renderer uses 8–9 draws in these static captures, with no precision fallback
+triangles. Full-planet preparation still misses the inherited CPU review target.
+
+Loose certificates, not only curvature, drive the quality debt. A visible mountain
+level-13 example reports sphere 0.0356 m, filtered interpolation 372.4623 m,
+unresolved 130.9163 m, actual boundary correction 2.3203 m and numeric `7.26e-7` m,
+for about 43.12 projected pixels. The full report remains unsettled. Neither
+increased level nor watertight geometry is advertised as repaired morphology.
+
+### Morph endpoint, intermediate and resource evidence
+
+Manual balanced level-13→14 transition captures use the production GPU path at
+mountain/face/corner directions, including split fractions 0/.25/.5/.75/1 and
+coarsening 0/.5/1 in Lit/Normals/Diffuse. Actual regular old/new images provide
+matched-camera endpoint references. Across these scenes/modes, endpoints differ
+by at most **one 8-bit channel value in 0–6 pixels**. These float raster comparisons
+complement, not replace, the CPU triangle-reference/closure tests. Inspected
+intermediate images showed no evident holes; the close physical footprints are
+low-contrast and are not mountain-shape/operator acceptance. Existing extent-based
+elevation normalization can show profile/albedo blocks in static mixed-level views.
+
+| Manual cover scene | Overlay triangles | Resident transition bytes | Affected old / new | Split / merge construction (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| Mountain | 16,782 | 10,543,760 | 15 / 33 | 554.90 / 576.21 |
+| Face seam | 17,344 | 10,863,272 | 16 / 34 | 588.49 / 555.75 |
+| Corner | 7,088 | 4,473,140 | 5 / 14 | 205.20 / 193.16 |
+
+Those construction times are a **large synchronous interactive-performance miss**.
+The 150 ms duration bounds interpolation time, not preparation time. Mountain
+active rendering took roughly 9.69–10.43 ms total preparation and approximately
+0.15–0.19 ms warm host upload/encoding, ten draws, around 2.54 MB upload and about
+2,750 clipped morph triangles (the complete overlay is larger). No GPU-time claim.
+
+The production morph-enabled mountain convergence ran 150 morphs: construction
+median 152.80 ms, worst 736.43 ms; full stitch median 10.97 ms; ordinary active-morph
+host-update median 2.34 ms, worst 36.13 ms, excluding new overlay construction.
+It reached 693 ready/398 visible patches, levels 1–12, peak transition residency
+12,780,308 bytes, and remained quality-pending. A subsequent 96-update oscillating
+lateral/clearance motion probe had selector median 4.71 ms, worst 5.80 ms and max
+94 pending requests. It generated 3617 extra samples and prepared two extra morphs
+(20 active-morph updates). Heavy-motion total-update median was 5.06 ms, worst
+169.11 ms; morph construction median/worst 148.06 ms, with two full stitch builds.
+Coverage and accounted memory remained bounded, but debt/large preparation stalls
+make this **not heavy-motion refinement acceptance**.
+
+The aggregate 128 MiB cap is unchanged. Admission charges retained cache and
+derived geometry capacities, scratch/construction peaks and transition reservation.
+Final live admission conservatively reserves the renderer's complete 64 MiB
+outgoing + 8 MiB boundary capacities. This replaces the earlier typical 32 MiB
+allowance and lowers available refinement. Fixed preparation/query stack allowances
+are reserved as well. Measured accounted static peaks range
+134,217,447–134,217,699 bytes, below 134,217,728; morph-enabled peak 134,217,589.
+These are capacity/reservation accounting, **not RSS**. Initial `target/phase57-static`
+2016-patch measurements predate this correction and are superseded. Selection,
+generation, stitching, overlay construction and render preparation are separately
+reported in retained manifests.
+
+### Windows quality commands
+
+```text
+cargo fmt --all -- --check
+cargo check --locked --workspace --all-targets --all-features
+cargo test --locked --workspace --all-features
+cargo test --locked --workspace --all-features --release
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --all-features --no-deps
+cargo test --locked -p mundaris_simulation --release --test orbits long_run -- --ignored --nocapture
+cargo build --locked --release -p mundaris_app --all-features
+cargo build --locked --release -p mundaris_app --all-features --examples
+cargo test --locked -p mundaris_app --test terrain_real_transitions --release -- --nocapture
+cargo test --locked -p mundaris_app --all-features --lib --test terrain_adaptive --test terrain_adaptive_transitions --test terrain_real_transitions
+```
+
+All listed commands passed on Windows. The final debug and release workspace runs
+each reported 199 passed/0 failed/2 ignored across 53 suites including Rustdoc tests;
+the ignored orbital filter then passed both `long_run_hierarchy` and
+`long_run_circular_eccentric`. The final focused app check passed 29 tests.
+
+The ignored orbital filter runs both long tests explicitly; ordinary workspace
+tests still leave those two ignored. Rustdoc uses warnings denied in PowerShell
+via `$env:RUSTDOCFLAGS='-D warnings'`. Native processes are closed before release
+build/test commands to avoid Windows executable locking. Local evidence does not
+imply Linux or current remote CI execution.
+
+An earlier native executable build encountered transient Windows access denied;
+an identical retry passed, and the final complete quality run after owned native
+shutdown passed without that failure. Early capture automation refused an
+unconfirmed foreground window and later exposed missing PowerShell exit-status
+caching; those attempts were not counted as accepted native evidence. The final
+run retained a process handle, verified normal close status 0 and owned-window
+screenshots. No application process was force-terminated.
+
+### Native operational evidence
+
+Native Vulkan launch/capture/resize/minimize/restore and ordinary shutdown passed
+at 96 DPI, exit code 0, against implementation `1985d86`. Four owned-window PNGs
+are retained in the capture index. The approach/restored images show approximately
+379/211 km reference-sphere clearance, not completed two-metre inspection. Restore
+exposes a 0.413 s rejected clock gap without catch-up; one Vulkan suboptimal-present
+warning was logged during resize, stderr empty. This is operational evidence, not
+an interactive-performance or high-DPI/OS-sleep acceptance result. The last UI-only
+wording cleanup replaces the legacy “uniform ready cover” header with “adaptive
+ready cover”; underlying captured algorithms are unchanged.
+
+### Remaining acceptance
+
+Morphology/seed acceptance remains open. Full-cover reconstruction and common
+refinement require optimization before ordinary interactive use. Tight certified
+terrain bounds/error, independent broader real-profile transition coverage,
+terrain-aware navigation/picking, horizon certification, human control-feel/
+high-DPI/actual OS sleep recovery, Linux native and current remote CI are not
+established here. No earlier Phase 4/5/5.5 prerequisite is retroactively accepted.
+
 ## Phase 5.6 terrain lighting / depth checkpoint — 2026-10-03
 
 **Renderer implementation and directed GPU evidence exist. Broader mountain and

@@ -2,7 +2,7 @@
 
 Mundaris is a native desktop world-building and planetary simulation project spanning astronomical and local surface scales. Checked reference frames, editable celestial state, deterministic Newtonian gravity, fixed-step orbital integration and minimal celestial debug rendering are implemented. Procedural worlds remain future work.
 
-**Status:** Phase 4 smooth planetary surface LOD is implemented in the connected celestial explorer. Windows headless/release, CPU benchmarks and directed native approach/inspection evidence are recorded in [Phase 4 validation](docs/phase-4-validation.md) and [ADR 0006](docs/adr/0006-planet-surface-topology-and-lod.md). Complete operator/high-DPI/recovery, Linux and current-revision remote CI acceptance remain open. Full-planet CPU preparation misses the review target; see [performance](docs/performance.md). Earlier phase evidence remains preserved. Phase 5 foundations now include hashed gradient noise, world terrain identity, pure analytic queries and initial certificate support; [Phase 5 evidence](docs/phase-5-validation.md) distinguishes these from the still-unimplemented procedural bands/cache/live terrain path.
+**Status:** Phase 4 smooth planetary surface LOD is implemented in the connected celestial explorer. Windows headless/release, CPU benchmarks and directed native approach/inspection evidence are recorded in [Phase 4 validation](docs/phase-4-validation.md) and [ADR 0006](docs/adr/0006-planet-surface-topology-and-lod.md). Complete operator/high-DPI/recovery, Linux and current-revision remote CI acceptance remain open. Full-planet CPU preparation misses the review target; see [performance](docs/performance.md). Phase 5 now includes deterministic filtered terrain, analytic erosion/lighting, bounded CPU caching, adaptive displaced stitching and common-refinement morphs. [Phase 5 evidence](docs/phase-5-validation.md) distinguishes implementation from still-open morphology, quality convergence and interactive-performance acceptance; earlier evidence is preserved.
 
 The initial native development targets are **Windows x86-64** and **Linux x86-64**.
 
@@ -32,9 +32,12 @@ Phase 5 has an opt-in **terrain checkpoint preview** in the surface panel of
 `--gravity-orbits`. Enable it there, or set `MUNDARIS_PHASE5_TERRAIN=1` before
 launching. It authors the deterministic fixture once, then renders cached f64
 displaced geometry; disabling the preview restores the Phase 4 sphere path.
-The interim display uses complete uniform covers through level 4: replacements
-can pop, mixed-LOD displaced stitching/morphing is not enabled, and close-range
-terrain navigation remains incomplete. See [checkpoint evidence](docs/phase-5-validation.md).
+The preview uses balanced adaptive displaced covers and common-refinement morphs
+(150 ms by default; `MUNDARIS_TERRAIN_MORPH_MS=0` selects the static checkpoint).
+Quality remains resource-constrained, synchronous transition preparation can stall,
+and close-range terrain navigation remains incomplete. See
+[checkpoint evidence](docs/phase-5-validation.md) and
+[implementation](docs/phase-5-7-adaptive-terrain.md).
 
 Normal invocation opens the bootstrap panel. `--reference-frames` draws abstract axes and wire boxes attached to an analytically translating/rotating hierarchy, with source-centred rendering, precision diagnostics, pause/seek/reset, a `1e16 m` shared-offset stress mode, continuous approach, paused frame re-expression, and centimetre movement buttons. Begin approach while paused, then select Play. Re-expression and local movement are available while paused. This fixture contains no planet, terrain, or physics simulation.
 
@@ -63,7 +66,7 @@ collision-laid-out labels.
 Body zoom controls **clearance above the real reference sphere**, with a one-metre/
 ULP floor and smooth wall-time response. Aurelia/Luma now use normalized cube-sphere,
 balanced stitched surface patches when projected curvature requires them. The surface
-is a smooth zero-height sphere. Navigation uses one high-precision observer; moving or
+is a smooth zero-height sphere unless the terrain checkpoint is enabled. Navigation uses one high-precision observer; moving or
 focusing it changes no world state. Physical spheres, markers, labels and curves are
 separate products. Dashed curves are instantaneous two-body **orbit guides**, not
 full N-body predictions; solid age-fading curves are **actual committed history**.
@@ -107,7 +110,8 @@ derived structure. Far/surface ownership is exclusive per BodyId; no scene switc
 For a reproducible native route through the same implementation, set
 `$env:MUNDARIS_PHASE4_VALIDATE='1'` in PowerShell before running `--gravity-orbits`.
 Omit/unset it for normal paused startup. UI also exposes **Run integrated validation
-route**. No procedural terrain, noise, atmosphere or collision is implemented.
+route**. The optional terrain checkpoint uses this same route; atmosphere and
+terrain collision/navigation remain unimplemented.
 
 ## Quality checks
 

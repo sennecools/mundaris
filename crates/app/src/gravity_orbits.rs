@@ -1911,7 +1911,7 @@ fn draw_ui(
         .any(|s| Some(s.body()) == info.camera.focused_body())
     {
         egui::Window::new("Planet surface / inspection").default_pos(egui::pos2(335.0,120.0)).default_width(360.0).vscroll(true).show(context,|ui| {
-            ui.label(if controls.terrain_preview {"Procedural terrain checkpoint · uniform ready cover"} else {"Smooth sphere · zero terrain height · one connected body"});
+            ui.label(if controls.terrain_preview {"Procedural terrain checkpoint · adaptive ready cover"} else {"Smooth sphere · zero terrain height · one connected body"});
             if ui.button("Run integrated validation route").clicked() {controls.pending.push_back(Command::ValidationRoute);}
             let id=info.camera.focused_body().expect("focused surface");
             let pair=info.projection.coherent_view(info.system).expect("coherent UI");
