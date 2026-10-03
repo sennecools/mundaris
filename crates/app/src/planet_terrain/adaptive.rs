@@ -440,7 +440,8 @@ impl AdaptiveTerrainCover {
         );
         Ok(work)
     }
-    fn prepare_visible(&mut self, input: &SurfaceViewInput<'_, '_>) -> Result<()> {
+    /// Re-culls the published cover without selection, generation, or publication.
+    pub(crate) fn prepare_visible(&mut self, input: &SurfaceViewInput<'_, '_>) -> Result<()> {
         self.visible.clear();
         let Some(surface) = &self.stitched else {
             return Ok(());
@@ -542,6 +543,46 @@ mod tests {
         }
         assert_eq!(cover.active().len(), 6);
         let source = cover.active().iter().map(|p| p.address).collect::<Vec<_>>();
+        // A post-publication camera correction re-culls only derived visibility.
+        let samples = cover.surface().unwrap().patches()[0].samples().as_ptr();
+        let cache_before_recull = cache.report();
+        let away = PreparedView::new(
+            &tree.evaluate(),
+            FramePose::new(
+                FramePosition::new(
+                    fixed,
+                    LocalPosition::try_metres(DVec3::Z * 10_000.0).unwrap(),
+                ),
+                UnitRotation::try_from_quaternion(glam::DQuat::from_rotation_y(
+                    std::f64::consts::PI,
+                ))
+                .unwrap(),
+            ),
+            RenderPrecisionBudget::near_debug(),
+        )
+        .unwrap();
+        cover
+            .prepare_visible(&SurfaceViewInput {
+                view: &away,
+                ..input
+            })
+            .unwrap();
+        assert!(cover.visible().is_empty());
+        assert_eq!(
+            cover.active().iter().map(|p| p.address).collect::<Vec<_>>(),
+            source
+        );
+        assert_eq!(
+            cover.surface().unwrap().patches()[0].samples().as_ptr(),
+            samples
+        );
+        assert_eq!(
+            cache.report().resident_bytes,
+            cache_before_recull.resident_bytes
+        );
+        assert_eq!(cache.report().evictions, cache_before_recull.evictions);
+        cover.prepare_visible(&input).unwrap();
+        assert!(!cover.visible().is_empty());
         cover.transition_budget_override = Some(1);
         let refined = LodSettings::default().with_limits(128, 128, 1).unwrap();
         for _ in 0..100 {

@@ -24,6 +24,7 @@ enum Command {
     SurfaceInspection,
     SurfaceHorizon,
     Clearance(f64),
+    TerrainGuard(Option<f64>),
     Approach,
     Pause(bool),
     Rate(f64),
@@ -62,6 +63,8 @@ struct Controls {
     surface_style: SurfaceStyle,
     approach: Option<(f64, f64, Duration)>,
     clearance_target: f64,
+    terrain_guard_m: Option<f64>,
+    reference_sea_level_m: Option<f64>,
     pending: VecDeque<Command>,
     seek_seconds: f64,
     name: String,
@@ -102,6 +105,8 @@ impl Controls {
             surface_style: SurfaceStyle::default(),
             approach: None,
             clearance_target: 1e11,
+            terrain_guard_m: None,
+            reference_sea_level_m: None,
             pending: VecDeque::new(),
             seek_seconds: 0.0,
             name: body.name().into(),
@@ -147,6 +152,9 @@ impl Controls {
 }
 
 pub struct GravityOrbitsDemo {
+    terrain_clearance: Option<crate::terrain_inspection::TerrainClearance>,
+    ready_mesh_probe: Option<crate::surface_probe::ReadyMeshProbe>,
+    clearance_query_us: f64,
     terrain: crate::terrain_population::TerrainPopulation,
     scenario: GravityFixture,
     validation_route: Option<SurfaceValidationRoute>,
@@ -210,6 +218,16 @@ struct SurfaceValidationRoute {
     physical_target: u64,
 }
 
+/// Retain the 0.1 m floor and existing infinite reverse-Z depth path. Relief can
+/// put drawn terrain much closer than reference-sphere altitude suggests.
+fn inspection_near_plane(clearance_m: f64) -> f64 {
+    if !clearance_m.is_finite() || clearance_m <= 0.0 || clearance_m == f64::MAX {
+        0.1
+    } else {
+        (0.01 * clearance_m).max(0.1)
+    }
+}
+
 fn terrain_lighting_from_environment() -> TerrainLighting {
     terrain_lighting_configuration(
         std::env::var("MUNDARIS_TERRAIN_MODE").ok().as_deref(),
@@ -236,6 +254,10 @@ fn terrain_lighting_configuration(mode: Option<&str>, sun: Option<&str>) -> Terr
         Some("lit") => TerrainRenderMode::Lit,
         Some("normals") => TerrainRenderMode::Normals,
         Some("diffuse") => TerrainRenderMode::Diffuse,
+        Some("readability" | "surface") => TerrainRenderMode::Readability,
+        Some("slope") => TerrainRenderMode::Slope,
+        Some("sea-mask") => TerrainRenderMode::SeaMask,
+        Some("rock-weight") => TerrainRenderMode::RockWeight,
         _ => lighting.mode(),
     };
     lighting = TerrainLighting::try_new(
@@ -338,6 +360,11 @@ impl GravityOrbitsDemo {
             GravityFixture::GameplaySolarSystem | GravityFixture::RealSolarSystem
         ) {
             controls.terrain_preview = true;
+            if std::env::var("MUNDARIS_TERRAIN_MODE").is_err() {
+                controls.terrain_lighting = controls
+                    .terrain_lighting
+                    .with_mode(TerrainRenderMode::Readability);
+            }
             controls.sun_from_star = std::env::var("MUNDARIS_TERRAIN_SUN").is_err();
             controls.surface_style.elevation_colors = true;
         }
@@ -356,6 +383,9 @@ impl GravityOrbitsDemo {
             .map(|id| PlanetSurfaceSession::new(id, 2048))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
+            terrain_clearance: None,
+            ready_mesh_probe: None,
+            clearance_query_us: 0.0,
             terrain: crate::terrain_population::TerrainPopulation::new()?,
             scenario,
             validation_route: None,
@@ -484,15 +514,22 @@ impl GravityOrbitsDemo {
                     .target_clearance(&self.projection.coherent_view(&self.system)?, clearance)?;
                 self.controls.approach = None;
             }
+            Command::TerrainGuard(clearance) => {
+                self.camera.set_terrain_clearance_guard(clearance)?;
+                self.controls.terrain_guard_m = clearance;
+            }
             Command::Approach => {
                 anyhow::ensure!(
                     self.camera.mode() == CameraMode::BodyOrbit && !self.camera.transitioning(),
                     "complete focused body orbit before approach"
                 );
-                let start = self.camera.measured_clearance(
-                    &self.projection.coherent_view(&self.system)?,
-                    self.camera.focused_body().expect("body orbit"),
-                )?;
+                let pair = self.projection.coherent_view(&self.system)?;
+                let body = self.camera.focused_body().expect("body orbit");
+                let start =
+                    crate::terrain_inspection::terrain_clearance(&pair, self.camera.pose(), body)?
+                        .map_or(self.camera.measured_clearance(&pair, body)?, |c| {
+                            c.clearance_m
+                        });
                 self.controls.approach = Some((start.max(2.0).ln(), 2.0_f64.ln(), Duration::ZERO));
             }
             Command::Pause(paused) => {
@@ -1206,6 +1243,17 @@ impl GravityOrbitsDemo {
         self.prepare_visuals()?;
         let selected_index = self.selected_index();
         let pair = self.projection.coherent_view(&self.system)?;
+        let query_started = Instant::now();
+        self.terrain_clearance = self
+            .camera
+            .focused_body()
+            .map(|body| {
+                crate::terrain_inspection::terrain_clearance(&pair, self.camera.pose(), body)
+            })
+            .transpose()?
+            .flatten();
+        self.clearance_query_us = query_started.elapsed().as_secs_f64() * 1e6;
+        self.ready_mesh_probe = None;
         let view = PreparedView::new(
             &pair.evaluation(),
             self.camera.pose(),
@@ -1233,12 +1281,13 @@ impl GravityOrbitsDemo {
                 selected: index == selected_index,
             });
         }
-        let near = if clearance <= 0.0 || clearance == f64::MAX {
-            0.1
-        } else {
-            (0.01 * clearance).max(0.1)
-        };
+        if let Some(terrain) = self.terrain_clearance {
+            clearance = clearance.min(terrain.clearance_m);
+        }
+        let near = inspection_near_plane(clearance);
         let projection = self.content_projection(near)?;
+        let population_pose = self.camera.pose();
+        let population_near = near;
         self.surface_owners.clear();
         self.surface_owners.resize(self.requests.len(), false);
         self.terrain.update(
@@ -1255,7 +1304,80 @@ impl GravityOrbitsDemo {
             Some(Duration::from_millis(2)),
             elapsed,
         )?;
+        if let Some(terrain) = self.terrain_clearance
+            && self.terrain.active_body() == Some(terrain.body)
+        {
+            self.ready_mesh_probe =
+                crate::surface_probe::ready_mesh_probe(&self.terrain.cover, terrain.location)?;
+            if let (Some(minimum), Some(mesh)) =
+                (self.controls.terrain_guard_m, self.ready_mesh_probe)
+            {
+                // A filtered ready mesh need not coincide with complete terrain.
+                // Guard both surfaces, including the currently published morph.
+                if self.camera.enforce_radial_clearance(
+                    &pair,
+                    terrain.body,
+                    terrain.surface_radius_m.max(mesh.radius_m),
+                    minimum,
+                )? {
+                    self.terrain_clearance = crate::terrain_inspection::terrain_clearance(
+                        &pair,
+                        self.camera.pose(),
+                        terrain.body,
+                    )?;
+                    self.diagnostic = Some("Debug terrain guard moved the observer above both complete terrain and the published mesh; not collision physics.".into());
+                }
+            }
+        }
+        if let Some(terrain) = self.terrain_clearance {
+            clearance = terrain.clearance_m;
+            if let Some(mesh) = self.ready_mesh_probe {
+                clearance = clearance.min(terrain.camera_radius_m - mesh.radius_m);
+            }
+        }
+        let near = inspection_near_plane(clearance);
+        let projection = self.content_projection(near)?;
+        // The optional debug guard may have changed only the observer after ready
+        // publication. Source-centred conversion must use the resulting pose.
+        let view = PreparedView::new(
+            &pair.evaluation(),
+            self.camera.pose(),
+            RenderPrecisionBudget::near_debug(),
+        )?;
+        if (self.camera.pose() != population_pose || near != population_near)
+            && let Some(active) = self.terrain.active_body()
+            && let Some(index) = self.ids.iter().position(|&id| id == active)
+        {
+            // A guard correction or tighter mesh-relative near plane must not
+            // draw the previous observer's frustum subset for one frame.
+            self.terrain.cover.prepare_visible(&SurfaceViewInput {
+                view: &view,
+                body_fixed_frame: self.requests[index].body_fixed_frame,
+                reference_radius_m: self.requests[index].reference_radius_m,
+                projection,
+            })?;
+        }
         let mut lighting = self.controls.terrain_lighting;
+        let mut readability = None;
+        if let Some(active) = self.terrain.active_body()
+            && let Some(index) = self.ids.iter().position(|&id| id == active)
+            && matches!(
+                self.scenario,
+                GravityFixture::GameplaySolarSystem | GravityFixture::RealSolarSystem
+            )
+            && let Some(palette) = crate::solar_system::terrain_readability_config_with_sea_level(
+                crate::solar_system::SOLAR_SYSTEM_CONTENT[index].identity,
+                self.requests[index].reference_radius_m,
+                self.controls.reference_sea_level_m.unwrap_or(
+                    crate::solar_system::reference_sea_level_m(
+                        crate::solar_system::SOLAR_SYSTEM_CONTENT[index].identity,
+                    )
+                    .unwrap_or(0.0),
+                ),
+            )?
+        {
+            readability = Some(palette);
+        }
         if self.controls.sun_from_star
             && let Some(active) = self.terrain.active_body()
         {
@@ -1276,6 +1398,9 @@ impl GravityOrbitsDemo {
                 lighting.diffuse_strength(),
                 lighting.mode(),
             )?;
+        }
+        if let Some(palette) = readability {
+            lighting = lighting.with_readability(palette);
         }
         let mut frame = CelestialFrame::new(&view, &mut self.staging, projection, &self.sphere);
         frame.set_terrain_lighting(lighting);
@@ -1470,6 +1595,9 @@ impl GravityOrbitsDemo {
         // Split borrows retain the coherent world/projection and prepared tree view
         // until submission. UI queues commands; it never mutates that borrowed state.
         let info = UiInfo {
+            terrain_clearance: self.terrain_clearance,
+            ready_mesh_probe: self.ready_mesh_probe,
+            clearance_query_us: self.clearance_query_us,
             owned_surface_count: self.surface_owners.iter().filter(|&&owned| owned).count(),
             terrain_body: self.terrain.active_body(),
             terrain_cache: self.terrain.cache.report(),
@@ -1546,6 +1674,9 @@ impl GravityOrbitsDemo {
             .expect("valid content projection");
         (
             UiInfo {
+                terrain_clearance: self.terrain_clearance,
+                ready_mesh_probe: self.ready_mesh_probe,
+                clearance_query_us: self.clearance_query_us,
                 owned_surface_count: self.surface_owners.iter().filter(|&&owned| owned).count(),
                 terrain_body: self.terrain.active_body(),
                 terrain_cache: self.terrain.cache.report(),
@@ -1696,6 +1827,9 @@ impl GravityOrbitsDemo {
 }
 
 struct UiInfo<'a> {
+    terrain_clearance: Option<crate::terrain_inspection::TerrainClearance>,
+    ready_mesh_probe: Option<crate::surface_probe::ReadyMeshProbe>,
+    clearance_query_us: f64,
     owned_surface_count: usize,
     terrain_body: Option<BodyId>,
     terrain_cache: crate::planet_terrain::TerrainCacheReport,
@@ -1901,26 +2035,45 @@ fn draw_ui(
     info: &UiInfo<'_>,
     markers: &[CelestialMarker],
 ) {
-    if info
-        .surfaces
-        .iter()
-        .any(|s| Some(s.body()) == info.camera.focused_body())
-    {
+    if info.camera.focused_body().is_some() {
         egui::Window::new("Planet surface / inspection").default_pos(egui::pos2(335.0,120.0)).default_width(360.0).vscroll(true).show(context,|ui| {
             ui.label(if controls.terrain_preview {"Procedural terrain checkpoint · adaptive ready cover"} else {"Smooth sphere · zero terrain height · one connected body"});
             if info.ids.len()==3 && ui.button("Run legacy integrated validation route").clicked() {controls.pending.push_back(Command::ValidationRoute);}
             let id=info.camera.focused_body().expect("focused surface");
             let pair=info.projection.coherent_view(info.system).expect("coherent UI");
-            if let Ok(clearance)=info.camera.measured_clearance(&pair,id) {ui.label(format!("Actual signed clearance {}",compact_distance(clearance)));}
-            if info.camera.mode()==CameraMode::BodyOrbit&&!info.camera.transitioning() {
+            if let Some(c)=info.terrain_clearance {
+                ui.strong(format!("Terrain clearance: {:+.2} m",c.clearance_m));
+                if c.clearance_m<0.0 {ui.colored_label(egui::Color32::RED,"INSIDE TERRAIN (complete field)");}
+                else {ui.label("Above complete displaced terrain");}
+                ui.monospace(format!("Centre distance {:.3} m\nSphere altitude {:+.3} m\nTerrain elevation {:+.3} m\nDisplaced radius {:.3} m\nAnalytic slope {:.2}°",c.camera_radius_m,c.sphere_altitude_m,c.terrain_elevation_m,c.surface_radius_m,c.slope_angle_rad.to_degrees()));
+                ui.small(format!("Body {} · direction {:?} · direct complete-footprint query {:.1} µs",info.system.body(id).expect("body").name(),c.location.direction().unit(),info.clearance_query_us));
+                if let Some(mesh)=info.ready_mesh_probe {
+                    let clearance=c.camera_radius_m-mesh.radius_m;
+                    ui.strong(format!("Drawn mesh clearance: {clearance:+.2} m"));
+                    if clearance<0.0 {ui.colored_label(egui::Color32::RED,"INSIDE DRAWN MESH — ready LOD differs from complete terrain");}
+                    ui.monospace(format!("Under camera {:?} · LOD {}\nMesh footprint {:.3} m{}",mesh.patch,mesh.patch.level(),mesh.footprint_m,if mesh.morphing {" · morphing"}else{""}));
+                } else {ui.colored_label(egui::Color32::YELLOW,"Drawn surface under camera unavailable / not admitted or not ready");}
+                egui::ComboBox::from_label("Debug terrain guard").selected_text(controls.terrain_guard_m.map_or("Disabled".into(),|m|format!("{m} m"))).show_ui(ui,|ui| {
+                    for minimum in [None,Some(2.0),Some(10.0),Some(100.0)] {
+                        let label=minimum.map_or("Disabled".into(),|m|format!("{m} m"));
+                        if ui.selectable_label(controls.terrain_guard_m==minimum,label).clicked() {controls.pending.push_back(Command::TerrainGuard(minimum));}
+                    }
+                });
+                ui.small("Guard uses max(complete terrain, published mesh); radial debug navigation, not collision. Quality-pending mesh may prevent exact requested clearance.");
+            } else if info.system.body(id).is_ok_and(|body|body.terrain().is_none()) {
+                ui.label("Non-terrain / far-only body: no rocky terrain query");
+                if let Ok(clearance)=info.camera.measured_clearance(&pair,id) {ui.label(format!("Reference-sphere altitude {}",compact_distance(clearance)));}
+            } else {ui.label("Terrain clearance unavailable");}
+            ui.small(format!("Near plane {:.3} m · infinite reverse-Z",info.near));
+            if matches!(info.camera.mode(),CameraMode::BodyOrbit|CameraMode::SurfaceInspection)&&!info.camera.transitioning() {
                 ui.add(egui::DragValue::new(&mut controls.clearance_target).speed(1.0).suffix(" m target clearance"));
                 if ui.button("Approach clearance target").clicked() {controls.pending.push_back(Command::Clearance(controls.clearance_target));}
-                if ui.button("Continuous 30 s approach to 2 m").clicked() {controls.pending.push_back(Command::Approach);}
+                if info.camera.mode()==CameraMode::BodyOrbit && ui.button("Continuous 30 s approach to 2 m").clicked() {controls.pending.push_back(Command::Approach);}
                 ui.horizontal_wrapped(|ui| {for clearance in [1e11,1e5,1e4,1e3,100.0,10.0,2.0] {if ui.button(compact_distance(clearance)).clicked() {controls.pending.push_back(Command::Clearance(clearance));}}});
-                if ui.button("Surface inspection (I): co-rotating attachment").clicked() {controls.pending.push_back(Command::SurfaceInspection);}
+                if info.camera.mode()==CameraMode::BodyOrbit && ui.button("Surface inspection (I): co-rotating attachment").clicked() {controls.pending.push_back(Command::SurfaceInspection);}
             }
             if info.camera.mode()==CameraMode::SurfaceInspection {
-                ui.small("Co-rotating; zero relative simulation derivative. WASD/QE editor offsets, right-drag look; reference-sphere navigation clearance guard.");
+                ui.small("Co-rotating; zero relative simulation derivative. WASD/QE editor offsets, right-drag look; optional displaced-terrain guard.");
                 if ui.button("Look tangent / horizon (H)").clicked() {controls.pending.push_back(Command::SurfaceHorizon);}
                 if ui.button("Depart to centre-look Body Orbit").clicked() {controls.pending.push_back(Command::Focus {fixed:false,fit:true});}
                 if ui.button("Single physical step +h").clicked() {controls.pending.push_back(Command::Single(true));}
@@ -1934,17 +2087,25 @@ fn draw_ui(
                 ui.checkbox(&mut controls.sun_from_star,"Use central star direction (disable for lighting presets)");
                 ui.add(egui::Slider::new(&mut controls.terrain_morph_ms,0..=1000).text("Morph ms (0: static)").clamping(egui::SliderClamping::Always));
                 ui.checkbox(&mut controls.surface_style.elevation_colors,"Derived terrain elevation colours");
-                let mut enabled = controls.terrain_lighting.mode() == TerrainRenderMode::Lit;
+                let mut enabled = matches!(controls.terrain_lighting.mode(),TerrainRenderMode::Lit|TerrainRenderMode::Readability);
                 if ui.checkbox(&mut enabled, "Terrain lighting enabled").changed() {
                     controls.terrain_lighting = controls.terrain_lighting.with_mode(if enabled { TerrainRenderMode::Lit } else { TerrainRenderMode::Elevation });
                 }
                 egui::ComboBox::from_label("Terrain shading mode").selected_text(format!("{:?}", controls.terrain_lighting.mode())).show_ui(ui, |ui| {
-                    for mode in [TerrainRenderMode::Elevation, TerrainRenderMode::Lit, TerrainRenderMode::Normals, TerrainRenderMode::Diffuse] {
+                    for mode in TerrainRenderMode::ALL {
                         if ui.selectable_label(controls.terrain_lighting.mode() == mode, format!("{mode:?}")).clicked() {
                             controls.terrain_lighting = controls.terrain_lighting.with_mode(mode);
                         }
                     }
                 });
+                let mut override_sea=controls.reference_sea_level_m.is_some();
+                if ui.checkbox(&mut override_sea,"Override content reference sea level (display only)").changed() {
+                    controls.reference_sea_level_m=override_sea.then_some(crate::solar_system::GAMEPLAY_EARTH_SEA_LEVEL_M);
+                }
+                if let Some(sea)=&mut controls.reference_sea_level_m {
+                    ui.add(egui::DragValue::new(sea).speed(10.0).suffix(" m sea datum"));
+                }
+                ui.small("Blue = height below datum; no water geometry or biomes. Rock blends analytic slope 8–16°. Height and slope are independent.");
                 egui::ComboBox::from_label("Body-fixed sun preset").selected_text("Choose preset").show_ui(ui, |ui| {
                     for (label, preset) in [("Overhead", TerrainSunPreset::Overhead), ("Side", TerrainSunPreset::Side), ("Grazing", TerrainSunPreset::Grazing), ("Terminator", TerrainSunPreset::Terminator), ("Night", TerrainSunPreset::Night)] {
                         if ui.button(label).clicked() {
@@ -1981,7 +2142,17 @@ fn draw_ui(
                     ui.small(format!("One synchronized morph: {:.1}% / {} overlay triangles; source {} / target {} changed leaves; remaining displacement {:.3} m",fraction*100.0,mesh.triangles().len(),mesh.affected_old().len(),mesh.affected_new().len(),mesh.max_displacement_m()*(1.0-fraction)));
                 }
                 ui.small(format!("Published source cover {} / visible regular {}; selector counts below refer to target readiness",cover.active().len(),cover.visible().len()));
-                ui.label("Adaptive displaced stitching and configurable common-refinement transitions. Reference-sphere picking/clearance remains approximate.");
+                let levels=cover.visible().iter().map(|p|p.address.level());
+                let min=levels.clone().min();let max=levels.max();
+                ui.monospace(format!("Visible LOD {:?}–{:?} · covering {} · visible {}\nReady source leaves {} · pending {} · active morphs {}",min,max,cover.active().len(),cover.visible().len(),if cover.ready(){cover.active().len()}else{0},w.pending_patches,usize::from(cover.transition().is_some())));
+                if controls.surface_style.lod_colors {
+                    ui.horizontal_wrapped(|ui| {for level in 0..=max.unwrap_or(0).min(30) {
+                        let color=lod_color(level);
+                        ui.colored_label(egui::Color32::from_rgb((color[0]*255.0) as u8,(color[1]*255.0) as u8,(color[2]*255.0) as u8),format!("L{level}"));
+                    }});
+                    ui.small("Hue repeats every 12 levels; numeric LOD readouts disambiguate.");
+                }
+                ui.label("Adaptive displaced stitching / ready-cover morphs; terrain-under-camera query is independent of patch UV.");
             }
             if let Some(pointer)=context.input(|i|i.pointer.hover_pos()) {
                 let pixels=[f64::from(pointer.x*context.pixels_per_point()),f64::from(pointer.y*context.pixels_per_point())];

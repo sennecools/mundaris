@@ -83,6 +83,8 @@ pub struct CelestialCamera {
     flight_log_scale: Option<f64>,
     inspection: Option<crate::planet_surface::SurfaceInspectionAnchor>,
     navigation_envelope: bool,
+    terrain_clearance_guard_m: Option<f64>,
+    terrain_approach: bool,
 }
 impl CelestialCamera {
     pub fn overview(
@@ -117,6 +119,8 @@ impl CelestialCamera {
             flight_log_scale: None,
             inspection: None,
             navigation_envelope: true,
+            terrain_clearance_guard_m: None,
+            terrain_approach: false,
         };
         camera.update_pose(root)?;
         Ok(camera)
@@ -218,21 +222,118 @@ impl CelestialCamera {
     pub fn set_navigation_envelope(&mut self, enabled: bool) {
         self.navigation_envelope = enabled;
     }
+    /// Optional navigation-only clearance above sampled terrain; disabled by default.
+    pub fn set_terrain_clearance_guard(&mut self, clearance_m: Option<f64>) -> Result<()> {
+        ensure!(
+            clearance_m.is_none_or(|x| x.is_finite() && x >= 0.0),
+            "invalid terrain clearance guard"
+        );
+        self.terrain_clearance_guard_m = clearance_m;
+        Ok(())
+    }
+    /// Push an observer outward to an explicit terrain radius. This is navigation
+    /// correction only; it does not modify world state or imply collision physics.
+    pub fn enforce_radial_clearance(
+        &mut self,
+        pair: &CoherentCelestialView<'_>,
+        body: BodyId,
+        surface_radius_m: f64,
+        minimum_clearance_m: f64,
+    ) -> Result<bool> {
+        ensure!(
+            surface_radius_m.is_finite()
+                && surface_radius_m > 0.0
+                && minimum_clearance_m.is_finite()
+                && minimum_clearance_m >= 0.0,
+            "invalid terrain radial clearance"
+        );
+        let fixed = pair.projection().frames_for(body)?.body_fixed;
+        let local = pair
+            .evaluation()
+            .convert_position(self.pose.position(), fixed)?
+            .local()
+            .metres();
+        let radius = local.length();
+        let minimum_radius = surface_radius_m + minimum_clearance_m;
+        if radius >= minimum_radius {
+            return Ok(false);
+        }
+        let guarded = Direction3::try_new(local)?.unit() * minimum_radius;
+        let fixed_pose = pair.evaluation().reexpress_pose(self.pose, fixed)?;
+        let pose = FramePose::new(
+            FramePosition::new(fixed, LocalPosition::try_metres(guarded)?),
+            fixed_pose.orientation(),
+        );
+        self.pose = pair
+            .evaluation()
+            .reexpress_pose(pose, self.pose.position().frame())?;
+        if self.mode == CameraMode::SurfaceInspection {
+            let anchor = self.inspection.expect("inspection owns anchor");
+            self.inspection = Some(crate::planet_surface::SurfaceInspectionAnchor::new(
+                body,
+                guarded,
+                pair.system().body(body)?.properties().reference_radius_m(),
+                Some(anchor.tangent),
+            )?);
+        } else if self.mode == CameraMode::BodyOrbit && self.focused_body() == Some(body) {
+            let terrain_height = self
+                .terrain_height_at_orbit_direction(pair, body)?
+                .unwrap_or(0.0);
+            let clearance = minimum_radius - self.radius_m - terrain_height;
+            self.distance_m = minimum_radius;
+            self.zoom_target_log = clearance.max(1.0).ln();
+            self.terrain_approach = pair.system().body(body)?.terrain().is_some();
+        }
+        Ok(true)
+    }
     /// Repeatable approach target; admitted wall-time smoothing changes only observer state.
     pub fn target_clearance(
         &mut self,
         pair: &CoherentCelestialView<'_>,
         clearance: f64,
     ) -> Result<()> {
+        if self.mode == CameraMode::SurfaceInspection && !self.transitioning() {
+            ensure!(
+                clearance.is_finite() && clearance >= 1.0,
+                "invalid terrain clearance"
+            );
+            let body = self
+                .focused_body()
+                .ok_or_else(|| anyhow::anyhow!("inspection has no body"))?;
+            let fixed = pair.projection().frames_for(body)?.body_fixed;
+            let pose = pair.evaluation().reexpress_pose(self.pose, fixed)?;
+            let direction = Direction3::try_new(pose.position().local().metres())?;
+            let radius = crate::terrain_inspection::terrain_clearance(pair, self.pose, body)?
+                .map_or(
+                    pair.system().body(body)?.properties().reference_radius_m(),
+                    |c| c.surface_radius_m,
+                );
+            let position = direction.unit() * (radius + clearance);
+            self.pose = FramePose::new(
+                FramePosition::new(fixed, LocalPosition::try_metres(position)?),
+                pose.orientation(),
+            );
+            self.inspection = Some(crate::planet_surface::SurfaceInspectionAnchor::new(
+                body,
+                position,
+                pair.system().body(body)?.properties().reference_radius_m(),
+                self.inspection.map(|a| a.tangent),
+            )?);
+            return Ok(());
+        }
         ensure!(
             self.mode == CameraMode::BodyOrbit && !self.transitioning(),
             "complete body orbit focus before approach"
         );
         self.refresh_navigation_constraint(pair)?;
+        let body = self.focused_body().expect("body orbit has focus");
+        let terrain_height = self.terrain_height_at_orbit_direction(pair, body)?;
+        self.terrain_approach = terrain_height.is_some();
+        let terrain_height = terrain_height.unwrap_or(0.0);
         ensure!(
             clearance.is_finite()
-                && clearance >= minimum_clearance(self.radius_m)?
-                && clearance + self.radius_m <= 1e15,
+                && clearance >= 1.0
+                && clearance + self.radius_m + terrain_height <= 1e15,
             "invalid navigation clearance"
         );
         self.zoom_target_log = clearance.ln();
@@ -504,6 +605,9 @@ impl CelestialCamera {
         );
         let mut candidate = self.clone();
         candidate.navigation_checked(pair, input, elapsed)?;
+        if let Some(minimum) = candidate.terrain_clearance_guard_m {
+            candidate.apply_terrain_guard(pair, minimum)?;
+        }
         *self = candidate;
         Ok(())
     }
@@ -645,6 +749,7 @@ impl CelestialCamera {
                 } else {
                     CameraMode::BodyOrbit
                 };
+                self.terrain_approach = false;
                 self.anchor = t.target_anchor;
                 self.radius_m = t.target_radius;
                 self.distance_m = t.target_distance;
@@ -671,6 +776,24 @@ impl CelestialCamera {
         self.refresh_navigation_constraint(pair)?;
         self.yaw = (self.yaw - input.drag[0] * 0.005).rem_euclid(std::f64::consts::TAU);
         self.pitch = (self.pitch - input.drag[1] * 0.005).clamp(-1.5, 1.5);
+        if self.terrain_approach {
+            let id = self.focused_body().expect("terrain approach has a body");
+            let effective_radius = self.radius_m
+                + self
+                    .terrain_height_at_orbit_direction(pair, id)?
+                    .unwrap_or(0.0);
+            let target = self.zoom_target_log - input.scroll_notches * 1.25_f64.ln();
+            ensure!(
+                target.is_finite() && target <= (1e15 - effective_radius).ln(),
+                "1e15 m navigation zoom limit"
+            );
+            self.zoom_target_log = target.max(1.0_f64.ln());
+            let clearance = (self.distance_m - effective_radius).max(1.0);
+            let next = self.zoom_target_log
+                + (clearance.ln() - self.zoom_target_log) * (-elapsed.as_secs_f64() / 0.08).exp();
+            self.distance_m = effective_radius + next.exp();
+            return self.update_pose(self.attachment.frame(pair.projection())?);
+        }
         let minimum = (self.min_distance_m - self.radius_m).max(0.1);
         let target = self.zoom_target_log - input.scroll_notches * 1.25_f64.ln();
         ensure!(
@@ -802,6 +925,9 @@ impl CelestialCamera {
                 }
             }
         }
+        if let Some(guard) = self.terrain_clearance_guard_m {
+            self.apply_terrain_guard(pair, guard)?;
+        }
         Ok(())
     }
     fn inspect_motion(
@@ -840,10 +966,37 @@ impl CelestialCamera {
         }
         let p = anchor.position()?.metres();
         let minimum = radius + minimum_clearance(radius)?;
-        let guarded = if self.navigation_envelope && p.length() < minimum {
+        let guarded = if self.navigation_envelope
+            && pair.system().body(anchor.body)?.terrain().is_none()
+            && p.length() < minimum
+        {
             Direction3::try_new(p)?.unit() * minimum
         } else {
             p
+        };
+        let guarded = if let Some(clearance) = self.terrain_clearance_guard_m {
+            let definition = pair.system().body(anchor.body)?.terrain();
+            let diagnostic = definition
+                .map(|definition| {
+                    crate::terrain_inspection::clearance_at_position(
+                        definition,
+                        radius,
+                        p,
+                        anchor.body,
+                    )
+                })
+                .transpose()?;
+            if let Some(diagnostic) = diagnostic {
+                if diagnostic.clearance_m < clearance {
+                    Direction3::try_new(p)?.unit() * (diagnostic.surface_radius_m + clearance)
+                } else {
+                    guarded
+                }
+            } else {
+                guarded
+            }
+        } else {
+            guarded
         };
         if guarded != p || anchor.observer_in_regional.metres().length() > 1000.0 {
             anchor = crate::planet_surface::SurfaceInspectionAnchor::new(
@@ -857,6 +1010,22 @@ impl CelestialCamera {
         self.pose = FramePose::new(FramePosition::new(frame, anchor.position()?), orientation);
         self.velocity = FrameVelocity::new(frame, LinearVelocity3::zero());
         self.inspection = Some(anchor);
+        Ok(())
+    }
+    fn apply_terrain_guard(
+        &mut self,
+        pair: &CoherentCelestialView<'_>,
+        clearance_m: f64,
+    ) -> Result<()> {
+        let id = match self.attachment {
+            CameraAttachment::Translating(id) | CameraAttachment::BodyFixed(id) => id,
+            CameraAttachment::System => return Ok(()),
+        };
+        if let Some(diagnostic) = crate::terrain_inspection::terrain_clearance(pair, self.pose, id)?
+            && diagnostic.clearance_m < clearance_m
+        {
+            self.enforce_radial_clearance(pair, id, diagnostic.surface_radius_m, clearance_m)?;
+        }
         Ok(())
     }
     /// Property edits may change the navigation envelope while leaving physics
@@ -883,6 +1052,9 @@ impl CelestialCamera {
         );
         self.min_distance_m = minimum;
         self.radius_m = radius;
+        if self.terrain_approach && pair.system().body(id)?.terrain().is_some() {
+            return Ok(());
+        }
         if self.distance_m < minimum {
             self.distance_m = minimum;
             self.zoom_target_log = (minimum - radius).ln();
@@ -930,6 +1102,7 @@ impl CelestialCamera {
         self.min_distance_m = radius + minimum_clearance(radius)?;
         self.radius_m = radius;
         self.mode = CameraMode::BodyOrbit;
+        self.terrain_approach = false;
         self.transition = None;
         self.zoom_target_log = (distance - radius).ln();
         self.update_pose(frame)
@@ -948,6 +1121,36 @@ impl CelestialCamera {
         self.distance_m = distance;
         self.zoom_target_log = (distance - self.radius_m).ln();
         self.update_pose(self.pose.position().frame())
+    }
+    fn terrain_height_at_orbit_direction(
+        &self,
+        pair: &CoherentCelestialView<'_>,
+        body: BodyId,
+    ) -> Result<Option<f64>> {
+        let Some(definition) = pair.system().body(body)?.terrain() else {
+            return Ok(None);
+        };
+        let rotation = self.orbit_basis.compose(UnitRotation::try_from_quaternion(
+            DQuat::from_rotation_y(self.yaw) * DQuat::from_rotation_x(self.pitch),
+        )?);
+        let direction = rotation.rotate_direction(Direction3::try_new(DVec3::Z)?)?;
+        let fixed = pair.projection().frames_for(body)?.body_fixed;
+        let direction = pair
+            .evaluation()
+            .convert_direction(
+                FrameDirection::new(self.attachment.frame(pair.projection())?, direction),
+                fixed,
+            )?
+            .local()
+            .unit();
+        let radius = pair.system().body(body)?.properties().reference_radius_m();
+        let sample = crate::terrain_inspection::clearance_at_position(
+            definition,
+            radius,
+            direction * radius,
+            body,
+        )?;
+        Ok(Some(sample.terrain_elevation_m))
     }
     /// Instantaneous pose/physical-velocity preservation between the focused body's
     /// translating/fixed debug roles. A new pivot uses Focus, not coordinate migration.
