@@ -55,6 +55,20 @@ fn lighting_changes_do_not_change_cached_terrain_geometry_or_identity() {
         TerrainLighting::default().with_mode(TerrainRenderMode::Elevation),
         TerrainLighting::default().with_mode(TerrainRenderMode::Normals),
         TerrainLighting::default().with_mode(TerrainRenderMode::Diffuse),
+        TerrainLighting::default().with_mode(TerrainRenderMode::Readability),
+        TerrainLighting::default().with_mode(TerrainRenderMode::Slope),
+        TerrainLighting::default().with_mode(TerrainRenderMode::SeaMask),
+        TerrainLighting::default().with_mode(TerrainRenderMode::RockWeight),
+        TerrainLighting::default()
+            .with_mode(TerrainRenderMode::Readability)
+            .with_readability(
+                TerrainReadability::try_new(350.0, 410.0, 600.0, 700.0, 1000.0, 8.0, 16.0).unwrap(),
+            ),
+        TerrainLighting::default()
+            .with_mode(TerrainRenderMode::Readability)
+            .with_readability(
+                TerrainReadability::try_new(-100.0, 0.0, 200.0, 300.0, 600.0, 5.0, 20.0).unwrap(),
+            ),
     ];
     assert_eq!(TerrainSunPreset::ALL.len(), 5);
     for lighting in lights {
@@ -126,7 +140,7 @@ fn lighting_changes_do_not_change_cached_terrain_geometry_or_identity() {
         assert_eq!(frame.report().surface.samples, 6 * GRID_SAMPLES);
         assert_eq!(
             frame.report().surface.uploaded_bytes,
-            6 * (GRID_SAMPLES * 32 + 64)
+            6 * (GRID_SAMPLES * 48 + 64)
         );
     }
 }

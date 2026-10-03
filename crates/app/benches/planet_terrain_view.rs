@@ -282,7 +282,7 @@ fn benches(c: &mut Criterion) {
         ready_cover.visible().len() * GRID_SAMPLES,
         terrain_cache.pending(),
         terrain_cache.report(),
-        ready_cover.visible().len() * (GRID_SAMPLES * 32 + 64)
+        ready_cover.visible().len() * (GRID_SAMPLES * 48 + 64)
     );
 }
 

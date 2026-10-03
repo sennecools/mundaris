@@ -200,6 +200,7 @@ impl SurfaceStaging {
             let mut positions = [DVec3::ZERO; 3];
             let mut normals = [DVec3::ZERO; 3];
             let mut elevations = [0.0; 3];
+            let mut classifications = [[0.0; 4]; 3];
             let mut colors = [body.color; 3];
             for (i, vertex) in triangle.iter().enumerate() {
                 let sample = vertex.sample(fraction)?;
@@ -210,6 +211,16 @@ impl SurfaceStaging {
                     ))?
                     .metres();
                 normals[i] = sample.normal_body;
+                let radial = sample.position_body_m.normalize_or_zero();
+                classifications[i] = [
+                    (sample.position_body_m.length() - body.reference_radius_m) as f32,
+                    radial
+                        .cross(sample.normal_body)
+                        .length()
+                        .atan2(radial.dot(sample.normal_body)) as f32,
+                    0.0,
+                    0.0,
+                ];
                 elevations[i] =
                     vertex.old_elevation + (vertex.new_elevation - vertex.old_elevation) * fraction;
                 if style.lod_colors {
@@ -217,15 +228,14 @@ impl SurfaceStaging {
                         + (vertex.new_reference.address.level() as f64
                             - vertex.old_reference.address.level() as f64)
                             * fraction;
-                    let t = level as f32 / 20.0;
-                    colors[i] = [0.2 + t * 0.6, 0.6 - t * 0.3, 1.0 - t * 0.7, 1.0];
+                    colors[i] = super::lod_color(level.clamp(0.0, 255.0) as u8);
                 }
             }
             let polygon = clip_triangle(positions, projection);
             if polygon.len() < 3 {
                 continue;
             }
-            let required = (polygon.len() - 2) * 3 * 64;
+            let required = (polygon.len() - 2) * 3 * 80;
             self.reserve_fallback(required)?;
             for i in 1..polygon.len() - 1 {
                 for v in [polygon[0], polygon[i], polygon[i + 1]] {
@@ -281,9 +291,15 @@ impl SurfaceStaging {
                                     2
                                 } else {
                                     0
-                                }) as f32,
+                                } | if style.lod_colors { 8 } else { 0 })
+                                    as f32,
                                 0.0,
-                            ]),
+                            ])
+                            .chain(std::array::from_fn::<_, 4, _>(|axis| {
+                                classifications[0][axis] * v.weights.x as f32
+                                    + classifications[1][axis] * v.weights.y as f32
+                                    + classifications[2][axis] * v.weights.z as f32
+                            })),
                     );
                 }
                 self.report.morph_triangles += 1;
@@ -504,7 +520,7 @@ impl SurfaceStaging {
         }
         // Complete preflight includes pessimistic clipped polygons (up to 8 vertices,
         // 6 triangles per input). Do not grow power-of-two past the aggregate cap.
-        let needed_samples = self.samples.len() + patches.len() * GRID_SAMPLES * 32;
+        let needed_samples = self.samples.len() + patches.len() * GRID_SAMPLES * 48;
         let needed_instances = self.instances.len() + patches.len() * 64;
         let needed_records = self.instances.len() / 64 + patches.len();
         let allocated = self.samples.capacity().max(needed_samples)
@@ -536,6 +552,10 @@ impl SurfaceStaging {
         let mut gpu_positions = [[0.0; 3]; GRID_SAMPLES];
         let mut gpu_normals = [[0.0; 3]; GRID_SAMPLES];
         let mut elevations = [0.0f32; GRID_SAMPLES];
+        // Readability data is transient per-frame GPU payload. Position-derived
+        // radial slope is analytic for generated samples; reconciled edges use
+        // their interpolated visual normal and are therefore diagnostic estimates.
+        let mut classifications = [[0.0f32; 4]; GRID_SAMPLES];
         // Instance buckets are appended as a complete batch. Rebucket aggregate
         // instances after appending; sample bases are unaffected by their order.
         self.records.clear();
@@ -587,6 +607,16 @@ impl SurfaceStaging {
                     // Terrain shading and normal diagnostics use body-fixed axes.
                     // Position conversion remains source-centred and camera-relative.
                     normals[index] = sample.normal_body;
+                    let radial = sample.position_body_m.normalize_or_zero();
+                    classifications[index] = [
+                        (sample.position_body_m.length() - radius) as f32,
+                        radial
+                            .cross(sample.normal_body)
+                            .length()
+                            .atan2(radial.dot(sample.normal_body)) as f32,
+                        0.0,
+                        0.0,
+                    ];
                 } else {
                     let direction = key.direction();
                     positions[index] = prepared
@@ -596,6 +626,7 @@ impl SurfaceStaging {
                         ))?
                         .metres();
                     normals[index] = prepared.view_direction(direction)?.unit();
+                    classifications[index] = [0.0, 0.0, 0.0, 0.0];
                 }
                 let packed = (
                     positions[index].as_vec3().to_array(),
@@ -735,8 +766,7 @@ impl SurfaceStaging {
                 }
             }
             let patch_color = if style.lod_colors {
-                let t = patch.address.level() as f32 / 20.0;
-                [0.2 + t * 0.6, 0.6 - t * 0.3, 1.0 - t * 0.7, 1.0]
+                super::lod_color(patch.address.level())
             } else if style.face_colors {
                 [
                     [1.0, 0.3, 0.3, 1.0],
@@ -764,7 +794,7 @@ impl SurfaceStaging {
                     if polygon.len() < 3 {
                         continue;
                     }
-                    let needed = (polygon.len() - 2) * 3 * 64;
+                    let needed = (polygon.len() - 2) * 3 * 80;
                     self.reserve_fallback(needed)?;
                     for i in 1..polygon.len() - 1 {
                         for v in [polygon[0], polygon[i], polygon[i + 1]] {
@@ -835,8 +865,29 @@ impl SurfaceStaging {
                                             } else {
                                                 0
                                             }
-                                            | if geometry.is_some() { 4 } else { 0 })
+                                            | if geometry.is_some() { 4 } else { 0 }
+                                            | if style.lod_colors { 8 } else { 0 })
                                             as f32,
+                                        0.0,
+                                    ])
+                                    .chain([
+                                        triangle
+                                            .iter()
+                                            .zip(v.weights.to_array())
+                                            .map(|(&j, t)| {
+                                                f64::from(classifications[usize::from(j)][0]) * t
+                                            })
+                                            .sum::<f64>()
+                                            as f32,
+                                        triangle
+                                            .iter()
+                                            .zip(v.weights.to_array())
+                                            .map(|(&j, t)| {
+                                                f64::from(classifications[usize::from(j)][1]) * t
+                                            })
+                                            .sum::<f64>()
+                                            as f32,
+                                        0.0,
                                         0.0,
                                     ]),
                             );
@@ -845,15 +896,19 @@ impl SurfaceStaging {
                     }
                 }
             } else {
-                let base = (self.samples.len() / 32) as u32;
-                for ((p, n), elevation) in
-                    gpu_positions.into_iter().zip(gpu_normals).zip(elevations)
+                let base = (self.samples.len() / 48) as u32;
+                for (index, ((p, n), elevation)) in gpu_positions
+                    .into_iter()
+                    .zip(gpu_normals)
+                    .zip(elevations)
+                    .enumerate()
                 {
                     // One bounded append per sample, rather than eight independent
-                    // vector length/capacity checks. The byte contract is unchanged.
-                    let mut sample = [0; 32];
+                    // vector length/capacity checks. Classification adds sixteen bytes.
+                    let mut sample = [0; 48];
                     for (value, out) in [p[0], p[1], p[2], 1.0, n[0], n[1], n[2], elevation]
                         .into_iter()
+                        .chain(classifications[index])
                         .zip(sample.as_chunks_mut::<4>().0)
                     {
                         out.copy_from_slice(&value.to_le_bytes());
@@ -1072,8 +1127,10 @@ mod tests {
                 .into_iter()
                 .flat_map(f32::to_le_bytes)
                 .collect();
-                let offset = (patch_index * GRID_SAMPLES + index) * 32;
-                assert_eq!(&storage.samples[offset..offset + 32], expected);
+                let mut expected = expected;
+                expected.extend([0u8; 16]);
+                let offset = (patch_index * GRID_SAMPLES + index) * 48;
+                assert_eq!(&storage.samples[offset..offset + 48], expected);
             }
         }
         storage
@@ -1169,7 +1226,7 @@ mod tests {
                 SurfaceStyle::default(),
             )
             .unwrap();
-        assert_eq!(storage.samples.len(), 2 * 289 * 32);
+        assert_eq!(storage.samples.len(), 2 * 289 * 48);
         assert_eq!(storage.instances.len(), 2 * 64);
         assert!(storage.fallback.is_empty());
         assert!(storage.instances[32..64].iter().all(|&b| b == 0));
@@ -1177,8 +1234,8 @@ mod tests {
             let first = j * 17;
             let second = 289 + j * 17 + 16;
             assert_eq!(
-                &storage.samples[first * 32..(first + 1) * 32],
-                &storage.samples[second * 32..(second + 1) * 32]
+                &storage.samples[first * 48..(first + 1) * 48],
+                &storage.samples[second * 48..(second + 1) * 48]
             );
         }
         let mut other = body;
@@ -1200,7 +1257,7 @@ mod tests {
         let position = |index: usize| {
             DVec3::from_array(std::array::from_fn(|axis| {
                 f64::from(f32::from_le_bytes(
-                    storage.samples[index * 32 + axis * 4..index * 32 + axis * 4 + 4]
+                    storage.samples[index * 48 + axis * 4..index * 48 + axis * 4 + 4]
                         .try_into()
                         .unwrap(),
                 ))
@@ -1211,7 +1268,7 @@ mod tests {
         assert_eq!(storage.report.draws, 1);
         assert!(storage.report.boundary_bytes <= 8 * 1024 * 1024);
         eprintln!(
-            "topology CPU={} bytes; sample32 instance64; payload={} staging={} boundary={}",
+            "topology CPU={} bytes; sample48 instance64; payload={} staging={} boundary={}",
             topology.allocated_bytes(),
             storage.report.uploaded_bytes,
             storage.report.allocated_staging_bytes,
@@ -1287,7 +1344,40 @@ mod tests {
                 SurfaceStyle::default(),
             )
             .unwrap();
-        assert_eq!(generated.samples, sphere.samples);
+        for (generated_sample, sphere_sample) in generated
+            .samples
+            .as_chunks::<48>()
+            .0
+            .iter()
+            .zip(sphere.samples.as_chunks::<48>().0.iter())
+        {
+            assert_eq!(&generated_sample[..32], &sphere_sample[..32]);
+        }
+        for mode in super::super::TerrainRenderMode::ALL {
+            let mut variant = SurfaceStaging {
+                lighting: super::super::TerrainLighting::default().with_mode(mode),
+                ..Default::default()
+            };
+            variant
+                .append_generated(
+                    &view,
+                    projection,
+                    body,
+                    &[patch],
+                    &[&geometry],
+                    &topology,
+                    SurfaceStyle::default(),
+                )
+                .unwrap();
+            assert_eq!(
+                variant.samples, generated.samples,
+                "mode {mode:?} changed sample payload"
+            );
+            assert_eq!(
+                variant.instances, generated.instances,
+                "mode {mode:?} changed instances"
+            );
+        }
         assert_eq!(
             u32::from_le_bytes(generated.instances[12..16].try_into().unwrap()),
             4
@@ -1325,10 +1415,10 @@ mod tests {
             assert_eq!(rotated.samples.len(), generated.samples.len());
             for (a, b) in rotated
                 .samples
-                .as_chunks::<32>()
+                .as_chunks::<48>()
                 .0
                 .iter()
-                .zip(generated.samples.as_chunks::<32>().0)
+                .zip(generated.samples.as_chunks::<48>().0)
             {
                 assert_eq!(&a[16..28], &b[16..28]);
             }
@@ -1474,7 +1564,7 @@ mod tests {
         assert!(storage.report.fallback_triangles > 0);
         assert_eq!(
             storage.fallback.len(),
-            storage.report.fallback_triangles * 3 * 64
+            storage.report.fallback_triangles * 3 * 80
         );
         assert!(storage.report.max_projected_error_pixels <= 0.05);
         assert!(storage.report.allocated_staging_bytes < 64 * 1024 * 1024);
@@ -1511,7 +1601,7 @@ mod tests {
             )
             .unwrap();
         assert!(terrain.report.fallback_triangles > 0);
-        for vertex in terrain.fallback.as_chunks::<64>().0 {
+        for vertex in terrain.fallback.as_chunks::<80>().0 {
             let n = DVec3::new(
                 f32::from_le_bytes(vertex[16..20].try_into().unwrap()) as f64,
                 f32::from_le_bytes(vertex[20..24].try_into().unwrap()) as f64,

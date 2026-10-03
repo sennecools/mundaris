@@ -169,7 +169,7 @@ fn benches(c: &mut Criterion) {
         "matched uniform4: visible={} samples={} draws=1 staged_bytes={} CPU_patch_bytes=13872 cache={:?}; no GPU/upload/presentation in CPU benchmarks",
         visible.len(),
         visible.len() * GRID_SAMPLES,
-        visible.len() * (GRID_SAMPLES * 32 + 64),
+        visible.len() * (GRID_SAMPLES * 48 + 64),
         cache.report()
     );
 }

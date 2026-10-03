@@ -12,10 +12,79 @@ pub enum TerrainRenderMode {
     Lit = 1,
     Normals = 2,
     Diffuse = 3,
+    Readability = 4,
+    Slope = 5,
+    SeaMask = 6,
+    RockWeight = 7,
 }
 
 impl TerrainRenderMode {
-    pub const ALL: [Self; 4] = [Self::Elevation, Self::Lit, Self::Normals, Self::Diffuse];
+    pub const ALL: [Self; 8] = [
+        Self::Elevation,
+        Self::Lit,
+        Self::Normals,
+        Self::Diffuse,
+        Self::Readability,
+        Self::Slope,
+        Self::SeaMask,
+        Self::RockWeight,
+    ];
+}
+
+/// Renderer-only thresholds supplied by the application; values are metres and degrees.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TerrainReadability {
+    sea_level_m: f64,
+    highland_start_m: f64,
+    highland_full_m: f64,
+    pale_start_m: f64,
+    pale_full_m: f64,
+    rock_start_degrees: f64,
+    rock_full_degrees: f64,
+}
+
+impl TerrainReadability {
+    pub fn try_new(
+        sea_level_m: f64,
+        highland_start_m: f64,
+        highland_full_m: f64,
+        pale_start_m: f64,
+        pale_full_m: f64,
+        rock_start_degrees: f64,
+        rock_full_degrees: f64,
+    ) -> Result<Self, RenderPreparationError> {
+        let value = Self {
+            sea_level_m,
+            highland_start_m,
+            highland_full_m,
+            pale_start_m,
+            pale_full_m,
+            rock_start_degrees,
+            rock_full_degrees,
+        };
+        if ![
+            sea_level_m,
+            highland_start_m,
+            highland_full_m,
+            pale_start_m,
+            pale_full_m,
+            rock_start_degrees,
+            rock_full_degrees,
+        ]
+        .iter()
+        .all(|v| v.is_finite())
+            || highland_start_m <= sea_level_m
+            || highland_full_m <= highland_start_m
+            || pale_start_m <= highland_full_m
+            || pale_full_m <= pale_start_m
+            || rock_start_degrees < 0.0
+            || rock_full_degrees <= rock_start_degrees
+            || rock_full_degrees > 90.0
+        {
+            return Err(RenderPreparationError::InvalidDebugGeometry);
+        }
+        Ok(value)
+    }
 }
 
 /// Deterministic body-fixed directions useful for lighting inspection.
@@ -56,6 +125,7 @@ pub struct TerrainLighting {
     ambient: f32,
     diffuse: f32,
     mode: TerrainRenderMode,
+    readability: Option<TerrainReadability>,
 }
 
 impl Default for TerrainLighting {
@@ -65,6 +135,7 @@ impl Default for TerrainLighting {
             ambient: 0.06,
             diffuse: 0.94,
             mode: TerrainRenderMode::Lit,
+            readability: None,
         }
     }
 }
@@ -100,6 +171,7 @@ impl TerrainLighting {
             ambient,
             diffuse,
             mode,
+            readability: None,
         })
     }
 
@@ -123,8 +195,22 @@ impl TerrainLighting {
         Self { mode, ..self }
     }
 
-    /// Packs the 32-byte WGSL uniform: sun xyz/ambient, diffuse/mode/sRGB/zero.
-    pub(crate) fn packed(self, target_srgb: bool) -> [f32; 8] {
+    pub fn with_readability(mut self, config: TerrainReadability) -> Self {
+        self.readability = Some(config);
+        self
+    }
+
+    /// Packs the 64-byte uniform: lighting controls followed by readability thresholds.
+    pub(crate) fn packed(self, target_srgb: bool) -> [f32; 16] {
+        let config = self.readability.unwrap_or(TerrainReadability {
+            sea_level_m: 0.0,
+            highland_start_m: 300.0,
+            highland_full_m: 1800.0,
+            pale_start_m: 3000.0,
+            pale_full_m: 5000.0,
+            rock_start_degrees: 12.0,
+            rock_full_degrees: 35.0,
+        });
         [
             self.sun_body.x as f32,
             self.sun_body.y as f32,
@@ -134,8 +220,31 @@ impl TerrainLighting {
             self.mode as u32 as f32,
             f32::from(target_srgb),
             0.0,
+            config.sea_level_m as f32,
+            config.highland_start_m as f32,
+            config.highland_full_m as f32,
+            config.pale_start_m as f32,
+            config.pale_full_m as f32,
+            config.rock_start_degrees.to_radians() as f32,
+            config.rock_full_degrees.to_radians() as f32,
+            0.0,
         ]
     }
+}
+
+/// Cyclic diagnostic colors with twelve distinguishable hues.
+pub fn lod_color(level: u8) -> [f32; 4] {
+    let sector = f32::from(level % 12) * 0.5;
+    let x = 1.0 - (sector % 2.0 - 1.0).abs();
+    let (r, g, b) = match sector as u8 {
+        0 => (1.0, x, 0.0),
+        1 => (x, 1.0, 0.0),
+        2 => (0.0, 1.0, x),
+        3 => (0.0, x, 1.0),
+        4 => (x, 0.0, 1.0),
+        _ => (1.0, 0.0, x),
+    };
+    [0.2 + r * 0.8, 0.2 + g * 0.8, 0.2 + b * 0.8, 1.0]
 }
 
 #[cfg(test)]

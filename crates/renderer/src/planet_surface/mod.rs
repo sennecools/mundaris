@@ -15,7 +15,9 @@ pub(crate) use bounds::projected_error as sphere_projected_error;
 pub use bounds::{PatchMetadata, SurfaceErrorContributions, SurfaceExtent};
 use cache::MetadataCache;
 pub(crate) use gpu::PlanetSurfaceRenderer;
-pub use lighting::{TerrainLighting, TerrainRenderMode, TerrainSunPreset};
+pub use lighting::{
+    TerrainLighting, TerrainReadability, TerrainRenderMode, TerrainSunPreset, lod_color,
+};
 #[cfg(feature = "surface-profile")]
 pub use lod::LodProfile;
 pub use lod::{

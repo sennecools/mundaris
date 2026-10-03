@@ -1,8 +1,8 @@
 struct Projection { matrix: mat4x4<f32> }
-struct Sample { position: vec4<f32>, normal: vec4<f32> }
+struct Sample { position: vec4<f32>, normal: vec4<f32>, classification: vec4<f32> }
 struct Instance { data: vec4<u32>, color: vec4<f32>, padding0: vec4<u32>, padding1: vec4<u32> }
 // Surface -> sun in body-fixed axes. strengths = diffuse, mode, sRGB target, unused.
-struct Lighting { sun_ambient: vec4<f32>, strengths: vec4<f32> }
+struct Lighting { sun_ambient: vec4<f32>, strengths: vec4<f32>, readability0: vec4<f32>, readability1: vec4<f32> }
 @group(0) @binding(0) var<uniform> projection: Projection;
 @group(1) @binding(0) var<storage, read> samples: array<Sample>;
 @group(1) @binding(1) var<storage, read> instances: array<Instance>;
@@ -14,6 +14,7 @@ struct Output {
     @location(2) uv: vec2<f32>,
     @location(3) @interpolate(flat) borders: u32,
     @location(4) elevation: f32,
+    @location(5) classification: vec4<f32>,
 }
 @vertex fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) index: u32) -> Output {
     let instance = instances[index];
@@ -25,9 +26,10 @@ struct Output {
     output.uv = vec2<f32>(f32(vertex % 17u), f32(vertex / 17u)) / 16.0;
     output.borders = instance.data.w;
     output.elevation = sample.normal.w;
+    output.classification = sample.classification;
     return output;
 }
-@vertex fn vs_clipped(@location(0) clip: vec4<f32>, @location(1) normal: vec4<f32>, @location(2) color: vec4<f32>, @location(3) uv_flags: vec4<f32>) -> Output {
+@vertex fn vs_clipped(@location(0) clip: vec4<f32>, @location(1) normal: vec4<f32>, @location(2) color: vec4<f32>, @location(3) uv_flags: vec4<f32>, @location(4) classification: vec4<f32>) -> Output {
     var output: Output;
     output.position = clip;
     output.normal = normal.xyz;
@@ -35,6 +37,7 @@ struct Output {
     output.uv = uv_flags.xy;
     output.borders = u32(uv_flags.z);
     output.elevation = normal.w;
+    output.classification = classification;
     return output;
 }
 // The debug elevation palette is display/sRGB authored, not a material system.
@@ -56,7 +59,9 @@ fn encode_srgb(color: vec3<f32>) -> vec3<f32> {
         base = mix(vec3<f32>(0.04, 0.12, 0.4), vec3<f32>(0.5, 0.65, 0.25), clamp(0.5 + 2.0 * input.elevation, 0.0, 1.0));
     }
     var color = base * legacy_shade;
-    if (input.borders & 4u) != 0u {
+    if (input.borders & 8u) != 0u {
+        color = input.color.rgb;
+    } else if (input.borders & 4u) != 0u {
         let diffuse = max(dot(normal, normalize(lighting.sun_ambient.xyz)), 0.0);
         let mode = u32(lighting.strengths.y);
         color = decode_srgb(base);
@@ -67,6 +72,22 @@ fn encode_srgb(color: vec3<f32>) -> vec3<f32> {
         } else if mode == 3u {
             // Raw diffuse is displayed as a linear grayscale diagnostic.
             color = vec3<f32>(diffuse);
+        } else if mode == 4u {
+            let h = input.classification.x;
+            var land = mix(vec3<f32>(0.22, 0.43, 0.20), vec3<f32>(0.42, 0.34, 0.24), smoothstep(lighting.readability0.y, lighting.readability0.z, h));
+            let rock = smoothstep(lighting.readability1.y, lighting.readability1.z, input.classification.y);
+            land = mix(land, vec3<f32>(0.43, 0.45, 0.46), rock);
+            land = mix(land, vec3<f32>(0.82, 0.81, 0.78), smoothstep(lighting.readability0.w, lighting.readability1.x, h));
+            // Blue is a strict reference-datum mask, not a physical water shell.
+            // Do not classify underwater steepness as exposed land rock.
+            color = decode_srgb(select(land, vec3<f32>(0.10, 0.30, 0.57), h < lighting.readability0.x));
+            color *= lighting.sun_ambient.w + lighting.strengths.x * diffuse;
+        } else if mode == 5u {
+            color = vec3<f32>(clamp(input.classification.y / lighting.readability1.z, 0.0, 1.0));
+        } else if mode == 6u {
+            color = decode_srgb(select(vec3<f32>(0.25, 0.42, 0.2), vec3<f32>(0.10, 0.30, 0.57), input.classification.x < lighting.readability0.x));
+        } else if mode == 7u {
+            color = vec3<f32>(smoothstep(lighting.readability1.y, lighting.readability1.z, input.classification.y));
         }
         if lighting.strengths.z == 0.0 { color = encode_srgb(color); }
     }

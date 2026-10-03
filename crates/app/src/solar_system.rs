@@ -395,6 +395,69 @@ pub fn body_color(body: SolarBody) -> [f32; 4] {
     content(body).color
 }
 
+/// Reference datum for diagnostic basin colouring, not an ocean or geometry input.
+/// Kept outside terrain definitions so display changes never invalidate meshes.
+pub const GAMEPLAY_EARTH_SEA_LEVEL_M: f64 = 350.0;
+
+/// Only Earth uses the tuned diagnostic ocean level; airless bodies use zero.
+pub fn reference_sea_level_m(body: SolarBody) -> Option<f64> {
+    content(body).rocky_terrain_seed.map(|_| {
+        if body == SolarBody::Earth {
+            GAMEPLAY_EARTH_SEA_LEVEL_M
+        } else {
+            0.0
+        }
+    })
+}
+
+/// Content-authored readability thresholds scaled to each rocky preset's relief.
+/// Blue on airless bodies means below the reference datum, not liquid water.
+pub fn terrain_readability_config(
+    body: SolarBody,
+    radius_m: f64,
+) -> anyhow::Result<Option<mundaris_renderer::planet_surface::TerrainReadability>> {
+    terrain_readability_config_with_sea_level(
+        body,
+        radius_m,
+        reference_sea_level_m(body).unwrap_or(0.0),
+    )
+}
+
+/// Debug/content override of the datum without modifying procedural geometry.
+pub fn terrain_readability_config_with_sea_level(
+    body: SolarBody,
+    radius_m: f64,
+    sea_level_m: f64,
+) -> anyhow::Result<Option<mundaris_renderer::planet_surface::TerrainReadability>> {
+    if content(body).rocky_terrain_seed.is_none() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        radius_m.is_finite() && radius_m > 0.0,
+        "invalid palette radius"
+    );
+    let relief = match body {
+        SolarBody::Mercury => 0.35,
+        SolarBody::Venus => 0.22,
+        SolarBody::Earth => 1.0,
+        SolarBody::Moon => 0.42,
+        SolarBody::Mars => 0.76,
+        _ => 0.5,
+    };
+    let scale = relief * (radius_m / 400_000.0).min(1.0);
+    Ok(Some(
+        mundaris_renderer::planet_surface::TerrainReadability::try_new(
+            sea_level_m,
+            sea_level_m + 60.0 * scale,
+            sea_level_m + 250.0 * scale,
+            sea_level_m + 350.0 * scale,
+            sea_level_m + 650.0 * scale,
+            8.0,
+            16.0,
+        )?,
+    ))
+}
+
 /// Build rocky V2 definitions. Macro relief wavelengths scale with the body;
 /// regional and local wavelengths remain physical, and heights shrink for small worlds.
 pub fn terrain_definition(

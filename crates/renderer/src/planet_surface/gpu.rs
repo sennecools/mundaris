@@ -29,7 +29,7 @@ impl PlanetSurfaceRenderer {
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Planet samples / instances"),
             entries: &[
-                entry(0, 32),
+                entry(0, 48),
                 entry(1, 64),
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
@@ -37,15 +37,15 @@ impl PlanetSurfaceRenderer {
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
-                        min_binding_size: wgpu::BufferSize::new(32),
+                        min_binding_size: wgpu::BufferSize::new(64),
                     },
                     count: None,
                 },
             ],
         });
-        let samples = buffer(device, 32, wgpu::BufferUsages::STORAGE);
+        let samples = buffer(device, 48, wgpu::BufferUsages::STORAGE);
         let instances = buffer(device, 64, wgpu::BufferUsages::STORAGE);
-        let lighting = buffer(device, 32, wgpu::BufferUsages::UNIFORM);
+        let lighting = buffer(device, 64, wgpu::BufferUsages::UNIFORM);
         let group = binding(device, &layout, &samples, &instances, &lighting);
         let topology = SurfaceTopology::new();
         let mut bytes = Vec::new();
@@ -109,8 +109,8 @@ impl PlanetSurfaceRenderer {
             group,
             samples,
             instances,
-            fallback: buffer(device, 64, wgpu::BufferUsages::VERTEX),
-            capacities: [32, 64, 64],
+            fallback: buffer(device, 80, wgpu::BufferUsages::VERTEX),
+            capacities: [48, 64, 80],
             indices,
             ranges,
             index_bytes,
@@ -136,7 +136,7 @@ impl PlanetSurfaceRenderer {
                 self.capacities[i]
             }
         });
-        if proposed.iter().sum::<u64>() + self.index_bytes + 32 > 80 * 1024 * 1024
+        if proposed.iter().sum::<u64>() + self.index_bytes + 64 > 80 * 1024 * 1024
             || proposed[..2]
                 .iter()
                 .any(|&n| n > u64::from(device.limits().max_storage_buffer_binding_size))
@@ -191,7 +191,7 @@ impl PlanetSurfaceRenderer {
                 &self.lighting,
             );
         }
-        let mut bytes = [0u8; 32];
+        let mut bytes = [0u8; 64];
         for (value, out) in staging
             .lighting
             .packed(self.target_srgb)
@@ -242,7 +242,7 @@ impl PlanetSurfaceRenderer {
             pass.set_bind_group(0, projection, &[]);
             pass.set_bind_group(1, &self.group, &[]);
             pass.set_vertex_buffer(0, self.fallback.slice(..));
-            pass.draw(0..(staging.fallback.len() / 64) as u32, 0..1);
+            pass.draw(0..(staging.fallback.len() / 80) as u32, 0..1);
         }
     }
 }
@@ -307,9 +307,10 @@ fn pipeline(
         bind_group_layouts: &groups,
         push_constant_ranges: &[],
     });
-    let attributes = wgpu::vertex_attr_array![0=>Float32x4,1=>Float32x4,2=>Float32x4,3=>Float32x4];
+    let attributes =
+        wgpu::vertex_attr_array![0=>Float32x4,1=>Float32x4,2=>Float32x4,3=>Float32x4,4=>Float32x4];
     let buffers = [wgpu::VertexBufferLayout {
-        array_stride: 64,
+        array_stride: 80,
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &attributes,
     }];
