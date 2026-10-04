@@ -15,11 +15,14 @@ type BoundaryReference = (u128, usize, usize);
 pub struct StitchedSurface {
     patches: Vec<GeneratedSurfacePatch>,
     masks: Vec<u8>,
+    reused_patches: usize,
 }
 impl StitchedSurface {
     /// Conservative allocated-capacity peak for construction, excluding inputs.
     pub fn construction_bytes(patches: usize) -> usize {
         size_of::<Self>()
+            // Reuse temporarily holds raw boundary scratch and its cloned result.
+            + GRID_SAMPLES * size_of::<SurfaceGeometrySample>()
             + patches
                 * (size_of::<GeneratedSurfacePatch>()
                     + GRID_SAMPLES * size_of::<SurfaceGeometrySample>()
@@ -32,6 +35,16 @@ impl StitchedSurface {
         geometry: &[&GeneratedSurfacePatch],
         _topology: &SurfaceTopology,
     ) -> Result<Self, RenderPreparationError> {
+        Self::build_reusing(patches, geometry, _topology, None)
+    }
+    /// Build constrained geometry, optionally reusing patches from a previous cover.
+    /// `previous_raw` must be ordered exactly like `previous.patches()`.
+    pub fn build_reusing(
+        patches: &[ActiveSurfacePatch],
+        geometry: &[&GeneratedSurfacePatch],
+        _topology: &SurfaceTopology,
+        previous: Option<(&StitchedSurface, &[&GeneratedSurfacePatch])>,
+    ) -> Result<Self, RenderPreparationError> {
         if patches.len() != geometry.len() || patches.len() > MAX_STITCHED_PATCHES {
             return Err(RenderPreparationError::InvalidBudget);
         }
@@ -42,6 +55,16 @@ impl StitchedSurface {
                 || g.reference_radius_m() != geometry[0].reference_radius_m()
                 || !expected_mask(p.address, &addresses).is_ok_and(|m| m == p.stitch_mask)
         }) {
+            return Err(RenderPreparationError::InvalidDebugGeometry);
+        }
+        if let Some((old, old_raw)) = previous
+            && (old.patches.len() != old_raw.len()
+                || old
+                    .patches
+                    .iter()
+                    .zip(old_raw)
+                    .any(|(p, raw)| p.address() != raw.address()))
+        {
             return Err(RenderPreparationError::InvalidDebugGeometry);
         }
         // Compact references, not a heap tree of duplicated physical samples.
@@ -72,6 +95,7 @@ impl StitchedSurface {
         });
         owners.dedup_by_key(|r| r.0);
         let mut output = Vec::with_capacity(patches.len());
+        let mut reused_patches = 0;
         for (at, patch) in patches.iter().enumerate() {
             let source = geometry[at];
             let raw = source.samples();
@@ -90,6 +114,28 @@ impl StitchedSurface {
                         samples[(j * 17 + i) as usize] = geometry[owner.1].samples()[owner.2];
                     }
                 }
+            }
+            let reusable = previous.and_then(|(old, old_raw)| {
+                let old_at = old
+                    .patches
+                    .iter()
+                    .position(|p| p.address() == patch.address)?;
+                let old_patch = &old.patches[old_at];
+                let raw_old = *old_raw.get(old_at)?;
+                (old.masks.get(old_at).copied() == Some(patch.stitch_mask)
+                    && raw_geometry_equal(source, raw_old)
+                    && samples.iter().enumerate().all(|(index, sample)| {
+                        let i = index % 17;
+                        let j = index / 17;
+                        (i != 0 && i != 16 && j != 0 && j != 16)
+                            || sample_exact(*sample, old_patch.samples()[index])
+                    }))
+                .then_some(old_patch.clone())
+            });
+            if let Some(reused) = reusable {
+                output.push(reused);
+                reused_patches += 1;
+                continue;
             }
             // Only referenced even boundary vertices matter on a collapsed edge.
             // Extend their profile correction smoothly over the first two rows.
@@ -178,10 +224,14 @@ impl StitchedSurface {
         Ok(Self {
             patches: output,
             masks: patches.iter().map(|p| p.stitch_mask).collect(),
+            reused_patches,
         })
     }
     pub fn patches(&self) -> &[GeneratedSurfacePatch] {
         &self.patches
+    }
+    pub fn reused_patches(&self) -> usize {
+        self.reused_patches
     }
     pub fn stitch_mask(&self, index: usize) -> Option<u8> {
         self.masks.get(index).copied()
@@ -196,6 +246,50 @@ impl StitchedSurface {
                 .map(GeneratedSurfacePatch::resident_heap_capacity_bytes)
                 .sum::<usize>()
     }
+}
+
+fn sample_exact(a: SurfaceGeometrySample, b: SurfaceGeometrySample) -> bool {
+    a.position_body_m.to_array().map(f64::to_bits) == b.position_body_m.to_array().map(f64::to_bits)
+        && a.normal_body.to_array().map(f64::to_bits) == b.normal_body.to_array().map(f64::to_bits)
+}
+
+fn raw_geometry_equal(a: &GeneratedSurfacePatch, b: &GeneratedSurfacePatch) -> bool {
+    a.address() == b.address()
+        && a.reference_radius_m().to_bits() == b.reference_radius_m().to_bits()
+        && a.footprint_m().to_bits() == b.footprint_m().to_bits()
+        && extent_exact(a.extent(), b.extent())
+        && error_exact(a.error(), b.error())
+        && a.samples().len() == b.samples().len()
+        && a.samples()
+            .iter()
+            .zip(b.samples())
+            .all(|(&x, &y)| sample_exact(x, y))
+}
+
+fn extent_exact(a: super::SurfaceExtent, b: super::SurfaceExtent) -> bool {
+    a.min_height_m.to_bits() == b.min_height_m.to_bits()
+        && a.max_height_m.to_bits() == b.max_height_m.to_bits()
+        && a.guaranteed_opaque_radius_m.to_bits() == b.guaranteed_opaque_radius_m.to_bits()
+}
+fn error_exact(a: super::SurfaceErrorContributions, b: super::SurfaceErrorContributions) -> bool {
+    [
+        a.sphere_m,
+        a.filtered_interpolation_m,
+        a.unresolved_m,
+        a.boundary_constraint_m,
+        a.morph_remaining_m,
+        a.numeric_m,
+    ]
+    .map(f64::to_bits)
+        == [
+            b.sphere_m,
+            b.filtered_interpolation_m,
+            b.unresolved_m,
+            b.boundary_constraint_m,
+            b.morph_remaining_m,
+            b.numeric_m,
+        ]
+        .map(f64::to_bits)
 }
 
 fn validate_cover(addresses: &[CubePatchAddress]) -> Result<(), RenderPreparationError> {

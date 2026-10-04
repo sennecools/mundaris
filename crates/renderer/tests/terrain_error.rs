@@ -30,8 +30,16 @@ fn terrain_total_projection_preserves_smooth_path_and_expanded_bounds() {
         max_height_m: 5000.0,
         guaranteed_opaque_radius_m: 0.0,
     };
-    let (_, displaced_ball) = metadata.ball(radius, extent).unwrap();
-    assert!(displaced_ball >= ball + 4999.999);
+    let (displaced_centre, displaced_ball) = metadata.ball(radius, extent).unwrap();
+    assert!(displaced_ball > ball && displaced_ball < ball + 5000.0);
+    for j in 0..=16 {
+        for i in 0..=16 {
+            let n = patch.sample_direction(i, j, 16).unwrap().unit();
+            for height in [extent.min_height_m, 2000.0, extent.max_height_m] {
+                assert!((n * (radius + height) - displaced_centre).length() <= displaced_ball);
+            }
+        }
+    }
     assert!(
         metadata
             .projected_total_error(
@@ -39,7 +47,7 @@ fn terrain_total_projection_preserves_smooth_path_and_expanded_bounds() {
                     unresolved_m: 5000.0,
                     ..errors
                 },
-                centre_view,
+                displaced_centre - DVec3::Z * (radius + 1e7),
                 displaced_ball,
                 projection
             )

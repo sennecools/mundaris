@@ -31,4 +31,6 @@ pub use prepare::{SurfacePreparationReport, SurfaceStyle};
 pub use stitching::{StitchedSurface, active_surface_cover};
 pub use terrain_geometry::{GeneratedSurfacePatch, SurfaceGeometrySample};
 pub use topology::{GRID_CELLS, GRID_SAMPLES, SurfaceTopology};
+#[cfg(feature = "surface-profile")]
+pub use transition::SurfaceTransitionProfile;
 pub use transition::{SurfaceTransition, SurfaceTriangleReference, TransitionVertex};

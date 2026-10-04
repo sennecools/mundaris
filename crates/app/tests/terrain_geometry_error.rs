@@ -40,6 +40,8 @@ fn all_stitch_certificates_bound_full_field_against_filtered_triangle_geometry()
             cache.generate(289, 32, None).unwrap();
             let patch = cache.peek(&identity, address).unwrap();
             let error = patch.error().total_m().unwrap();
+            let metadata = PatchMetadata::build(address, &topology).unwrap();
+            let (ball_center, ball_radius) = metadata.ball(radius, patch.extent()).unwrap();
             for mask in 0..16 {
                 let triangles = topology.indices(mask).as_chunks::<3>().0;
                 for _ in 0..256 {
@@ -68,6 +70,21 @@ fn all_stitch_certificates_bound_full_field_against_filtered_triangle_geometry()
                         })
                         .unwrap();
                     let truth = n.unit() * (radius + full.height_m());
+                    assert!(
+                        full.height_m() >= patch.extent().min_height_m
+                            && full.height_m() <= patch.extent().max_height_m,
+                        "regional interval: seed={seed} level={level} height={} extent={:?}",
+                        full.height_m(),
+                        patch.extent()
+                    );
+                    assert!(
+                        (truth - ball_center).length() <= ball_radius,
+                        "recentered ball: seed={seed} level={level}"
+                    );
+                    assert!(
+                        (mesh - ball_center).length() <= ball_radius,
+                        "convex stitched triangle ball: seed={seed} level={level} mask={mask}"
+                    );
                     assert!(truth.is_finite() && mesh.is_finite());
                     assert!(
                         (truth - mesh).length() <= error + 1e-6,

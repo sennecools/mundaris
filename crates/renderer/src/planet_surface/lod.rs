@@ -173,7 +173,7 @@ pub struct SurfaceLodSession {
     previous_splits: AddressSet,
     visible: Vec<ActiveSurfacePatch>,
     stack: Vec<CubePatchAddress>,
-    requests: Vec<(CubePatchAddress, f64, bool, f64)>,
+    requests: Vec<(CubePatchAddress, f64, bool, f64, f64, f64)>,
     desired: AddressSet,
     proposal: AddressSet,
     pins: AddressSet,
@@ -357,12 +357,28 @@ impl SurfaceLodSession {
                 if p.level() < settings.max_level {
                     let observer = source.observer_in_source().metres();
                     let local = address_contains_observer_direction(p, observer);
-                    let (center, _) = m.ball(
+                    let (center, ball_radius) = m.ball(
                         input.reference_radius_m,
                         SurfaceExtent::smooth(input.reference_radius_m),
                     )?;
-                    self.requests
-                        .push((p, error, local, (center - observer).length()));
+                    let center_view = source
+                        .view_displacement(FramePosition::new(
+                            input.body_fixed_frame,
+                            LocalPosition::try_metres(center)?,
+                        ))?
+                        .metres();
+                    let extent =
+                        ball_radius / (-center_view.z - ball_radius).max(input.projection.near_m());
+                    let view_offset = center_view.x.hypot(center_view.y)
+                        / (-center_view.z).max(input.projection.near_m());
+                    self.requests.push((
+                        p,
+                        error,
+                        local,
+                        extent,
+                        view_offset,
+                        (center - observer).length(),
+                    ));
                 } else {
                     report.precision_floor = true;
                 }
@@ -623,7 +639,8 @@ impl SurfaceLodSession {
         .map(|s| s.bytes())
         .sum::<usize>()
             + self.stack.capacity() * std::mem::size_of::<CubePatchAddress>()
-            + self.requests.capacity() * std::mem::size_of::<(CubePatchAddress, f64, bool, f64)>()
+            + self.requests.capacity()
+                * std::mem::size_of::<(CubePatchAddress, f64, bool, f64, f64, f64)>()
             + (self.visible.capacity() + self.visible_scratch.capacity())
                 * std::mem::size_of::<ActiveSurfacePatch>();
         if report.scratch_bytes > 8 * 1024 * 1024 {
@@ -831,13 +848,15 @@ fn address_contains_direction(
 }
 
 fn compare_request_priority(
-    a: &(CubePatchAddress, f64, bool, f64),
-    b: &(CubePatchAddress, f64, bool, f64),
+    a: &(CubePatchAddress, f64, bool, f64, f64, f64),
+    b: &(CubePatchAddress, f64, bool, f64, f64, f64),
 ) -> std::cmp::Ordering {
     b.1.total_cmp(&a.1).then_with(|| {
         if a.1.is_infinite() && b.1.is_infinite() {
             b.2.cmp(&a.2)
-                .then_with(|| a.3.total_cmp(&b.3))
+                .then_with(|| b.3.total_cmp(&a.3))
+                .then_with(|| a.4.total_cmp(&b.4))
+                .then_with(|| a.5.total_cmp(&b.5))
                 .then(a.0.cmp(&b.0))
         } else {
             a.0.cmp(&b.0)
@@ -848,7 +867,7 @@ fn compare_request_priority(
 mod tests {
     use super::*;
     #[test]
-    fn infinite_error_priority_prefers_observer_local_then_distance_then_address() {
+    fn infinite_error_priority_prefers_local_then_projected_extent_and_view_center() {
         let local = CubePatchAddress::try_new(CubeFace::PositiveX, 2, 1, 1).unwrap();
         let other = CubePatchAddress::try_new(CubeFace::PositiveX, 2, 3, 1).unwrap();
         assert!(!address_contains_observer_direction(
@@ -865,21 +884,49 @@ mod tests {
             CubeFace::PositiveX,
             [0.0, 0.0]
         ));
-        let mut requests: [(CubePatchAddress, f64, bool, f64); 2] = [
-            (other, f64::INFINITY, false, 2.0),
-            (local, f64::INFINITY, true, 9.0),
+        let mut requests: [(CubePatchAddress, f64, bool, f64, f64, f64); 2] = [
+            (other, f64::INFINITY, false, 2.0, 0.0, 2.0),
+            (local, f64::INFINITY, true, 1.0, 0.0, 9.0),
         ];
         requests.sort_by(compare_request_priority);
         assert_eq!(requests[0].0, local);
         requests[0].2 = false;
-        requests[0].3 = 1.0;
-        requests[1].3 = 3.0;
+        requests[1].2 = false;
         requests.sort_by(compare_request_priority);
-        assert_eq!(requests[0].0, local);
-        requests[0].3 = 4.0;
-        requests[1].3 = 4.0;
+        assert_eq!(requests[0].0, other);
+        requests[0].3 = 1.0;
+        requests[1].3 = 1.0;
+        requests[0].2 = true;
+        requests[1].2 = false;
+        requests.sort_by(compare_request_priority);
+        assert_eq!(requests[0].0, other);
+        requests[0].2 = false;
+        requests[1].2 = false;
+        requests[0].4 = 0.0;
+        requests[1].4 = 1.0;
+        requests.sort_by(compare_request_priority);
+        assert_eq!(requests[0].0, other);
+        requests[0].4 = 1.0;
+        requests[1].4 = 1.0;
+        requests[0].5 = 4.0;
+        requests[1].5 = 4.0;
         requests.sort_by(compare_request_priority);
         assert_eq!(requests[0].0, local.min(other));
+    }
+    #[test]
+    fn finite_error_priority_remains_error_first_and_stable_by_address() {
+        let a = CubePatchAddress::try_new(CubeFace::PositiveX, 2, 1, 1).unwrap();
+        let b = CubePatchAddress::try_new(CubeFace::PositiveX, 2, 3, 1).unwrap();
+        let mut requests = [
+            (a, 3.0, true, 10.0, 5.0, 0.0),
+            (b, 8.0, false, 0.0, 0.0, 100.0),
+        ];
+        requests.sort_by(compare_request_priority);
+        assert_eq!(requests[0].0, b);
+        requests[0].1 = 3.0;
+        requests[1].1 = 3.0;
+        requests.sort_by(compare_request_priority);
+        assert_eq!(requests[0].0, a);
     }
     #[test]
     fn adversarial_corner_closure_to_level_twenty_is_complete_and_finite() {

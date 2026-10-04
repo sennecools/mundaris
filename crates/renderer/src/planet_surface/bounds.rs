@@ -185,10 +185,23 @@ impl PatchMetadata {
         {
             return Err(RenderPreparationError::InvalidDebugGeometry);
         }
-        let center = self.axis * (radius_m * self.alpha.cos());
-        let radius = radius_m * self.alpha.sin()
-            + radius_m * FLOOR
-            + extent.min_height_m.abs().max(extent.max_height_m.abs());
+        // Recenter the reference cap at the interval midpoint. A radial sample
+        // is within R_mid*sin(alpha) + half_width of this centre; convex drawn
+        // triangles remain inside the same ball. Absolute elevation must not
+        // act like uncertainty when a regional interval becomes narrow.
+        let midpoint = extent.min_height_m * 0.5 + extent.max_height_m * 0.5;
+        let effective_radius = radius_m + midpoint;
+        if effective_radius <= 0.0 {
+            return Err(RenderPreparationError::InvalidDebugGeometry);
+        }
+        let half_width = (extent.max_height_m - midpoint)
+            .max(midpoint - extent.min_height_m)
+            .next_up();
+        let center = self.axis * (effective_radius * self.alpha.cos());
+        let radius = (effective_radius * self.alpha.sin()
+            + half_width
+            + (radius_m + midpoint.abs() + half_width) * FLOOR)
+            .next_up();
         if !center.is_finite() || !radius.is_finite() {
             return Err(RenderPreparationError::InvalidDebugGeometry);
         }

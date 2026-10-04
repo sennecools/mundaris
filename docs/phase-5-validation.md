@@ -1,5 +1,48 @@
 # Phase 5 implementation and validation evidence
 
+## Phase 5.10 convergence checkpoint — 2026-10-04
+
+**Bounded CPU workers and exact derived-geometry optimizations are implemented;
+responsiveness acceptance A still fails. Morphology recovery has not begun and
+the existing appearance remains rejected.** The
+[20-part implementation/gate report](../MUNDARIS_PHASE_5_10_LOD_CONVERGENCE_AND_MORPHOLOGY_RECOVERY.md)
+and [retained evidence](evidence/phase510/README.md) distinguish fresh committed
+before-state captures, intermediate serial measurements and current worker probes.
+No commit or push has been performed; the starting HEAD is Phase 5.9 `c25e173`.
+
+Native terrain defaults to four workers; exact operation-budget fixtures remain
+serial and explicit 0/1/2/4 controls are available. Workers generate immutable
+patches and complete stitched-cover/common-refinement outputs; app retains bounded
+admission, cancellation, pins and atomic publication. Source ownership transfers
+through cancellation acknowledgement without duplicate charging, and worker-held
+invalid raw entries remain inaccessible but accounted. Cache Arc payload metadata
+and allocation counters are included. Aggregate CPU admission remains 128 MiB,
+including renderer staging and worker stack/scratch reservations.
+
+Construction retries 16/24/32 MiB overlays inside that aggregate cap instead of
+permanently freezing on the first rejection. Exact bins, identical-topology
+templates and integer separating-edge rejection reduce common-refinement work;
+full rational overlay is retained for positive-area overlap. Split/merge reference
+regressions compare endpoint/normal/reference/elevation/intermediate-sample bits on
+every face; integer rejection is checked across all 16×16 stitch-mask pairs.
+Generated height intervals and recentered balls use conservative proofs, not
+sampled extrema or relaxed interpolation certificates.
+
+The 150 ms morph default is unchanged. Numerical eight-seed/all-stitch stress is
+not eight-seed visual morphology acceptance. Native offscreen readback is not
+human interaction; Linux, high-DPI/OS sleep, GPU/compositor distributions and
+current-revision remote CI remain open. Final command outcomes and measured timed
+LOD/stage/memory results are recorded in the evidence index, not inferred from
+implementation or compilation. Earlier evidence below remains historical.
+Final cold-four source LOD is 9 at five seconds against requested LOD25; sequential
+descent reaches source LOD19 without transition deferral. Update plus render
+preparation still has a 97.082 ms descent outlier, and peak accounted memory is
+127.993 MiB (6,828-byte headroom). Final debug/release workspace suites each pass
+224 tests, zero failures and three ignored; two long-orbit tests and the native
+close-surface regression pass separately. Formatting, check, warnings-denied
+Clippy/Rustdoc and final forced worker-cancellation/retry tests pass. These results
+establish regression evidence, not acceptance A or recovered morphology.
+
 ## Phase 5.9 terrain readability and inspection — 2026-10-04
 
 **Diagnostic terrain colouring and displaced-surface inspection are implemented.

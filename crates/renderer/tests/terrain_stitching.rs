@@ -166,6 +166,104 @@ fn exercise_cover(addresses: Vec<CubePatchAddress>) {
 }
 
 #[test]
+fn reusing_matches_fresh_build_across_split_merge_and_cross_face_ownership() {
+    let topology = SurfaceTopology::new();
+    let roots: Vec<_> = CubeFace::ALL
+        .into_iter()
+        .map(CubePatchAddress::root)
+        .collect();
+    let split_face = CubeFace::PositiveX;
+    let mut split = Vec::new();
+    for address in &roots {
+        if address.face() == split_face {
+            split.extend(address.children().unwrap());
+        } else {
+            split.push(*address);
+        }
+    }
+    split.sort_unstable();
+    let make = |addresses: &[CubePatchAddress]| {
+        let active = active_surface_cover(addresses, &topology).unwrap();
+        let geometry: Vec<_> = addresses.iter().copied().map(fixture).collect();
+        (active, geometry)
+    };
+    let (root_active, root_raw) = make(&roots);
+    let root_refs: Vec<_> = root_raw.iter().collect();
+    let root_surface = StitchedSurface::build(&root_active, &root_refs, &topology).unwrap();
+    let (split_active, split_raw) = make(&split);
+    let split_refs: Vec<_> = split_raw.iter().collect();
+    let split_reused = StitchedSurface::build_reusing(
+        &split_active,
+        &split_refs,
+        &topology,
+        Some((&root_surface, &root_refs)),
+    )
+    .unwrap();
+    let split_fresh = StitchedSurface::build(&split_active, &split_refs, &topology).unwrap();
+    assert!(split_reused.reused_patches() > 0);
+    assert_surfaces_equal(&split_reused, &split_fresh);
+    let (merge_active, merge_raw) = make(&roots);
+    let merge_refs: Vec<_> = merge_raw.iter().collect();
+    let merged = StitchedSurface::build_reusing(
+        &merge_active,
+        &merge_refs,
+        &topology,
+        Some((&split_reused, &split_refs)),
+    )
+    .unwrap();
+    let fresh = StitchedSurface::build(&merge_active, &merge_refs, &topology).unwrap();
+    assert!(merged.reused_patches() > 0);
+    assert_surfaces_equal(&merged, &fresh);
+}
+
+fn assert_surfaces_equal(a: &StitchedSurface, b: &StitchedSurface) {
+    assert_eq!(a.patches().len(), b.patches().len());
+    for (left, right) in a.patches().iter().zip(b.patches()) {
+        assert_eq!(left.address(), right.address());
+        assert_eq!(
+            left.extent().min_height_m.to_bits(),
+            right.extent().min_height_m.to_bits()
+        );
+        assert_eq!(
+            left.extent().max_height_m.to_bits(),
+            right.extent().max_height_m.to_bits()
+        );
+        assert_eq!(
+            left.extent().guaranteed_opaque_radius_m.to_bits(),
+            right.extent().guaranteed_opaque_radius_m.to_bits()
+        );
+        let le = left.error();
+        let re = right.error();
+        assert_eq!(
+            [
+                le.sphere_m,
+                le.filtered_interpolation_m,
+                le.unresolved_m,
+                le.boundary_constraint_m,
+                le.morph_remaining_m,
+                le.numeric_m
+            ]
+            .map(f64::to_bits),
+            [
+                re.sphere_m,
+                re.filtered_interpolation_m,
+                re.unresolved_m,
+                re.boundary_constraint_m,
+                re.morph_remaining_m,
+                re.numeric_m
+            ]
+            .map(f64::to_bits),
+        );
+        assert!(left.samples().iter().zip(right.samples()).all(|(a, b)| {
+            a.position_body_m.to_array().map(f64::to_bits)
+                == b.position_body_m.to_array().map(f64::to_bits)
+                && a.normal_body.to_array().map(f64::to_bits)
+                    == b.normal_body.to_array().map(f64::to_bits)
+        }));
+    }
+}
+
+#[test]
 fn balanced_mixed_covers_reconcile_boundaries_and_stitch_indices() {
     let mut seed = 0x9e37_79b9_u64;
     for round in 0..96 {

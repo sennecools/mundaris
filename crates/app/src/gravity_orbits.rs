@@ -386,7 +386,7 @@ impl GravityOrbitsDemo {
             terrain_clearance: None,
             ready_mesh_probe: None,
             clearance_query_us: 0.0,
-            terrain: crate::terrain_population::TerrainPopulation::new()?,
+            terrain: crate::terrain_population::TerrainPopulation::interactive()?,
             scenario,
             validation_route: None,
             surfaces,
@@ -2136,6 +2136,21 @@ fn draw_ui(
                 let c=info.terrain_cache;let w=info.terrain_work;
                 ui.monospace(format!("Terrain: {} resident, {} pending; {} vertices / {} patches this frame, {:.3} ms; {:.2} MiB (peak {:.2}); evictions {}",c.resident_patches,w.pending_patches,w.vertices_generated,w.patches_completed,w.elapsed.as_secs_f64()*1000.0,c.resident_bytes as f64/1048576.0,c.peak_bytes as f64/1048576.0,c.evictions));
                 let cover=info.terrain_cover;
+                let d=cover.convergence;
+                ui.monospace(format!("Desired local LOD: {:?}\nReady local LOD: {:?}\nRendered source LOD: {:?}",d.desired_local_lod,d.ready_local_lod,d.rendered_local_lod));
+                ui.monospace(format!("Desired patches: {}{} · ready source: {}\nPending work: {} · queue: {} · workers: {}/{}\nActive morphs: {} · building cover: {} · blocked transactions: {}",
+                    cover.report.desired_patches,if cover.report.desired_estimate_incomplete {" (incomplete estimate)"}else{""},cover.active().len(),w.pending_patches,c.queued_patches,c.worker_jobs,c.worker_count,
+                    usize::from(cover.transition().is_some()),cover.construction_pending(),cover.report.deferred_transactions));
+                ui.small(format!("Main thread: scheduling {:.3} ms · raw publication {:.3} ms · cover publication {:.3} ms · diagnostics {:.3} ms. Worker CPU completed this frame {:.3} ms / {} samples; last stitch {:.3} ms / morph {:.3} ms",
+                    w.scheduling.as_secs_f64()*1000.0,w.publication.as_secs_f64()*1000.0,cover.result_publication.as_secs_f64()*1000.0,d.diagnostic_cpu.as_secs_f64()*1000.0,
+                    w.worker_cpu.as_secs_f64()*1000.0,w.worker_samples_completed,cover.worker_stitch_cpu.as_secs_f64()*1000.0,cover.worker_morph_cpu.as_secs_f64()*1000.0));
+                let e=d.local_error;
+                ui.small(format!("Local certificate metres: sphere {:.3e} · interpolation {:.3e} · unresolved {:.3e} · boundary {:.3e} · morph {:.3e} · numeric {:.3e}",e.sphere_m,e.filtered_interpolation_m,e.unresolved_m,e.boundary_constraint_m,e.morph_remaining_m,e.numeric_m));
+                if !d.target_certifiable {ui.colored_label(egui::Color32::YELLOW,"Local pixel target not certifiable by LOD30; not merely queued work");}
+                else if cover.report.budget_constrained {ui.label("Local target certifiable; current refinement resource-constrained");}
+                else if d.rendered_local_lod<d.desired_local_lod {ui.label("Local target certifiable; generation / replacement pending");}
+                ui.small(format!("Worker reservations {:.2} MiB · stacks/scratch {:.2} MiB · completed cover reservation {:.2} MiB · cancellations {}",
+                    c.worker_reserved_bytes as f64/1048576.0,c.worker_fixed_bytes as f64/1048576.0,c.completed_unpublished_bytes as f64/1048576.0,c.cancellations));
                 if cover.transition_deferred {ui.colored_label(egui::Color32::YELLOW,"Transition reservation cannot fit replacement; complete source retained. Reset terrain or explicitly change morph duration to retry.");}
                 ui.small(format!("Accounted aggregate {:.2} MiB / peak {:.2} MiB; {} pinned. Selector {:.3} ms / stitching {:.3} ms / morph construction {:.3} ms",(c.resident_bytes+c.external_bytes) as f64/1048576.0,c.peak_aggregate_bytes as f64/1048576.0,c.pinned_patches,cover.selection_preparation.as_secs_f64()*1000.0,cover.stitch_preparation.as_secs_f64()*1000.0,cover.morph_preparation.as_secs_f64()*1000.0));
                 if let Some((mesh,fraction))=cover.transition() {

@@ -100,6 +100,16 @@ fn check_transition(old_addresses: Vec<CubePatchAddress>, new_addresses: Vec<Cub
     )
     .unwrap();
     assert!(!transition.triangles().is_empty());
+    #[cfg(feature = "surface-profile")]
+    {
+        let profile = transition.profile();
+        assert!(profile.overlapping_patch_pairs > 0);
+        assert!(profile.destination_triangles_precomputed > 0);
+        assert_eq!(profile.emitted_triangles, transition.triangles().len());
+        assert!(profile.triangle_pairs_considered >= profile.bbox_rejected_pairs);
+        assert!(profile.triangle_pairs_considered < profile.potential_triangle_pairs);
+        assert!(profile.clipped_pairs > 0);
+    }
     for fraction in [0.0, 0.125, 0.5, 0.875, 1.0] {
         let mut edges = std::collections::BTreeMap::<([i64; 3], [i64; 3]), (usize, i32)>::new();
         let mut append = |points: [DVec3; 3]| {

@@ -48,3 +48,43 @@ pub fn terrain_surface_certificate(
         },
     ))
 }
+
+/// Intersect the global interval with a certified regional interval around the
+/// already evaluated chart-centre sample. This is not a sampled-extrema bound:
+/// integrating the global tangent-gradient bound along a unit-sphere geodesic
+/// proves variation <= G * alpha throughout the cap. The omitted-band allowance
+/// covers complete truth as well as the filtered field; numeric margins cover
+/// radial reconstruction and the centre direction. Interpolation is unchanged.
+pub(super) fn certificate_for_samples(
+    generator: &TerrainGenerator,
+    address: CubePatchAddress,
+    metadata: PatchMetadata,
+    samples: &[SurfaceGeometrySample],
+) -> Result<(SurfaceExtent, SurfaceErrorContributions)> {
+    let (mut extent, error) = terrain_surface_certificate(generator, address, metadata)?;
+    let (axis, alpha) = metadata.cap();
+    let footprint = TerrainFootprint::new(
+        generator.radius_m() * 2.0 / (16.0 * (1u64 << address.level()) as f64),
+    )?;
+    let certificate = generator.bounds_for_region(
+        DirectionalCap::new(Direction3::try_new(axis)?, alpha)?,
+        footprint,
+    )?;
+    let centre = samples
+        .get(8 * 17 + 8)
+        .ok_or_else(|| anyhow::anyhow!("missing terrain centre sample"))?;
+    let height = centre.position_body_m.length() - generator.radius_m();
+    let variation = (certificate.cartesian_height_gradient_bound_m()
+        * (alpha + 64.0 * f64::EPSILON).next_up())
+    .next_up();
+    let allowance = ((variation + certificate.unresolved_height_bound_m()).next_up()
+        + error.numeric_m)
+        .next_up();
+    extent.min_height_m = extent.min_height_m.max((height - allowance).next_down());
+    extent.max_height_m = extent.max_height_m.min((height + allowance).next_up());
+    anyhow::ensure!(
+        extent.min_height_m <= extent.max_height_m,
+        "invalid regional terrain interval"
+    );
+    Ok((extent, error))
+}

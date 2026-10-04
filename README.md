@@ -16,6 +16,13 @@ quality convergence, morphology and platform acceptance gaps remain open.
 The [Phase 5.8 capture index](docs/evidence/phase58/README.md) links retained scenes,
 exact manifests and the reproduction command.
 
+**Phase 5.10 checkpoint:** native terrain generation and stitch/morph construction
+now use four bounded CPU workers (`MUNDARIS_TERRAIN_WORKERS=0..4` for comparisons),
+under the unchanged 128 MiB aggregate cap. Interactive quality convergence still
+fails acceptance A; morphology recovery is therefore blocked. See the
+[implementation/gate report](MUNDARIS_PHASE_5_10_LOD_CONVERGENCE_AND_MORPHOLOGY_RECOVERY.md)
+and [timed evidence](docs/evidence/phase510/README.md).
+
 ## Prerequisites
 
 - Stable Rust with the `rustfmt` and `clippy` components (the included `rust-toolchain.toml` requests them).
@@ -54,8 +61,9 @@ launching. It authors the deterministic fixture once, then renders cached f64
 displaced geometry; disabling the preview restores the Phase 4 sphere path.
 The preview uses balanced adaptive displaced covers and common-refinement morphs
 (150 ms by default; `MUNDARIS_TERRAIN_MORPH_MS=0` selects the static checkpoint).
-Quality remains resource-constrained, synchronous transition preparation can stall,
-and close-range terrain navigation remains incomplete. See
+Quality remains resource-constrained; native transition construction is off-thread,
+but the serial comparison path can stall. Close-range terrain navigation and
+interactive convergence remain incomplete. See
 [checkpoint evidence](docs/phase-5-validation.md) and
 [implementation](docs/phase-5-7-adaptive-terrain.md).
 

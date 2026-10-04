@@ -1,4 +1,4 @@
-//! Bounded, disposable CPU terrain geometry and resumable synchronous generation.
+//! Bounded, disposable CPU terrain geometry with serial and worker generation.
 //! Neither observer motion nor renderer resource lifetime participates in identity.
 use anyhow::{Result, bail};
 use mundaris_math::{Direction3, surface::*};
@@ -6,13 +6,15 @@ use mundaris_renderer::planet_surface::*;
 use mundaris_world::{BodyId, terrain::*};
 use std::{
     mem::size_of,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 mod certificate;
 pub use certificate::terrain_surface_certificate;
 mod adaptive;
-pub use adaptive::{AdaptiveTerrainCover, TerrainSelectionPolicy};
+pub use adaptive::{AdaptiveTerrainCover, TerrainConvergenceDiagnostic, TerrainSelectionPolicy};
+mod workers;
 
 pub const TERRAIN_CPU_CAP_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_TERRAIN_PATCHES: usize = 4096;
@@ -218,18 +220,7 @@ impl TerrainReadyCover {
         // App has one aggregate live cover coordinator. Pin all active geometry
         // and fallback roots before admitting any replacement allocations.
         cache.unpin_body(identity.body);
-        cache.requests.retain(|r| {
-            r.identity.body != identity.body
-                || self.target.contains(&r.address)
-                || r.address.level() == 0
-        });
-        if cache.building.as_ref().is_some_and(|b| {
-            b.request.identity.body == identity.body
-                && b.request.address.level() != 0
-                && !self.target.contains(&b.request.address)
-        }) {
-            cache.building = None;
-        }
+        cache.retain_required(identity, &self.target);
         for p in &self.active {
             cache.pin(identity, p.address);
         }
@@ -349,6 +340,11 @@ pub struct TerrainWorkReport {
     pub elapsed: Duration,
     pub allocation_delta_bytes: isize,
     pub pending_patches: usize,
+    /// CPU time for completed worker calculations; not main-thread latency.
+    pub worker_cpu: Duration,
+    pub worker_samples_completed: usize,
+    pub scheduling: Duration,
+    pub publication: Duration,
 }
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TerrainCacheReport {
@@ -362,13 +358,21 @@ pub struct TerrainCacheReport {
     pub pinned_bytes: usize,
     pub external_bytes: usize,
     pub peak_aggregate_bytes: usize,
+    pub worker_count: usize,
+    pub worker_jobs: usize,
+    pub queued_patches: usize,
+    pub worker_reserved_bytes: usize,
+    pub worker_fixed_bytes: usize,
+    pub completed_unpublished_bytes: usize,
+    pub cancellations: u64,
 }
 struct Entry {
     identity: TerrainGeometryIdentity,
-    patch: GeneratedSurfacePatch,
+    patch: Arc<GeneratedSurfacePatch>,
     access: u64,
     pinned: bool,
     metadata: PatchMetadata,
+    valid: bool,
 }
 struct Request {
     identity: TerrainGeometryIdentity,
@@ -382,7 +386,7 @@ struct Builder {
 }
 
 /// One aggregate cache/queue for all enabled bodies. All retained capacities and
-/// the single private builder are charged to the same cap. No worker threads.
+/// builders, worker stacks/scratch, inputs and outputs are charged to the same cap.
 pub struct TerrainPatchCache {
     entries: Vec<Entry>,
     requests: Vec<Request>,
@@ -393,6 +397,10 @@ pub struct TerrainPatchCache {
     sequence: u64,
     report: TerrainCacheReport,
     topology: SurfaceTopology,
+    workers: Option<workers::TerrainWorkers>,
+    // A cover reservation also owns the shared source charge until its
+    // coordinator consumes the result, including cancellation acknowledgements.
+    completed_covers: Vec<workers::Completion>,
 }
 impl TerrainPatchCache {
     pub fn new(cap_bytes: usize, max_entries: usize) -> Result<Self> {
@@ -414,11 +422,42 @@ impl TerrainPatchCache {
             sequence: 0,
             report: TerrainCacheReport::default(),
             topology: SurfaceTopology::new(),
+            workers: None,
+            completed_covers: Vec::with_capacity(4),
         };
         if cache.resident_bytes() > cap_bytes {
             bail!("terrain quota cannot hold bookkeeping");
         }
         Ok(cache)
+    }
+    /// Zero keeps the exact operation-budget serial reference path for tests.
+    pub fn new_with_workers(cap_bytes: usize, max_entries: usize, count: usize) -> Result<Self> {
+        let mut cache = Self::new(cap_bytes, max_entries)?;
+        if count != 0 {
+            anyhow::ensure!(
+                (1..=4).contains(&count),
+                "terrain worker count must be 0..=4"
+            );
+            anyhow::ensure!(
+                cache
+                    .resident_bytes()
+                    .saturating_add(workers::TerrainWorkers::required_bytes(count))
+                    <= cap_bytes,
+                "terrain quota cannot hold workers"
+            );
+            cache.workers = Some(workers::TerrainWorkers::new(count)?);
+            anyhow::ensure!(
+                cache.resident_bytes() <= cap_bytes,
+                "terrain quota cannot hold workers"
+            );
+            cache.record_peak();
+        }
+        Ok(cache)
+    }
+    pub fn worker_count(&self) -> usize {
+        self.workers
+            .as_ref()
+            .map_or(0, workers::TerrainWorkers::count)
     }
     pub fn resident_bytes(&self) -> usize {
         size_of::<Self>()
@@ -427,16 +466,32 @@ impl TerrainPatchCache {
             + 64 * 1024
             + self.entries.capacity() * size_of::<Entry>()
             + self.requests.capacity() * size_of::<Request>()
+            + self.completed_covers.capacity() * size_of::<workers::Completion>()
             + self.topology.allocated_bytes()
             - size_of::<SurfaceTopology>()
             + self
                 .entries
                 .iter()
-                .map(|e| e.patch.resident_heap_capacity_bytes())
+                .map(|e| {
+                    e.patch.resident_heap_capacity_bytes()
+                        + size_of::<GeneratedSurfacePatch>()
+                        + 2 * size_of::<usize>() // Arc strong/weak allocation counters
+                })
                 .sum::<usize>()
             + self.building.as_ref().map_or(0, |b| {
                 b.samples.capacity() * size_of::<SurfaceGeometrySample>()
+                    + size_of::<GeneratedSurfacePatch>()
+                    + 2 * size_of::<usize>()
             })
+            + self
+                .workers
+                .as_ref()
+                .map_or(0, workers::TerrainWorkers::bytes)
+            + self
+                .completed_covers
+                .iter()
+                .map(|c| c.reserved_bytes)
+                .sum::<usize>()
     }
     fn record_peak(&mut self) {
         self.report.peak_bytes = self.report.peak_bytes.max(self.resident_bytes());
@@ -454,14 +509,44 @@ impl TerrainPatchCache {
                 .entries
                 .iter()
                 .filter(|e| e.pinned)
-                .map(|e| size_of::<Entry>() + e.patch.resident_heap_bytes())
+                .map(|e| {
+                    size_of::<Entry>()
+                        + e.patch.resident_heap_bytes()
+                        + size_of::<GeneratedSurfacePatch>()
+                        + 2 * size_of::<usize>()
+                })
                 .sum(),
             external_bytes: self.external_bytes,
+            worker_count: self.worker_count(),
+            worker_jobs: self
+                .workers
+                .as_ref()
+                .map_or(0, workers::TerrainWorkers::in_flight),
+            queued_patches: self.requests.len(),
+            worker_reserved_bytes: self
+                .workers
+                .as_ref()
+                .map_or(0, workers::TerrainWorkers::reservations),
+            worker_fixed_bytes: self
+                .workers
+                .as_ref()
+                .map_or(0, workers::TerrainWorkers::fixed_bytes),
+            completed_unpublished_bytes: self
+                .completed_covers
+                .iter()
+                .map(|c| c.reserved_bytes)
+                .sum(),
             ..self.report
         }
     }
     pub fn pending(&self) -> usize {
-        self.requests.len() + usize::from(self.building.is_some())
+        self.requests.len()
+            + usize::from(self.building.is_some())
+            + self
+                .workers
+                .as_ref()
+                .map_or(0, workers::TerrainWorkers::in_flight)
+            + self.completed_covers.len()
     }
     pub fn pending_for_body(&self, body: BodyId) -> usize {
         self.requests
@@ -473,6 +558,15 @@ impl TerrainPatchCache {
                     .as_ref()
                     .is_some_and(|b| b.request.identity.body == body),
             )
+            + self
+                .workers
+                .as_ref()
+                .map_or(0, |w| w.pending_for_body(body))
+            + self
+                .completed_covers
+                .iter()
+                .filter(|c| c.identity.body == body)
+                .count()
     }
     /// Admit derived cover/transition capacity into the same aggregate CPU cap.
     /// Pressure only evicts unpinned entries; failure retains valid old coverage.
@@ -501,6 +595,7 @@ impl TerrainPatchCache {
     /// Stop inactive-body generation while retaining reusable unpinned raw patches.
     pub fn cancel_body_work(&mut self, body: BodyId) {
         self.unpin_body(body);
+        self.cancel_workers(|identity, _| identity.body == body);
         self.requests.retain(|r| r.identity.body != body);
         if self
             .building
@@ -509,6 +604,58 @@ impl TerrainPatchCache {
         {
             self.building = None;
         }
+    }
+    fn cancel_workers(
+        &mut self,
+        predicate: impl Fn(&TerrainGeometryIdentity, Option<CubePatchAddress>) -> bool,
+    ) {
+        if let Some(pool) = &mut self.workers {
+            self.report.cancellations += pool.cancel_where(&predicate) as u64;
+        }
+        for completion in &mut self.completed_covers {
+            if predicate(&completion.identity, None)
+                && !matches!(completion.result, Ok(workers::Output::Cancelled))
+            {
+                completion.result = Ok(workers::Output::Cancelled);
+                self.report.cancellations += 1;
+            }
+        }
+    }
+    fn take_cover_completion(&mut self, id: u64) -> Option<workers::Completion> {
+        self.completed_covers
+            .iter()
+            .position(|c| c.id == id)
+            .map(|index| self.completed_covers.remove(index))
+    }
+    /// The coordinator is about to drop its source. In-flight work retains its
+    /// charge until acknowledgement; an already completed reservation can go now.
+    fn abandon_cover(&mut self, id: u64) {
+        self.take_cover_completion(id);
+        if let Some(pool) = &mut self.workers {
+            self.report.cancellations += u64::from(pool.abandon_cover(id));
+        }
+    }
+    fn retain_required(
+        &mut self,
+        identity: &TerrainGeometryIdentity,
+        required: &[CubePatchAddress],
+    ) {
+        let keep = |address: CubePatchAddress| address.level() == 0 || required.contains(&address);
+        let before = self.requests.len();
+        self.requests
+            .retain(|r| r.identity.body != identity.body || keep(r.address));
+        self.report.cancellations += (before - self.requests.len()) as u64;
+        if self
+            .building
+            .as_ref()
+            .is_some_and(|b| b.request.identity.body == identity.body && !keep(b.request.address))
+        {
+            self.building = None;
+            self.report.cancellations += 1;
+        }
+        self.cancel_workers(|i, address| {
+            i.body == identity.body && address.is_some_and(|a| !keep(a))
+        });
     }
     pub fn pin(&mut self, identity: &TerrainGeometryIdentity, address: CubePatchAddress) -> bool {
         if let Some(index) = self.entry_index(identity, address) {
@@ -521,8 +668,16 @@ impl TerrainPatchCache {
     /// Cancel obsolete work and remove stale geometry for this body before any
     /// new-revision result can be observed. Other bodies retain their entries.
     pub fn invalidate_body(&mut self, identity: &TerrainGeometryIdentity) {
+        self.cancel_workers(|i, _| i.body == identity.body && i != identity);
+        for e in &mut self.entries {
+            if e.identity.body == identity.body && e.identity != *identity {
+                // Keep worker-held input bytes charged, but never expose stale truth.
+                e.valid = false;
+                e.pinned = false;
+            }
+        }
         self.entries
-            .retain(|e| e.identity.body != identity.body || e.identity == *identity);
+            .retain(|e| e.valid || Arc::strong_count(&e.patch) > 1);
         self.requests
             .retain(|r| r.identity.body != identity.body || r.identity == *identity);
         if self.building.as_ref().is_some_and(|b| {
@@ -556,7 +711,7 @@ impl TerrainPatchCache {
         address: CubePatchAddress,
     ) -> Option<&GeneratedSurfacePatch> {
         self.entry_index(identity, address)
-            .map(|index| &self.entries[index].patch)
+            .map(|index| self.entries[index].patch.as_ref())
     }
     // Compact sorted storage avoids an O(patches²) settled-view scan without
     // unaccounted hash-table buckets. Equal addresses still verify full truth.
@@ -571,7 +726,7 @@ impl TerrainPatchCache {
         self.entries[start..]
             .iter()
             .take_while(|e| e.patch.address() == address)
-            .position(|e| e.identity == *identity)
+            .position(|e| e.valid && e.identity == *identity)
             .map(|offset| start + offset)
     }
     fn metadata(
@@ -599,6 +754,10 @@ impl TerrainPatchCache {
                 .building
                 .as_ref()
                 .is_some_and(|b| b.request.identity == *identity && b.request.address == address)
+            || self
+                .workers
+                .as_ref()
+                .is_some_and(|w| w.patch_pending(identity, address))
         {
             return true;
         }
@@ -633,6 +792,9 @@ impl TerrainPatchCache {
         {
             builder.request.pin_when_ready = true;
         }
+        if let Some(pool) = &mut self.workers {
+            pool.pin(identity, address);
+        }
         admitted
     }
     fn evict_one(&mut self) -> bool {
@@ -640,7 +802,7 @@ impl TerrainPatchCache {
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, e)| !e.pinned)
+            .filter(|(_, e)| !e.pinned && Arc::strong_count(&e.patch) == 1)
             .min_by_key(|(_, e)| (e.access, e.patch.address()))
             .map(|(i, _)| i);
         if let Some(i) = victim {
@@ -662,6 +824,9 @@ impl TerrainPatchCache {
         if !(1..=MAX_GENERATION_BATCH).contains(&batch_size) {
             bail!("invalid terrain microbatch size");
         }
+        if self.workers.is_some() {
+            return self.generate_workers(vertex_budget != 0);
+        }
         let start = Instant::now();
         let before = self.resident_bytes();
         let mut work = TerrainWorkReport::default();
@@ -672,7 +837,9 @@ impl TerrainPatchCache {
                 if self.requests.is_empty() {
                     break;
                 }
-                let bytes = GRID_SAMPLES * size_of::<SurfaceGeometrySample>();
+                let bytes = GRID_SAMPLES * size_of::<SurfaceGeometrySample>()
+                    + size_of::<GeneratedSurfacePatch>()
+                    + 2 * size_of::<usize>();
                 while self.entries.len() >= self.max_entries
                     || self.resident_bytes() + self.external_bytes + bytes > self.cap_bytes
                 {
@@ -728,7 +895,12 @@ impl TerrainPatchCache {
             work.vertices_generated += count;
             if builder.samples.len() == GRID_SAMPLES {
                 let metadata = PatchMetadata::build(address, &self.topology)?;
-                let (extent, error) = terrain_surface_certificate(generator, address, metadata)?;
+                let (extent, error) = certificate::certificate_for_samples(
+                    generator,
+                    address,
+                    metadata,
+                    &builder.samples,
+                )?;
                 let builder = self
                     .building
                     .take()
@@ -752,10 +924,11 @@ impl TerrainPatchCache {
                     insertion,
                     Entry {
                         identity: builder.request.identity,
-                        patch,
+                        patch: Arc::new(patch),
                         access: self.sequence,
                         pinned: builder.request.pin_when_ready,
                         metadata,
+                        valid: true,
                     },
                 );
                 work.patches_completed += 1;
@@ -765,6 +938,98 @@ impl TerrainPatchCache {
         work.elapsed = start.elapsed();
         work.allocation_delta_bytes = self.resident_bytes() as isize - before as isize;
         work.pending_patches = self.pending();
+        Ok(work)
+    }
+    fn generate_workers(&mut self, schedule: bool) -> Result<TerrainWorkReport> {
+        let start = Instant::now();
+        let before = self.resident_bytes();
+        self.entries
+            .retain(|e| e.valid || Arc::strong_count(&e.patch) > 1);
+        let mut work = TerrainWorkReport::default();
+        while let Some(completion) = self
+            .workers
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("missing workers"))?
+            .take_next()?
+        {
+            work.worker_cpu += completion.cpu;
+            if completion.address.is_none() {
+                anyhow::ensure!(
+                    self.completed_covers.len() < 4,
+                    "terrain cover completion capacity exceeded"
+                );
+                self.completed_covers.push(completion);
+                continue;
+            }
+            match completion.result {
+                Ok(workers::Output::Patch(patch, metadata)) => {
+                    let address = patch.address();
+                    anyhow::ensure!(
+                        completion.address == Some(address),
+                        "worker patch identity mismatch"
+                    );
+                    self.sequence = self
+                        .sequence
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow::anyhow!("terrain access sequence overflow"))?;
+                    let insertion = self
+                        .entries
+                        .partition_point(|e| e.patch.address() <= address);
+                    self.entries.insert(
+                        insertion,
+                        Entry {
+                            identity: completion.identity,
+                            patch: Arc::new(patch),
+                            metadata,
+                            access: self.sequence,
+                            pinned: completion.pin_when_ready,
+                            valid: true,
+                        },
+                    );
+                    work.patches_completed += 1;
+                    work.worker_samples_completed += GRID_SAMPLES;
+                }
+                Ok(workers::Output::Cover(_)) => bail!("unexpected terrain patch cover result"),
+                Ok(workers::Output::Cancelled) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        work.publication = start.elapsed();
+        let scheduling_start = Instant::now();
+        while schedule
+            && !self.requests.is_empty()
+            && self.workers.as_ref().is_some_and(|w| w.idle())
+        {
+            let in_flight = self
+                .workers
+                .as_ref()
+                .map_or(0, workers::TerrainWorkers::in_flight);
+            while self.entries.len() + in_flight >= self.max_entries
+                || self.resident_bytes() + self.external_bytes + workers::PATCH_RESERVATION
+                    > self.cap_bytes
+            {
+                if !self.evict_one() {
+                    break;
+                }
+            }
+            if self.entries.len() + in_flight >= self.max_entries
+                || self.resident_bytes() + self.external_bytes + workers::PATCH_RESERVATION
+                    > self.cap_bytes
+            {
+                break;
+            }
+            let request = self.requests.remove(0);
+            self.workers
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("missing workers"))?
+                .submit_patch(&request)?;
+            self.record_peak();
+        }
+        work.scheduling = scheduling_start.elapsed();
+        work.elapsed = start.elapsed();
+        work.pending_patches = self.pending();
+        work.allocation_delta_bytes = self.resident_bytes() as isize - before as isize;
+        self.record_peak();
         Ok(work)
     }
 }

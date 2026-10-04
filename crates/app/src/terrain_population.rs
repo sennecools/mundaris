@@ -16,10 +16,25 @@ pub struct TerrainPopulation {
 }
 impl TerrainPopulation {
     pub fn new() -> Result<Self> {
+        Self::with_worker_count(0)
+    }
+    /// Native default retains application CPU headroom with four bounded workers.
+    /// Serial operation-count fixtures use `new`; controls permit measured A/B.
+    pub fn interactive() -> Result<Self> {
+        let count = match std::env::var("MUNDARIS_TERRAIN_WORKERS") {
+            Ok(value) => value.parse::<usize>()?,
+            Err(std::env::VarError::NotPresent) => 4,
+            Err(error) => return Err(error.into()),
+        };
+        Self::with_worker_count(count)
+    }
+    /// Explicit count makes serial/1/2/4 measurements use the same admission path.
+    pub fn with_worker_count(worker_count: usize) -> Result<Self> {
         Ok(Self {
-            cache: TerrainPatchCache::new(
-                TERRAIN_CPU_CAP_BYTES - 16 * 1024 * 1024,
+            cache: TerrainPatchCache::new_with_workers(
+                TERRAIN_CPU_CAP_BYTES,
                 MAX_TERRAIN_PATCHES,
+                worker_count,
             )?,
             cover: AdaptiveTerrainCover::default(),
             work: TerrainWorkReport::default(),
@@ -93,6 +108,7 @@ impl TerrainPopulation {
                 );
                 self.cache.cancel_body_work(old);
             }
+            self.cover.abandon_construction(&mut self.cache);
             self.cover = AdaptiveTerrainCover::default();
             anyhow::ensure!(
                 self.cache.reserve_external(0),
