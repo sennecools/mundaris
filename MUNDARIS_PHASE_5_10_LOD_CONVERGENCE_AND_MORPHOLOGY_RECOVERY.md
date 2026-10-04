@@ -6,6 +6,11 @@ commit `c25e173`. The worker/convergence foundation is an intermediate checkpoin
 not Phase 5.10 completion. Nothing has been pushed. Existing
 unrelated documentation and workflow changes are preserved.
 
+This report retains the foundation measurements. The subsequent
+[Phase 5.10B recovery report](docs/phase-5-10b-acceptance-a.md) and
+[evidence index](docs/evidence/phase510b/README.md) record the latest certificate,
+scheduling and preparation changes; Acceptance A still fails.
+
 ## 1. Acceptance and sequencing
 
 Interactive convergence must be demonstrated before substantial morphology tuning.

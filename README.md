@@ -23,6 +23,12 @@ fails acceptance A; morphology recovery is therefore blocked. See the
 [implementation/gate report](MUNDARIS_PHASE_5_10_LOD_CONVERGENCE_AND_MORPHOLOGY_RECOVERY.md)
 and [timed evidence](docs/evidence/phase510/README.md).
 
+The [Phase 5.10B recovery checkpoint](docs/phase-5-10b-acceptance-a.md) corrects
+certificate interpretation and reduces measured preparation costs, but Acceptance A
+still fails: cold useful-quality convergence and operational memory headroom remain
+open. [Latest evidence](docs/evidence/phase510b/README.md) separates current probes
+and captures from intermediate experiments. Morphology remains unchanged.
+
 ## Prerequisites
 
 - Stable Rust with the `rustfmt` and `clippy` components (the included `rust-toolchain.toml` requests them).
