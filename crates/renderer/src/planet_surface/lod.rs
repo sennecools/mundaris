@@ -128,6 +128,11 @@ pub struct LodReport {
     pub scratch_bytes: usize,
     pub quality_pending: bool,
     pub settled: bool,
+    /// Current/last atomic refinement closure, not the global desired estimate.
+    pub refinement_parent: Option<CubePatchAddress>,
+    pub refinement_dependencies: usize,
+    pub refinement_balance_parents: usize,
+    pub refinement_local: bool,
     /// Opt-in coarse CPU timings and scratch-capacity observations for this update.
     #[cfg(feature = "surface-profile")]
     pub profile: LodProfile,
@@ -236,6 +241,70 @@ impl SurfaceLodSession {
     pub fn covering_leaves(&self) -> impl Iterator<Item = CubePatchAddress> + '_ {
         self.cover.iter().copied()
     }
+    /// Exact raw-generation closure for one prospective local split. This does
+    /// not mutate coverage/readiness or require unrelated desired refinements.
+    pub fn replacement_dependencies(
+        &self,
+        parent: CubePatchAddress,
+        settings: &LodSettings,
+    ) -> Result<Vec<CubePatchAddress>, RenderPreparationError> {
+        if !self.cover.contains(&parent) || parent.level() >= settings.max_level {
+            return Ok(Vec::new());
+        }
+        let mut proposal = self.cover.clone();
+        let mut dependencies = AddressSet::new();
+        let mut coarse = AddressSet::new();
+        proposal.remove(&parent);
+        let children = parent
+            .children()
+            .map_err(|_| RenderPreparationError::InvalidDebugGeometry)?;
+        proposal.extend(children);
+        dependencies.extend(children);
+        loop {
+            balance_violations(&proposal, &mut coarse);
+            if coarse.is_empty() {
+                break;
+            }
+            if proposal.len() + 3 * coarse.len() > settings.cover_limit {
+                return Err(RenderPreparationError::InvalidBudget);
+            }
+            for &address in &coarse {
+                let children = address
+                    .children()
+                    .map_err(|_| RenderPreparationError::InvalidDebugGeometry)?;
+                proposal.remove(&address);
+                dependencies.remove(&address);
+                proposal.extend(children);
+                dependencies.extend(children);
+            }
+        }
+        Ok(dependencies.iter().copied().collect())
+    }
+    /// Restore an externally retained complete source after abandoning an
+    /// unpublished geometry transaction. Never call this during an active morph.
+    pub fn restore_published_cover(
+        &mut self,
+        patches: &[ActiveSurfacePatch],
+    ) -> Result<(), RenderPreparationError> {
+        let addresses: Vec<_> = patches.iter().map(|p| p.address).collect();
+        super::stitching::validate_cover(&addresses)?;
+        let restored: AddressSet = addresses.into_iter().collect();
+        balance_violations(&restored, &mut self.coarse);
+        if !self.coarse.is_empty() {
+            return Err(RenderPreparationError::InvalidDebugGeometry);
+        }
+        for &address in &restored {
+            if self.cache.get(address)?.is_none()
+                && !self.cache.build(address, &self.topology, &restored)?
+            {
+                return Err(RenderPreparationError::InvalidBudget);
+            }
+        }
+        self.cover = restored;
+        self.pending.clear();
+        self.pending_parent = None;
+        Ok(())
+    }
     pub fn update(
         &mut self,
         input: &SurfaceViewInput<'_, '_>,
@@ -328,6 +397,13 @@ impl SurfaceLodSession {
                 self.cover.insert(parent);
                 self.previous_splits.remove(&parent);
                 report.merges += 1;
+                report.refinement_parent = Some(parent);
+                report.refinement_dependencies = 1;
+                report.refinement_balance_parents = 0;
+                report.refinement_local = address_contains_observer_direction(
+                    parent,
+                    source.observer_in_source().metres(),
+                );
                 if let Some(p) = policy.as_deref_mut() {
                     p.replacement_committed();
                 }
@@ -385,17 +461,16 @@ impl SurfaceLodSession {
             }
         }
         self.requests.sort_by(compare_request_priority);
-        // Preserve the previous finite-error dependency completion policy. Only
-        // uncertifiably infinite work needs the camera-local urgency tie-break.
-        if self.requests.first().is_none_or(|r| !r.1.is_infinite())
-            && let Some(parent) = self.pending_parent
+        // Finish an admitted closure unless a newly relevant camera-local chain
+        // outranks it. Peripheral infinite certificates must not starve a local
+        // finite-error request; thresholds and balance rules are unchanged.
+        if let Some(parent) = self.pending_parent
             && let Some(index) = self.requests.iter().position(|r| r.0 == parent)
+            && (self.requests[index].2 || self.requests.first().is_none_or(|r| !r.2))
         {
             let request = self.requests.remove(index);
             self.requests.insert(0, request);
         }
-        // Do not let a retained dependency transaction leapfrog newly observed
-        // infinite-error work; the ordinary deterministic priority order selects it.
         // Highest-error local closures allow progress without simultaneously pinning
         // two whole global covers. All balancing dependencies activate atomically.
         for index in 0..self.requests.len() {
@@ -433,6 +508,7 @@ impl SurfaceLodSession {
                             .children()
                             .map_err(|_| RenderPreparationError::InvalidDebugGeometry)?;
                         self.proposal.remove(&p);
+                        self.pending.remove(&p);
                         self.proposal.extend(children);
                         self.pending.extend(children);
                         forced += 1;
@@ -503,6 +579,10 @@ impl SurfaceLodSession {
                     report.constrained_refinements += 1;
                 }
             }
+            report.refinement_parent = Some(parent);
+            report.refinement_dependencies = self.pending.len().max(4 + forced * 4);
+            report.refinement_balance_parents = forced;
+            report.refinement_local = self.requests[index].2;
             if !ready {
                 report.deferred_transactions += 1;
                 if self.cache.len() + self.pending.len() > 4096 {
@@ -851,17 +931,19 @@ fn compare_request_priority(
     a: &(CubePatchAddress, f64, bool, f64, f64, f64),
     b: &(CubePatchAddress, f64, bool, f64, f64, f64),
 ) -> std::cmp::Ordering {
-    b.1.total_cmp(&a.1).then_with(|| {
-        if a.1.is_infinite() && b.1.is_infinite() {
-            b.2.cmp(&a.2)
-                .then_with(|| b.3.total_cmp(&a.3))
-                .then_with(|| a.4.total_cmp(&b.4))
-                .then_with(|| a.5.total_cmp(&b.5))
-                .then(a.0.cmp(&b.0))
-        } else {
-            a.0.cmp(&b.0)
-        }
-    })
+    b.2.cmp(&a.2)
+        .then_with(|| b.1.total_cmp(&a.1))
+        .then_with(|| {
+            if a.1.is_infinite() && b.1.is_infinite() {
+                b.2.cmp(&a.2)
+                    .then_with(|| b.3.total_cmp(&a.3))
+                    .then_with(|| a.4.total_cmp(&b.4))
+                    .then_with(|| a.5.total_cmp(&b.5))
+                    .then(a.0.cmp(&b.0))
+            } else {
+                a.0.cmp(&b.0)
+            }
+        })
 }
 #[cfg(test)]
 mod tests {
@@ -914,7 +996,7 @@ mod tests {
         assert_eq!(requests[0].0, local.min(other));
     }
     #[test]
-    fn finite_error_priority_remains_error_first_and_stable_by_address() {
+    fn finite_local_chain_precedes_unrelated_higher_error() {
         let a = CubePatchAddress::try_new(CubeFace::PositiveX, 2, 1, 1).unwrap();
         let b = CubePatchAddress::try_new(CubeFace::PositiveX, 2, 3, 1).unwrap();
         let mut requests = [
@@ -922,7 +1004,7 @@ mod tests {
             (b, 8.0, false, 0.0, 0.0, 100.0),
         ];
         requests.sort_by(compare_request_priority);
-        assert_eq!(requests[0].0, b);
+        assert_eq!(requests[0].0, a);
         requests[0].1 = 3.0;
         requests[1].1 = 3.0;
         requests.sort_by(compare_request_priority);

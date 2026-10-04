@@ -3,9 +3,10 @@ use super::GeneratedSurfacePatch;
 use super::{ActiveSurfacePatch, GRID_SAMPLES, SurfaceTopology};
 use crate::{CelestialProjection, PreparedView, RenderPreparationError};
 use glam::DVec3;
-use mundaris_math::{FramePosition, LocalPosition};
+use mundaris_math::{FrameId, FramePosition, LocalPosition};
 use std::ops::Range;
 const STAGING_CAP: usize = 64 * 1024 * 1024;
+const BOUNDARY_CAP: usize = 8 * 1024 * 1024;
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SurfaceStyle {
     pub borders: bool,
@@ -27,6 +28,8 @@ pub struct SurfacePreparationReport {
     pub uploaded_bytes: usize,
     pub allocated_staging_bytes: usize,
     pub boundary_bytes: usize,
+    pub proof_cache_hits: usize,
+    pub proof_cache_misses: usize,
     pub max_component_error_m: f64,
     pub max_projected_error_pixels: f64,
     pub max_gpu_projection_error_pixels: f64,
@@ -49,6 +52,19 @@ pub struct SurfacePreparationProfile {
     pub clipped_patch_proofs: usize,
     /// Number of owned vectors whose capacity grew, not allocator calls.
     pub capacity_growths: usize,
+    /// Transition-only preparation stages, separate from regular patch preparation.
+    pub transition_samples: std::time::Duration,
+    pub transition_clipping: std::time::Duration,
+    pub transition_packing: std::time::Duration,
+    pub transition_input_triangles: usize,
+    pub transition_emitted_triangles: usize,
+    pub transition_bytes_staged: usize,
+    pub transition_capacity_growths: usize,
+    pub fallback_growths: usize,
+    pub fallback_growth_bytes: usize,
+    /// Sum of old capacities at growth points; an upper copy-work proxy,
+    /// not allocator instrumentation (an allocator may extend in place).
+    pub fallback_growth_copy_upper_bytes: usize,
 }
 #[derive(Default)]
 pub(crate) struct SurfaceStaging {
@@ -56,6 +72,8 @@ pub(crate) struct SurfaceStaging {
     pub samples: Vec<u8>,
     pub instances: Vec<u8>,
     pub fallback: Vec<u8>,
+    proof_cache: Vec<PrecisionProofEntry>,
+    proof_cursor: usize,
     pub buckets: [Range<u32>; 16],
     boundary_keys: Vec<u128>,
     boundary_samples: Vec<([f32; 3], [f32; 3])>,
@@ -63,6 +81,34 @@ pub(crate) struct SurfaceStaging {
     records: Vec<(u8, [u8; 64])>,
     pub report: SurfacePreparationReport,
     pub underside: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PrecisionProofResult {
+    fallback: bool,
+    whole: bool,
+    component_m: f64,
+    pixels: f64,
+    gpu_pixels: f64,
+}
+struct PrecisionProofEntry {
+    source: FrameId,
+    address: mundaris_math::surface::CubePatchAddress,
+    mask: u8,
+    projection: ([u32; 2], u64, u64),
+    positions: [DVec3; GRID_SAMPLES],
+    gpu_positions: [[f32; 3]; GRID_SAMPLES],
+    result: PrecisionProofResult,
+}
+fn same_positions(a: &[DVec3; GRID_SAMPLES], b: &[DVec3; GRID_SAMPLES]) -> bool {
+    a.iter()
+        .zip(b)
+        .all(|(a, b)| a.to_array().map(f64::to_bits) == b.to_array().map(f64::to_bits))
+}
+fn same_gpu_positions(a: &[[f32; 3]; GRID_SAMPLES], b: &[[f32; 3]; GRID_SAMPLES]) -> bool {
+    a.iter()
+        .zip(b)
+        .all(|(a, b)| a.map(f32::to_bits) == b.map(f32::to_bits))
 }
 #[derive(Clone, Copy)]
 struct ClipVertex {
@@ -158,6 +204,38 @@ fn physical_budget(p: DVec3) -> f64 {
     }
 }
 impl SurfaceStaging {
+    fn boundary_capacity_bytes(&self) -> usize {
+        self.boundary_keys.capacity() * std::mem::size_of::<u128>()
+            + self.boundary_samples.capacity() * std::mem::size_of::<([f32; 3], [f32; 3])>()
+            + self.boundary_ready.capacity() * std::mem::size_of::<bool>()
+    }
+    fn drop_proofs_for_boundary_growth(&mut self, predicted_boundary_bytes: usize) {
+        if predicted_boundary_bytes.saturating_add(
+            self.proof_cache.capacity() * std::mem::size_of::<PrecisionProofEntry>(),
+        ) > BOUNDARY_CAP
+        {
+            self.proof_cache = Vec::new();
+            self.proof_cursor = 0;
+        }
+    }
+    fn prepare_proof_cache(&mut self, patches: usize) {
+        let boundary = self.boundary_capacity_bytes();
+        self.drop_proofs_for_boundary_growth(boundary);
+        let limit = (BOUNDARY_CAP.saturating_sub(boundary)
+            / std::mem::size_of::<PrecisionProofEntry>())
+        .min(512);
+        let desired = patches
+            .checked_next_power_of_two()
+            .unwrap_or(512)
+            .min(limit);
+        if patches != 0 && desired > self.proof_cache.capacity() {
+            self.proof_cache
+                .reserve_exact(desired - self.proof_cache.len());
+        }
+        // Allocator capacity, rather than requested capacity, is authoritative.
+        // This optional disposable optimization can never reject valid geometry.
+        self.drop_proofs_for_boundary_growth(boundary);
+    }
     fn allocated_outgoing_bytes(&self) -> usize {
         self.samples.capacity()
             + self.instances.capacity()
@@ -171,7 +249,22 @@ impl SurfaceStaging {
             return Err(RenderPreparationError::InvalidBudget);
         }
         if needed > self.fallback.capacity() {
-            self.fallback.reserve_exact(required);
+            // Exact per-triangle growth repeatedly copies the already staged
+            // overlay. Grow geometrically, clipped to the remaining aggregate
+            // allowance; retained capacity is still fully accounted.
+            let available = STAGING_CAP - other;
+            let target = needed
+                .max(self.fallback.capacity().saturating_mul(2))
+                .min(available);
+            #[cfg(feature = "surface-profile")]
+            let old = self.fallback.capacity();
+            self.fallback.reserve_exact(target - self.fallback.len());
+            #[cfg(feature = "surface-profile")]
+            {
+                self.report.profile.fallback_growths += 1;
+                self.report.profile.fallback_growth_bytes += self.fallback.capacity() - old;
+                self.report.profile.fallback_growth_copy_upper_bytes += old;
+            }
         }
         if self.allocated_outgoing_bytes() > STAGING_CAP {
             return Err(RenderPreparationError::InvalidBudget);
@@ -188,6 +281,10 @@ impl SurfaceStaging {
         fraction: f64,
         style: SurfaceStyle,
     ) -> Result<(), RenderPreparationError> {
+        #[cfg(feature = "surface-profile")]
+        let transition_growths_before = self.report.profile.fallback_growths;
+        #[cfg(feature = "surface-profile")]
+        let transition_bytes_before = self.fallback.len();
         if !fraction.is_finite()
             || !(0.0..=1.0).contains(&fraction)
             || !body.color.iter().all(|c| c.is_finite())
@@ -196,7 +293,13 @@ impl SurfaceStaging {
         }
         let source = view.prepare_source(body.body_fixed_frame)?;
         self.underside |= style.underside;
+        #[cfg(feature = "surface-profile")]
+        {
+            self.report.profile.transition_input_triangles += mesh.triangles().len();
+        }
         for triangle in mesh.triangles() {
+            #[cfg(feature = "surface-profile")]
+            let sample_start = std::time::Instant::now();
             let mut positions = [DVec3::ZERO; 3];
             let mut normals = [DVec3::ZERO; 3];
             let mut elevations = [0.0; 3];
@@ -231,10 +334,22 @@ impl SurfaceStaging {
                     colors[i] = super::lod_color(level.clamp(0.0, 255.0) as u8);
                 }
             }
+            #[cfg(feature = "surface-profile")]
+            {
+                self.report.profile.transition_samples += sample_start.elapsed();
+            }
+            #[cfg(feature = "surface-profile")]
+            let clipping_start = std::time::Instant::now();
             let polygon = clip_triangle(positions, projection);
+            #[cfg(feature = "surface-profile")]
+            {
+                self.report.profile.transition_clipping += clipping_start.elapsed();
+            }
             if polygon.len() < 3 {
                 continue;
             }
+            #[cfg(feature = "surface-profile")]
+            let packing_start = std::time::Instant::now();
             let required = (polygon.len() - 2) * 3 * 80;
             self.reserve_fallback(required)?;
             for i in 1..polygon.len() - 1 {
@@ -303,6 +418,14 @@ impl SurfaceStaging {
                     );
                 }
                 self.report.morph_triangles += 1;
+                #[cfg(feature = "surface-profile")]
+                {
+                    self.report.profile.transition_emitted_triangles += 1;
+                }
+            }
+            #[cfg(feature = "surface-profile")]
+            {
+                self.report.profile.transition_packing += packing_start.elapsed();
             }
         }
         self.report.patches += mesh.affected_new().len();
@@ -310,12 +433,19 @@ impl SurfaceStaging {
             + usize::from(!self.fallback.is_empty());
         self.report.uploaded_bytes =
             self.samples.len() + self.instances.len() + self.fallback.len();
+        #[cfg(feature = "surface-profile")]
+        {
+            self.report.profile.transition_bytes_staged +=
+                self.fallback.len().saturating_sub(transition_bytes_before);
+            self.report.profile.transition_capacity_growths +=
+                self.report.profile.fallback_growths - transition_growths_before;
+        }
         self.report.allocated_staging_bytes = self.samples.capacity()
             + self.instances.capacity()
             + self.fallback.capacity()
             + self.records.capacity() * std::mem::size_of::<(u8, [u8; 64])>();
         if self.report.allocated_staging_bytes > STAGING_CAP
-            || self.report.boundary_bytes > 8 * 1024 * 1024
+            || self.report.boundary_bytes > BOUNDARY_CAP
         {
             return Err(RenderPreparationError::InvalidBudget);
         }
@@ -440,6 +570,11 @@ impl SurfaceStaging {
         // body has the same unit tuples but different observer-relative samples.
         self.boundary_keys.clear();
         let needed = patches.len() * 64;
+        self.drop_proofs_for_boundary_growth(
+            self.boundary_keys.capacity().max(needed) * std::mem::size_of::<u128>()
+                + self.boundary_samples.capacity() * std::mem::size_of::<([f32; 3], [f32; 3])>()
+                + self.boundary_ready.capacity() * std::mem::size_of::<bool>(),
+        );
         if needed > self.boundary_keys.capacity() {
             self.boundary_keys.reserve_exact(needed);
         }
@@ -479,6 +614,12 @@ impl SurfaceStaging {
         self.boundary_keys.truncate(write);
         self.boundary_samples.clear();
         self.boundary_ready.clear();
+        self.drop_proofs_for_boundary_growth(
+            self.boundary_keys.capacity() * std::mem::size_of::<u128>()
+                + self.boundary_samples.capacity().max(write)
+                    * std::mem::size_of::<([f32; 3], [f32; 3])>()
+                + self.boundary_ready.capacity().max(write) * std::mem::size_of::<bool>(),
+        );
         if write > self.boundary_samples.capacity() {
             self.boundary_samples.reserve_exact(write);
         }
@@ -487,6 +628,7 @@ impl SurfaceStaging {
         }
         self.boundary_samples.resize(write, ([0.0; 3], [0.0; 3]));
         self.boundary_ready.resize(write, false);
+        self.prepare_proof_cache(patches.len());
         #[cfg(feature = "surface-profile")]
         {
             self.report.profile.boundary += stage_start.elapsed();
@@ -659,112 +801,186 @@ impl SurfaceStaging {
             }
             #[cfg(feature = "surface-profile")]
             let proof_start = std::time::Instant::now();
-            let mut fallback = false;
-            // Convex interpolation cannot exceed the maximum vertex perturbation.
-            // Front-of-near patches prove all clipped triangles at once using the
-            // projection differential over the expanded frustum. Only uncertain
-            // crossings require individual triangle clipping.
-            let mut delta_max: f64 = 0.0;
-            let mut component_max: f64 = 0.0;
-            let mut depth_min = f64::MAX;
-            for (p, gpu) in positions.iter().zip(gpu_positions) {
-                let delta = DVec3::from_array(gpu.map(f64::from)) - *p;
-                delta_max = delta_max.max(delta.length());
-                component_max = component_max.max(delta.abs().max_element());
-                depth_min = depth_min.min(-p.z);
-            }
-            let [w, h] = projection.viewport();
-            let ty = (projection.vertical_fov_rad() * 0.5).tan();
-            let tx = ty * w as f64 / h as f64;
-            let safe = depth_min - delta_max;
-            let pixel_bound = if safe > 0.0 {
-                projection.focal_pixels() * delta_max / safe
-                    * (1.0 + (tx + delta_max / safe).powi(2) + (ty + delta_max / safe).powi(2))
-                        .sqrt()
-            } else {
-                f64::INFINITY
-            };
-            let scales = projection.gpu_clip([1.0, 1.0, -1.0]);
-            let coefficient_error = (scales[0] as f64 * tx - 1.0)
-                .abs()
-                .max((scales[1] as f64 * ty - 1.0).abs());
-            let arithmetic_bound =
-                0.5 * (w as f64).hypot(h as f64) * (coefficient_error + 8.0 * f32::EPSILON as f64);
-            let whole_proof = depth_min >= projection.near_m()
-                && pixel_bound <= 0.05
-                && arithmetic_bound <= 0.05
-                && component_max <= physical_budget(DVec3::new(0.0, 0.0, -depth_min));
-            if whole_proof {
+            let projection_key = (
+                projection.viewport(),
+                projection.vertical_fov_rad().to_bits(),
+                projection.near_m().to_bits(),
+            );
+            let proof_slot = self
+                .proof_cache
+                .iter()
+                .position(|entry| entry.source == source && entry.address == patch.address);
+            let cached = proof_slot.and_then(|index| {
+                let entry = &self.proof_cache[index];
+                (entry.mask == patch.stitch_mask
+                    && entry.projection == projection_key
+                    && same_positions(&entry.positions, &positions)
+                    && same_gpu_positions(&entry.gpu_positions, &gpu_positions))
+                .then_some(entry.result)
+            });
+            let (fallback, whole_proof) = if let Some(result) = cached {
+                self.report.proof_cache_hits += 1;
                 self.report.max_component_error_m =
-                    self.report.max_component_error_m.max(component_max);
+                    self.report.max_component_error_m.max(result.component_m);
                 self.report.max_projected_error_pixels =
-                    self.report.max_projected_error_pixels.max(pixel_bound);
+                    self.report.max_projected_error_pixels.max(result.pixels);
                 self.report.max_gpu_projection_error_pixels = self
                     .report
                     .max_gpu_projection_error_pixels
-                    .max(arithmetic_bound);
-            }
-            if !whole_proof {
-                for triangle in indices.as_chunks::<3>().0 {
-                    let points = triangle.map(|i| positions[usize::from(i)]);
-                    let polygon = clip_triangle(points, projection);
-                    if polygon.is_empty() {
-                        continue;
-                    }
-                    let gpu = triangle
-                        .map(|i| DVec3::from_array(gpu_positions[usize::from(i)].map(f64::from)));
-                    let mut max_delta: f64 = 0.0;
-                    let mut zmin = f64::MAX;
-                    for v in &polygon {
-                        let round =
-                            gpu[0] * v.weights.x + gpu[1] * v.weights.y + gpu[2] * v.weights.z;
-                        let delta = round - v.position;
-                        max_delta = max_delta.max(delta.length());
-                        zmin = zmin.min(-v.position.z);
-                        let component = delta.abs().max_element();
-                        if component > physical_budget(v.position) {
-                            fallback = true;
-                        }
-                        self.report.max_component_error_m =
-                            self.report.max_component_error_m.max(component);
-                    }
-                    let [w, h] = projection.viewport();
-                    let ty = (projection.vertical_fov_rad() * 0.5).tan();
-                    let tx = ty * w as f64 / h as f64;
-                    let safe = zmin - max_delta;
-                    let error = if safe > 0.0 {
-                        projection.focal_pixels() * max_delta / safe
-                            * (1.0
-                                + (tx + max_delta / safe).powi(2)
-                                + (ty + max_delta / safe).powi(2))
+                    .max(result.gpu_pixels);
+                (result.fallback, result.whole)
+            } else {
+                self.report.proof_cache_misses += 1;
+                let previous_errors = [
+                    self.report.max_component_error_m,
+                    self.report.max_projected_error_pixels,
+                    self.report.max_gpu_projection_error_pixels,
+                ];
+                self.report.max_component_error_m = 0.0;
+                self.report.max_projected_error_pixels = 0.0;
+                self.report.max_gpu_projection_error_pixels = 0.0;
+                let mut fallback = false;
+                // Convex interpolation cannot exceed the maximum vertex perturbation.
+                // Front-of-near patches prove all clipped triangles at once using the
+                // projection differential over the expanded frustum. Only uncertain
+                // crossings require individual triangle clipping.
+                let mut delta_max: f64 = 0.0;
+                let mut component_max: f64 = 0.0;
+                let mut depth_min = f64::MAX;
+                for (p, gpu) in positions.iter().zip(gpu_positions) {
+                    let delta = DVec3::from_array(gpu.map(f64::from)) - *p;
+                    delta_max = delta_max.max(delta.length());
+                    component_max = component_max.max(delta.abs().max_element());
+                    depth_min = depth_min.min(-p.z);
+                }
+                let [w, h] = projection.viewport();
+                let ty = (projection.vertical_fov_rad() * 0.5).tan();
+                let tx = ty * w as f64 / h as f64;
+                let safe = depth_min - delta_max;
+                let pixel_bound = if safe > 0.0 {
+                    projection.focal_pixels() * delta_max / safe
+                        * (1.0 + (tx + delta_max / safe).powi(2) + (ty + delta_max / safe).powi(2))
                             .sqrt()
-                    } else {
-                        f64::INFINITY
-                    };
-                    fallback |= error > 0.05;
-                    // Projection multiplication rounding is measured independently.
-                    for v in &polygon {
-                        let exact = screen(projection, v.position);
-                        let narrowed = v.position.as_vec3().to_array();
-                        let rounded =
-                            screen(projection, DVec3::from_array(narrowed.map(f64::from)));
-                        let projected = gpu_screen(projection, narrowed);
-                        let arithmetic =
-                            (rounded[0] - projected[0]).hypot(rounded[1] - projected[1]);
-                        self.report.max_gpu_projection_error_pixels =
-                            self.report.max_gpu_projection_error_pixels.max(arithmetic);
-                        fallback |= arithmetic > 0.05;
-                        let total = (exact[0] - projected[0]).hypot(exact[1] - projected[1]);
-                        if !total.is_finite() {
-                            fallback = true;
+                } else {
+                    f64::INFINITY
+                };
+                let scales = projection.gpu_clip([1.0, 1.0, -1.0]);
+                let coefficient_error = (scales[0] as f64 * tx - 1.0)
+                    .abs()
+                    .max((scales[1] as f64 * ty - 1.0).abs());
+                let arithmetic_bound = 0.5
+                    * (w as f64).hypot(h as f64)
+                    * (coefficient_error + 8.0 * f32::EPSILON as f64);
+                let whole_proof = depth_min >= projection.near_m()
+                    && pixel_bound <= 0.05
+                    && arithmetic_bound <= 0.05
+                    && component_max <= physical_budget(DVec3::new(0.0, 0.0, -depth_min));
+                if whole_proof {
+                    self.report.max_component_error_m =
+                        self.report.max_component_error_m.max(component_max);
+                    self.report.max_projected_error_pixels =
+                        self.report.max_projected_error_pixels.max(pixel_bound);
+                    self.report.max_gpu_projection_error_pixels = self
+                        .report
+                        .max_gpu_projection_error_pixels
+                        .max(arithmetic_bound);
+                }
+                if !whole_proof {
+                    for triangle in indices.as_chunks::<3>().0 {
+                        let points = triangle.map(|i| positions[usize::from(i)]);
+                        let polygon = clip_triangle(points, projection);
+                        if polygon.is_empty() {
+                            continue;
                         }
-                    }
-                    if !fallback {
-                        self.report.max_projected_error_pixels =
-                            self.report.max_projected_error_pixels.max(error);
+                        let gpu = triangle.map(|i| {
+                            DVec3::from_array(gpu_positions[usize::from(i)].map(f64::from))
+                        });
+                        let mut max_delta: f64 = 0.0;
+                        let mut zmin = f64::MAX;
+                        for v in &polygon {
+                            let round =
+                                gpu[0] * v.weights.x + gpu[1] * v.weights.y + gpu[2] * v.weights.z;
+                            let delta = round - v.position;
+                            max_delta = max_delta.max(delta.length());
+                            zmin = zmin.min(-v.position.z);
+                            let component = delta.abs().max_element();
+                            if component > physical_budget(v.position) {
+                                fallback = true;
+                            }
+                            self.report.max_component_error_m =
+                                self.report.max_component_error_m.max(component);
+                        }
+                        let [w, h] = projection.viewport();
+                        let ty = (projection.vertical_fov_rad() * 0.5).tan();
+                        let tx = ty * w as f64 / h as f64;
+                        let safe = zmin - max_delta;
+                        let error = if safe > 0.0 {
+                            projection.focal_pixels() * max_delta / safe
+                                * (1.0
+                                    + (tx + max_delta / safe).powi(2)
+                                    + (ty + max_delta / safe).powi(2))
+                                .sqrt()
+                        } else {
+                            f64::INFINITY
+                        };
+                        fallback |= error > 0.05;
+                        // Projection multiplication rounding is measured independently.
+                        for v in &polygon {
+                            let exact = screen(projection, v.position);
+                            let narrowed = v.position.as_vec3().to_array();
+                            let rounded =
+                                screen(projection, DVec3::from_array(narrowed.map(f64::from)));
+                            let projected = gpu_screen(projection, narrowed);
+                            let arithmetic =
+                                (rounded[0] - projected[0]).hypot(rounded[1] - projected[1]);
+                            self.report.max_gpu_projection_error_pixels =
+                                self.report.max_gpu_projection_error_pixels.max(arithmetic);
+                            fallback |= arithmetic > 0.05;
+                            let total = (exact[0] - projected[0]).hypot(exact[1] - projected[1]);
+                            if !total.is_finite() {
+                                fallback = true;
+                            }
+                        }
+                        if !fallback {
+                            self.report.max_projected_error_pixels =
+                                self.report.max_projected_error_pixels.max(error);
+                        }
                     }
                 }
-            }
+                let result = PrecisionProofResult {
+                    fallback,
+                    whole: whole_proof,
+                    component_m: self.report.max_component_error_m,
+                    pixels: self.report.max_projected_error_pixels,
+                    gpu_pixels: self.report.max_gpu_projection_error_pixels,
+                };
+                self.report.max_component_error_m = previous_errors[0].max(result.component_m);
+                self.report.max_projected_error_pixels = previous_errors[1].max(result.pixels);
+                self.report.max_gpu_projection_error_pixels =
+                    previous_errors[2].max(result.gpu_pixels);
+                if self.proof_cache.capacity() != 0 {
+                    let entry = PrecisionProofEntry {
+                        source,
+                        address: patch.address,
+                        mask: patch.stitch_mask,
+                        projection: projection_key,
+                        positions,
+                        gpu_positions,
+                        result,
+                    };
+                    if let Some(index) = proof_slot {
+                        self.proof_cache[index] = entry;
+                    } else if self.proof_cache.len() < self.proof_cache.capacity() {
+                        self.proof_cache.push(entry);
+                    } else {
+                        self.proof_cache[self.proof_cursor] = entry;
+                        self.proof_cursor = (self.proof_cursor + 1) % self.proof_cache.len();
+                    }
+                }
+                (fallback, whole_proof)
+            };
+            #[cfg(not(feature = "surface-profile"))]
+            let _ = whole_proof;
             let patch_color = if style.lod_colors {
                 super::lod_color(patch.address.level())
             } else if style.face_colors {
@@ -972,12 +1188,11 @@ impl SurfaceStaging {
             + self.fallback.capacity()
             + self.records.capacity() * std::mem::size_of::<(u8, [u8; 64])>();
         self.report.boundary_bytes = self.report.boundary_bytes.max(
-            self.boundary_keys.capacity() * 16
-                + self.boundary_samples.capacity() * 24
-                + self.boundary_ready.capacity() * std::mem::size_of::<bool>(),
+            self.boundary_capacity_bytes()
+                + self.proof_cache.capacity() * std::mem::size_of::<PrecisionProofEntry>(),
         );
         if self.report.allocated_staging_bytes > STAGING_CAP
-            || self.report.boundary_bytes > 8 * 1024 * 1024
+            || self.report.boundary_bytes > BOUNDARY_CAP
         {
             return Err(RenderPreparationError::InvalidBudget);
         }
@@ -994,7 +1209,7 @@ impl SurfaceStaging {
         Ok(())
     }
     #[cfg(feature = "surface-profile")]
-    fn profile_capacities(&self) -> [usize; 7] {
+    fn profile_capacities(&self) -> [usize; 8] {
         [
             self.samples.capacity(),
             self.instances.capacity(),
@@ -1003,6 +1218,7 @@ impl SurfaceStaging {
             self.boundary_samples.capacity(),
             self.boundary_ready.capacity(),
             self.records.capacity(),
+            self.proof_cache.capacity(),
         ]
     }
 }
@@ -1026,6 +1242,177 @@ mod tests {
             error_pixels: 0.0,
         }
     }
+    #[test]
+    fn exact_precision_proofs_reuse_only_identical_inputs_and_keep_packed_bits() {
+        let tree = FrameTree::new(NonZeroU64::new(501).unwrap());
+        let source = tree.root();
+        let view_at = |height: f64| {
+            PreparedView::new(
+                &tree.evaluate(),
+                FramePose::new(
+                    FramePosition::new(
+                        source,
+                        LocalPosition::try_metres(DVec3::Z * height).unwrap(),
+                    ),
+                    UnitRotation::identity(),
+                ),
+                crate::RenderPrecisionBudget::near_debug(),
+            )
+            .unwrap()
+        };
+        let view = view_at(1000.05);
+        let topology = SurfaceTopology::new();
+        let mut patches = [patch(CubeFace::PositiveZ, &topology)];
+        let projection = CelestialProjection::try_new(128, 96, 60.0_f64.to_radians(), 0.1).unwrap();
+        let body = crate::CelestialRenderBody {
+            body_fixed_frame: source,
+            reference_radius_m: 1000.0,
+            color: [0.2, 0.5, 1.0, 1.0],
+            unlit: false,
+            selected: false,
+        };
+        let mut storage = SurfaceStaging::default();
+        storage
+            .append(
+                &view,
+                projection,
+                body,
+                &patches,
+                &topology,
+                SurfaceStyle::default(),
+            )
+            .unwrap();
+        assert_eq!(storage.report.proof_cache_misses, 1);
+        let expected = (
+            storage.samples.clone(),
+            storage.instances.clone(),
+            storage.fallback.clone(),
+        );
+        let errors = [
+            storage.report.max_component_error_m,
+            storage.report.max_projected_error_pixels,
+            storage.report.max_gpu_projection_error_pixels,
+        ];
+        storage.clear();
+        storage
+            .append(
+                &view,
+                projection,
+                body,
+                &patches,
+                &topology,
+                SurfaceStyle::default(),
+            )
+            .unwrap();
+        assert_eq!(storage.report.proof_cache_hits, 1);
+        assert_eq!(
+            (&storage.samples, &storage.instances, &storage.fallback),
+            (&expected.0, &expected.1, &expected.2)
+        );
+        assert_eq!(
+            [
+                storage.report.max_component_error_m,
+                storage.report.max_projected_error_pixels,
+                storage.report.max_gpu_projection_error_pixels
+            ],
+            errors
+        );
+        storage.proof_cache = Vec::new();
+        storage.clear();
+        storage
+            .append(
+                &view,
+                projection,
+                body,
+                &patches,
+                &topology,
+                SurfaceStyle::default(),
+            )
+            .unwrap();
+        assert_eq!(storage.report.proof_cache_hits, 0);
+        assert_eq!(
+            (&storage.samples, &storage.instances, &storage.fallback),
+            (&expected.0, &expected.1, &expected.2)
+        );
+        let moved = view_at(1001.05);
+        storage.clear();
+        storage
+            .append(
+                &moved,
+                projection,
+                body,
+                &patches,
+                &topology,
+                SurfaceStyle::default(),
+            )
+            .unwrap();
+        assert_eq!(storage.report.proof_cache_misses, 1);
+        let resized = CelestialProjection::try_new(160, 96, 60.0_f64.to_radians(), 0.1).unwrap();
+        storage.clear();
+        storage
+            .append(
+                &moved,
+                resized,
+                body,
+                &patches,
+                &topology,
+                SurfaceStyle::default(),
+            )
+            .unwrap();
+        assert_eq!(storage.report.proof_cache_misses, 1);
+        patches[0].stitch_mask = 8;
+        storage.clear();
+        storage
+            .append(
+                &moved,
+                resized,
+                body,
+                &patches,
+                &topology,
+                SurfaceStyle::default(),
+            )
+            .unwrap();
+        assert_eq!(storage.report.proof_cache_misses, 1);
+        assert!(storage.report.boundary_bytes <= BOUNDARY_CAP);
+        storage.drop_proofs_for_boundary_growth(BOUNDARY_CAP);
+        assert_eq!(storage.proof_cache.capacity(), 0);
+        let a = [DVec3::ZERO; GRID_SAMPLES];
+        let mut b = a;
+        b[0].x = -0.0;
+        assert!(!same_positions(&a, &b));
+        let a = [[0.0f32; 3]; GRID_SAMPLES];
+        let mut b = a;
+        b[0][0] = -0.0;
+        assert!(!same_gpu_positions(&a, &b));
+    }
+
+    #[test]
+    fn triangle_staging_growth_is_geometric_and_warm_storage_is_reused() {
+        let mut storage = SurfaceStaging::default();
+        let mut growths = 0;
+        for triangle in 0..10_000usize {
+            let old = storage.fallback.capacity();
+            storage.reserve_fallback(240).unwrap();
+            growths += usize::from(storage.fallback.capacity() != old);
+            storage
+                .fallback
+                .extend(std::iter::repeat_n((triangle % 251) as u8, 240));
+            assert!(storage.allocated_outgoing_bytes() <= STAGING_CAP);
+        }
+        assert!(growths <= 16, "per-triangle reallocations: {growths}");
+        let bytes = storage.fallback.clone();
+        let capacity = storage.fallback.capacity();
+        storage.fallback.clear();
+        for triangle in 0..10_000usize {
+            storage.reserve_fallback(240).unwrap();
+            storage
+                .fallback
+                .extend(std::iter::repeat_n((triangle % 251) as u8, 240));
+        }
+        assert_eq!(storage.fallback, bytes);
+        assert_eq!(storage.fallback.capacity(), capacity);
+    }
+
     #[test]
     fn retained_capacities_and_records_are_preflighted_before_fallback_growth() {
         let mut storage = SurfaceStaging {
@@ -1094,6 +1481,7 @@ mod tests {
             storage.boundary_keys.capacity() * std::mem::size_of::<u128>()
                 + storage.boundary_samples.capacity() * std::mem::size_of::<([f32; 3], [f32; 3])>()
                 + storage.boundary_ready.capacity() * std::mem::size_of::<bool>()
+                + storage.proof_cache.capacity() * std::mem::size_of::<PrecisionProofEntry>()
         );
         assert_eq!(storage.buckets[0], 0..1);
         assert_eq!(storage.buckets[8], 1..3);

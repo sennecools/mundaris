@@ -11,6 +11,62 @@ pub struct TerrainConvergenceDiagnostic {
     pub target_certifiable: bool,
     pub local_error: SurfaceErrorContributions,
     pub diagnostic_cpu: Duration,
+    pub useful_target_lod: Option<u8>,
+    pub certificate_limited_target_lod: Option<u8>,
+    pub desired_patch_width_m: f64,
+    pub desired_sample_spacing_m: f64,
+    pub rendered_sample_spacing_m: f64,
+    pub terrain_footprint_m: f64,
+    pub projected_depth_floor_m: f64,
+    pub pixel_footprint_m: f64,
+    pub desired_error: SurfaceErrorContributions,
+    pub desired_error_pixels: [f64; 6],
+    pub desired_total_pixels: f64,
+    pub dominant_term: &'static str,
+    pub represented_height_bound_m: f64,
+}
+
+type CachedCertificate = (CubePatchAddress, SurfaceExtent, SurfaceErrorContributions);
+struct CertificateCache {
+    entries: [Option<CachedCertificate>; 256],
+    cursor: usize,
+}
+impl Default for CertificateCache {
+    fn default() -> Self {
+        Self {
+            entries: [None; 256],
+            cursor: 0,
+        }
+    }
+}
+impl CertificateCache {
+    fn get(
+        &mut self,
+        generator: &TerrainGenerator,
+        address: CubePatchAddress,
+        metadata: PatchMetadata,
+    ) -> Result<(SurfaceExtent, SurfaceErrorContributions)> {
+        if let Some((_, extent, error)) = self
+            .entries
+            .iter()
+            .flatten()
+            .find(|(a, _, _)| *a == address)
+        {
+            return Ok((*extent, *error));
+        }
+        let (extent, error) = terrain_surface_certificate(generator, address, metadata)?;
+        self.entries[self.cursor] = Some((address, extent, error));
+        self.cursor = (self.cursor + 1) % self.entries.len();
+        Ok((extent, error))
+    }
+}
+
+fn physical_resolution(address: CubePatchAddress, radius_m: f64) -> Result<(f64, f64)> {
+    let n = |x, y| -> Result<glam::DVec3> { Ok(address.sample_direction(x, y, 16)?.unit()) };
+    let arc = |a: glam::DVec3, b: glam::DVec3| radius_m * a.cross(b).length().atan2(a.dot(b));
+    let width = arc(n(0, 8)?, n(16, 8)?).max(arc(n(8, 0)?, n(8, 16)?));
+    let spacing = arc(n(8, 8)?, n(9, 8)?).max(arc(n(8, 8)?, n(8, 9)?));
+    Ok((width, spacing))
 }
 
 /// Temporary mutable bridge. Renderer receives only certificates/readiness, never
@@ -25,6 +81,7 @@ pub struct TerrainSelectionPolicy<'a> {
     replacements: usize,
     frozen: bool,
     reservation_base: usize,
+    certificates: &'a mut CertificateCache,
 }
 impl SurfaceGeometryPolicy for TerrainSelectionPolicy<'_> {
     fn certificate(
@@ -40,7 +97,8 @@ impl SurfaceGeometryPolicy for TerrainSelectionPolicy<'_> {
         let (mut extent, mut error) = if let Some(g) = self.cache.peek(self.identity, address) {
             (g.extent(), g.error())
         } else {
-            terrain_surface_certificate(self.generator, address, metadata)
+            self.certificates
+                .get(self.generator, address, metadata)
                 .map_err(|_| RenderPreparationError::InvalidDebugGeometry)?
         };
         // Edge balance also bounds a four-quadrant vertex's coarsest owner by
@@ -90,6 +148,10 @@ pub struct AdaptiveTerrainCover {
     morph: Option<ActiveMorph>,
     construction: Option<u64>,
     construction_duration: Duration,
+    construction_parent: Option<CubePatchAddress>,
+    construction_obsolete: bool,
+    construction_refining: bool,
+    unpublished_parent: Option<(CubePatchAddress, bool)>,
     morph_duration: Duration,
     /// Overlay rejection keeps the complete source and private target frozen.
     /// Bounded larger-budget retries never bypass aggregate admission.
@@ -108,6 +170,10 @@ pub struct AdaptiveTerrainCover {
     pub result_publication: Duration,
     pub convergence: TerrainConvergenceDiagnostic,
     local_metadata: [Option<(CubePatchAddress, PatchMetadata)>; 31],
+    local_certificates: [Option<CachedCertificate>; 31],
+    certificates: CertificateCache,
+    prefetch_parent: Option<CubePatchAddress>,
+    prefetch_dependencies: Vec<CubePatchAddress>,
     pub peak_transition_bytes: usize,
     pub peak_cpu_bytes: usize,
 }
@@ -174,6 +240,7 @@ impl AdaptiveTerrainCover {
     /// charge separately; sum with cache residency for the aggregate accounting.
     pub fn resident_bytes(&self) -> usize {
         size_of::<Self>()
+            + self.prefetch_dependencies.capacity() * size_of::<CubePatchAddress>()
             + (self.active.capacity() + self.visible.capacity()) * size_of::<ActiveSurfacePatch>()
             // An admitted cover reservation owns this same shared allocation
             // until publication or cancellation acknowledgement, not both owners.
@@ -235,7 +302,14 @@ impl AdaptiveTerrainCover {
             self.stitched = None;
             self.morph = None;
             self.construction = None;
+            self.construction_parent = None;
+            self.construction_obsolete = false;
+            self.unpublished_parent = None;
             self.local_metadata = [None; 31];
+            self.local_certificates = [None; 31];
+            self.certificates = CertificateCache::default();
+            self.prefetch_parent = None;
+            self.prefetch_dependencies.clear();
             self.transition_deferred = false;
             self.transition_budget_step = 0;
             self.generator = Some(TerrainGenerator::new(
@@ -268,6 +342,49 @@ impl AdaptiveTerrainCover {
                 .ok_or_else(|| anyhow::anyhow!("missing completed terrain morph"))?;
             self.stitched = Some(morph.destination);
             self.active = morph.destination_cover;
+        }
+        if self.construction.is_some()
+            && !self.construction_obsolete
+            && let Some(parent) = self.construction_parent
+            && self.stitched.is_some()
+        {
+            let topology = self
+                .lod
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing selector"))?
+                .topology();
+            let metadata = PatchMetadata::build(parent, topology)?;
+            let generator = self
+                .generator
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing generator"))?;
+            let (mut extent, mut error) = self.certificates.get(generator, parent, metadata)?;
+            error.boundary_constraint_m =
+                (self.boundary_bounds[usize::from(parent.level())] + error.numeric_m).next_up();
+            extent.min_height_m = (extent.min_height_m - error.boundary_constraint_m).next_down();
+            extent.max_height_m = (extent.max_height_m + error.boundary_constraint_m).next_up();
+            let (center, ball) = metadata.ball(identity.radius_m, extent)?;
+            let source = input.view.prepare_source(input.body_fixed_frame)?;
+            let center = source
+                .view_displacement(mundaris_math::FramePosition::new(
+                    input.body_fixed_frame,
+                    mundaris_math::LocalPosition::try_metres(center)?,
+                ))?
+                .metres();
+            let visible = !input.projection.rejects_ball(center, ball)?;
+            let projected =
+                metadata.projected_total_error(error, center, ball, input.projection)?;
+            let obsolete = if self.construction_refining {
+                !visible || projected <= settings.split_pixels()
+            } else {
+                visible && projected >= settings.merge_pixels()
+            };
+            if obsolete {
+                // Keep construction ownership until the cancellation acknowledgement;
+                // the source Arc must not be double charged while the worker holds it.
+                self.construction_obsolete = true;
+                cache.cancel_workers(|i, address| i == identity && address.is_none());
+            }
         }
         cache.unpin_body(identity.body);
         for p in &self.active {
@@ -321,6 +438,10 @@ impl AdaptiveTerrainCover {
             };
         let reserve =
             self.resident_bytes() + STAGING_ALLOWANCE + 8 * 1024 * 1024 + transition_reserve;
+        cache.operational_reserve_bytes = transition_reserve
+            + self.morph.as_ref().map_or(0, |m| {
+                m.mesh.resident_bytes() + shared_surface_bytes(&m.destination)
+            });
         let admitted = cache.reserve_external(reserve);
         let generator = self
             .generator
@@ -348,9 +469,16 @@ impl AdaptiveTerrainCover {
                 || self.transition_deferred
                 || unpublished_target,
             reservation_base: reserve,
+            certificates: &mut self.certificates,
         };
         let selection_start = Instant::now();
         self.report = lod.update_with_policy(input, settings, &mut policy)?;
+        if self.report.splits != 0 || self.report.merges != 0 {
+            self.unpublished_parent = self
+                .report
+                .refinement_parent
+                .map(|parent| (parent, self.report.splits != 0));
+        }
         self.selection_preparation = selection_start.elapsed();
         if !admitted || self.transition_deferred {
             self.report.budget_constrained = true;
@@ -361,10 +489,92 @@ impl AdaptiveTerrainCover {
         if unpublished_target {
             required.extend(lod.covering_leaves());
         }
+        let publishing_required = required.clone();
+        // While the current endpoint is being constructed/morphed, otherwise
+        // idle patch workers can prepare the *next* local balanced closure.
+        // This never advances topology beyond the endpoint or changes quality.
+        let mut next_parent = if self.construction.is_some() || self.morph.is_some() {
+            let source = input.view.prepare_source(input.body_fixed_frame)?;
+            Direction3::try_new(source.observer_in_source().metres())
+                .ok()
+                .and_then(|direction| {
+                    let (face, uv) = SurfaceLocation::new(direction).face_uv();
+                    lod.active_visible()
+                        .iter()
+                        .find(|p| {
+                            p.error_pixels > settings.split_pixels()
+                                && p.address.face() == face
+                                && p.address.patch_local(uv).is_ok_and(|st| {
+                                    st[0] >= 0.0 && st[0] <= 1.0 && st[1] >= 0.0 && st[1] <= 1.0
+                                })
+                        })
+                        .map(|p| p.address)
+                })
+        } else {
+            None
+        };
+        if let Some(parent) = next_parent {
+            let source = input.view.prepare_source(input.body_fixed_frame)?;
+            let metadata = lod
+                .active_visible()
+                .iter()
+                .find(|p| p.address == parent)
+                .ok_or_else(|| anyhow::anyhow!("missing prefetch parent"))?
+                .metadata;
+            let (mut extent, mut error) = self.certificates.get(generator, parent, metadata)?;
+            error.boundary_constraint_m =
+                (self.boundary_bounds[usize::from(parent.level())] + error.numeric_m).next_up();
+            extent.min_height_m = (extent.min_height_m - error.boundary_constraint_m).next_down();
+            extent.max_height_m = (extent.max_height_m + error.boundary_constraint_m).next_up();
+            let (center, ball) = metadata.ball(identity.radius_m, extent)?;
+            let center = source
+                .view_displacement(mundaris_math::FramePosition::new(
+                    input.body_fixed_frame,
+                    mundaris_math::LocalPosition::try_metres(center)?,
+                ))?
+                .metres();
+            // An active transition's remaining displacement is not unresolved
+            // endpoint terrain and must not manufacture speculative refinement.
+            if input.projection.rejects_ball(center, ball)?
+                || metadata.projected_total_error(error, center, ball, input.projection)?
+                    <= settings.split_pixels()
+            {
+                next_parent = None;
+            }
+        }
+        if self.prefetch_parent != next_parent {
+            self.prefetch_dependencies.clear();
+            if let Some(parent) = next_parent {
+                match lod.replacement_dependencies(parent, settings) {
+                    Ok(dependencies) if dependencies.len() <= MAX_PENDING_PATCHES => {
+                        self.prefetch_dependencies = dependencies
+                    }
+                    Ok(_) | Err(RenderPreparationError::InvalidBudget) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            self.prefetch_parent = next_parent;
+        }
+        for &address in &self.prefetch_dependencies {
+            cache.request_pinned(identity, address);
+            required.push(address);
+        }
         // Preserve the highest projected-error blocking closure. Everything else
         // is discardable, including an obsolete partially generated builder.
         cache.retain_required(identity, &required);
-        let work = cache.generate(vertex_budget, GENERATION_MICROBATCH, wall_budget)?;
+        let ready_before = publishing_required
+            .iter()
+            .filter(|&&a| cache.peek(identity, a).is_some())
+            .count();
+        let mut work = cache.generate(vertex_budget, GENERATION_MICROBATCH, wall_budget)?;
+        let ready_after = publishing_required
+            .iter()
+            .filter(|&&a| cache.peek(identity, a).is_some())
+            .count();
+        work.replacement_useful_completed = ready_after.saturating_sub(ready_before);
+        if self.report.refinement_local {
+            work.local_useful_completed = work.replacement_useful_completed;
+        }
         self.result_publication = Duration::ZERO;
         if let Some(completion) = self
             .construction
@@ -373,43 +583,61 @@ impl AdaptiveTerrainCover {
             let start = Instant::now();
             if self.construction == Some(completion.id) && completion.identity == *identity {
                 self.construction = None;
-                match completion.result {
-                    Ok(workers::Output::Cover(output)) => {
-                        self.transition_deferred = false;
-                        self.transition_budget_step = 0;
-                        self.worker_stitch_cpu = output.stitch_cpu;
-                        self.worker_morph_cpu = output.morph_cpu;
-                        if let Some(mesh) = output.transition {
-                            self.peak_transition_bytes =
-                                self.peak_transition_bytes.max(mesh.resident_bytes());
-                            self.morph = Some(ActiveMorph {
-                                mesh,
-                                destination: output.surface,
-                                destination_cover: output.cover,
-                                elapsed: Duration::ZERO,
-                                duration: self.construction_duration,
-                            });
-                        } else {
-                            self.stitched = Some(output.surface);
-                            self.active = output.cover;
+                self.construction_parent = None;
+                if self.construction_obsolete {
+                    self.construction_obsolete = false;
+                    self.unpublished_parent = None;
+                    self.lod
+                        .as_mut()
+                        .ok_or_else(|| anyhow::anyhow!("missing selector"))?
+                        .restore_published_cover(&self.active)?;
+                } else {
+                    match completion.result {
+                        Ok(workers::Output::Cover(output)) => {
+                            self.unpublished_parent = None;
+                            self.transition_deferred = false;
+                            self.transition_budget_step = 0;
+                            self.worker_stitch_cpu = output.stitch_cpu;
+                            self.worker_morph_cpu = output.morph_cpu;
+                            if let Some(mesh) = output.transition {
+                                self.peak_transition_bytes =
+                                    self.peak_transition_bytes.max(mesh.resident_bytes());
+                                self.morph = Some(ActiveMorph {
+                                    mesh,
+                                    destination: output.surface,
+                                    destination_cover: output.cover,
+                                    elapsed: Duration::ZERO,
+                                    duration: self.construction_duration,
+                                });
+                            } else {
+                                self.stitched = Some(output.surface);
+                                self.active = output.cover;
+                            }
                         }
+                        Err(error)
+                            if error.downcast_ref::<RenderPreparationError>().is_some_and(
+                                |e| matches!(e, RenderPreparationError::InvalidBudget),
+                            ) =>
+                        {
+                            self.transition_budget_step =
+                                self.transition_budget_step.saturating_add(1);
+                            self.transition_deferred = self.transition_budget_step > 2;
+                            self.report.budget_constrained = true;
+                            self.report.quality_pending = true;
+                            self.report.settled = false;
+                        }
+                        Err(error) => return Err(error),
+                        Ok(workers::Output::Cancelled) => {
+                            self.unpublished_parent = None;
+                            if self.stitched.is_some() {
+                                self.lod
+                                    .as_mut()
+                                    .ok_or_else(|| anyhow::anyhow!("missing selector"))?
+                                    .restore_published_cover(&self.active)?;
+                            }
+                        }
+                        _ => anyhow::bail!("unexpected terrain cover completion"),
                     }
-                    Err(error)
-                        if error
-                            .downcast_ref::<RenderPreparationError>()
-                            .is_some_and(|e| {
-                                matches!(e, RenderPreparationError::InvalidBudget)
-                            }) =>
-                    {
-                        self.transition_budget_step = self.transition_budget_step.saturating_add(1);
-                        self.transition_deferred = self.transition_budget_step > 2;
-                        self.report.budget_constrained = true;
-                        self.report.quality_pending = true;
-                        self.report.settled = false;
-                    }
-                    Err(error) => return Err(error),
-                    Ok(workers::Output::Cancelled) => {}
-                    _ => anyhow::bail!("unexpected terrain cover completion"),
                 }
             }
             self.result_publication = start.elapsed();
@@ -430,6 +658,10 @@ impl AdaptiveTerrainCover {
             };
         let reserve =
             self.resident_bytes() + STAGING_ALLOWANCE + 8 * 1024 * 1024 + transition_reserve;
+        cache.operational_reserve_bytes = transition_reserve
+            + self.morph.as_ref().map_or(0, |m| {
+                m.mesh.resident_bytes() + shared_surface_bytes(&m.destination)
+            });
         let construction_admitted = cache.reserve_external(reserve);
         if !construction_admitted {
             self.report.budget_constrained = true;
@@ -548,6 +780,11 @@ impl AdaptiveTerrainCover {
                             .submit_cover(identity, job, bytes)?,
                     );
                     self.construction_duration = self.morph_duration;
+                    self.construction_parent = self.unpublished_parent.map(|(parent, _)| parent);
+                    self.construction_obsolete = false;
+                    self.construction_refining = self
+                        .unpublished_parent
+                        .is_some_and(|(_, refining)| refining);
                     cache.record_peak();
                 } else {
                     self.report.budget_constrained = true;
@@ -571,6 +808,7 @@ impl AdaptiveTerrainCover {
                     self.morph_preparation = start.elapsed();
                     match prepared {
                         Ok(mesh) => {
+                            self.unpublished_parent = None;
                             self.transition_budget_step = 0;
                             self.peak_transition_bytes =
                                 self.peak_transition_bytes.max(mesh.resident_bytes());
@@ -595,6 +833,7 @@ impl AdaptiveTerrainCover {
                         Err(error) => return Err(error.into()),
                     }
                 } else {
+                    self.unpublished_parent = None;
                     self.stitched = Some(surface);
                     self.active = active;
                 }
@@ -700,10 +939,18 @@ impl AdaptiveTerrainCover {
             let metadata = slot
                 .ok_or_else(|| anyhow::anyhow!("missing local certificate metadata"))?
                 .1;
-            let (mut extent, mut error) = geometry
-                .map(|g| (g.extent(), g.error()))
-                .map(Ok)
-                .unwrap_or_else(|| terrain_surface_certificate(generator, address, metadata))?;
+            let (mut extent, mut error) = if let Some(g) = geometry {
+                (g.extent(), g.error())
+            } else {
+                let slot = &mut self.local_certificates[usize::from(level)];
+                if slot.is_none_or(|(a, _, _)| a != address) {
+                    let (extent, error) = self.certificates.get(generator, address, metadata)?;
+                    *slot = Some((address, extent, error));
+                }
+                let (_, extent, error) =
+                    slot.ok_or_else(|| anyhow::anyhow!("missing local certificate"))?;
+                (extent, error)
+            };
             error.boundary_constraint_m =
                 (self.boundary_bounds[usize::from(level)] + error.numeric_m).next_up();
             extent.min_height_m = (extent.min_height_m - error.boundary_constraint_m).next_down();
@@ -715,18 +962,73 @@ impl AdaptiveTerrainCover {
                     mundaris_math::LocalPosition::try_metres(center)?,
                 ))?
                 .metres();
-            if metadata.projected_total_error(error, center, radius, input.projection)?
-                <= settings.split_pixels()
-            {
+            let pixels = metadata.projected_total_error(error, center, radius, input.projection)?;
+            if pixels <= settings.split_pixels() || level == 30 {
                 diagnostic.desired_local_lod = Some(level);
-                diagnostic.target_certifiable = true;
-            } else if level == 30 {
-                diagnostic.desired_local_lod = Some(30);
+                diagnostic.target_certifiable = pixels <= settings.split_pixels();
+                diagnostic.certificate_limited_target_lod = Some(level);
+                // This is the certified useful target, not a heuristic geometry
+                // spacing target. No second, unproved quality threshold is used.
+                diagnostic.useful_target_lod = diagnostic.target_certifiable.then_some(level);
+                let (width, spacing) = physical_resolution(address, identity.radius_m)?;
+                diagnostic.desired_patch_width_m = width;
+                diagnostic.desired_sample_spacing_m = spacing;
+                diagnostic.terrain_footprint_m =
+                    identity.radius_m * 2.0 / (16.0 * (1u64 << level) as f64);
+                diagnostic.represented_height_bound_m = generator
+                    .bounds_for_region(
+                        DirectionalCap::new(
+                            Direction3::try_new(metadata.cap().0)?,
+                            metadata.cap().1,
+                        )?,
+                        TerrainFootprint::new(diagnostic.terrain_footprint_m)?,
+                    )?
+                    .represented_height_bound_m();
+                diagnostic.projected_depth_floor_m =
+                    (-center.z - radius).max(input.projection.near_m());
+                diagnostic.pixel_footprint_m =
+                    diagnostic.projected_depth_floor_m / input.projection.focal_pixels();
+                diagnostic.desired_error = error;
+                diagnostic.desired_total_pixels = pixels;
+                let terms = [
+                    error.sphere_m,
+                    error.filtered_interpolation_m,
+                    error.unresolved_m,
+                    error.boundary_constraint_m,
+                    error.morph_remaining_m,
+                    error.numeric_m,
+                ];
+                let names = [
+                    "sphere",
+                    "interpolation",
+                    "unresolved terrain",
+                    "boundary",
+                    "morph",
+                    "numerical",
+                ];
+                let mut dominant = 0;
+                for (i, &term) in terms.iter().enumerate() {
+                    if term > terms[dominant] {
+                        dominant = i;
+                    }
+                    diagnostic.desired_error_pixels[i] = metadata.projected_total_error(
+                        SurfaceErrorContributions {
+                            sphere_m: term,
+                            ..Default::default()
+                        },
+                        center,
+                        radius,
+                        input.projection,
+                    )?;
+                }
+                diagnostic.dominant_term = names[dominant];
             }
         }
         if let Some(level) = diagnostic.rendered_local_lod
             && let Some(geometry) = cache.peek(identity, address_at(level)?)
         {
+            diagnostic.rendered_sample_spacing_m =
+                physical_resolution(address_at(level)?, identity.radius_m)?.1;
             diagnostic.local_error = geometry.error();
             diagnostic.local_error.boundary_constraint_m = self.boundary_bounds[usize::from(level)];
             diagnostic.local_error.morph_remaining_m = self
@@ -1017,6 +1319,32 @@ mod tests {
                 assert!(Instant::now() < deadline);
                 std::thread::sleep(Duration::from_millis(1));
             }
+            // A body-center observer has no camera-radial prefetch direction,
+            // but must not invalidate an in-flight source/target transaction.
+            let center = PreparedView::new(
+                &tree.evaluate(),
+                FramePose::new(
+                    FramePosition::new(fixed, LocalPosition::origin()),
+                    UnitRotation::identity(),
+                ),
+                RenderPrecisionBudget::near_debug(),
+            )
+            .unwrap();
+            let center_input = SurfaceViewInput {
+                view: &center,
+                ..input
+            };
+            let source: Vec<_> = cover.active.iter().map(|p| p.address).collect();
+            let job = cover.construction;
+            cover
+                .update(&mut cache, &identity, &center_input, &refined, 0, None)
+                .unwrap();
+            assert_eq!(cover.construction, job);
+            assert_eq!(
+                cover.active.iter().map(|p| p.address).collect::<Vec<_>>(),
+                source
+            );
+            assert!(cache.report().peak_aggregate_bytes <= TERRAIN_CPU_CAP_BYTES);
             let job = cover.construction.unwrap();
             assert!(cache.report().worker_reserved_bytes >= source_bytes);
             let charged_cover_bytes = cover.resident_bytes();
@@ -1045,9 +1373,124 @@ mod tests {
                 cache.report().resident_bytes + cache.report().external_bytes
                     <= TERRAIN_CPU_CAP_BYTES
             );
+            let away = PreparedView::new(
+                &tree.evaluate(),
+                FramePose::new(
+                    FramePosition::new(
+                        fixed,
+                        LocalPosition::try_metres(DVec3::Z * (identity.radius_m + 1_000_000.0))
+                            .unwrap(),
+                    ),
+                    UnitRotation::try_from_quaternion(glam::DQuat::from_rotation_y(
+                        std::f64::consts::PI,
+                    ))
+                    .unwrap(),
+                ),
+                RenderPrecisionBudget::near_debug(),
+            )
+            .unwrap();
+            let away_input = SurfaceViewInput {
+                view: &away,
+                ..input
+            };
+            for unpublished in [false, true] {
+                while !cover.construction_pending() {
+                    cover
+                        .update(&mut cache, &identity, &input, &refined, 1, None)
+                        .unwrap();
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let obsolete_job = cover.construction.unwrap();
+                let source: Vec<_> = cover.active.iter().map(|p| p.address).collect();
+                if unpublished {
+                    while !cache.completed_covers.iter().any(|c| c.id == obsolete_job) {
+                        cache.generate(0, GENERATION_MICROBATCH, None).unwrap();
+                        assert!(Instant::now() < deadline);
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                let cancellations = cache.report().cancellations;
+                while cover.construction == Some(obsolete_job) {
+                    cover
+                        .update(&mut cache, &identity, &away_input, &refined, 0, None)
+                        .unwrap();
+                    assert!(cover.transition().is_none());
+                    assert_eq!(
+                        cover.active.iter().map(|p| p.address).collect::<Vec<_>>(),
+                        source
+                    );
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert!(cache.report().cancellations > cancellations);
+                assert_eq!(
+                    cover
+                        .lod
+                        .as_ref()
+                        .unwrap()
+                        .covering_leaves()
+                        .collect::<Vec<_>>(),
+                    source
+                );
+                assert!(cache.report().peak_aggregate_bytes <= TERRAIN_CPU_CAP_BYTES);
+            }
+            // Active morphs finish, but a newly requested unpublished merge
+            // must reverse when its parent is visibly above the merge threshold.
+            while cover.transition().is_none() {
+                cover
+                    .update(&mut cache, &identity, &input, &refined, 1, None)
+                    .unwrap();
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            cover
+                .update_with_elapsed(
+                    &mut cache,
+                    &identity,
+                    &input,
+                    &refined,
+                    0,
+                    None,
+                    Duration::from_secs(1),
+                )
+                .unwrap();
+            assert!(cover.active.len() > 6);
+            let source: Vec<_> = cover.active.iter().map(|p| p.address).collect();
+            while !cover.construction_pending() {
+                cover
+                    .update(&mut cache, &identity, &away_input, &refined, 0, None)
+                    .unwrap();
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(!cover.construction_refining);
+            let merge_job = cover.construction.unwrap();
+            while cover.construction == Some(merge_job) {
+                cover
+                    .update(&mut cache, &identity, &input, &refined, 0, None)
+                    .unwrap();
+                assert!(cover.transition().is_none());
+                assert_eq!(
+                    cover.active.iter().map(|p| p.address).collect::<Vec<_>>(),
+                    source
+                );
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(
+                cover
+                    .lod
+                    .as_ref()
+                    .unwrap()
+                    .covering_leaves()
+                    .collect::<Vec<_>>(),
+                source
+            );
             cover.abandon_construction(&mut cache);
             drop(cover);
             cache.reserve_external(0);
+            cache.cancel_body_work(body);
             while cache.pending() != 0 {
                 cache.generate(0, GENERATION_MICROBATCH, None).unwrap();
                 assert!(Instant::now() < deadline);

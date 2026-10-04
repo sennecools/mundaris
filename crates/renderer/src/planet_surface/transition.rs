@@ -26,6 +26,14 @@ impl Rational {
         if d == 0 || n == i128::MIN || d == i128::MIN {
             return Err(invalid());
         }
+        // Canonical dyadic overlay endpoints overwhelmingly have denominator
+        // one. Their exact representation requires no GCD or integer division.
+        if d == 1 {
+            return Ok(Self::integer(n));
+        }
+        if n == 0 {
+            return Ok(Self::integer(0));
+        }
         let sign = if d < 0 { -1 } else { 1 };
         let (mut a, mut b) = (n.abs(), d.abs());
         while b != 0 {
@@ -135,6 +143,17 @@ fn cross(a: Point, b: Point) -> Result<Rational> {
     a[0].mul(b[1])?.sub(a[1].mul(b[0])?)
 }
 fn oriented(a: Point, b: Point, c: Point) -> Result<Rational> {
+    if a.into_iter().chain(b).chain(c).all(|p| p.d == 1) {
+        let dx = b[0].n.checked_sub(a[0].n).ok_or_else(invalid)?;
+        let dy = b[1].n.checked_sub(a[1].n).ok_or_else(invalid)?;
+        let x = c[0].n.checked_sub(a[0].n).ok_or_else(invalid)?;
+        let y = c[1].n.checked_sub(a[1].n).ok_or_else(invalid)?;
+        let determinant = dx
+            .checked_mul(y)
+            .and_then(|v| dy.checked_mul(x).and_then(|w| v.checked_sub(w)))
+            .ok_or_else(invalid)?;
+        return Rational::new(determinant, 1);
+    }
     cross(subtract(b, a)?, subtract(c, a)?)
 }
 fn intersection(a: Point, b: Point, da: Rational, db: Rational) -> Result<Point> {
@@ -280,8 +299,34 @@ impl SurfaceTransition {
         topology: &SurfaceTopology,
         max_bytes: usize,
     ) -> Result<Self> {
+        Self::build_cancellable(old_cover, old, new_cover, new, topology, max_bytes, || {
+            false
+        })?
+        .ok_or_else(invalid)
+    }
+
+    /// Builds an exact transition, returning `Ok(None)` when the caller cancels.
+    /// The callback is polled throughout candidate enumeration and overlay emission.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_cancellable(
+        old_cover: &[ActiveSurfacePatch],
+        old: &StitchedSurface,
+        new_cover: &[ActiveSurfacePatch],
+        new: &StitchedSurface,
+        topology: &SurfaceTopology,
+        max_bytes: usize,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<Option<Self>> {
         Self::build_impl(
-            old_cover, old, new_cover, new, topology, max_bytes, true, true,
+            old_cover,
+            old,
+            new_cover,
+            new,
+            topology,
+            max_bytes,
+            true,
+            true,
+            &mut cancelled,
         )
     }
 
@@ -295,7 +340,8 @@ impl SurfaceTransition {
         max_bytes: usize,
         use_identity_templates: bool,
         reject_touching_pairs: bool,
-    ) -> Result<Self> {
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<Option<Self>> {
         #[cfg(feature = "surface-profile")]
         let build_started = Instant::now();
         if old_cover.len() != old.patches().len() || new_cover.len() != new.patches().len() {
@@ -424,7 +470,13 @@ impl SurfaceTransition {
             .enumerate()
             .filter(|(_, p)| transition.affected_old.binary_search(&p.address).is_ok())
         {
+            if cancelled() {
+                return Ok(None);
+            }
             for (ni, np) in new_cover.iter().enumerate() {
+                if cancelled() {
+                    return Ok(None);
+                }
                 if !op.address.contains(np.address) && !np.address.contains(op.address) {
                     continue;
                 }
@@ -471,6 +523,9 @@ impl SurfaceTransition {
                 if !identity_topology {
                     mapped_new = Vec::with_capacity(mapped_triangles);
                     for &nt in topology.indices(np.stitch_mask).as_chunks::<3>().0 {
+                        if cancelled() {
+                            return Ok(None);
+                        }
                         let points = mapped(np.address, nt);
                         mapped_new.push(MappedTriangle {
                             points,
@@ -480,6 +535,9 @@ impl SurfaceTransition {
                     }
                     bin_links = Vec::with_capacity(bin_link_capacity);
                     for (triangle_index, triangle) in mapped_new.iter().enumerate() {
+                        if cancelled() {
+                            return Ok(None);
+                        }
                         for y in bin_range(triangle.bounds.min_y, triangle.bounds.max_y, cells) {
                             for x in bin_range(triangle.bounds.min_x, triangle.bounds.max_x, cells)
                             {
@@ -502,6 +560,9 @@ impl SurfaceTransition {
                 }
                 #[cfg(feature = "surface-profile")]
                 {
+                    if cancelled() {
+                        return Ok(None);
+                    }
                     transition.profile.pair_mapping_bbox += mapping_started.elapsed();
                     transition.profile.overlapping_patch_pairs += 1;
                     transition.profile.destination_triangles_precomputed += mapped_new.len();
@@ -541,6 +602,9 @@ impl SurfaceTransition {
                     for (word_index, word) in candidates.into_iter().enumerate() {
                         let mut remaining = word;
                         while remaining != 0 {
+                            if cancelled() {
+                                return Ok(None);
+                            }
                             let bit = remaining.trailing_zeros() as usize;
                             remaining &= remaining - 1;
                             let triangle_index = word_index * 64 + bit;
@@ -619,6 +683,9 @@ impl SurfaceTransition {
                                 overlay(od, nd)?
                             };
                             for k in 1..len.saturating_sub(1) {
+                                if cancelled() {
+                                    return Ok(None);
+                                }
                                 let points = [polygon[0], polygon[k], polygon[k + 1]];
                                 let area = oriented(points[0], points[1], points[2])?;
                                 if area.n == 0 {
@@ -645,6 +712,9 @@ impl SurfaceTransition {
                                 };
                                 let mut vertices = [initial; 3];
                                 for (vertex_index, point) in points.into_iter().enumerate() {
+                                    if cancelled() {
+                                        return Ok(None);
+                                    }
                                     #[cfg(feature = "surface-profile")]
                                     let capture_started = Instant::now();
                                     let capture = |domain: [Point; 3],
@@ -794,8 +864,9 @@ impl SurfaceTransition {
                                 {
                                     return Err(RenderPreparationError::InvalidBudget);
                                 }
-                                // Exact growth is essential: Vec's geometric doubling
-                                // must not silently consume the transition reservation.
+                                // Grow geometrically only up to the preflighted
+                                // reservation. Repeated 128-triangle reallocations
+                                // copy an increasingly large exact overlay.
                                 if transition.triangles.len() == transition.triangles.capacity() {
                                     let overhead = size_of::<Self>()
                                         + scratch_bytes
@@ -804,7 +875,11 @@ impl SurfaceTransition {
                                             * size_of::<CubePatchAddress>();
                                     let limit = max_bytes.saturating_sub(overhead)
                                         / size_of::<[TransitionVertex; 3]>();
-                                    let next = (transition.triangles.capacity() + 128).min(limit);
+                                    let capacity = transition.triangles.capacity();
+                                    let next = capacity
+                                        .saturating_mul(2)
+                                        .max(capacity.saturating_add(128))
+                                        .min(limit);
                                     if next <= transition.triangles.len() {
                                         return Err(RenderPreparationError::InvalidBudget);
                                     }
@@ -844,7 +919,7 @@ impl SurfaceTransition {
                 build_started.elapsed()
             };
         }
-        Ok(transition)
+        Ok(Some(transition))
     }
     pub fn triangles(&self) -> &[[TransitionVertex; 3]] {
         &self.triangles
@@ -1041,7 +1116,9 @@ mod tests {
                     16 * 1024 * 1024,
                     false,
                     false,
+                    &mut || false,
                 )
+                .unwrap()
                 .unwrap();
                 let optimized = SurfaceTransition::build(
                     old_cover,
@@ -1071,7 +1148,9 @@ mod tests {
             16 * 1024 * 1024,
             false,
             false,
+            &mut || false,
         )
+        .unwrap()
         .unwrap();
         let optimized = SurfaceTransition::build(
             &old_cover,

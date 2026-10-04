@@ -20,7 +20,7 @@ use std::{
 
 const WIDTH: u32 = 768;
 const HEIGHT: u32 = 512;
-const TIMES_MS: [u64; 7] = [0, 100, 250, 500, 1000, 2000, 5000];
+const TIMES_MS: [u64; 8] = [0, 100, 250, 500, 1000, 2000, 3000, 5000];
 const DIRECTION: DVec3 = DVec3::new(0.04592207301441123, 0.4595519490375417, 0.886962890625);
 const CLEARANCES_M: [(&str, f64); 7] = [
     ("high-orbit", 600_000.0),
@@ -121,6 +121,20 @@ fn main() -> Result<()> {
         ),
     )?;
     let mut population = TerrainPopulation::with_worker_count(workers)?;
+    let headroom_mib: usize = std::env::var("MUNDARIS_TERRAIN_HEADROOM_MIB")
+        .ok()
+        .map(|s| s.parse())
+        .transpose()?
+        .unwrap_or(0);
+    population
+        .cache
+        .set_soft_residency_headroom(headroom_mib * 1024 * 1024);
+    fs::write(
+        output.join("headroom.txt"),
+        format!(
+            "soft_headroom_mib={headroom_mib}; critical pinned replacement jobs may use the hard quota after all disposable raw entries are reclaimed\n"
+        ),
+    )?;
     let mut owners = vec![false; requests.len()];
     let mut csv = BufWriter::new(File::create(output.join("timeline.csv"))?);
     writeln!(
@@ -129,6 +143,20 @@ fn main() -> Result<()> {
     )?;
 
     let mut frames_csv = BufWriter::new(File::create(output.join("frames.csv"))?);
+    let mut detail = BufWriter::new(File::create(output.join("detail.csv"))?);
+    writeln!(
+        detail,
+        "view,actual_ms,stitched_append_ms,transition_append_ms,far_append_ms,closure_parent,closure_dependencies,balance_parents,closure_local,completed_patches,completed_replacement_useful,completed_local_useful,total_completed,local_useful_total,useful_ratio,queued,worker_jobs,accounted_bytes,reservation_rejected,eviction_attempts,bytes_freed,evictions,hits,misses,soft_waterline_misses,desired_spacing_m,rendered_spacing_m,desired_error_px,restaged_patches,bytes_staged,stitch_reused,active_morph,construction_pending,proof_hits,proof_misses"
+    )?;
+    let mut memory_csv = BufWriter::new(File::create(output.join("memory.csv"))?);
+    writeln!(
+        memory_csv,
+        "view,actual_ms,raw_and_bookkeeping_bytes,pinned_raw_bytes,worker_reserved_bytes,worker_fixed_bytes,completed_unpublished_bytes,stitched_source_bytes,morph_mesh_bytes,selector_scratch_bytes,renderer_outgoing_capacity_bytes,renderer_boundary_and_proof_capacity_bytes,renderer_staging_allowance_bytes,frame_end_accounted_bytes,peak_accounted_bytes"
+    )?;
+    #[cfg(feature = "surface-profile")]
+    let mut render_profiles = BufWriter::new(File::create(output.join("render-profiles.txt"))?);
+    let mut completed_total = 0usize;
+    let mut useful_total = 0usize;
     writeln!(
         frames_csv,
         "view,actual_ms,update_ms,local_ready_lod,local_rendered_lod,pending,queued,worker_jobs,worker_cpu_ms,samples_completed,selection_ms,publication_ms,stitch_main_ms,morph_main_ms,stitch_worker_ms,morph_worker_ms,construction_pending,cancellations,accounted_bytes,render_prepare_ms,desired_local_lod,transition_deferred,active_morphs,diagnostics_ms,body_index,body_id,clearance_m,cache_bytes,worker_reservations,worker_fixed_bytes,completed_cover_reservation,external_bytes,peak_accounted_bytes,transition_peak_bytes,cover_publication_ms,scheduling_ms,stitched_reused,sphere_error_m,interpolation_error_m,unresolved_error_m,boundary_error_m,morph_error_m,numeric_error_m"
@@ -315,6 +343,8 @@ fn main() -> Result<()> {
                 lighting = lighting.with_readability(palette);
             }
             frame.set_terrain_lighting(lighting);
+            let mut stitched_append_ms = 0.0;
+            let mut transition_append_ms = 0.0;
             let owner_count = owners.iter().filter(|owner| **owner).count();
             ensure!(owner_count <= 1, "multiple surface owners published");
             if let Some(owner_index) = owners.iter().position(|owner| *owner) {
@@ -338,6 +368,7 @@ fn main() -> Result<()> {
                         .all(|p| p.reference_radius_m() == body_radius),
                     "cover radius does not match the current candidate body"
                 );
+                let append_start = Instant::now();
                 frame.append_stitched_surface(
                     requests[body_index],
                     population.cover.visible(),
@@ -345,13 +376,16 @@ fn main() -> Result<()> {
                     population.cover.topology().context("missing topology")?,
                     SurfaceStyle::default(),
                 )?;
+                stitched_append_ms = append_start.elapsed().as_secs_f64() * 1000.0;
                 if let Some((mesh, fraction)) = population.cover.transition() {
+                    let append_start = Instant::now();
                     frame.append_surface_transition(
                         requests[body_index],
                         mesh,
                         fraction,
                         SurfaceStyle::default(),
                     )?;
+                    transition_append_ms = append_start.elapsed().as_secs_f64() * 1000.0;
                 }
             }
             let far: Vec<_> = requests
@@ -360,8 +394,19 @@ fn main() -> Result<()> {
                 .filter(|(i, _)| !owners[*i])
                 .map(|(_, r)| *r)
                 .collect();
+            let far_start = Instant::now();
             frame.append_bodies(&far)?;
+            let far_append_ms = far_start.elapsed().as_secs_f64() * 1000.0;
             let render_ms = preparation_start.elapsed().as_secs_f64() * 1000.0;
+            let surface_report = frame.report().surface;
+            #[cfg(feature = "surface-profile")]
+            writeln!(
+                render_profiles,
+                "{view_name},{:.3},render={:?},selection={:?}",
+                start.elapsed().as_secs_f64() * 1000.0,
+                surface_report.profile,
+                population.cover.report.profile
+            )?;
             let (face, uv) = SurfaceLocation::new(Direction3::try_new(frame_direction)?).face_uv();
             let address_at = |level: u8| {
                 mundaris_math::surface::CubePatchAddress::try_new(
@@ -384,6 +429,70 @@ fn main() -> Result<()> {
                 .find(|p| p.address.contains(local))
                 .map(|p| p.address.level());
             let c = population.cache.report();
+            completed_total += population.work.patches_completed;
+            useful_total += population.work.local_useful_completed;
+            let r = population.cover.report;
+            let d = population.cover.convergence;
+            writeln!(
+                detail,
+                "{view_name},{:.3},{stitched_append_ms:.6},{transition_append_ms:.6},{far_append_ms:.6},\"{:?}\",{},{},{},{},{},{},{completed_total},{useful_total},{:.6},{},{},{},{},{},{},{},{},{},{},{:.9e},{:.9e},{:.9e},{},{},{},{},{},{},{}",
+                start.elapsed().as_secs_f64() * 1000.0,
+                r.refinement_parent,
+                r.refinement_dependencies,
+                r.refinement_balance_parents,
+                r.refinement_local,
+                population.work.patches_completed,
+                population.work.replacement_useful_completed,
+                population.work.local_useful_completed,
+                if completed_total == 0 {
+                    0.0
+                } else {
+                    useful_total as f64 / completed_total as f64
+                },
+                c.queued_patches,
+                c.worker_jobs,
+                c.resident_bytes + c.external_bytes,
+                c.reservation_rejected,
+                c.eviction_attempts,
+                c.eviction_freed_bytes,
+                c.evictions,
+                c.hits,
+                c.misses,
+                c.soft_waterline_misses,
+                d.desired_sample_spacing_m,
+                d.rendered_sample_spacing_m,
+                d.desired_total_pixels,
+                surface_report.patches,
+                surface_report.uploaded_bytes,
+                population.cover.surface().map_or(0, |s| s.reused_patches()),
+                population.cover.transition().is_some(),
+                population.cover.construction_pending(),
+                surface_report.proof_cache_hits,
+                surface_report.proof_cache_misses
+            )?;
+            writeln!(
+                memory_csv,
+                "{view_name},{:.3},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                start.elapsed().as_secs_f64() * 1000.0,
+                c.resident_bytes.saturating_sub(
+                    c.worker_reserved_bytes + c.worker_fixed_bytes + c.completed_unpublished_bytes
+                ),
+                c.pinned_bytes,
+                c.worker_reserved_bytes,
+                c.worker_fixed_bytes,
+                c.completed_unpublished_bytes,
+                population.cover.surface().map_or(0, |s| s.resident_bytes()),
+                population
+                    .cover
+                    .transition()
+                    .map_or(0, |(m, _)| m.resident_bytes()),
+                r.scratch_bytes,
+                surface_report.allocated_staging_bytes,
+                surface_report.boundary_bytes,
+                72 * 1024 * 1024 + 32 * 1024,
+                c.resident_bytes + c.external_bytes,
+                c.peak_aggregate_bytes
+            )?;
             writeln!(
                 frames_csv,
                 "{view_name},{:.3},{update_ms:.6},{ready_lod:?},{rendered_lod:?},{},{},{},{:.6},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{},{},{},{render_ms:.6},{:?},{},{},{:.6},{body_index},\"{body_id:?}\",{frame_clearance:.3},{},{},{},{},{},{},{},{:.6},{:.6},{},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e}",
@@ -526,6 +635,10 @@ fn main() -> Result<()> {
     }
     csv.flush()?;
     frames_csv.flush()?;
+    detail.flush()?;
+    memory_csv.flush()?;
+    #[cfg(feature = "surface-profile")]
+    render_profiles.flush()?;
     #[cfg(feature = "surface-profile")]
     transition_profiles.flush()?;
     println!(

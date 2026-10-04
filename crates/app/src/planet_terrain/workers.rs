@@ -412,19 +412,24 @@ fn calculate(job: Job, topology: &SurfaceTopology) -> Result<Output> {
                     .old
                     .as_ref()
                     .map(|old| {
-                        SurfaceTransition::build(
+                        SurfaceTransition::build_cancellable(
                             &input.old_cover,
                             old,
                             &input.cover,
                             &surface,
                             topology,
                             input.transition_budget,
+                            || job.cancelled.load(Ordering::Relaxed),
                         )
                     })
                     .transpose()?
+                    .flatten()
             } else {
                 None
             };
+            if job.cancelled.load(Ordering::Relaxed) {
+                return Ok(Output::Cancelled);
+            }
             Ok(Output::Cover(CoverOutput {
                 surface,
                 cover: input.cover,

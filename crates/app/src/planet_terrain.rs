@@ -88,6 +88,19 @@ mod publication_pin_tests {
         assert_eq!(cache.report().evictions, 1);
         assert!(cache.peek(&identity, extra).is_some());
         assert!(cache.report().peak_aggregate_bytes <= TERRAIN_CPU_CAP_BYTES);
+        // A soft waterline must not permanently block a pinned replacement
+        // when only indispensable data remains and the hard quota still fits.
+        cache.set_soft_residency_headroom(TERRAIN_CPU_CAP_BYTES);
+        let critical = CubePatchAddress::root(CubeFace::NegativeX);
+        cache.request_pinned(&identity, critical);
+        let work = cache
+            .generate(GRID_SAMPLES, GENERATION_MICROBATCH, None)
+            .unwrap();
+        assert_eq!(work.patches_completed, 1);
+        assert!(cache.peek(&identity, extra).is_some());
+        assert!(cache.peek(&identity, critical).is_some());
+        assert!(cache.report().soft_waterline_misses > 0);
+        assert!(cache.report().peak_aggregate_bytes <= TERRAIN_CPU_CAP_BYTES);
     }
 }
 
@@ -345,6 +358,9 @@ pub struct TerrainWorkReport {
     pub worker_samples_completed: usize,
     pub scheduling: Duration,
     pub publication: Duration,
+    /// Newly ready raw patches in the currently selected replacement closure.
+    pub replacement_useful_completed: usize,
+    pub local_useful_completed: usize,
 }
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TerrainCacheReport {
@@ -365,6 +381,14 @@ pub struct TerrainCacheReport {
     pub worker_fixed_bytes: usize,
     pub completed_unpublished_bytes: usize,
     pub cancellations: u64,
+    /// Generation admissions blocked by entry capacity or the effective quota.
+    /// The effective quota can be the experimental soft target or the hard cap.
+    pub reservation_rejected: u64,
+    /// Attempts to reclaim an unpinned, cache-owned raw patch.
+    pub eviction_attempts: u64,
+    /// Accounted bytes reclaimed by those evictions.
+    pub eviction_freed_bytes: u64,
+    pub soft_waterline_misses: u64,
 }
 struct Entry {
     identity: TerrainGeometryIdentity,
@@ -392,6 +416,8 @@ pub struct TerrainPatchCache {
     requests: Vec<Request>,
     building: Option<Builder>,
     cap_bytes: usize,
+    soft_headroom_bytes: usize,
+    operational_reserve_bytes: usize,
     external_bytes: usize,
     max_entries: usize,
     sequence: u64,
@@ -417,6 +443,8 @@ impl TerrainPatchCache {
             requests: Vec::with_capacity(MAX_PENDING_PATCHES),
             building: None,
             cap_bytes,
+            soft_headroom_bytes: 0,
+            operational_reserve_bytes: 0,
             external_bytes: 0,
             max_entries,
             sequence: 0,
@@ -458,6 +486,33 @@ impl TerrainPatchCache {
         self.workers
             .as_ref()
             .map_or(0, workers::TerrainWorkers::count)
+    }
+    /// Keep this many bytes of the hard aggregate quota available for later
+    /// derived-terrain reservations. This is a soft target: pinned and externally
+    /// held data is never evicted to satisfy it. Defaults to zero, preserving the
+    /// historical admission behavior. Values above the hard cap are clamped.
+    pub fn set_soft_residency_headroom(&mut self, bytes: usize) {
+        self.soft_headroom_bytes = bytes.min(self.cap_bytes);
+    }
+    fn soft_admission_cap(&self) -> usize {
+        // A preflighted transition/worker output already occupies operational
+        // headroom. Do not reserve the same working space a second time by
+        // subtracting the entire waterline from an aggregate containing it.
+        let operational = self
+            .operational_reserve_bytes
+            .saturating_add(
+                self.workers
+                    .as_ref()
+                    .map_or(0, workers::TerrainWorkers::reservations),
+            )
+            .saturating_add(
+                self.completed_covers
+                    .iter()
+                    .map(|c| c.reserved_bytes)
+                    .sum::<usize>(),
+            );
+        self.cap_bytes
+            .saturating_sub(self.soft_headroom_bytes.saturating_sub(operational))
     }
     pub fn resident_bytes(&self) -> usize {
         size_of::<Self>()
@@ -798,6 +853,7 @@ impl TerrainPatchCache {
         admitted
     }
     fn evict_one(&mut self) -> bool {
+        self.report.eviction_attempts += 1;
         let victim = self
             .entries
             .iter()
@@ -806,8 +862,16 @@ impl TerrainPatchCache {
             .min_by_key(|(_, e)| (e.access, e.patch.address()))
             .map(|(i, _)| i);
         if let Some(i) = victim {
+            // Entry vector capacity is retained, so its slot is not freed.
+            let bytes = self.entries[i].patch.resident_heap_capacity_bytes()
+                + size_of::<GeneratedSurfacePatch>()
+                + 2 * size_of::<usize>();
             self.entries.remove(i);
             self.report.evictions += 1;
+            self.report.eviction_freed_bytes = self
+                .report
+                .eviction_freed_bytes
+                .saturating_add(bytes as u64);
             true
         } else {
             false
@@ -840,10 +904,19 @@ impl TerrainPatchCache {
                 let bytes = GRID_SAMPLES * size_of::<SurfaceGeometrySample>()
                     + size_of::<GeneratedSurfacePatch>()
                     + 2 * size_of::<usize>();
+                let admission_cap = self.soft_admission_cap();
                 while self.entries.len() >= self.max_entries
-                    || self.resident_bytes() + self.external_bytes + bytes > self.cap_bytes
+                    || self.resident_bytes() + self.external_bytes + bytes > admission_cap
                 {
                     if !self.evict_one() {
+                        if self.requests.first().is_some_and(|r| r.pin_when_ready)
+                            && self.entries.len() < self.max_entries
+                            && self.resident_bytes() + self.external_bytes + bytes <= self.cap_bytes
+                        {
+                            self.report.soft_waterline_misses += 1;
+                            break;
+                        }
+                        self.report.reservation_rejected += 1;
                         work.pending_patches = self.pending();
                         work.elapsed = start.elapsed();
                         work.allocation_delta_bytes =
@@ -1004,18 +1077,31 @@ impl TerrainPatchCache {
                 .workers
                 .as_ref()
                 .map_or(0, workers::TerrainWorkers::in_flight);
+            let admission_cap = self.soft_admission_cap();
             while self.entries.len() + in_flight >= self.max_entries
                 || self.resident_bytes() + self.external_bytes + workers::PATCH_RESERVATION
-                    > self.cap_bytes
+                    > admission_cap
             {
                 if !self.evict_one() {
                     break;
                 }
             }
+            let critical = self.requests.first().is_some_and(|r| r.pin_when_ready);
+            let admission_cap = if critical {
+                if self.resident_bytes() + self.external_bytes + workers::PATCH_RESERVATION
+                    > admission_cap
+                {
+                    self.report.soft_waterline_misses += 1;
+                }
+                self.cap_bytes
+            } else {
+                admission_cap
+            };
             if self.entries.len() + in_flight >= self.max_entries
                 || self.resident_bytes() + self.external_bytes + workers::PATCH_RESERVATION
-                    > self.cap_bytes
+                    > admission_cap
             {
+                self.report.reservation_rejected += 1;
                 break;
             }
             let request = self.requests.remove(0);

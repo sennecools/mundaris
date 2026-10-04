@@ -292,7 +292,7 @@ fn error_exact(a: super::SurfaceErrorContributions, b: super::SurfaceErrorContri
         .map(f64::to_bits)
 }
 
-fn validate_cover(addresses: &[CubePatchAddress]) -> Result<(), RenderPreparationError> {
+pub(crate) fn validate_cover(addresses: &[CubePatchAddress]) -> Result<(), RenderPreparationError> {
     if addresses.len() < 6 || addresses.len() > MAX_STITCHED_PATCHES {
         return Err(RenderPreparationError::InvalidBudget);
     }

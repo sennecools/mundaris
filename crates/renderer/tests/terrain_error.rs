@@ -94,6 +94,24 @@ fn vector_interpolation_remainder_uses_actual_domain_barycentrics() {
 }
 
 #[test]
+fn equilateral_centroid_requires_the_triangle_variance_bound() {
+    let vertices = [
+        DVec2::new(1.0, 0.0),
+        DVec2::new(-0.5, 3.0_f64.sqrt() * 0.5),
+        DVec2::new(-0.5, -3.0_f64.sqrt() * 0.5),
+    ];
+    let diameter = (vertices[0] - vertices[1])
+        .length()
+        .max((vertices[1] - vertices[2]).length());
+    let interpolated = vertices.iter().map(|v| v.length_squared()).sum::<f64>() / 3.0;
+    let bound = SurfaceErrorContributions::interpolation_bound_m(2.0, diameter).unwrap();
+    assert!(bound >= interpolated);
+    assert!(bound - interpolated < 1e-14);
+    // D²/8 is NOT a valid arbitrary-triangle remainder bound.
+    assert!(2.0 * diameter * diameter / 8.0 < interpolated);
+}
+
+#[test]
 fn every_error_component_increases_the_complete_certificate() {
     let base = SurfaceErrorContributions {
         sphere_m: 1.0,

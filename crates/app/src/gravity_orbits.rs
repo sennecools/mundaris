@@ -2138,6 +2138,10 @@ fn draw_ui(
                 let cover=info.terrain_cover;
                 let d=cover.convergence;
                 ui.monospace(format!("Desired local LOD: {:?}\nReady local LOD: {:?}\nRendered source LOD: {:?}",d.desired_local_lod,d.ready_local_lod,d.rendered_local_lod));
+                ui.monospace(format!("Useful target LOD: {:?} · certificate target: {:?}\nDesired width {:.6} m · Grid16 spacing {:.6} m\nRendered spacing {:.6} m · evaluator footprint {:.6} m\nConservative pixel footprint {:.6} m · depth floor {:.6} m",d.useful_target_lod,d.certificate_limited_target_lod,d.desired_patch_width_m,d.desired_sample_spacing_m,d.rendered_sample_spacing_m,d.terrain_footprint_m,d.pixel_footprint_m,d.projected_depth_floor_m));
+                let px=d.desired_error_pixels;
+                ui.small(format!("Desired projected error px: sphere {:.4e} · interpolation {:.4e} · unresolved {:.4e} · boundary {:.4e} · morph {:.4e} · numeric {:.4e}\nTOTAL {:.4e} px · dominant: {}",px[0],px[1],px[2],px[3],px[4],px[5],d.desired_total_pixels,d.dominant_term));
+                ui.small(format!("Represented height bound {:.3} m (not interpolation error). Targets above are radial certificates, not whole-view quality.",d.represented_height_bound_m));
                 ui.monospace(format!("Desired patches: {}{} · ready source: {}\nPending work: {} · queue: {} · workers: {}/{}\nActive morphs: {} · building cover: {} · blocked transactions: {}",
                     cover.report.desired_patches,if cover.report.desired_estimate_incomplete {" (incomplete estimate)"}else{""},cover.active().len(),w.pending_patches,c.queued_patches,c.worker_jobs,c.worker_count,
                     usize::from(cover.transition().is_some()),cover.construction_pending(),cover.report.deferred_transactions));

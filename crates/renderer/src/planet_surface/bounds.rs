@@ -59,8 +59,13 @@ impl SurfaceErrorContributions {
         if vector_hessian_bound_m == 0.0 || triangle_diameter == 0.0 {
             return Ok(0.0);
         }
+        // Taylor expansion about the barycentric point cancels linear terms.
+        // The remainder is <= M/2 * sum_i lambda_i |v_i - x|².
+        // Variance = sum_{i<j} lambda_i lambda_j |v_i-v_j|², and for
+        // three weights sum_{i<j} lambda_i lambda_j <= 1/3. Thus M*D²/6
+        // bounds arbitrary triangles (the equilateral centroid is sharp).
         // Round each nonnegative operation outward, including subnormal results.
-        let bound = (0.5 * vector_hessian_bound_m).next_up();
+        let bound = (vector_hessian_bound_m / 6.0).next_up();
         let bound = (bound * triangle_diameter).next_up();
         let bound = (bound * triangle_diameter).next_up();
         if !bound.is_finite() {
