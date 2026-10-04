@@ -58,6 +58,9 @@ struct Controls {
     terrain_preview: bool,
     sun_from_star: bool,
     terrain_lighting: TerrainLighting,
+    planetary_ocean: bool,
+    planetary_clouds: bool,
+    planetary_atmosphere: bool,
     terrain_morph_ms: u64,
     surface_bounds: bool,
     surface_style: SurfaceStyle,
@@ -96,6 +99,9 @@ impl Controls {
             terrain_preview: false,
             sun_from_star: false,
             terrain_lighting: terrain_lighting_from_environment(),
+            planetary_ocean: true,
+            planetary_clouds: true,
+            planetary_atmosphere: true,
             terrain_morph_ms: std::env::var("MUNDARIS_TERRAIN_MORPH_MS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -250,6 +256,7 @@ fn terrain_lighting_configuration(mode: Option<&str>, sun: Option<&str>) -> Terr
         |preset| preset.direction_body(),
     );
     let mode = match mode {
+        Some("planetary" | "natural") => TerrainRenderMode::Natural,
         Some("elevation") => TerrainRenderMode::Elevation,
         Some("lit") => TerrainRenderMode::Lit,
         Some("normals") => TerrainRenderMode::Normals,
@@ -363,7 +370,7 @@ impl GravityOrbitsDemo {
             if std::env::var("MUNDARIS_TERRAIN_MODE").is_err() {
                 controls.terrain_lighting = controls
                     .terrain_lighting
-                    .with_mode(TerrainRenderMode::Readability);
+                    .with_mode(TerrainRenderMode::Natural);
             }
             controls.sun_from_star = std::env::var("MUNDARIS_TERRAIN_SUN").is_err();
             controls.surface_style.elevation_colors = true;
@@ -1404,6 +1411,31 @@ impl GravityOrbitsDemo {
         }
         let mut frame = CelestialFrame::new(&view, &mut self.staging, projection, &self.sphere);
         frame.set_terrain_lighting(lighting);
+        if let Some(active) = self.terrain.active_body()
+            && let Some(index) = self.ids.iter().position(|&id| id == active)
+            && matches!(
+                self.scenario,
+                GravityFixture::GameplaySolarSystem | GravityFixture::RealSolarSystem
+            )
+            && matches!(lighting.mode(), TerrainRenderMode::Natural)
+        {
+            let body = crate::solar_system::SOLAR_SYSTEM_CONTENT[index].identity;
+            if let Some(mut config) = crate::solar_system::planetary_config(
+                body,
+                self.requests[index].reference_radius_m,
+            )? {
+                config.ocean_enabled &= self.controls.planetary_ocean;
+                config.clouds_enabled &= self.controls.planetary_clouds;
+                config.atmosphere_enabled &= self.controls.planetary_atmosphere;
+                if body == crate::solar_system::SolarBody::Earth {
+                    config.sea_datum_m = self
+                        .controls
+                        .reference_sea_level_m
+                        .unwrap_or(config.sea_datum_m);
+                }
+                frame.set_planetary_environment(self.requests[index], config)?;
+            }
+        }
         let prepared = (|| -> Result<()> {
             for session in &self.surfaces {
                 let index = self
@@ -1652,6 +1684,14 @@ impl GravityOrbitsDemo {
             pump_ms = self.pump_ms,
             preparation_ms,
             surface_ms = report.surface.profile.total.as_secs_f64() * 1000.0,
+            clearance_query_us = self.clearance_query_us,
+            population = ?self.terrain.profile,
+            adaptive = ?self.terrain.cover.profile,
+            selector = ?self.terrain.cover.report.profile,
+            workers = ?self.terrain.work.profile,
+            preparation = ?report.surface.profile,
+            terrain_upload = ?renderer.last_terrain_upload_profile(),
+            latest_completed_gpu_query = ?renderer.latest_gpu_profile(),
             render_present_ms = render_started.elapsed().as_secs_f64() * 1000.0,
             patches = report.surface.patches,
             samples = report.surface.samples,
@@ -2084,10 +2124,14 @@ fn draw_ui(
             let mut preview=controls.terrain_preview;
             if ui.checkbox(&mut preview,"Adaptive terrain with stitched transitions").changed() {controls.pending.push_back(Command::TerrainPreview(preview));}
             if controls.terrain_preview {
+                ui.label("Natural planetary presentation (render-only layers)");
+                ui.checkbox(&mut controls.planetary_ocean,"Ocean layer (where defined)");
+                ui.checkbox(&mut controls.planetary_clouds,"Cloud layer (where defined)");
+                ui.checkbox(&mut controls.planetary_atmosphere,"Atmosphere layer (where defined)");
                 ui.checkbox(&mut controls.sun_from_star,"Use central star direction (disable for lighting presets)");
                 ui.add(egui::Slider::new(&mut controls.terrain_morph_ms,0..=1000).text("Morph ms (0: static)").clamping(egui::SliderClamping::Always));
                 ui.checkbox(&mut controls.surface_style.elevation_colors,"Derived terrain elevation colours");
-                let mut enabled = matches!(controls.terrain_lighting.mode(),TerrainRenderMode::Lit|TerrainRenderMode::Readability);
+                let mut enabled = matches!(controls.terrain_lighting.mode(),TerrainRenderMode::Lit|TerrainRenderMode::Readability|TerrainRenderMode::Natural);
                 if ui.checkbox(&mut enabled, "Terrain lighting enabled").changed() {
                     controls.terrain_lighting = controls.terrain_lighting.with_mode(if enabled { TerrainRenderMode::Lit } else { TerrainRenderMode::Elevation });
                 }

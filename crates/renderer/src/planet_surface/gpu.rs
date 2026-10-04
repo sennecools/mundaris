@@ -18,6 +18,7 @@ pub(crate) struct PlanetSurfaceRenderer {
     index_bytes: u64,
     lighting: wgpu::Buffer,
     target_srgb: bool,
+    last_upload_profile: crate::gpu_profile::CpuUploadProfile,
 }
 impl PlanetSurfaceRenderer {
     pub fn new(
@@ -116,6 +117,7 @@ impl PlanetSurfaceRenderer {
             index_bytes,
             lighting,
             target_srgb: format.is_srgb(),
+            last_upload_profile: crate::gpu_profile::CpuUploadProfile::default(),
         }
     }
     pub fn upload(
@@ -147,6 +149,12 @@ impl PlanetSurfaceRenderer {
             return Err(RenderPreparationError::InvalidBudget);
         }
         let mut rebound = false;
+        let growth_events = proposed
+            .iter()
+            .zip(self.capacities)
+            .filter(|(next, old)| **next > *old)
+            .count() as u32;
+        let mut growth_wait = std::time::Duration::ZERO;
         if proposed
             .iter()
             .zip(self.capacities)
@@ -154,12 +162,14 @@ impl PlanetSurfaceRenderer {
         {
             // Growth is rare. Complete earlier submissions before destroying old
             // allocations, so in-flight generations cannot bypass the 80 MiB cap.
+            let wait_start = std::time::Instant::now();
             device
                 .poll(wgpu::PollType::Wait {
                     submission_index: None,
                     timeout: None,
                 })
                 .map_err(|e| RenderPreparationError::GpuProgress(e.to_string()))?;
+            growth_wait = wait_start.elapsed();
         }
         for (i, &size) in proposed.iter().enumerate() {
             if size > self.capacities[i] {
@@ -191,6 +201,7 @@ impl PlanetSurfaceRenderer {
                 &self.lighting,
             );
         }
+        let api_start = std::time::Instant::now();
         let mut bytes = [0u8; 64];
         for (value, out) in staging
             .lighting
@@ -210,15 +221,32 @@ impl PlanetSurfaceRenderer {
                 queue.write_buffer(buffer, 0, bytes);
             }
         }
+        let uploaded = 64u64 + sizes.iter().sum::<u64>();
+        self.last_upload_profile = crate::gpu_profile::CpuUploadProfile {
+            bytes_uploaded: uploaded,
+            resident_capacity_bytes: self.capacities.iter().sum::<u64>() + self.index_bytes + 64,
+            buffer_growth_events: growth_events,
+            growth_wait_events: u32::from(growth_events > 0),
+            growth_wait,
+            upload_api_duration: api_start.elapsed(),
+        };
         Ok(())
+    }
+
+    pub fn last_upload_profile(&self) -> crate::gpu_profile::CpuUploadProfile {
+        self.last_upload_profile
     }
     pub fn draw(
         &self,
         pass: &mut wgpu::RenderPass<'_>,
         projection: &wgpu::BindGroup,
         staging: &SurfaceStaging,
+        timestamps: Option<&crate::gpu_profile::CelestialQueries>,
     ) {
         if !staging.instances.is_empty() {
+            if let Some(queries) = timestamps.filter(|q| q.inside_passes()) {
+                queries.write_scope(pass, 3);
+            }
             pass.set_pipeline(if staging.underside {
                 &self.underside
             } else {
@@ -232,8 +260,14 @@ impl PlanetSurfaceRenderer {
                     pass.draw_indexed(self.ranges[mask].clone(), 0, instances.clone());
                 }
             }
+            if let Some(queries) = timestamps.filter(|q| q.inside_passes()) {
+                queries.end_scope(pass, 3);
+            }
         }
         if !staging.fallback.is_empty() {
+            if let Some(queries) = timestamps.filter(|q| q.inside_passes()) {
+                queries.write_scope(pass, 4);
+            }
             pass.set_pipeline(if staging.underside {
                 &self.clipped_underside
             } else {
@@ -243,6 +277,9 @@ impl PlanetSurfaceRenderer {
             pass.set_bind_group(1, &self.group, &[]);
             pass.set_vertex_buffer(0, self.fallback.slice(..));
             pass.draw(0..(staging.fallback.len() / 80) as u32, 0..1);
+            if let Some(queries) = timestamps.filter(|q| q.inside_passes()) {
+                queries.end_scope(pass, 4);
+            }
         }
     }
 }

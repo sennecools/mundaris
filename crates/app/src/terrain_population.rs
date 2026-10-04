@@ -5,9 +5,20 @@ use mundaris_renderer::{planet_surface::*, *};
 use mundaris_world::{BodyId, CoherentCelestialView};
 use std::time::Duration;
 
+/// Population-level candidate admission and ownership handoff timing.
+#[cfg(feature = "surface-profile")]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TerrainPopulationProfile {
+    pub candidate_admission: Duration,
+    pub ownership_handoff: Duration,
+    pub total: Duration,
+}
+
 use crate::{planet_surface::*, planet_terrain::*};
 
 pub struct TerrainPopulation {
+    #[cfg(feature = "surface-profile")]
+    pub profile: TerrainPopulationProfile,
     pub cache: TerrainPatchCache,
     pub cover: AdaptiveTerrainCover,
     pub work: TerrainWorkReport,
@@ -31,6 +42,8 @@ impl TerrainPopulation {
     /// Explicit count makes serial/1/2/4 measurements use the same admission path.
     pub fn with_worker_count(worker_count: usize) -> Result<Self> {
         Ok(Self {
+            #[cfg(feature = "surface-profile")]
+            profile: TerrainPopulationProfile::default(),
             cache: TerrainPatchCache::new_with_workers(
                 TERRAIN_CPU_CAP_BYTES,
                 MAX_TERRAIN_PATCHES,
@@ -64,6 +77,12 @@ impl TerrainPopulation {
         wall_budget: Option<Duration>,
         elapsed: Duration,
     ) -> Result<()> {
+        #[cfg(feature = "surface-profile")]
+        let total_started = std::time::Instant::now();
+        #[cfg(feature = "surface-profile")]
+        {
+            self.profile = TerrainPopulationProfile::default();
+        }
         anyhow::ensure!(
             requests.len() == pair.system().body_count() && owners.len() == requests.len(),
             "population request association mismatch"
@@ -78,6 +97,8 @@ impl TerrainPopulation {
         };
         let mut candidate = None;
         let mut greatest_error = 0.0;
+        #[cfg(feature = "surface-profile")]
+        let admission_started = std::time::Instant::now();
         for session in sessions.iter_mut() {
             let index = index_of(session.body())?;
             let body = pair.system().body(session.body())?;
@@ -97,6 +118,12 @@ impl TerrainPopulation {
                 }
             }
         }
+        #[cfg(feature = "surface-profile")]
+        {
+            self.profile.candidate_admission = admission_started.elapsed();
+        }
+        #[cfg(feature = "surface-profile")]
+        let handoff_started = std::time::Instant::now();
         if self.active_body != candidate {
             if let Some(old) = self.active_body {
                 let index = index_of(old)?;
@@ -115,6 +142,10 @@ impl TerrainPopulation {
                 "inactive cache reservation failed"
             );
             self.active_body = candidate;
+        }
+        #[cfg(feature = "surface-profile")]
+        {
+            self.profile.ownership_handoff = handoff_started.elapsed();
         }
         let settings = LodSettings::default()
             .with_limits(2048, 2048, 30)?
@@ -177,6 +208,10 @@ impl TerrainPopulation {
                 }
                 owners[index] = session.state() == SurfaceRepresentationState::Surface;
             }
+        }
+        #[cfg(feature = "surface-profile")]
+        {
+            self.profile.total = total_started.elapsed();
         }
         Ok(())
     }

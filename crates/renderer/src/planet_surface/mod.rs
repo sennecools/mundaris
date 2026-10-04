@@ -3,6 +3,8 @@
 mod bounds;
 mod cache;
 mod cover;
+#[cfg(feature = "surface-profile")]
+mod cpu_profile;
 mod gpu;
 mod lighting;
 mod lod;
@@ -14,6 +16,8 @@ mod transition;
 pub(crate) use bounds::projected_error as sphere_projected_error;
 pub use bounds::{PatchMetadata, SurfaceErrorContributions, SurfaceExtent};
 use cache::MetadataCache;
+#[cfg(feature = "surface-profile")]
+pub use cpu_profile::CpuStageTimer;
 pub(crate) use gpu::PlanetSurfaceRenderer;
 pub use lighting::{
     TerrainLighting, TerrainReadability, TerrainRenderMode, TerrainSunPreset, lod_color,

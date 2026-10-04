@@ -191,3 +191,24 @@ Observations/labels/picking keep their dense body association even when sphere
 geometry is suppressed. No world/simulation functionality or dependency changes.
 See [ADR0006](adr/0006-planet-surface-topology-and-lod.md) and
 [evidence](phase-4-validation.md) for API choices, measurements and open acceptance.
+
+## Phase 5 terrain design boundary (not implemented)
+
+The [Phase 5 specification](../MUNDARIS_PHASE_5_PROCEDURAL_TERRAIN_GENERATION.md)
+adds pure deterministic terrain queries in world, with generic noise/derivative
+math in math. App adapts immutable terrain definitions and regional certificates to
+renderer-owned domain-free geometry, and owns bounded generation/cache orchestration.
+Renderer consumes reusable f64 body-fixed samples and prepares current observer-relative
+data; it does not own seed, generator version or terrain truth. The existing dependency
+graph and six crates remain unchanged.
+
+Geometry readiness extends metadata readiness without removing parent coverage.
+Scale filtering, displaced canonical boundaries and temporary old/new triangle-overlay
+morphs compose with the frozen balanced grid16/16-stitch representation. Terrain
+certificates extend error/culling/handoff conservatively; uncertified terrain horizon
+occlusion is disabled. Stable views and celestial motion do not regenerate terrain.
+
+Phase 5 development is permitted despite retained Phase 4 acceptance debt and the
+accepted approximately 11 ms full-view preparation limitation. Outstanding platform/
+operator gates remain required before a later release-quality milestone; this design
+neither changes the frozen Phase 4 architecture nor claims those gates completed.

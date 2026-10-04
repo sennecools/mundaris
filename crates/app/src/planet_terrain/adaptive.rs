@@ -2,6 +2,26 @@
 use super::*;
 use mundaris_renderer::RenderPreparationError;
 
+/// Coarse update-stage timings; existing selection/stitch fields remain parent scopes.
+#[cfg(feature = "surface-profile")]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AdaptiveTerrainProfile {
+    pub identity_reset: Duration,
+    pub morph_bookkeeping: Duration,
+    pub stale_destination_validation: Duration,
+    pub pinning_reservation: Duration,
+    pub selector_setup: Duration,
+    pub selector: Duration,
+    pub successor_preparation_prefetch: Duration,
+    pub cache_generation: Duration,
+    pub cover_publication: Duration,
+    pub construction_submission: Duration,
+    pub visibility: Duration,
+    pub diagnostics: Duration,
+    pub final_reservation: Duration,
+    pub total: Duration,
+}
+
 /// Camera-radial demand is distinct from complete coverage and cache residency.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TerrainConvergenceDiagnostic {
@@ -138,6 +158,8 @@ impl SurfaceGeometryPolicy for TerrainSelectionPolicy<'_> {
 /// transactions; pending geometry never replaces an existing covering leaf.
 #[derive(Default)]
 pub struct AdaptiveTerrainCover {
+    #[cfg(feature = "surface-profile")]
+    pub profile: AdaptiveTerrainProfile,
     identity: Option<TerrainGeometryIdentity>,
     generator: Option<TerrainGenerator>,
     boundary_bounds: [f64; 31],
@@ -146,8 +168,15 @@ pub struct AdaptiveTerrainCover {
     visible: Vec<ActiveSurfacePatch>,
     stitched: Option<Arc<StitchedSurface>>,
     morph: Option<ActiveMorph>,
+    /// At most one exact successor, built from the active morph's immutable endpoint.
+    /// It cannot display until that endpoint has been promoted to the source.
+    queued: Option<workers::CoverOutput>,
+    queued_duration: Duration,
+    queued_parent: Option<(CubePatchAddress, bool)>,
     construction: Option<u64>,
+    construction_from_morph: bool,
     construction_duration: Duration,
+    last_construction_budget: usize,
     construction_parent: Option<CubePatchAddress>,
     construction_obsolete: bool,
     construction_refining: bool,
@@ -218,6 +247,10 @@ impl AdaptiveTerrainCover {
     pub fn transition(&self) -> Option<(&SurfaceTransition, f64)> {
         self.morph.as_ref().map(|m| (&m.mesh, m.fraction()))
     }
+    /// Captured display duration; changing the debug setting never retimes this mesh.
+    pub fn active_morph_duration(&self) -> Option<Duration> {
+        self.morph.as_ref().map(|m| m.duration)
+    }
     pub fn active(&self) -> &[ActiveSurfacePatch] {
         &self.active
     }
@@ -233,6 +266,18 @@ impl AdaptiveTerrainCover {
     pub fn construction_pending(&self) -> bool {
         self.construction.is_some()
     }
+    /// A complete successor exists but cannot display before the current endpoint.
+    pub fn successor_ready(&self) -> bool {
+        self.queued.is_some()
+    }
+    /// Current bounded overlay reservation, including a retained retry allowance.
+    pub fn construction_budget_bytes(&self) -> usize {
+        self.transition_budget()
+    }
+    /// Last admitted construction's actual envelope, not its larger retry ceiling.
+    pub fn last_construction_budget_bytes(&self) -> usize {
+        self.last_construction_budget
+    }
     pub fn topology(&self) -> Option<&SurfaceTopology> {
         self.lod.as_ref().map(SurfaceLodSession::topology)
     }
@@ -244,12 +289,56 @@ impl AdaptiveTerrainCover {
             + (self.active.capacity() + self.visible.capacity()) * size_of::<ActiveSurfacePatch>()
             // An admitted cover reservation owns this same shared allocation
             // until publication or cancellation acknowledgement, not both owners.
-            + if self.construction.is_some() { 0 } else {
+            + if self.construction.is_some() && !self.construction_from_morph { 0 } else {
                 self.stitched.as_ref().map_or(0, shared_surface_bytes)
             }
             + self.lod.as_ref().map_or(0, |l| l.cache_usage().1)
             + self.report.scratch_bytes
             + self.morph.as_ref().map_or(0, ActiveMorph::resident_bytes)
+            - if self.construction.is_some() && self.construction_from_morph {
+                self.morph
+                    .as_ref()
+                    .map_or(0, |m| shared_surface_bytes(&m.destination))
+            } else {
+                0
+            }
+            + self.queued.as_ref().map_or(0, |output| {
+                size_of::<workers::CoverOutput>()
+                    + shared_surface_bytes(&output.surface)
+                    + output.cover.capacity() * size_of::<ActiveSurfacePatch>()
+                    + output
+                        .transition
+                        .as_ref()
+                        .map_or(0, SurfaceTransition::resident_bytes)
+            })
+    }
+    fn endpoint_cover(&self) -> &[ActiveSurfacePatch] {
+        self.morph
+            .as_ref()
+            .map_or(&self.active, |m| &m.destination_cover)
+    }
+    fn restore_endpoint(&mut self) -> Result<()> {
+        let cover = self.endpoint_cover().to_vec();
+        self.lod
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("missing selector"))?
+            .restore_published_cover(&cover)?;
+        Ok(())
+    }
+    fn publish_output(&mut self, output: workers::CoverOutput, duration: Duration) {
+        if let Some(mesh) = output.transition {
+            self.peak_transition_bytes = self.peak_transition_bytes.max(mesh.resident_bytes());
+            self.morph = Some(ActiveMorph {
+                mesh,
+                destination: output.surface,
+                destination_cover: output.cover,
+                elapsed: Duration::ZERO,
+                duration,
+            });
+        } else {
+            self.stitched = Some(output.surface);
+            self.active = output.cover;
+        }
     }
     pub(crate) fn abandon_construction(&mut self, cache: &mut TerrainPatchCache) {
         if let Some(id) = self.construction.take() {
@@ -294,6 +383,14 @@ impl AdaptiveTerrainCover {
         wall_budget: Option<Duration>,
         elapsed: Duration,
     ) -> Result<TerrainWorkReport> {
+        #[cfg(feature = "surface-profile")]
+        let profile_started = Instant::now();
+        #[cfg(feature = "surface-profile")]
+        {
+            self.profile = AdaptiveTerrainProfile::default();
+        }
+        #[cfg(feature = "surface-profile")]
+        let stage_started = Instant::now();
         if self.identity.as_ref() != Some(identity) {
             self.abandon_construction(cache);
             cache.invalidate_body(identity);
@@ -301,7 +398,11 @@ impl AdaptiveTerrainCover {
             self.visible.clear();
             self.stitched = None;
             self.morph = None;
+            self.queued = None;
+            self.queued_parent = None;
             self.construction = None;
+            self.construction_from_morph = false;
+            self.last_construction_budget = 0;
             self.construction_parent = None;
             self.construction_obsolete = false;
             self.unpublished_parent = None;
@@ -332,6 +433,12 @@ impl AdaptiveTerrainCover {
             self.lod = Some(SurfaceLodSession::new(MAX_TERRAIN_PATCHES)?);
             self.identity = Some(identity.clone());
         }
+        #[cfg(feature = "surface-profile")]
+        {
+            self.profile.identity_reset = stage_started.elapsed();
+        }
+        #[cfg(feature = "surface-profile")]
+        let stage_started = Instant::now();
         if let Some(morph) = self.morph.as_mut() {
             morph.elapsed = morph.elapsed.saturating_add(elapsed);
         }
@@ -342,10 +449,21 @@ impl AdaptiveTerrainCover {
                 .ok_or_else(|| anyhow::anyhow!("missing completed terrain morph"))?;
             self.stitched = Some(morph.destination);
             self.active = morph.destination_cover;
+            // The worker now owns the promoted source, not an active destination.
+            self.construction_from_morph = false;
         }
-        if self.construction.is_some()
+        #[cfg(feature = "surface-profile")]
+        {
+            self.profile.morph_bookkeeping = stage_started.elapsed();
+        }
+        #[cfg(feature = "surface-profile")]
+        let stage_started = Instant::now();
+        if (self.construction.is_some() || self.queued.is_some())
             && !self.construction_obsolete
-            && let Some(parent) = self.construction_parent
+            && let Some((parent, refining)) = self
+                .construction_parent
+                .map(|p| (p, self.construction_refining))
+                .or(self.queued_parent)
             && self.stitched.is_some()
         {
             let topology = self
@@ -374,7 +492,7 @@ impl AdaptiveTerrainCover {
             let visible = !input.projection.rejects_ball(center, ball)?;
             let projected =
                 metadata.projected_total_error(error, center, ball, input.projection)?;
-            let obsolete = if self.construction_refining {
+            let obsolete = if refining {
                 !visible || projected <= settings.split_pixels()
             } else {
                 visible && projected >= settings.merge_pixels()
@@ -382,9 +500,27 @@ impl AdaptiveTerrainCover {
             if obsolete {
                 // Keep construction ownership until the cancellation acknowledgement;
                 // the source Arc must not be double charged while the worker holds it.
-                self.construction_obsolete = true;
-                cache.cancel_workers(|i, address| i == identity && address.is_none());
+                if self.construction.is_some() {
+                    self.construction_obsolete = true;
+                    cache.cancel_workers(|i, address| i == identity && address.is_none());
+                } else {
+                    self.queued = None;
+                    self.queued_parent = None;
+                    self.restore_endpoint()?;
+                }
             }
+        }
+        #[cfg(feature = "surface-profile")]
+        {
+            self.profile.stale_destination_validation = stage_started.elapsed();
+        }
+        #[cfg(feature = "surface-profile")]
+        let stage_started = Instant::now();
+        if self.morph.is_none()
+            && let Some(output) = self.queued.take()
+        {
+            self.queued_parent = None;
+            self.publish_output(output, self.queued_duration);
         }
         cache.unpin_body(identity.body);
         for p in &self.active {
@@ -403,10 +539,9 @@ impl AdaptiveTerrainCover {
             }
         }
         let unpublished_target = self.stitched.is_some()
-            && self.morph.is_none()
             && self.lod.as_ref().is_some_and(|lod| {
                 !lod.covering_leaves()
-                    .eq(self.active.iter().map(|p| p.address))
+                    .eq(self.endpoint_cover().iter().map(|p| p.address))
             });
         if unpublished_target && let Some(lod) = &self.lod {
             // Budget retries must not evict their own immutable destination and
@@ -429,13 +564,14 @@ impl AdaptiveTerrainCover {
         let transition_budget = self.transition_budget();
         // Selector scratch is separately bounded by 8 MiB; account for capacity
         // growth before its metadata/balance traversal, not after allocation.
-        let transition_reserve =
-            if self.morph_duration.is_zero() || self.morph.is_some() || self.construction.is_some()
-            {
-                0
-            } else {
-                transition_budget
-            };
+        let transition_reserve = if self.morph_duration.is_zero()
+            || self.queued.is_some()
+            || self.construction.is_some()
+        {
+            0
+        } else {
+            transition_budget
+        };
         let reserve =
             self.resident_bytes() + STAGING_ALLOWANCE + 8 * 1024 * 1024 + transition_reserve;
         cache.operational_reserve_bytes = transition_reserve
@@ -443,6 +579,12 @@ impl AdaptiveTerrainCover {
                 m.mesh.resident_bytes() + shared_surface_bytes(&m.destination)
             });
         let admitted = cache.reserve_external(reserve);
+        #[cfg(feature = "surface-profile")]
+        {
+            self.profile.pinning_reservation = stage_started.elapsed();
+        }
+        #[cfg(feature = "surface-profile")]
+        let stage_started = Instant::now();
         let generator = self
             .generator
             .as_ref()
@@ -456,21 +598,24 @@ impl AdaptiveTerrainCover {
             identity,
             generator,
             boundary_bounds: &self.boundary_bounds,
-            morph_remaining_m: self
-                .morph
-                .as_ref()
-                .map_or(0.0, |m| m.mesh.max_displacement_m() * (1.0 - m.fraction())),
+            // Selection describes the immutable endpoint, not the displayed
+            // interpolation. Remaining displayed displacement is reported separately.
+            morph_remaining_m: 0.0,
             required: Vec::new(),
             replacements: 0,
             frozen: !admitted
                 || self.stitched.is_none()
-                || self.morph.is_some()
+                || self.queued.is_some()
                 || self.construction.is_some()
                 || self.transition_deferred
                 || unpublished_target,
             reservation_base: reserve,
             certificates: &mut self.certificates,
         };
+        #[cfg(feature = "surface-profile")]
+        {
+            self.profile.selector_setup = stage_started.elapsed();
+        }
         let selection_start = Instant::now();
         self.report = lod.update_with_policy(input, settings, &mut policy)?;
         if self.report.splits != 0 || self.report.merges != 0 {
@@ -480,6 +625,12 @@ impl AdaptiveTerrainCover {
                 .map(|parent| (parent, self.report.splits != 0));
         }
         self.selection_preparation = selection_start.elapsed();
+        #[cfg(feature = "surface-profile")]
+        {
+            self.profile.selector = self.selection_preparation;
+        }
+        #[cfg(feature = "surface-profile")]
+        let stage_started = Instant::now();
         if !admitted || self.transition_deferred {
             self.report.budget_constrained = true;
             self.report.quality_pending = true;
@@ -559,6 +710,12 @@ impl AdaptiveTerrainCover {
             cache.request_pinned(identity, address);
             required.push(address);
         }
+        #[cfg(feature = "surface-profile")]
+        {
+            self.profile.successor_preparation_prefetch = stage_started.elapsed();
+        }
+        #[cfg(feature = "surface-profile")]
+        let stage_started = Instant::now();
         // Preserve the highest projected-error blocking closure. Everything else
         // is discardable, including an obsolete partially generated builder.
         cache.retain_required(identity, &required);
@@ -567,6 +724,10 @@ impl AdaptiveTerrainCover {
             .filter(|&&a| cache.peek(identity, a).is_some())
             .count();
         let mut work = cache.generate(vertex_budget, GENERATION_MICROBATCH, wall_budget)?;
+        #[cfg(feature = "surface-profile")]
+        {
+            self.profile.cache_generation = stage_started.elapsed();
+        }
         let ready_after = publishing_required
             .iter()
             .filter(|&&a| cache.peek(identity, a).is_some())
@@ -581,16 +742,21 @@ impl AdaptiveTerrainCover {
             .and_then(|id| cache.take_cover_completion(id))
         {
             let start = Instant::now();
+            #[cfg(feature = "surface-profile")]
+            {
+                work.profile.include_worker(completion.metrics);
+                work.profile.cover_coordinator_wait += completion.received.elapsed();
+            }
             if self.construction == Some(completion.id) && completion.identity == *identity {
+                let completed_parent = self
+                    .construction_parent
+                    .map(|p| (p, self.construction_refining));
                 self.construction = None;
                 self.construction_parent = None;
                 if self.construction_obsolete {
                     self.construction_obsolete = false;
                     self.unpublished_parent = None;
-                    self.lod
-                        .as_mut()
-                        .ok_or_else(|| anyhow::anyhow!("missing selector"))?
-                        .restore_published_cover(&self.active)?;
+                    self.restore_endpoint()?;
                 } else {
                     match completion.result {
                         Ok(workers::Output::Cover(output)) => {
@@ -599,19 +765,16 @@ impl AdaptiveTerrainCover {
                             self.transition_budget_step = 0;
                             self.worker_stitch_cpu = output.stitch_cpu;
                             self.worker_morph_cpu = output.morph_cpu;
-                            if let Some(mesh) = output.transition {
-                                self.peak_transition_bytes =
-                                    self.peak_transition_bytes.max(mesh.resident_bytes());
-                                self.morph = Some(ActiveMorph {
-                                    mesh,
-                                    destination: output.surface,
-                                    destination_cover: output.cover,
-                                    elapsed: Duration::ZERO,
-                                    duration: self.construction_duration,
-                                });
+                            if self.morph.is_some() {
+                                anyhow::ensure!(
+                                    self.queued.is_none(),
+                                    "duplicate queued terrain endpoint"
+                                );
+                                self.queued_duration = self.construction_duration;
+                                self.queued_parent = completed_parent;
+                                self.queued = Some(output);
                             } else {
-                                self.stitched = Some(output.surface);
-                                self.active = output.cover;
+                                self.publish_output(output, self.construction_duration);
                             }
                         }
                         Err(error)
@@ -630,10 +793,7 @@ impl AdaptiveTerrainCover {
                         Ok(workers::Output::Cancelled) => {
                             self.unpublished_parent = None;
                             if self.stitched.is_some() {
-                                self.lod
-                                    .as_mut()
-                                    .ok_or_else(|| anyhow::anyhow!("missing selector"))?
-                                    .restore_published_cover(&self.active)?;
+                                self.restore_endpoint()?;
                             }
                         }
                         _ => anyhow::bail!("unexpected terrain cover completion"),
@@ -642,20 +802,29 @@ impl AdaptiveTerrainCover {
             }
             self.result_publication = start.elapsed();
         }
+        #[cfg(feature = "surface-profile")]
+        {
+            // Only the consumed result's publication, not the preceding raw
+            // cache scheduling/publication parent interval.
+            self.profile.cover_publication = self.result_publication;
+        }
         // Publication restores coordinator ownership before any new allocation.
         // A failed overlay retries only within the fixed aggregate cap.
+        #[cfg(feature = "surface-profile")]
+        let stage_started = Instant::now();
         let transition_budget = (TRANSITION_RESERVATION
             + usize::from(self.transition_budget_step) * 8 * 1024 * 1024)
             .min(MAX_TRANSITION_RESERVATION);
         #[cfg(test)]
         let transition_budget = self.transition_budget_override.unwrap_or(transition_budget);
-        let transition_reserve =
-            if self.morph_duration.is_zero() || self.morph.is_some() || self.construction.is_some()
-            {
-                0
-            } else {
-                transition_budget
-            };
+        let transition_reserve = if self.morph_duration.is_zero()
+            || self.queued.is_some()
+            || self.construction.is_some()
+        {
+            0
+        } else {
+            transition_budget
+        };
         let reserve =
             self.resident_bytes() + STAGING_ALLOWANCE + 8 * 1024 * 1024 + transition_reserve;
         cache.operational_reserve_bytes = transition_reserve
@@ -663,6 +832,12 @@ impl AdaptiveTerrainCover {
                 m.mesh.resident_bytes() + shared_surface_bytes(&m.destination)
             });
         let construction_admitted = cache.reserve_external(reserve);
+        #[cfg(feature = "surface-profile")]
+        {
+            self.profile.pinning_reservation += stage_started.elapsed();
+        }
+        #[cfg(feature = "surface-profile")]
+        let construction_started = Instant::now();
         if !construction_admitted {
             self.report.budget_constrained = true;
             self.report.quality_pending = true;
@@ -673,18 +848,56 @@ impl AdaptiveTerrainCover {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("missing adaptive selector"))?;
         let addresses: Vec<_> = lod.covering_leaves().collect();
-        let changed = self.active.len() != addresses.len()
-            || self
-                .active
+        let endpoint_cover = self
+            .morph
+            .as_ref()
+            .map_or(&self.active, |m| &m.destination_cover);
+        let endpoint_surface = self
+            .morph
+            .as_ref()
+            .map(|m| &m.destination)
+            .or(self.stitched.as_ref());
+        let changed = endpoint_cover.len() != addresses.len()
+            || endpoint_cover
                 .iter()
                 .zip(&addresses)
                 .any(|(p, a)| p.address != *a);
+        // Retry allowances are ceilings, not a requirement to reserve unused
+        // overlay bytes. A complete target can otherwise remain frozen forever
+        // when a 24 MiB retry plus its full construction workspace just exceeds
+        // the cap, even though the exact overlay fits the remaining envelope.
+        let cover_workspace = if cache.workers.is_some() {
+            StitchedSurface::construction_bytes(addresses.len())
+                + (endpoint_cover.len() + addresses.len())
+                    * (size_of::<ActiveSurfacePatch>() + size_of::<Arc<GeneratedSurfacePatch>>())
+                + (endpoint_cover.len() + 2 * addresses.len()) * size_of::<&GeneratedSurfacePatch>()
+                + 256
+        } else {
+            StitchedSurface::construction_bytes(addresses.len())
+                + addresses.len()
+                    * (size_of::<ActiveSurfacePatch>() + size_of::<&GeneratedSurfacePatch>())
+        };
+        let reserve_without_overlay = reserve.saturating_sub(transition_reserve);
+        let available_overlay = cache
+            .cap_bytes
+            .saturating_sub(cache.resident_bytes() + reserve_without_overlay + cover_workspace);
+        let transition_budget = transition_budget.min(available_overlay);
+        let envelope_available = transition_reserve == 0
+            || transition_budget >= transition_reserve.min(TRANSITION_RESERVATION);
+        let transition_reserve = if transition_reserve == 0 {
+            0
+        } else {
+            transition_budget
+        };
+        let reserve = reserve_without_overlay + transition_reserve;
+        let construction_admitted =
+            envelope_available && (construction_admitted || cache.reserve_external(reserve));
         self.stitch_preparation = Duration::ZERO;
         self.morph_preparation = Duration::ZERO;
         if changed
             && construction_admitted
             && !self.transition_deferred
-            && self.morph.is_none()
+            && self.queued.is_none()
             && self.construction.is_none()
             && addresses.iter().all(|&a| cache.peek(identity, a).is_some())
             && cache.reserve_external(
@@ -731,18 +944,18 @@ impl AdaptiveTerrainCover {
                 // worker handle drops, even after invalidation. Source stitching
                 // is reserved here as well so a session switch cannot unaccount it.
                 let bytes = StitchedSurface::construction_bytes(active.len())
-                    + self.stitched.as_ref().map_or(0, shared_surface_bytes)
-                    + (self.active.len() + active.len())
+                    + endpoint_surface.map_or(0, shared_surface_bytes)
+                    + (endpoint_cover.len() + active.len())
                         * (size_of::<ActiveSurfacePatch>()
                             + size_of::<Arc<GeneratedSurfacePatch>>())
-                    + (self.active.len() + 2 * active.len()) * size_of::<&GeneratedSurfacePatch>()
+                    + (endpoint_cover.len() + 2 * active.len()) * size_of::<&GeneratedSurfacePatch>()
                     + 256 // shared allocation headers and result envelope
-                    + if self.morph_duration.is_zero() || self.stitched.is_none() {
+                    + if self.morph_duration.is_zero() || endpoint_surface.is_none() {
                         0
                     } else {
                         transition_budget
                     };
-                let source_bytes = self.stitched.as_ref().map_or(0, shared_surface_bytes);
+                let source_bytes = endpoint_surface.map_or(0, shared_surface_bytes);
                 let worker_external = reserve.saturating_sub(transition_reserve + source_bytes);
                 if cache.workers.as_ref().is_some_and(|w| w.idle())
                     && cache.completed_covers.len()
@@ -753,15 +966,16 @@ impl AdaptiveTerrainCover {
                         < 4
                     && cache.reserve_external(worker_external + bytes)
                 {
+                    self.last_construction_budget = transition_budget;
                     let clone_raw = |patches: &[ActiveSurfacePatch]| -> Result<Vec<Arc<GeneratedSurfacePatch>>> {
                         patches.iter().map(|p| cache.entry_index(identity, p.address)
                             .map(|i| cache.entries[i].patch.clone())
                             .ok_or_else(|| anyhow::anyhow!("missing pinned worker input"))).collect()
                     };
                     let job = workers::CoverJob {
-                        old: self.stitched.clone(),
-                        old_cover: self.active.clone(),
-                        old_raw: clone_raw(&self.active)?,
+                        old: endpoint_surface.cloned(),
+                        old_cover: endpoint_cover.clone(),
+                        old_raw: clone_raw(endpoint_cover)?,
                         raw: clone_raw(&active)?,
                         cover: active,
                         transition_budget,
@@ -780,6 +994,7 @@ impl AdaptiveTerrainCover {
                             .submit_cover(identity, job, bytes)?,
                     );
                     self.construction_duration = self.morph_duration;
+                    self.construction_from_morph = self.morph.is_some();
                     self.construction_parent = self.unpublished_parent.map(|(parent, _)| parent);
                     self.construction_obsolete = false;
                     self.construction_refining = self
@@ -791,14 +1006,15 @@ impl AdaptiveTerrainCover {
                 }
                 self.stitch_preparation = start.elapsed();
             } else {
+                self.last_construction_budget = transition_budget;
                 let surface = Arc::new(StitchedSurface::build(&active, &geometry, lod.topology())?);
                 self.stitch_preparation = start.elapsed();
                 if !self.morph_duration.is_zero()
-                    && let Some(old) = &self.stitched
+                    && let Some(old) = endpoint_surface
                 {
                     let start = Instant::now();
                     let prepared = SurfaceTransition::build(
-                        &self.active,
+                        endpoint_cover,
                         old,
                         &active,
                         &surface,
@@ -808,17 +1024,23 @@ impl AdaptiveTerrainCover {
                     self.morph_preparation = start.elapsed();
                     match prepared {
                         Ok(mesh) => {
+                            let completed_parent = self.unpublished_parent;
                             self.unpublished_parent = None;
                             self.transition_budget_step = 0;
-                            self.peak_transition_bytes =
-                                self.peak_transition_bytes.max(mesh.resident_bytes());
-                            self.morph = Some(ActiveMorph {
-                                mesh,
-                                destination: surface,
-                                destination_cover: active,
-                                elapsed: Duration::ZERO,
-                                duration: self.morph_duration,
-                            });
+                            let output = workers::CoverOutput {
+                                surface,
+                                cover: active,
+                                transition: Some(mesh),
+                                stitch_cpu: self.stitch_preparation,
+                                morph_cpu: self.morph_preparation,
+                            };
+                            if self.morph.is_some() {
+                                self.queued_duration = self.morph_duration;
+                                self.queued_parent = completed_parent;
+                                self.queued = Some(output);
+                            } else {
+                                self.publish_output(output, self.morph_duration);
+                            }
                         }
                         Err(RenderPreparationError::InvalidBudget) => {
                             // The selector's private target is frozen; it must not
@@ -833,12 +1055,31 @@ impl AdaptiveTerrainCover {
                         Err(error) => return Err(error.into()),
                     }
                 } else {
+                    let completed_parent = self.unpublished_parent;
                     self.unpublished_parent = None;
-                    self.stitched = Some(surface);
-                    self.active = active;
+                    if self.morph.is_some() {
+                        self.queued_duration = self.morph_duration;
+                        self.queued_parent = completed_parent;
+                        self.queued = Some(workers::CoverOutput {
+                            surface,
+                            cover: active,
+                            transition: None,
+                            stitch_cpu: self.stitch_preparation,
+                            morph_cpu: Duration::ZERO,
+                        });
+                    } else {
+                        self.stitched = Some(surface);
+                        self.active = active;
+                    }
                 }
             }
         }
+        #[cfg(feature = "surface-profile")]
+        {
+            self.profile.construction_submission = construction_started.elapsed();
+        }
+        #[cfg(feature = "surface-profile")]
+        let stage_started = Instant::now();
         for p in &self.active {
             cache.pin(identity, p.address);
         }
@@ -847,8 +1088,18 @@ impl AdaptiveTerrainCover {
                 cache.pin(identity, p.address);
             }
         }
+        if let Some(output) = &self.queued {
+            for p in &output.cover {
+                cache.pin(identity, p.address);
+            }
+        }
         if self.construction.is_some() {
-            for address in lod.covering_leaves() {
+            for address in self
+                .lod
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing selector"))?
+                .covering_leaves()
+            {
                 cache.pin(identity, address);
             }
         }
@@ -856,8 +1107,24 @@ impl AdaptiveTerrainCover {
             self.report.quality_pending = true;
             self.report.settled = false;
         }
+        #[cfg(feature = "surface-profile")]
+        {
+            self.profile.pinning_reservation += stage_started.elapsed();
+        }
+        #[cfg(feature = "surface-profile")]
+        let stage_started = Instant::now();
         self.prepare_visible(input)?;
+        #[cfg(feature = "surface-profile")]
+        {
+            self.profile.visibility = stage_started.elapsed();
+        }
+        #[cfg(feature = "surface-profile")]
+        let stage_started = Instant::now();
         self.update_convergence(cache, identity, input, settings)?;
+        #[cfg(feature = "surface-profile")]
+        {
+            self.profile.diagnostics = stage_started.elapsed();
+        }
         if self.transition_deferred {
             // Handoff quality must describe what remains displayed, not the
             // finer unpublished target whose overlay could not be admitted.
@@ -868,6 +1135,8 @@ impl AdaptiveTerrainCover {
                 .fold(0.0, f64::max);
         }
         let external = self.resident_bytes() + STAGING_ALLOWANCE;
+        #[cfg(feature = "surface-profile")]
+        let stage_started = Instant::now();
         anyhow::ensure!(
             cache.reserve_external(external),
             "terrain cover exceeded aggregate CPU budget"
@@ -877,6 +1146,11 @@ impl AdaptiveTerrainCover {
             self.peak_cpu_bytes <= TERRAIN_CPU_CAP_BYTES,
             "terrain aggregate peak exceeded 128 MiB"
         );
+        #[cfg(feature = "surface-profile")]
+        {
+            self.profile.final_reservation = stage_started.elapsed();
+            self.profile.total = profile_started.elapsed();
+        }
         Ok(work)
     }
     fn update_convergence(
@@ -1249,9 +1523,70 @@ mod tests {
             cache.peek(&identity, retry_dependency).is_some(),
             "a frozen private target must reconstruct an evicted retry dependency"
         );
-        cover.set_morph_duration(Duration::ZERO).unwrap();
+        // A retry ceiling must not freeze a ready target when a smaller ordinary
+        // envelope fits. Charge source, staging and full synchronous workspace
+        // before assigning overlay headroom; below the initial floor, do not build.
+        cover.transition_budget_override = None;
+        cover.transition_budget_step = 1;
+        cover.transition_deferred = false;
+        let workspace = StitchedSurface::construction_bytes(target.len())
+            + target.len()
+                * (size_of::<ActiveSurfacePatch>() + size_of::<&GeneratedSurfacePatch>());
+        let staging_allowance = 72 * 1024 * 1024 + 32 * 1024;
+        let non_overlay = cover.resident_bytes() + staging_allowance + 8 * 1024 * 1024;
+        let constrained_cap = cache.resident_bytes() + non_overlay + workspace;
+        cache.cap_bytes = constrained_cap + TRANSITION_RESERVATION - 1;
+        let previous_budget = cover.last_construction_budget;
         cover
-            .update(&mut cache, &identity, &input, &refined, 64, None)
+            .update_with_elapsed(
+                &mut cache,
+                &identity,
+                &input,
+                &refined,
+                64,
+                None,
+                Duration::ZERO,
+            )
+            .unwrap();
+        assert!(cover.transition().is_none());
+        assert_eq!(cover.last_construction_budget, previous_budget);
+        assert_eq!(
+            cover.active().iter().map(|p| p.address).collect::<Vec<_>>(),
+            source
+        );
+        cache.cap_bytes = constrained_cap + 20 * 1024 * 1024;
+        cover
+            .update_with_elapsed(
+                &mut cache,
+                &identity,
+                &input,
+                &refined,
+                64,
+                None,
+                Duration::ZERO,
+            )
+            .unwrap();
+        assert!(cover.transition().is_some());
+        assert!(!cover.transition_deferred);
+        assert!(cover.last_construction_budget >= TRANSITION_RESERVATION);
+        assert!(cover.last_construction_budget < TRANSITION_RESERVATION + 8 * 1024 * 1024);
+        assert!(cache.resident_bytes() + cache.external_bytes <= cache.cap_bytes);
+        cache.cap_bytes = TERRAIN_CPU_CAP_BYTES;
+        cover.set_morph_duration(Duration::ZERO).unwrap();
+        assert_eq!(
+            cover.active_morph_duration(),
+            Some(Duration::from_millis(150))
+        );
+        cover
+            .update_with_elapsed(
+                &mut cache,
+                &identity,
+                &input,
+                &refined,
+                64,
+                None,
+                Duration::from_millis(150),
+            )
             .unwrap();
         assert!(!cover.transition_deferred);
         assert!(cover.active().len() > source.len());

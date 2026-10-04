@@ -414,6 +414,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cpu-time"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9e393a7668fe1fad3075085b86c781883000b4ede868f43627b34a87c8b7ded"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "criterion"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1134,6 +1144,7 @@ dependencies = [
 name = "mundaris_renderer"
 version = "0.0.1"
 dependencies = [
+ "cpu-time",
  "criterion",
  "egui",
  "egui-wgpu",

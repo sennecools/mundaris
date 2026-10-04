@@ -361,6 +361,56 @@ pub struct TerrainWorkReport {
     /// Newly ready raw patches in the currently selected replacement closure.
     pub replacement_useful_completed: usize,
     pub local_useful_completed: usize,
+    /// Detailed worker/cache measurements; present only in profiling builds.
+    #[cfg(feature = "surface-profile")]
+    pub profile: TerrainWorkProfile,
+}
+/// Per-frame terrain measurements. Legacy `*_cpu` stage names below measure
+/// elapsed worker/app intervals (including descheduling), not scheduled CPU time.
+/// `worker_scheduled_cpu` separately reads the OS thread clock, whose short-stage
+/// resolution can be coarse. Waits are elapsed time between distinct events.
+#[cfg(feature = "surface-profile")]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TerrainWorkProfile {
+    pub worker_scheduled_cpu: Duration,
+    pub worker_cpu_clock_unavailable_jobs: usize,
+    pub cover_coordinator_wait: Duration,
+    /// Worker time creating raw samples, excluding certificate construction.
+    pub worker_raw_generation_cpu: Duration,
+    pub worker_certificate_cpu: Duration,
+    pub worker_stitch_cpu: Duration,
+    pub worker_morph_cpu: Duration,
+    /// Submit-to-worker-start delay for consumed jobs.
+    pub worker_queue_wait: Duration,
+    /// Worker-finish-to-cache-reception delay for consumed jobs.
+    pub cache_publication_wait: Duration,
+    pub cancelled_work_cpu: Duration,
+    pub cancelled_work_count: usize,
+    /// Time and number of cache reservation/admission attempts during scheduling.
+    pub cache_reservation_cpu: Duration,
+    pub cache_reservation_attempts: usize,
+    /// Admission retries after an eviction attempt; rejected admissions are included.
+    pub cache_reservation_retries: usize,
+}
+#[cfg(feature = "surface-profile")]
+impl TerrainWorkProfile {
+    pub(crate) fn include_worker(&mut self, metrics: workers::WorkerMetrics) {
+        if let Some(cpu) = metrics.scheduled_cpu {
+            self.worker_scheduled_cpu += cpu;
+        } else {
+            self.worker_cpu_clock_unavailable_jobs += 1;
+        }
+        self.worker_raw_generation_cpu += metrics.raw_generation_cpu;
+        self.worker_certificate_cpu += metrics.certificate_cpu;
+        self.worker_stitch_cpu += metrics.stitch_cpu;
+        self.worker_morph_cpu += metrics.morph_cpu;
+        self.worker_queue_wait += metrics.queue_wait;
+        self.cache_publication_wait += metrics.cache_publication_wait;
+        if metrics.cancelled {
+            self.cancelled_work_cpu += metrics.cpu;
+            self.cancelled_work_count += 1;
+        }
+    }
 }
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TerrainCacheReport {
@@ -1034,8 +1084,10 @@ impl TerrainPatchCache {
                 self.completed_covers.push(completion);
                 continue;
             }
+            #[cfg(feature = "surface-profile")]
+            work.profile.include_worker(completion.metrics);
             match completion.result {
-                Ok(workers::Output::Patch(patch, metadata)) => {
+                Ok(workers::Output::Patch(patch, metadata, ..)) => {
                     let address = patch.address();
                     anyhow::ensure!(
                         completion.address == Some(address),
@@ -1068,11 +1120,23 @@ impl TerrainPatchCache {
             }
         }
         work.publication = start.elapsed();
+        #[cfg(feature = "surface-profile")]
+        if let Some(workers) = &mut self.workers {
+            for metrics in workers.take_abandoned_metrics().into_iter().flatten() {
+                work.profile.include_worker(metrics);
+            }
+        }
         let scheduling_start = Instant::now();
         while schedule
             && !self.requests.is_empty()
             && self.workers.as_ref().is_some_and(|w| w.idle())
         {
+            #[cfg(feature = "surface-profile")]
+            let reservation_start = Instant::now();
+            #[cfg(feature = "surface-profile")]
+            {
+                work.profile.cache_reservation_attempts += 1;
+            }
             let in_flight = self
                 .workers
                 .as_ref()
@@ -1082,6 +1146,10 @@ impl TerrainPatchCache {
                 || self.resident_bytes() + self.external_bytes + workers::PATCH_RESERVATION
                     > admission_cap
             {
+                #[cfg(feature = "surface-profile")]
+                {
+                    work.profile.cache_reservation_retries += 1;
+                }
                 if !self.evict_one() {
                     break;
                 }
@@ -1102,6 +1170,11 @@ impl TerrainPatchCache {
                     > admission_cap
             {
                 self.report.reservation_rejected += 1;
+                #[cfg(feature = "surface-profile")]
+                {
+                    work.profile.cache_reservation_cpu += reservation_start.elapsed();
+                    work.profile.cache_reservation_retries += 1;
+                }
                 break;
             }
             let request = self.requests.remove(0);
@@ -1109,6 +1182,10 @@ impl TerrainPatchCache {
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("missing workers"))?
                 .submit_patch(&request)?;
+            #[cfg(feature = "surface-profile")]
+            {
+                work.profile.cache_reservation_cpu += reservation_start.elapsed();
+            }
             self.record_peak();
         }
         work.scheduling = scheduling_start.elapsed();

@@ -1,4 +1,6 @@
 //! Complete flat cover with hysteresis and atomic local balancing transactions.
+#[cfg(feature = "surface-profile")]
+use super::CpuStageTimer;
 use super::{
     MetadataCache, PatchMetadata, SurfaceErrorContributions, SurfaceExtent, SurfaceTopology,
     cover::AddressSet,
@@ -144,6 +146,30 @@ pub struct LodReport {
 #[cfg(feature = "surface-profile")]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LodProfile {
+    /// CPU time for coarse parent stages; short stages can read zero due to OS
+    /// accounting resolution. `None` denotes an unavailable clock.
+    pub thread_cpu_total: Option<Duration>,
+    pub thread_cpu_setup: Option<Duration>,
+    pub thread_cpu_merge: Option<Duration>,
+    pub thread_cpu_split: Option<Duration>,
+    pub thread_cpu_visibility: Option<Duration>,
+    pub thread_cpu_desired: Option<Duration>,
+    /// Initial/current cover and pending dependency pin construction.
+    pub setup_pinning: Duration,
+    /// Candidate scanning from the active cover (excluding sorting).
+    pub request_scan: Duration,
+    /// Request ordering and pending-priority adjustment.
+    pub request_sort: Duration,
+    /// Balance-closure construction and candidate balancing passes.
+    pub balancing: Duration,
+    /// Cover leaves considered during merge and split request scans.
+    pub cover_candidates: usize,
+    /// Refinement requests surviving the relevance/threshold scan.
+    pub request_candidates: usize,
+    /// Calls to balance-violation scans, including empty/final passes.
+    pub balance_passes: usize,
+    /// Merge parents considered.
+    pub merge_candidates: usize,
     /// Merge candidate construction and sibling/balance eligibility decisions.
     pub merge_decisions: Duration,
     /// Requested splits, dependency metadata readiness, balancing and atomic commits.
@@ -332,10 +358,14 @@ impl SurfaceLodSession {
         let source = input.view.prepare_source(input.body_fixed_frame)?;
         let mut report = LodReport::default();
         #[cfg(feature = "surface-profile")]
-        let total_started = Instant::now();
+        let total_started = CpuStageTimer::new();
         #[cfg(feature = "surface-profile")]
         let capacities = self.profile_capacities();
         self.cache.reset_counters();
+        #[cfg(feature = "surface-profile")]
+        let setup_cpu = CpuStageTimer::new();
+        #[cfg(feature = "surface-profile")]
+        let stage_started = Instant::now();
         self.pins.clear();
         self.pins.extend(self.cover.iter().copied());
         for &leaf in &self.cover {
@@ -360,13 +390,24 @@ impl SurfaceLodSession {
         for &p in &self.pending {
             self.pins.insert(p);
         }
+        #[cfg(feature = "surface-profile")]
+        {
+            report.profile.setup_pinning += stage_started.elapsed();
+            report.profile.thread_cpu_setup = setup_cpu.thread_elapsed();
+        }
         // Coarsening is also one complete sibling transaction. Deepest first frees
         // pins before approaching a different region of the same body.
         #[cfg(feature = "surface-profile")]
         let stage_started = Instant::now();
+        #[cfg(feature = "surface-profile")]
+        let merge_cpu = CpuStageTimer::new();
         self.merge_candidates.clear();
         self.merge_candidates
             .extend(self.cover.iter().filter_map(|p| p.parent()));
+        #[cfg(feature = "surface-profile")]
+        {
+            report.profile.merge_candidates += self.merge_candidates.len();
+        }
         for index in (0..self.merge_candidates.len()).rev() {
             let parent = *self
                 .merge_candidates
@@ -422,11 +463,20 @@ impl SurfaceLodSession {
         #[cfg(feature = "surface-profile")]
         {
             report.profile.merge_decisions = stage_started.elapsed();
+            report.profile.thread_cpu_merge = merge_cpu.thread_elapsed();
         }
         #[cfg(feature = "surface-profile")]
         let stage_started = Instant::now();
+        #[cfg(feature = "surface-profile")]
+        let split_cpu = CpuStageTimer::new();
         self.requests.clear();
+        #[cfg(feature = "surface-profile")]
+        let request_scan_started = Instant::now();
         for &p in &self.cover {
+            #[cfg(feature = "surface-profile")]
+            {
+                report.profile.cover_candidates += 1;
+            }
             let m = self.cache.get(p)?.expect("active metadata pinned");
             let (visible, error, _) = relevance(p, m, input, &source, &mut policy)?;
             if visible && error > settings.split_px {
@@ -455,11 +505,21 @@ impl SurfaceLodSession {
                         view_offset,
                         (center - observer).length(),
                     ));
+                    #[cfg(feature = "surface-profile")]
+                    {
+                        report.profile.request_candidates += 1;
+                    }
                 } else {
                     report.precision_floor = true;
                 }
             }
         }
+        #[cfg(feature = "surface-profile")]
+        {
+            report.profile.request_scan = request_scan_started.elapsed();
+        }
+        #[cfg(feature = "surface-profile")]
+        let request_sort_started = Instant::now();
         self.requests.sort_by(compare_request_priority);
         // Finish an admitted closure unless a newly relevant camera-local chain
         // outranks it. Peripheral infinite certificates must not starve a local
@@ -470,6 +530,10 @@ impl SurfaceLodSession {
         {
             let request = self.requests.remove(index);
             self.requests.insert(0, request);
+        }
+        #[cfg(feature = "surface-profile")]
+        {
+            report.profile.request_sort = request_sort_started.elapsed();
         }
         // Highest-error local closures allow progress without simultaneously pinning
         // two whole global covers. All balancing dependencies activate atomically.
@@ -496,7 +560,17 @@ impl SurfaceLodSession {
                 self.pending.insert(child);
             }
             loop {
+                #[cfg(feature = "surface-profile")]
+                {
+                    report.profile.balance_passes += 1;
+                }
+                #[cfg(feature = "surface-profile")]
+                let balance_started = Instant::now();
                 balance_violations(&self.proposal, &mut self.coarse);
+                #[cfg(feature = "surface-profile")]
+                {
+                    report.profile.balancing += balance_started.elapsed();
+                }
                 if !self.coarse.is_empty() {
                     if self.proposal.len() + 3 * self.coarse.len() > settings.cover_limit {
                         ready = false;
@@ -596,9 +670,12 @@ impl SurfaceLodSession {
         #[cfg(feature = "surface-profile")]
         {
             report.profile.split_ready_transactions = stage_started.elapsed();
+            report.profile.thread_cpu_split = split_cpu.thread_elapsed();
         }
         #[cfg(feature = "surface-profile")]
         let stage_started = Instant::now();
+        #[cfg(feature = "surface-profile")]
+        let visibility_cpu = CpuStageTimer::new();
         visible_for(
             &mut self.cache,
             &self.cover,
@@ -631,6 +708,7 @@ impl SurfaceLodSession {
         #[cfg(feature = "surface-profile")]
         {
             report.profile.visible_and_masks = stage_started.elapsed();
+            report.profile.thread_cpu_visibility = visibility_cpu.thread_elapsed();
         }
         // Rebuild desired coverage from roots using previous quality splits and
         // readiness. Missing subdomains explicitly remain an incomplete estimate.
@@ -640,6 +718,8 @@ impl SurfaceLodSession {
             .extend(CubeFace::ALL.into_iter().rev().map(CubePatchAddress::root));
         #[cfg(feature = "surface-profile")]
         let stage_started = Instant::now();
+        #[cfg(feature = "surface-profile")]
+        let desired_cpu = CpuStageTimer::new();
         while let Some(p) = self.stack.pop() {
             let m = self
                 .cache
@@ -671,6 +751,7 @@ impl SurfaceLodSession {
         #[cfg(feature = "surface-profile")]
         {
             report.profile.desired_traversal = stage_started.elapsed();
+            report.profile.thread_cpu_desired = desired_cpu.thread_elapsed();
         }
         report.desired_patches = self.desired.len();
         report.balanced_patches = self.cover.len();
@@ -737,7 +818,8 @@ impl SurfaceLodSession {
                         .visible_scratch
                         .capacity()
                         .saturating_sub(self.visible_scratch.len());
-            report.profile.total = total_started.elapsed();
+            report.profile.total = total_started.wall_elapsed();
+            report.profile.thread_cpu_total = total_started.thread_elapsed();
             report.profile.capacity_growths = capacities
                 .into_iter()
                 .zip(self.profile_capacities())

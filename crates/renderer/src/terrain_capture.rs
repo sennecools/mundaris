@@ -4,12 +4,15 @@
 //! viewport. Creating a capture requires a locally available GPU adapter; no GPU
 //! integration test runs as part of the ordinary test suite.
 
-use crate::{CelestialFrame, RenderPreparationError, celestial::CelestialRenderer};
+use crate::{
+    CelestialFrame, RenderPreparationError, TimestampAvailability, celestial::CelestialRenderer,
+};
 
 /// Offscreen RGBA8 target that submits through the ordinary celestial renderer.
 pub struct TerrainCaptureRenderer {
     _instance: wgpu::Instance,
     adapter_name: String,
+    adapter_backend: String,
     device: wgpu::Device,
     queue: wgpu::Queue,
     renderer: CelestialRenderer,
@@ -19,6 +22,11 @@ pub struct TerrainCaptureRenderer {
     height: u32,
     padded_bytes_per_row: u32,
     last_cpu_encode: std::time::Duration,
+    timestamp_availability: TimestampAvailability,
+    timestamp_queries: Option<crate::gpu_profile::CelestialQueries>,
+    timestamp_resolve: Option<wgpu::Buffer>,
+    timestamp_readback: Option<wgpu::Buffer>,
+    last_gpu_profile: crate::gpu_profile::GpuProfile,
 }
 
 impl TerrainCaptureRenderer {
@@ -40,11 +48,15 @@ impl TerrainCaptureRenderer {
             })
             .await
             .map_err(|error| RenderPreparationError::GpuProgress(error.to_string()))?;
-        let adapter_name = adapter.get_info().name;
+        let info = adapter.get_info();
+        let requested_features = crate::gpu_profile::available_features(&adapter);
+        let timestamp_availability = crate::gpu_profile::availability(requested_features);
+        let adapter_name = info.name;
+        let adapter_backend = format!("{:?}", info.backend);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("Mundaris terrain capture device"),
-                required_features: wgpu::Features::empty(),
+                required_features: requested_features,
                 required_limits: wgpu::Limits::default(),
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 memory_hints: wgpu::MemoryHints::default(),
@@ -57,7 +69,7 @@ impl TerrainCaptureRenderer {
         {
             return Err(RenderPreparationError::InvalidBudget);
         }
-        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Terrain capture color target"),
             size: wgpu::Extent3d {
@@ -92,10 +104,28 @@ impl TerrainCaptureRenderer {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
+        let timestamp_queries = crate::gpu_profile::CelestialQueries::new(&device);
+        let timestamp_resolve = timestamp_queries.as_ref().map(|_| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Terrain capture timestamp resolve"),
+                size: u64::from(crate::gpu_profile::QUERY_COUNT) * 8,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        });
+        let timestamp_readback = timestamp_queries.as_ref().map(|_| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Terrain capture timestamp readback"),
+                size: u64::from(crate::gpu_profile::QUERY_COUNT) * 8,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        });
         let renderer = CelestialRenderer::new(&device, &queue, format, width, height);
         Ok(Self {
             _instance: instance,
             adapter_name,
+            adapter_backend,
             device,
             queue,
             renderer,
@@ -105,6 +135,11 @@ impl TerrainCaptureRenderer {
             height,
             padded_bytes_per_row,
             last_cpu_encode: std::time::Duration::ZERO,
+            timestamp_availability,
+            timestamp_queries,
+            timestamp_resolve,
+            timestamp_readback,
+            last_gpu_profile: crate::gpu_profile::GpuProfile::default(),
         })
     }
 
@@ -126,8 +161,28 @@ impl TerrainCaptureRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Terrain capture encoder"),
             });
-        self.renderer
-            .draw(&self.device, &self.queue, &mut encoder, &view, frame)?;
+        let scope_mask = self.renderer.draw(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &view,
+            frame,
+            self.timestamp_queries.as_ref(),
+        )?;
+        if let (Some(queries), Some(resolve), Some(timestamp_readback)) = (
+            self.timestamp_queries.as_ref(),
+            self.timestamp_resolve.as_ref(),
+            self.timestamp_readback.as_ref(),
+        ) {
+            encoder.resolve_query_set(&queries.set, 0..crate::gpu_profile::QUERY_COUNT, resolve, 0);
+            encoder.copy_buffer_to_buffer(
+                resolve,
+                0,
+                timestamp_readback,
+                0,
+                u64::from(crate::gpu_profile::QUERY_COUNT) * 8,
+            );
+        }
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.target,
@@ -169,6 +224,33 @@ impl TerrainCaptureRenderer {
             .recv()
             .map_err(|error| RenderPreparationError::GpuProgress(error.to_string()))?
             .map_err(|error| RenderPreparationError::GpuProgress(error.to_string()))?;
+        if let Some(timestamp_readback) = &self.timestamp_readback {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            timestamp_readback.map_async(wgpu::MapMode::Read, .., move |result| {
+                let _ = sender.send(result);
+            });
+            self.device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                })
+                .map_err(|error| RenderPreparationError::GpuProgress(error.to_string()))?;
+            receiver
+                .recv()
+                .map_err(|error| RenderPreparationError::GpuProgress(error.to_string()))?
+                .map_err(|error| RenderPreparationError::GpuProgress(error.to_string()))?;
+            let mapped = timestamp_readback.get_mapped_range(..);
+            let ticks: Vec<u64> = mapped
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|bytes| u64::from_le_bytes(*bytes))
+                .collect();
+            let period = self.queue.get_timestamp_period();
+            self.last_gpu_profile = crate::gpu_profile::decode(&ticks, period, scope_mask);
+            drop(mapped);
+            timestamp_readback.unmap();
+        }
         let mapped = self.readback.get_mapped_range(..);
         let row_bytes = self.width as usize * 4;
         let padded_row_bytes = self.padded_bytes_per_row as usize;
@@ -187,10 +269,30 @@ impl TerrainCaptureRenderer {
     pub fn adapter_name(&self) -> &str {
         &self.adapter_name
     }
+    /// Backend selected for this offscreen adapter (not a native-window timing claim).
+    pub fn adapter_backend(&self) -> &str {
+        &self.adapter_backend
+    }
 
     /// Last host upload/encoding wall duration, excluding GPU wait/readback.
     pub fn last_cpu_encode(&self) -> std::time::Duration {
         self.last_cpu_encode
+    }
+
+    /// Adapter timestamp capability. Capture currently waits for readback, but
+    /// capability alone is not a GPU timing measurement.
+    pub fn timestamp_availability(&self) -> TimestampAvailability {
+        self.timestamp_availability
+    }
+
+    /// Latest timestamp-query values from the last completed capture render.
+    pub fn last_gpu_profile(&self) -> crate::gpu_profile::GpuProfile {
+        self.last_gpu_profile
+    }
+
+    /// Last CPU-side terrain upload bytes, capacity, growth and wait accounting.
+    pub fn last_terrain_upload_profile(&self) -> crate::gpu_profile::CpuUploadProfile {
+        self.renderer.last_surface_upload_profile()
     }
 
     pub fn width(&self) -> u32 {

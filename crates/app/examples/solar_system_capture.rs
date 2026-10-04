@@ -14,7 +14,8 @@ use mundaris_app::{
 use mundaris_math::{surface::SurfaceLocation, *};
 use mundaris_renderer::{
     CelestialFrame, CelestialLineStyle, CelestialPolyline, CelestialProjection,
-    CelestialRenderBody, CelestialStaging, Icosphere, PreparedView, RenderPrecisionBudget,
+    CelestialRenderBody, CelestialStaging, Icosphere, PlanetaryConfig, PreparedView,
+    RenderPrecisionBudget,
     planet_surface::{SurfaceStyle, TerrainLighting, TerrainRenderMode},
     terrain_capture::TerrainCaptureRenderer,
 };
@@ -71,6 +72,11 @@ const SCENES: &[&str] = &[
     "phase59-land-ridge",
     "phase59-land-gully",
     "phase59-shoreline",
+    "planetary-terminator",
+    "planetary-grazing",
+    "planetary-real-orbit",
+    "planetary-moon",
+    "planetary-mars",
 ];
 
 fn bitmap(path: &Path, rgba: &[u8]) -> Result<()> {
@@ -360,8 +366,8 @@ fn observer_pose(
     }
 
     let target = match scene {
-        "mars" | "phase59-mars-10" => SolarBody::Mars,
-        "phase59-moon-10" => SolarBody::Moon,
+        "mars" | "phase59-mars-10" | "planetary-mars" => SolarBody::Mars,
+        "phase59-moon-10" | "planetary-moon" => SolarBody::Moon,
         "jupiter" => SolarBody::Jupiter,
         "saturn" => SolarBody::Saturn,
         "neptune" => SolarBody::Neptune,
@@ -394,6 +400,22 @@ fn observer_pose(
         .unit();
     let (mut direction, clearance, horizon) = match scene {
         "high-orbit" | "phase59-high-orbit" => (star_direction, 600_000.0, false),
+        "planetary-real-orbit" => (star_direction, radius * 1.5, false),
+        "planetary-moon" | "planetary-mars" => (star_direction, radius * 1.5, false),
+        "planetary-terminator" | "planetary-grazing" => {
+            let tangent = star_direction.cross(DVec3::Y).normalize();
+            let angle = if scene == "planetary-terminator" {
+                90.0_f64
+            } else {
+                75.0_f64
+            }
+            .to_radians();
+            (
+                star_direction * angle.cos() + tangent * angle.sin(),
+                600_000.0,
+                false,
+            )
+        }
         "adaptive" => (star_direction, 200_000.0, false),
         "low-orbit" => (star_direction, 40_000.0, false),
         "high-altitude" => (star_direction, 10_000.0, false),
@@ -566,12 +588,18 @@ fn build_frame<'view, 'tree, 'storage>(
     population: &TerrainPopulation,
     lighting: TerrainLighting,
     style: SurfaceStyle,
+    environment: Option<PlanetaryConfig>,
 ) -> Result<CelestialFrame<'view, 'tree, 'storage>> {
     let mut frame = CelestialFrame::new(view, staging, projection, sphere);
     frame.set_terrain_lighting(lighting);
     if let Some(index) = owners.iter().position(|&owner| owner)
         && population.cover.ready()
     {
+        if lighting.mode() == TerrainRenderMode::Natural
+            && let Some(config) = environment
+        {
+            frame.set_planetary_environment(requests[index], config)?;
+        }
         let (surface, topology) = (
             population
                 .cover
@@ -673,6 +701,9 @@ fn run_scene(
 ) -> Result<()> {
     let namespace = NonZeroU64::new(580).ok_or_else(|| anyhow::anyhow!("namespace"))?;
     let mut preset = SolarSystemPreset::gameplay();
+    if scene == "planetary-real-orbit" {
+        preset = SolarSystemPreset::real_scale();
+    }
     if let Some(diameter) = scene.strip_prefix("compare") {
         let diameter_km = diameter.parse::<f64>()?;
         preset.body_radius_scale = diameter_km * 1000.0 / (2.0 * 6_371_000.0);
@@ -879,10 +910,11 @@ fn run_scene(
     let visible_levels = distribution(population.cover.visible().iter().map(|p| p.address.level()));
     let cache = population.cache.report();
     let mut manifest = format!(
-        "Phase 5.8 gameplay authored-system capture\nscene={scene}\npreset=gameplay body_radius_scale={} orbital_distance_scale={} viewport={WIDTH}x{HEIGHT} fov_degrees=60\nscene_geometry={scene_description}\nlabels=manifest-only; screen-space identity markers are navigational aids and do not change physical scales\nadapter={} gpu_timestamps_unavailable=true\nupdates={updates} update_limit={max_updates} update_vertex_budget={VERTEX_BUDGET} elapsed_step_ms=16 morph_ms={}\nrequested_target={target:?} active_body={population_body:?} active_body_id={:?} surface_owner_count={}\nactive_cover_patches={} visible_cover_patches={} levels={levels:?} visible_levels={visible_levels:?} ready={} quality_pending={} settled={} budget_constrained={} max_level={} max_error_px={}\ncache_resident_patches={} cache_resident_bytes={} cache_pinned_patches={} cache_external_bytes={} cache_peak_aggregate_bytes={} cache_hits={} cache_misses={} cache_evictions={} pending_final={} pending_max={} vertices_per_update_max={} generated_samples_total={}\nmorph_active_updates={} morph_build_count={} morph_build_ms_total={} morph_build_ms_worst={} morph_transition_active={} morph_fraction={:?} morph_capture={}\n",
+        "Production terrain capture — static operation-budget fixture\nscene={scene}\npreset_radius_scale={} orbital_distance_scale={} viewport={WIDTH}x{HEIGHT} fov_degrees=60\nscene_geometry={scene_description}\nlabels=manifest-only; screen-space identity markers are navigational aids and do not change physical scales\nadapter={} gpu_timestamp_capability={:?}\nupdates={updates} update_limit={max_updates} update_vertex_budget={VERTEX_BUDGET} elapsed_step_ms=16 morph_ms={}\nrequested_target={target:?} active_body={population_body:?} active_body_id={:?} surface_owner_count={}\nactive_cover_patches={} visible_cover_patches={} levels={levels:?} visible_levels={visible_levels:?} ready={} quality_pending={} settled={} budget_constrained={} max_level={} max_error_px={}\ncache_resident_patches={} cache_resident_bytes={} cache_pinned_patches={} cache_external_bytes={} cache_peak_aggregate_bytes={} cache_hits={} cache_misses={} cache_evictions={} pending_final={} pending_max={} vertices_per_update_max={} generated_samples_total={}\nmorph_active_updates={} morph_build_count={} morph_build_ms_total={} morph_build_ms_worst={} morph_transition_active={} morph_fraction={:?} morph_capture={}\n",
         preset.body_radius_scale,
         preset.orbital_distance_scale,
         capture.adapter_name(),
+        capture.timestamp_availability(),
         morph_duration.as_millis(),
         population.active_body(),
         owners.iter().filter(|&&owner| owner).count(),
@@ -914,6 +946,22 @@ fn run_scene(
         morph_fraction,
         morph_sample
     );
+    for args in [vec!["rev-parse", "HEAD"], vec!["status", "--short"]] {
+        let value = std::process::Command::new("git")
+            .args(&args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_else(|| "unavailable".into());
+        writeln!(manifest, "repository_command={args:?}\n{value}")?;
+    }
+    writeln!(
+        manifest,
+        "capture_label={} adapter_backend={}",
+        std::env::var("MUNDARIS_CAPTURE_LABEL").unwrap_or_else(|_| "current-working-tree".into()),
+        capture.adapter_backend()
+    )?;
     ensure!(
         population.cache.pending() <= MAX_PENDING_PATCHES,
         "capture exceeded pending-work cap"
@@ -977,6 +1025,7 @@ fn run_scene(
     let mut render_preparation_ms = Vec::new();
     let mut render_encode_ms = Vec::new();
     let mut image = None;
+    let mut initial_rgba = None;
     let mut marker_counts = BTreeMap::<String, usize>::new();
     let default_lighting = TerrainLighting::default();
     let lighting = if let Some(active) = population.active_body() {
@@ -1023,6 +1072,37 @@ fn run_scene(
     } else {
         lighting
     };
+    let environment = population_body
+        .map(|body| {
+            mundaris_app::solar_system::planetary_config(
+                body,
+                requests[body_index(body)].reference_radius_m,
+            )
+        })
+        .transpose()?
+        .flatten();
+    let lighting = if std::env::var_os("MUNDARIS_CAPTURE_PLANETARY").is_some()
+        || scene.starts_with("planetary-")
+    {
+        lighting.with_mode(TerrainRenderMode::Natural)
+    } else {
+        lighting
+    };
+    writeln!(
+        manifest,
+        "planetary_environment={environment:?} camera_pose={pose:?} radial_convergence={:?}",
+        population.cover.convergence
+    )?;
+    if let Some(id) = population.active_body() {
+        let body = world.body(id)?;
+        writeln!(
+            manifest,
+            "terrain_definition={:?} terrain_revision={:?} identity_radius_m={}",
+            body.terrain(),
+            body.terrain_revision(),
+            body.properties().reference_radius_m()
+        )?;
+    }
     let lighting = if let Some(active) = population.active_body() {
         let index = world
             .bodies()
@@ -1041,8 +1121,9 @@ fn run_scene(
     };
     writeln!(
         manifest,
-        "terrain_lighting_sun_body={:?} mode=Lit ambient={} diffuse={} lighting_source={}",
+        "terrain_lighting_sun_body={:?} mode={:?} ambient={} diffuse={} lighting_source={}",
         lighting.sun_direction_body(),
+        lighting.mode(),
         lighting.ambient_strength(),
         lighting.diffuse_strength(),
         if diagnostic_light {
@@ -1068,6 +1149,7 @@ fn run_scene(
                 }),
                 ..Default::default()
             },
+            environment,
         )?;
         if matches!(scene, "system" | "inner" | "earth-moon") {
             let root = frames.tree().root();
@@ -1083,6 +1165,14 @@ fn run_scene(
         }
         let preparation = start.elapsed();
         let rgba = capture.render(&frame)?;
+        if let Some(initial) = &initial_rgba {
+            ensure!(
+                initial == &rgba,
+                "unchanged production frame was not pixel deterministic"
+            );
+        } else {
+            initial_rgba = Some(rgba.clone());
+        }
         if repetition > 0 {
             render_preparation_ms.push(preparation.as_secs_f64() * 1000.0);
             render_encode_ms.push(capture.last_cpu_encode().as_secs_f64() * 1000.0);
@@ -1149,13 +1239,19 @@ fn run_scene(
             let report = frame.report();
             writeln!(
                 manifest,
-                "draw_count_total={} sphere_draws={} terrain_draws={} navigation_polyline_draws={}",
+                "draw_count_total={} sphere_draws={} terrain_draws={} navigation_polyline_draws={} visual_layer_draws={}",
                 marker_counts.get("PhysicalSphere").copied().unwrap_or(0)
                     + report.surface.draws
-                    + usize::from(report.polyline_segments > 0),
+                    + usize::from(report.polyline_segments > 0)
+                    + report.planetary_ocean_draws
+                    + report.planetary_cloud_draws
+                    + report.planetary_atmosphere_draws,
                 marker_counts.get("PhysicalSphere").copied().unwrap_or(0),
                 report.surface.draws,
-                usize::from(report.polyline_segments > 0)
+                usize::from(report.polyline_segments > 0),
+                report.planetary_ocean_draws
+                    + report.planetary_cloud_draws
+                    + report.planetary_atmosphere_draws
             )?;
         }
     }
@@ -1179,6 +1275,10 @@ fn run_scene(
         "host_timing_convergence_update_cpu_ms_median={update_median} worst={update_worst} samples={}\nhost_timing_steady_update_cpu_ms_median={steady_update_median} worst={steady_update_worst} samples=8 generated_samples=0\nhost_timing_render_prepare_cpu_ms_median={prep_median} worst={prep_worst} steady_samples={}\nhost_timing_render_upload_encode_cpu_ms_median={encode_median} worst={encode_worst}; draw/GPU execution excluded\n",
         update_cpu_ms.len(),
         render_preparation_ms.len()
+    )?;
+    writeln!(
+        manifest,
+        "unchanged_frame_gpu_readback_repetitions=8 pixel_identical=true color_target=Rgba8UnormSrgb"
     )?;
     for (index, (id, body)) in world.bodies().enumerate() {
         writeln!(
@@ -1228,15 +1328,45 @@ fn run_scene(
                 borders: true,
                 ..Default::default()
             },
+            environment,
         )?;
         bitmap(
             &output.join(format!("{scene}-lod.bmp")),
             &capture.render(&frame)?,
         )?;
     }
-    if scene.starts_with("phase59-") {
+    if scene.starts_with("phase59-") || scene.starts_with("planetary-") {
         let cache_before_modes = population.cache.report();
         let mut mode_specs = vec![
+            (
+                "planetary",
+                TerrainRenderMode::Natural,
+                SurfaceStyle::default(),
+            ),
+            (
+                "elevation",
+                TerrainRenderMode::Elevation,
+                SurfaceStyle {
+                    elevation_colors: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "normals",
+                TerrainRenderMode::Normals,
+                SurfaceStyle::default(),
+            ),
+            ("slope", TerrainRenderMode::Slope, SurfaceStyle::default()),
+            (
+                "rock-weight",
+                TerrainRenderMode::RockWeight,
+                SurfaceStyle::default(),
+            ),
+            (
+                "sea-mask",
+                TerrainRenderMode::SeaMask,
+                SurfaceStyle::default(),
+            ),
             ("lit", TerrainRenderMode::Lit, SurfaceStyle::default()),
             (
                 "readability",
@@ -1293,6 +1423,7 @@ fn run_scene(
                     &population,
                     lighting.with_mode(mode),
                     style,
+                    environment,
                 )?;
                 std::hint::black_box(frame.report());
                 prepare_samples_ms.push(started.elapsed().as_secs_f64() * 1000.0);
@@ -1315,6 +1446,7 @@ fn run_scene(
                 &population,
                 lighting.with_mode(mode),
                 style,
+                environment,
             )?;
             bitmap(
                 &output.join(format!("{scene}-{suffix}.bmp")),
@@ -1336,11 +1468,91 @@ fn run_scene(
                 underside: true,
                 ..Default::default()
             },
+            environment,
         )?;
         bitmap(
             &output.join(format!("{scene}-no-cull.bmp")),
             &capture.render(&frame)?,
         )?;
+        if let Some(config) = environment {
+            for (suffix, layers) in [
+                ("all-layers", config),
+                (
+                    "no-atmosphere",
+                    PlanetaryConfig {
+                        atmosphere_enabled: false,
+                        ..config
+                    },
+                ),
+                (
+                    "no-ocean",
+                    PlanetaryConfig {
+                        ocean_enabled: false,
+                        ..config
+                    },
+                ),
+                (
+                    "no-clouds",
+                    PlanetaryConfig {
+                        clouds_enabled: false,
+                        ..config
+                    },
+                ),
+                (
+                    "land-only",
+                    PlanetaryConfig {
+                        atmosphere_enabled: false,
+                        ocean_enabled: false,
+                        clouds_enabled: false,
+                        ..config
+                    },
+                ),
+            ] {
+                let start = Instant::now();
+                let frame = build_frame(
+                    &view,
+                    &mut staging,
+                    projection,
+                    &sphere,
+                    &requests,
+                    &owners,
+                    &population,
+                    lighting.with_mode(TerrainRenderMode::Natural),
+                    SurfaceStyle::default(),
+                    Some(layers),
+                )?;
+                let prepare_ms = start.elapsed().as_secs_f64() * 1000.0;
+                let mut encode_samples = Vec::with_capacity(8);
+                let mut readback_samples = Vec::with_capacity(8);
+                let mut first_image = None;
+                for _ in 0..8 {
+                    let start = Instant::now();
+                    let rgba = capture.render(&frame)?;
+                    readback_samples.push(start.elapsed().as_secs_f64() * 1000.0);
+                    encode_samples.push(capture.last_cpu_encode().as_secs_f64() * 1000.0);
+                    if let Some(first) = &first_image {
+                        ensure!(
+                            first == &rgba,
+                            "unchanged layer capture was not deterministic"
+                        );
+                    } else {
+                        bitmap(&output.join(format!("{scene}-{suffix}.bmp")), &rgba)?;
+                        first_image = Some(rgba);
+                    }
+                }
+                encode_samples.sort_by(f64::total_cmp);
+                readback_samples.sort_by(f64::total_cmp);
+                let (encode_median, encode_worst) = quantiles(&encode_samples);
+                let (readback_median, readback_worst) = quantiles(&readback_samples);
+                writeln!(
+                    manifest,
+                    "layer_variant={suffix} config={layers:?} prepare_ms={prepare_ms} encode_ms_median={encode_median} encode_ms_worst={encode_worst} render_wait_readback_ms_median={readback_median} render_wait_readback_ms_worst={readback_worst} repeats=8 pixel_identical=true report={:?} gpu_timestamp_last={:?} upload_last={:?}",
+                    frame.report(),
+                    capture.last_gpu_profile(),
+                    capture.last_terrain_upload_profile()
+                )?;
+            }
+        }
         writeln!(
             manifest,
             "exact_camera_no_cull_intervention=true unchanged_near_m={} unchanged_geometry=true unchanged_ownership=true",

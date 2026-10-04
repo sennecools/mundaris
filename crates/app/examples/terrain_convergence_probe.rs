@@ -114,12 +114,31 @@ fn main() -> Result<()> {
     let capture_adapter = gpu.as_ref().map_or("none", |gpu| gpu.adapter_name());
     #[cfg(not(feature = "terrain-capture"))]
     let capture_adapter = "none";
+    #[cfg(feature = "terrain-capture")]
+    let capture_timestamps = gpu.as_ref().map_or_else(
+        || "not_requested".to_string(),
+        |gpu| format!("{:?}", gpu.timestamp_availability()),
+    );
+    #[cfg(not(feature = "terrain-capture"))]
+    let capture_timestamps = "capture_feature_disabled";
     fs::write(
         output.join("probe-manifest.txt"),
         format!(
-            "preset=gameplay mode={mode} workers={workers} morph_ms={morph_ms}\nviewport={WIDTH}x{HEIGHT} fov_degrees=60 near_m=0.1 frame_opportunity_ms=16\nrequested_times_ms={TIMES_MS:?}\nearth_radius_m={radius} direction_body_fixed={direction:?} earth_complete_height_m={complete_height}\nearth_terrain={definition:?}\ncapture_adapter={capture_adapter} gpu_timestamps_unavailable=true\nquality=radial-source-LOD-is-not-screen-wide-quality\nevidence=production-route-wall-clock-and-optional-native-offscreen-not-human-interactive-acceptance\n"
+            "preset=gameplay mode={mode} workers={workers} morph_ms={morph_ms}\nviewport={WIDTH}x{HEIGHT} fov_degrees=60 near_m=0.1 frame_opportunity_ms=16\nrequested_times_ms={TIMES_MS:?}\nearth_radius_m={radius} direction_body_fixed={direction:?} earth_complete_height_m={complete_height}\nearth_terrain={definition:?}\ncapture_adapter={capture_adapter} gpu_timestamp_capability={capture_timestamps}\nquality=radial-source-LOD-is-not-screen-wide-quality\nevidence=production-route-wall-clock-and-optional-native-offscreen-not-human-interactive-acceptance\n"
         ),
     )?;
+    let mut repository = String::new();
+    for args in [vec!["rev-parse", "HEAD"], vec!["status", "--short"]] {
+        let value = std::process::Command::new("git")
+            .args(&args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_else(|| "unavailable".into());
+        repository.push_str(&format!("repository_command={args:?}\n{value}\n"));
+    }
+    fs::write(output.join("repository.txt"), repository)?;
     let mut population = TerrainPopulation::with_worker_count(workers)?;
     let headroom_mib: usize = std::env::var("MUNDARIS_TERRAIN_HEADROOM_MIB")
         .ok()
@@ -146,7 +165,7 @@ fn main() -> Result<()> {
     let mut detail = BufWriter::new(File::create(output.join("detail.csv"))?);
     writeln!(
         detail,
-        "view,actual_ms,stitched_append_ms,transition_append_ms,far_append_ms,closure_parent,closure_dependencies,balance_parents,closure_local,completed_patches,completed_replacement_useful,completed_local_useful,total_completed,local_useful_total,useful_ratio,queued,worker_jobs,accounted_bytes,reservation_rejected,eviction_attempts,bytes_freed,evictions,hits,misses,soft_waterline_misses,desired_spacing_m,rendered_spacing_m,desired_error_px,restaged_patches,bytes_staged,stitch_reused,active_morph,construction_pending,proof_hits,proof_misses"
+        "view,actual_ms,stitched_append_ms,transition_append_ms,far_append_ms,closure_parent,closure_dependencies,balance_parents,closure_local,completed_patches,completed_replacement_useful,completed_local_useful,total_completed,local_useful_total,useful_ratio,queued,worker_jobs,accounted_bytes,reservation_rejected,eviction_attempts,bytes_freed,evictions,hits,misses,soft_waterline_misses,desired_spacing_m,rendered_spacing_m,desired_error_px,restaged_patches,bytes_staged,stitch_reused,active_morph,construction_pending,proof_hits,proof_misses,successor_ready,morph_fraction,morph_duration_ms,overlay_budget_bytes,last_overlay_granted_bytes"
     )?;
     let mut memory_csv = BufWriter::new(File::create(output.join("memory.csv"))?);
     writeln!(
@@ -157,6 +176,15 @@ fn main() -> Result<()> {
     let mut render_profiles = BufWriter::new(File::create(output.join("render-profiles.txt"))?);
     let mut completed_total = 0usize;
     let mut useful_total = 0usize;
+    #[cfg(feature = "surface-profile")]
+    let mut stages = BufWriter::new(File::create(output.join("stages.csv"))?);
+    #[cfg(feature = "surface-profile")]
+    writeln!(
+        stages,
+        "frame,view,actual_ms,clearance_query_ms,population_ms,update_thread_cpu_ms,prepare_thread_cpu_ms,update_ms,prepare_ms"
+    )?;
+    #[cfg(feature = "surface-profile")]
+    let mut frame_number = 0usize;
     writeln!(
         frames_csv,
         "view,actual_ms,update_ms,local_ready_lod,local_rendered_lod,pending,queued,worker_jobs,worker_cpu_ms,samples_completed,selection_ms,publication_ms,stitch_main_ms,morph_main_ms,stitch_worker_ms,morph_worker_ms,construction_pending,cancellations,accounted_bytes,render_prepare_ms,desired_local_lod,transition_deferred,active_morphs,diagnostics_ms,body_index,body_id,clearance_m,cache_bytes,worker_reservations,worker_fixed_bytes,completed_cover_reservation,external_bytes,peak_accounted_bytes,transition_peak_bytes,cover_publication_ms,scheduling_ms,stitched_reused,sphere_error_m,interpolation_error_m,unresolved_error_m,boundary_error_m,morph_error_m,numeric_error_m"
@@ -166,6 +194,8 @@ fn main() -> Result<()> {
         BufWriter::new(File::create(output.join("transition-profiles.log"))?);
     #[cfg(feature = "surface-profile")]
     writeln!(transition_profiles, "view,actual_ms,transition_profile")?;
+    #[cfg(feature = "terrain-capture")]
+    let mut gpu_profiles = BufWriter::new(File::create(output.join("gpu-profiles.txt"))?);
     for (view_name, clearance) in CLEARANCES_M
         .into_iter()
         .filter(|(_, c)| match mode.as_str() {
@@ -184,6 +214,8 @@ fn main() -> Result<()> {
                 continue;
             }
             let update_start = Instant::now();
+            #[cfg(feature = "surface-profile")]
+            let update_cpu = mundaris_renderer::planet_surface::CpuStageTimer::new();
             let elapsed = update_start.duration_since(previous_update);
             previous_update = update_start;
             let route_seconds = start.elapsed().as_secs_f64().min(5.0);
@@ -208,6 +240,7 @@ fn main() -> Result<()> {
             let body = world.body(body_id)?;
             let body_radius = requests[body_index].reference_radius_m;
             let body_definition = body.terrain().context("route body terrain missing")?;
+            let clearance_query_start = Instant::now();
             let body_generator = TerrainGenerator::new(body_definition, body_radius)?;
             let orbit_fraction = if mode == "motion" {
                 if route_seconds < 1.0 {
@@ -232,6 +265,7 @@ fn main() -> Result<()> {
                     footprint: TerrainFootprint::COMPLETE,
                 })?
                 .height_m();
+            let clearance_query_ms = clearance_query_start.elapsed().as_secs_f64() * 1000.0;
             let frame_clearance = if mode == "motion" {
                 if route_seconds < 1.0 {
                     100.0 + (600_000.0 - 100.0) * orbit_fraction
@@ -282,6 +316,7 @@ fn main() -> Result<()> {
                 ),
                 RenderPrecisionBudget::near_debug(),
             )?;
+            let population_start = Instant::now();
             population.update(
                 &pair,
                 &view,
@@ -296,6 +331,7 @@ fn main() -> Result<()> {
                 Some(Duration::from_millis(2)),
                 elapsed,
             )?;
+            let population_ms = population_start.elapsed().as_secs_f64() * 1000.0;
             let key = TerrainGeometryIdentity::new(
                 body_id,
                 body_definition.clone(),
@@ -331,7 +367,11 @@ fn main() -> Result<()> {
                 }
             }
             let update_ms = update_start.elapsed().as_secs_f64() * 1000.0;
+            #[cfg(feature = "surface-profile")]
+            let update_thread_cpu = update_cpu.thread_elapsed();
             let preparation_start = Instant::now();
+            #[cfg(feature = "surface-profile")]
+            let prepare_cpu = mundaris_renderer::planet_surface::CpuStageTimer::new();
             let mut frame = CelestialFrame::new(&view, &mut staging, projection, &sphere);
             let mut lighting = TerrainLighting::try_new(
                 (frame_direction * 0.55 + right * 0.8).normalize(),
@@ -398,15 +438,40 @@ fn main() -> Result<()> {
             frame.append_bodies(&far)?;
             let far_append_ms = far_start.elapsed().as_secs_f64() * 1000.0;
             let render_ms = preparation_start.elapsed().as_secs_f64() * 1000.0;
+            #[cfg(feature = "surface-profile")]
+            let prepare_thread_cpu = prepare_cpu.thread_elapsed();
+            #[cfg(feature = "surface-profile")]
+            {
+                let cpu_ms = |d: Option<Duration>| {
+                    d.map(|d| format!("{:.6}", d.as_secs_f64() * 1000.0))
+                        .unwrap_or_else(|| "unavailable".into())
+                };
+                writeln!(
+                    stages,
+                    "{frame_number},{view_name},{:.3},{clearance_query_ms:.6},{population_ms:.6},{},{},{update_ms:.6},{render_ms:.6}",
+                    start.elapsed().as_secs_f64() * 1000.0,
+                    cpu_ms(update_thread_cpu),
+                    cpu_ms(prepare_thread_cpu)
+                )?;
+            }
+            #[cfg(not(feature = "surface-profile"))]
+            let _ = (clearance_query_ms, population_ms);
             let surface_report = frame.report().surface;
             #[cfg(feature = "surface-profile")]
             writeln!(
                 render_profiles,
-                "{view_name},{:.3},render={:?},selection={:?}",
+                "{view_name},{:.3},frame={frame_number},render={:?},selection={:?},adaptive={:?},population={:?},work={:?}",
                 start.elapsed().as_secs_f64() * 1000.0,
                 surface_report.profile,
-                population.cover.report.profile
+                population.cover.report.profile,
+                population.cover.profile,
+                population.profile,
+                population.work
             )?;
+            #[cfg(feature = "surface-profile")]
+            {
+                frame_number += 1;
+            }
             let (face, uv) = SurfaceLocation::new(Direction3::try_new(frame_direction)?).face_uv();
             let address_at = |level: u8| {
                 mundaris_math::surface::CubePatchAddress::try_new(
@@ -435,7 +500,7 @@ fn main() -> Result<()> {
             let d = population.cover.convergence;
             writeln!(
                 detail,
-                "{view_name},{:.3},{stitched_append_ms:.6},{transition_append_ms:.6},{far_append_ms:.6},\"{:?}\",{},{},{},{},{},{},{completed_total},{useful_total},{:.6},{},{},{},{},{},{},{},{},{},{},{:.9e},{:.9e},{:.9e},{},{},{},{},{},{},{}",
+                "{view_name},{:.3},{stitched_append_ms:.6},{transition_append_ms:.6},{far_append_ms:.6},\"{:?}\",{},{},{},{},{},{},{completed_total},{useful_total},{:.6},{},{},{},{},{},{},{},{},{},{},{:.9e},{:.9e},{:.9e},{},{},{},{},{},{},{},{},{:.6},{},{},{}",
                 start.elapsed().as_secs_f64() * 1000.0,
                 r.refinement_parent,
                 r.refinement_dependencies,
@@ -468,7 +533,18 @@ fn main() -> Result<()> {
                 population.cover.transition().is_some(),
                 population.cover.construction_pending(),
                 surface_report.proof_cache_hits,
-                surface_report.proof_cache_misses
+                surface_report.proof_cache_misses,
+                population.cover.successor_ready(),
+                population
+                    .cover
+                    .transition()
+                    .map_or(0.0, |(_, fraction)| fraction),
+                population
+                    .cover
+                    .active_morph_duration()
+                    .map_or(0, |d| d.as_millis()),
+                population.cover.construction_budget_bytes(),
+                population.cover.last_construction_budget_bytes()
             )?;
             writeln!(
                 memory_csv,
@@ -586,6 +662,16 @@ fn main() -> Result<()> {
             #[cfg(feature = "terrain-capture")]
             if let Some(gpu) = &mut gpu {
                 let rgba = gpu.render(&frame)?;
+                writeln!(
+                    gpu_profiles,
+                    "{view_name},target_ms={},actual_ms={:.3},capability={:?},host_encode_ms={:.6},gpu={:?},terrain_upload={:?}",
+                    TIMES_MS[next],
+                    start.elapsed().as_secs_f64() * 1000.0,
+                    gpu.timestamp_availability(),
+                    gpu.last_cpu_encode().as_secs_f64() * 1000.0,
+                    gpu.last_gpu_profile(),
+                    gpu.last_terrain_upload_profile()
+                )?;
                 bitmap(
                     &output.join(format!("{view_name}-{}ms.bmp", TIMES_MS[next])),
                     &rgba,
@@ -640,7 +726,11 @@ fn main() -> Result<()> {
     #[cfg(feature = "surface-profile")]
     render_profiles.flush()?;
     #[cfg(feature = "surface-profile")]
+    stages.flush()?;
+    #[cfg(feature = "surface-profile")]
     transition_profiles.flush()?;
+    #[cfg(feature = "terrain-capture")]
+    gpu_profiles.flush()?;
     println!(
         "wrote {} ({} views × 5 seconds; native interactive acceptance is separate)",
         output.join("timeline.csv").display(),

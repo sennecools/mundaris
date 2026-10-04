@@ -29,6 +29,14 @@ still fails: cold useful-quality convergence and operational memory headroom rem
 open. [Latest evidence](docs/evidence/phase510b/README.md) separates current probes
 and captures from intermediate experiments. Morphology remains unchanged.
 
+**Planetary presentation continuation:** Solar terrain now defaults to **Natural**,
+with body-fixed land materials and renderer-owned ocean, cloud and atmosphere layers.
+The existing diagnostics remain available. A bounded successor-construction pipeline
+reduces one refinement exclusion but does **not** pass Acceptance A; morphology is
+unchanged. [Current report](docs/PHASE_5_PLANETARY_PRESENTATION_REPORT.md) and
+[before/after evidence](docs/evidence/phase5-overnight-planetary/README.md) distinguish
+visual-layer implementation from still-open convergence and visual acceptance.
+
 ## Prerequisites
 
 - Stable Rust with the `rustfmt` and `clippy` components (the included `rust-toolchain.toml` requests them).
@@ -130,11 +138,14 @@ mode. Rate samples report their actual wall window and tick-limited quantization
 
 ## Planet surface inspection
 
-**Phase 5.9:** gameplay terrain defaults to **Readability** (blue below the content
+**Phase 5.9 diagnostic:** **Readability** (blue below the content
 sea datum, green lowlands, smooth grey rock by analytic slope), with the existing
 directional lighting. The shading menu retains Elevation/Lit/Normals/Diffuse and
 adds Slope/SeaMask/RockWeight. Earth uses a +350 m diagnostic sea datum; this is
 colour only, not water geometry or biomes. LOD colours have a numeric hue legend.
+**Natural** is now the normal Solar presentation, with independent **Ocean / Clouds /
+Atmosphere** controls. Earth receives the three layers; Moon and Mars do not receive
+Earth oceans/clouds. These are visual approximations, not physical fluids or climate.
 
 The inspection panel separately reports signed **complete terrain clearance** and
 **drawn mesh clearance**, plus explicit inside warnings, local patch/LOD, mesh
@@ -169,8 +180,8 @@ derived structure. Far/surface ownership is exclusive per BodyId; no scene switc
 For a reproducible native route through the same implementation, set
 `$env:MUNDARIS_PHASE4_VALIDATE='1'` in PowerShell before running `--gravity-orbits`.
 Omit/unset it for normal paused startup. UI also exposes **Run integrated validation
-route**. The optional terrain checkpoint uses this same route; atmosphere and
-terrain collision/navigation remain unimplemented.
+route**. The optional terrain checkpoint uses this same route; physical atmospheric
+simulation and terrain collision/navigation remain unimplemented.
 
 ## Quality checks
 

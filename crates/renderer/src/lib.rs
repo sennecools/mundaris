@@ -9,7 +9,9 @@ mod celestial;
 mod celestial_lines;
 mod celestial_view;
 mod debug;
+mod gpu_profile;
 pub mod planet_surface;
+mod planetary;
 #[cfg(feature = "terrain-capture")]
 pub mod terrain_capture;
 mod view;
@@ -17,6 +19,8 @@ pub use celestial::*;
 pub use celestial_lines::{CelestialLineStyle, CelestialPolyline, PolylinePreparationReport};
 pub use celestial_view::*;
 pub use debug::{DebugFrame, DebugLine, DebugProjection, DebugStaging};
+pub use gpu_profile::{CpuUploadProfile, GpuProfile, TimestampAvailability};
+pub use planetary::{PlanetLandProfile, PlanetaryConfig};
 pub use view::*;
 
 use std::sync::Arc;
@@ -66,11 +70,35 @@ pub struct Renderer {
     suspended: bool,
     debug: Option<debug::DebugRenderer>,
     celestial: Option<celestial::CelestialRenderer>,
+    timestamp_availability: TimestampAvailability,
+    timestamp_slot: Option<gpu_profile::AsyncTimestampSlot>,
 }
 
 impl Renderer {
     pub fn pixels_per_point(&self) -> f32 {
         self.egui_context.pixels_per_point()
+    }
+
+    /// Timestamp-query support enabled for this adapter.
+    pub fn timestamp_availability(&self) -> TimestampAvailability {
+        self.timestamp_availability
+    }
+
+    /// Latest completed nonblocking GPU query profile. A frame skips timestamp
+    /// submission while its single bounded readback slot is busy.
+    pub fn latest_gpu_profile(&self) -> gpu_profile::GpuProfile {
+        self.timestamp_slot
+            .as_ref()
+            .map_or_else(Default::default, |slot| slot.latest)
+    }
+
+    /// Latest CPU-side terrain upload accounting from the production renderer.
+    pub fn last_terrain_upload_profile(&self) -> gpu_profile::CpuUploadProfile {
+        self.celestial
+            .as_ref()
+            .map_or_else(Default::default, |renderer| {
+                renderer.last_surface_upload_profile()
+            })
     }
     /// Creates a surface and GPU device for the supplied native window.
     pub fn new(window: Arc<Window>) -> Result<Self, RendererError> {
@@ -88,10 +116,12 @@ impl Renderer {
             })
             .await?;
         let adapter_info = adapter.get_info();
+        let requested_features = gpu_profile::available_features(&adapter);
+        let timestamp_availability = gpu_profile::availability(requested_features);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("Mundaris device"),
-                required_features: wgpu::Features::empty(),
+                required_features: requested_features,
                 required_limits: wgpu::Limits::default(),
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 memory_hints: wgpu::MemoryHints::default(),
@@ -104,8 +134,7 @@ impl Renderer {
             .formats
             .iter()
             .copied()
-            .find(|format| !format.is_srgb())
-            .or_else(|| surface_capabilities.formats.first().copied())
+            .find(|format| format.is_srgb())
             .ok_or(RendererError::NoSurfaceFormats)?;
         let alpha_mode = surface_capabilities
             .alpha_modes
@@ -146,6 +175,7 @@ impl Renderer {
             "GPU adapter initialized"
         );
 
+        let timestamp_slot = gpu_profile::AsyncTimestampSlot::new(&device);
         Ok(Self {
             _instance: instance,
             surface,
@@ -159,6 +189,8 @@ impl Renderer {
             suspended,
             debug: None,
             celestial: None,
+            timestamp_availability,
+            timestamp_slot,
         })
     }
 
@@ -220,6 +252,15 @@ impl Renderer {
         if self.suspended {
             return Ok(());
         }
+
+        self.device.poll(wgpu::PollType::Poll).map_err(|error| {
+            RendererError::Preparation(RenderPreparationError::GpuProgress(error.to_string()))
+        })?;
+        let timestamp_active = celestial_frame.is_some()
+            && self
+                .timestamp_slot
+                .as_mut()
+                .is_some_and(|slot| slot.available());
 
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
@@ -284,6 +325,7 @@ impl Renderer {
             });
             debug.draw(&self.device, &self.queue, &mut encoder, &view, frame)?;
         }
+        let mut scope_mask = 0;
         if let Some(frame) = celestial_frame {
             let celestial = self.celestial.get_or_insert_with(|| {
                 celestial::CelestialRenderer::new(
@@ -294,7 +336,16 @@ impl Renderer {
                     self.surface_config.height,
                 )
             });
-            celestial.draw(&self.device, &self.queue, &mut encoder, &view, frame)?;
+            scope_mask = celestial.draw(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                &view,
+                frame,
+                timestamp_active
+                    .then(|| self.timestamp_slot.as_ref().map(|slot| &slot.queries))
+                    .flatten(),
+            )?;
         }
 
         {
@@ -329,8 +380,14 @@ impl Renderer {
             );
         }
 
+        if timestamp_active && let Some(slot) = &self.timestamp_slot {
+            slot.resolve(&mut encoder);
+        }
         self.queue
             .submit(extra_command_buffers.into_iter().chain([encoder.finish()]));
+        if timestamp_active && let Some(slot) = &mut self.timestamp_slot {
+            slot.map(self.queue.get_timestamp_period(), scope_mask);
+        }
         // Wayland uses this notification to coordinate compositor frame callbacks.
         self.window.pre_present_notify();
         frame.present();

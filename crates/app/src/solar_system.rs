@@ -395,8 +395,51 @@ pub fn body_color(body: SolarBody) -> [f32; 4] {
     content(body).color
 }
 
-/// Reference datum for diagnostic basin colouring, not an ocean or geometry input.
-/// Kept outside terrain definitions so display changes never invalidate meshes.
+/// Natural material defaults for catalogue bodies; all dimensions are authored
+/// relative to the supplied (possibly gameplay-scaled) reference radius.
+pub fn planetary_config(
+    body: SolarBody,
+    radius_m: f64,
+) -> anyhow::Result<Option<mundaris_renderer::PlanetaryConfig>> {
+    if !radius_m.is_finite() || radius_m <= 0.0 {
+        anyhow::bail!("planetary radius must be finite and positive");
+    }
+    use mundaris_renderer::{PlanetLandProfile as Land, PlanetaryConfig};
+    let mut config = match body {
+        SolarBody::Sun
+        | SolarBody::Jupiter
+        | SolarBody::Saturn
+        | SolarBody::Uranus
+        | SolarBody::Neptune => return Ok(None),
+        SolarBody::Earth => PlanetaryConfig {
+            land: Land::Earth,
+            sea_datum_m: GAMEPLAY_EARTH_SEA_LEVEL_M,
+            ..Default::default()
+        },
+        SolarBody::Mars => PlanetaryConfig {
+            land: Land::Mars,
+            ocean_enabled: false,
+            clouds_enabled: false,
+            atmosphere_enabled: false,
+            ..Default::default()
+        },
+        SolarBody::Moon | SolarBody::Mercury | SolarBody::Venus => PlanetaryConfig {
+            land: Land::Rock,
+            ocean_enabled: false,
+            clouds_enabled: false,
+            atmosphere_enabled: false,
+            ..Default::default()
+        },
+    };
+    if body == SolarBody::Earth {
+        config.cloud_altitude_m = (0.012 * radius_m).min(12_000.0);
+        config.atmosphere_height_m = (0.025 * radius_m).min(100_000.0);
+    }
+    Ok(Some(config.try_validate()?))
+}
+
+/// Reference datum for diagnostic basin colouring and the render-only ocean.
+/// Kept outside terrain definitions so display changes never invalidate raw terrain.
 pub const GAMEPLAY_EARTH_SEA_LEVEL_M: f64 = 350.0;
 
 /// Only Earth uses the tuned diagnostic ocean level; airless bodies use zero.

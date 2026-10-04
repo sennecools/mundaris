@@ -37,11 +37,40 @@ struct Job {
     identity: TerrainGeometryIdentity,
     cancelled: Arc<AtomicBool>,
     calculation: Calculation,
+    #[cfg(feature = "surface-profile")]
+    submitted: Instant,
 }
 pub(super) enum Output {
-    Patch(GeneratedSurfacePatch, PatchMetadata),
+    Patch(
+        GeneratedSurfacePatch,
+        PatchMetadata,
+        #[cfg(feature = "surface-profile")] Duration,
+        #[cfg(feature = "surface-profile")] Duration,
+    ),
     Cover(CoverOutput),
     Cancelled,
+}
+#[cfg(feature = "surface-profile")]
+impl Output {
+    fn metrics(&self) -> (Duration, Duration, Duration, Duration) {
+        match self {
+            Self::Patch(_, _, raw, certificate) => {
+                (*raw, *certificate, Duration::ZERO, Duration::ZERO)
+            }
+            Self::Cover(output) => (
+                Duration::ZERO,
+                Duration::ZERO,
+                output.stitch_cpu,
+                output.morph_cpu,
+            ),
+            Self::Cancelled => (
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::ZERO,
+            ),
+        }
+    }
 }
 pub(super) struct Completion {
     pub id: u64,
@@ -50,7 +79,24 @@ pub(super) struct Completion {
     pub pin_when_ready: bool,
     pub reserved_bytes: usize,
     pub cpu: Duration,
+    #[cfg(feature = "surface-profile")]
+    pub metrics: WorkerMetrics,
+    #[cfg(feature = "surface-profile")]
+    pub received: Instant,
     pub result: Result<Output>,
+}
+#[cfg(feature = "surface-profile")]
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct WorkerMetrics {
+    pub scheduled_cpu: Option<Duration>,
+    pub cpu: Duration,
+    pub raw_generation_cpu: Duration,
+    pub certificate_cpu: Duration,
+    pub stitch_cpu: Duration,
+    pub morph_cpu: Duration,
+    pub queue_wait: Duration,
+    pub cache_publication_wait: Duration,
+    pub cancelled: bool,
 }
 struct Pending {
     id: u64,
@@ -63,14 +109,36 @@ struct Pending {
 }
 struct Slot {
     sender: Option<SyncSender<Job>>,
-    receiver: Receiver<(Duration, Result<Output>)>,
+    receiver: Receiver<WorkerResult>,
     thread: Option<JoinHandle<()>>,
     pending: Option<Pending>,
-    completed: Option<(Duration, Result<Output>)>,
+    completed: Option<WorkerResult>,
+}
+struct WorkerResult {
+    #[cfg(feature = "surface-profile")]
+    scheduled_cpu: Option<Duration>,
+    cpu: Duration,
+    #[cfg(feature = "surface-profile")]
+    submitted: Instant,
+    #[cfg(feature = "surface-profile")]
+    started: Instant,
+    #[cfg(feature = "surface-profile")]
+    finished: Instant,
+    #[cfg(feature = "surface-profile")]
+    raw_generation_cpu: Duration,
+    #[cfg(feature = "surface-profile")]
+    certificate_cpu: Duration,
+    #[cfg(feature = "surface-profile")]
+    stitch_cpu: Duration,
+    #[cfg(feature = "surface-profile")]
+    morph_cpu: Duration,
+    result: Result<Output>,
 }
 pub(super) struct TerrainWorkers {
     slots: Vec<Slot>,
     next_id: u64,
+    #[cfg(feature = "surface-profile")]
+    abandoned_metrics: [Option<WorkerMetrics>; 4],
 }
 impl TerrainWorkers {
     pub fn required_bytes(count: usize) -> usize {
@@ -84,6 +152,8 @@ impl TerrainWorkers {
         let mut pool = Self {
             slots: Vec::with_capacity(count),
             next_id: 0,
+            #[cfg(feature = "surface-profile")]
+            abandoned_metrics: [None; 4],
         };
         for index in 0..count {
             let (sender, jobs) = mpsc::sync_channel::<Job>(1);
@@ -94,9 +164,47 @@ impl TerrainWorkers {
                 .spawn(move || {
                     let topology = SurfaceTopology::new();
                     while let Ok(job) = jobs.recv() {
-                        let start = Instant::now();
+                        #[cfg(feature = "surface-profile")]
+                        let submitted = job.submitted;
+                        let started = Instant::now();
+                        #[cfg(feature = "surface-profile")]
+                        let scheduled = mundaris_renderer::planet_surface::CpuStageTimer::new();
                         let output = calculate(job, &topology);
-                        if results.send((start.elapsed(), output)).is_err() {
+                        let cpu = started.elapsed();
+                        #[cfg(feature = "surface-profile")]
+                        let finished = Instant::now();
+                        #[cfg(feature = "surface-profile")]
+                        let (raw_generation_cpu, certificate_cpu, stitch_cpu, morph_cpu) =
+                            output.as_ref().map_or(
+                                (
+                                    Duration::ZERO,
+                                    Duration::ZERO,
+                                    Duration::ZERO,
+                                    Duration::ZERO,
+                                ),
+                                |out| out.metrics(),
+                            );
+                        let result = WorkerResult {
+                            #[cfg(feature = "surface-profile")]
+                            scheduled_cpu: scheduled.thread_elapsed(),
+                            cpu,
+                            #[cfg(feature = "surface-profile")]
+                            submitted,
+                            #[cfg(feature = "surface-profile")]
+                            started,
+                            #[cfg(feature = "surface-profile")]
+                            finished,
+                            #[cfg(feature = "surface-profile")]
+                            raw_generation_cpu,
+                            #[cfg(feature = "surface-profile")]
+                            certificate_cpu,
+                            #[cfg(feature = "surface-profile")]
+                            stitch_cpu,
+                            #[cfg(feature = "surface-profile")]
+                            morph_cpu,
+                            result: output,
+                        };
+                        if results.send(result).is_err() {
                             break;
                         }
                     }
@@ -239,6 +347,8 @@ impl TerrainWorkers {
                 identity: identity.clone(),
                 cancelled: cancelled.clone(),
                 calculation,
+                #[cfg(feature = "surface-profile")]
+                submitted: Instant::now(),
             })
             .map_err(|_| anyhow::anyhow!("terrain worker submission failed"))?;
         slot.pending = Some(Pending {
@@ -252,22 +362,19 @@ impl TerrainWorkers {
         });
         Ok(self.next_id)
     }
-    /// Ordered app-thread publication, independent of which worker finished first.
+    /// Publish completed jobs in stable admission order among available results.
+    /// Immutable outputs do not depend on publication order. An unfinished job
+    /// must not hold completed slots hostage and prevent useful prefetch sampling.
     pub fn take_next(&mut self) -> Result<Option<Completion>> {
-        // Cancelled reconstructible calculations may finish in the background,
-        // but cannot head-of-line block a newer body's useful publication.
+        // Poll every bounded slot before selecting. Reservations remain charged
+        // until that particular result/acknowledgement is consumed.
         for slot in &mut self.slots {
-            if slot
-                .pending
-                .as_ref()
-                .is_some_and(|p| p.cancelled.load(Ordering::Relaxed))
-                && slot.completed.is_none()
-            {
+            if slot.pending.is_some() && slot.completed.is_none() {
                 match slot.receiver.try_recv() {
                     Ok(value) => slot.completed = Some(value),
                     Err(TryRecvError::Empty) => {}
                     Err(TryRecvError::Disconnected) => {
-                        bail!("cancelled terrain worker stopped before acknowledgement")
+                        bail!("terrain worker stopped before completion acknowledgement")
                     }
                 }
             }
@@ -279,7 +386,7 @@ impl TerrainWorkers {
             .filter_map(|(i, s)| {
                 s.pending.as_ref().and_then(|p| {
                     let cancelled = p.cancelled.load(Ordering::Relaxed);
-                    (!cancelled || s.completed.is_some()).then_some((i, (!cancelled, p.id)))
+                    s.completed.is_some().then_some((i, (!cancelled, p.id)))
                 })
             })
             .min_by_key(|(_, order)| *order)
@@ -288,26 +395,41 @@ impl TerrainWorkers {
             return Ok(None);
         };
         let slot = &mut self.slots[index];
-        if slot.completed.is_none() {
-            match slot.receiver.try_recv() {
-                Ok(value) => slot.completed = Some(value),
-                Err(TryRecvError::Empty) => return Ok(None),
-                Err(TryRecvError::Disconnected) => {
-                    bail!("terrain worker stopped before completion")
-                }
-            }
-        }
         let pending = slot
             .pending
             .take()
             .ok_or_else(|| anyhow::anyhow!("missing terrain job"))?;
-        let (cpu, result) = slot
+        let result = slot
             .completed
             .take()
             .ok_or_else(|| anyhow::anyhow!("missing terrain result"))?;
+        #[cfg(feature = "surface-profile")]
+        let received = Instant::now();
+        #[cfg(feature = "surface-profile")]
+        let metrics = WorkerMetrics {
+            scheduled_cpu: result.scheduled_cpu,
+            cpu: result.cpu,
+            raw_generation_cpu: result.raw_generation_cpu,
+            certificate_cpu: result.certificate_cpu,
+            stitch_cpu: result.stitch_cpu,
+            morph_cpu: result.morph_cpu,
+            queue_wait: result.started.duration_since(result.submitted),
+            cache_publication_wait: received.duration_since(result.finished),
+            cancelled: pending.cancelled.load(Ordering::Relaxed)
+                || matches!(&result.result, Ok(Output::Cancelled)),
+        };
         if pending.abandoned {
             // No coordinator retains this source now. All calculation handles
             // have dropped, so the acknowledgement may release its charge.
+            #[cfg(feature = "surface-profile")]
+            {
+                if let Some(entry) = self.abandoned_metrics.iter_mut().find(|m| m.is_none()) {
+                    *entry = Some(WorkerMetrics {
+                        cancelled: true,
+                        ..metrics
+                    });
+                }
+            }
             return self.take_next();
         }
         Ok(Some(Completion {
@@ -316,13 +438,21 @@ impl TerrainWorkers {
             address: pending.address,
             pin_when_ready: pending.pin_when_ready,
             reserved_bytes: pending.reserved_bytes,
-            cpu,
+            cpu: result.cpu,
+            #[cfg(feature = "surface-profile")]
+            metrics,
+            #[cfg(feature = "surface-profile")]
+            received,
             result: if pending.cancelled.load(Ordering::Relaxed) {
                 Ok(Output::Cancelled)
             } else {
-                result
+                result.result
             },
         }))
+    }
+    #[cfg(feature = "surface-profile")]
+    pub fn take_abandoned_metrics(&mut self) -> [Option<WorkerMetrics>; 4] {
+        std::mem::take(&mut self.abandoned_metrics)
     }
 }
 impl Drop for TerrainWorkers {
@@ -345,6 +475,8 @@ fn calculate(job: Job, topology: &SurfaceTopology) -> Result<Output> {
     }
     match job.calculation {
         Calculation::Patch(address) => {
+            #[cfg(feature = "surface-profile")]
+            let generation_start = Instant::now();
             let generator = TerrainGenerator::new(&job.identity.definition, job.identity.radius_m)?;
             let radius = job.identity.radius_m;
             let footprint =
@@ -374,9 +506,15 @@ fn calculate(job: Job, topology: &SurfaceTopology) -> Result<Output> {
                     });
                 }
             }
+            #[cfg(feature = "surface-profile")]
+            let raw_generation_cpu = generation_start.elapsed();
+            #[cfg(feature = "surface-profile")]
+            let certificate_start = Instant::now();
             let metadata = PatchMetadata::build(address, topology)?;
             let (extent, error) =
                 certificate::certificate_for_samples(&generator, address, metadata, &samples)?;
+            #[cfg(feature = "surface-profile")]
+            let certificate_cpu = certificate_start.elapsed();
             Ok(Output::Patch(
                 GeneratedSurfacePatch::new(
                     address,
@@ -387,6 +525,10 @@ fn calculate(job: Job, topology: &SurfaceTopology) -> Result<Output> {
                     error,
                 )?,
                 metadata,
+                #[cfg(feature = "surface-profile")]
+                raw_generation_cpu,
+                #[cfg(feature = "surface-profile")]
+                certificate_cpu,
             ))
         }
         Calculation::Cover(input) => {
@@ -450,6 +592,107 @@ mod tests {
     use super::*;
     use crate::solar_system::{SolarBody, SolarSystemPreset};
     use std::num::NonZeroU64;
+
+    fn cancelled_worker_result() -> WorkerResult {
+        #[cfg(feature = "surface-profile")]
+        let now = Instant::now();
+        WorkerResult {
+            cpu: Duration::ZERO,
+            #[cfg(feature = "surface-profile")]
+            scheduled_cpu: Some(Duration::ZERO),
+            #[cfg(feature = "surface-profile")]
+            submitted: now,
+            #[cfg(feature = "surface-profile")]
+            started: now,
+            #[cfg(feature = "surface-profile")]
+            finished: now,
+            #[cfg(feature = "surface-profile")]
+            raw_generation_cpu: Duration::ZERO,
+            #[cfg(feature = "surface-profile")]
+            certificate_cpu: Duration::ZERO,
+            #[cfg(feature = "surface-profile")]
+            stitch_cpu: Duration::ZERO,
+            #[cfg(feature = "surface-profile")]
+            morph_cpu: Duration::ZERO,
+            result: Ok(Output::Cancelled),
+        }
+    }
+
+    #[test]
+    fn unfinished_earlier_job_does_not_block_completed_slots_or_release_its_reservation() {
+        let world = SolarSystemPreset::gameplay()
+            .create(NonZeroU64::new(5111).unwrap())
+            .unwrap();
+        let (body, state) = world.bodies().nth(SolarBody::Earth as usize).unwrap();
+        let identity = TerrainGeometryIdentity::new(
+            body,
+            state.terrain().unwrap().clone(),
+            state.terrain_revision(),
+            state.properties().reference_radius_m(),
+        )
+        .unwrap();
+        let mut pool = TerrainWorkers {
+            slots: Vec::new(),
+            next_id: 3,
+            #[cfg(feature = "surface-profile")]
+            abandoned_metrics: [None; 4],
+        };
+        let mut senders = Vec::new();
+        for id in 1..=3 {
+            let (sender, receiver) = mpsc::sync_channel(1);
+            senders.push(sender);
+            pool.slots.push(Slot {
+                sender: None,
+                receiver,
+                thread: None,
+                completed: None,
+                pending: Some(Pending {
+                    id,
+                    identity: identity.clone(),
+                    address: Some(CubePatchAddress::root(CubeFace::PositiveZ)),
+                    pin_when_ready: true,
+                    reserved_bytes: 1234,
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                    abandoned: false,
+                }),
+            });
+        }
+        // Job one remains in flight. Simultaneously available results use job ID
+        // order even when channel arrival was reversed.
+        senders[2].send(cancelled_worker_result()).unwrap();
+        senders[1].send(cancelled_worker_result()).unwrap();
+        assert_eq!(pool.take_next().unwrap().unwrap().id, 2);
+        assert_eq!(pool.reservations(), 2468);
+        assert_eq!(pool.take_next().unwrap().unwrap().id, 3);
+        assert_eq!(pool.reservations(), 1234);
+        assert!(pool.take_next().unwrap().is_none());
+        assert_eq!(pool.in_flight(), 1);
+        senders[0].send(cancelled_worker_result()).unwrap();
+        assert_eq!(pool.take_next().unwrap().unwrap().id, 1);
+        assert_eq!(pool.reservations(), 0);
+        #[cfg(feature = "surface-profile")]
+        {
+            // Profiling an abandoned acknowledgement must neither retain its
+            // allocation charge nor count the same record on later frames.
+            pool.slots[0].pending = Some(Pending {
+                id: 4,
+                identity,
+                address: None,
+                pin_when_ready: false,
+                reserved_bytes: 1234,
+                cancelled: Arc::new(AtomicBool::new(true)),
+                abandoned: true,
+            });
+            senders[0].send(cancelled_worker_result()).unwrap();
+            assert!(pool.take_next().unwrap().is_none());
+            assert_eq!(pool.reservations(), 0);
+            let metrics = pool.take_abandoned_metrics();
+            assert_eq!(metrics.iter().flatten().count(), 1);
+            assert!(metrics[0].unwrap().cancelled);
+            assert_eq!(metrics[0].unwrap().scheduled_cpu, Some(Duration::ZERO));
+            assert!(pool.take_abandoned_metrics().iter().all(Option::is_none));
+        }
+    }
 
     #[test]
     fn worker_stitch_and_transition_endpoints_match_serial_and_cancel_atomically() {

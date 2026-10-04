@@ -6,10 +6,11 @@ publish = false
 
 [features]
 # Explicit diagnostic timing; ordinary preparation has no clock reads.
-surface-profile = []
+surface-profile = ["dep:cpu-time"]
 terrain-capture = []
 
 [dependencies]
+cpu-time = { version = "1.0.0", optional = true }
 mundaris_math = { path = "../math" }
 glam.workspace = true
 egui.workspace = true

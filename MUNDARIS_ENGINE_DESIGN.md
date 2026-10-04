@@ -2935,8 +2935,11 @@ Implementation and directed Windows evidence are recorded in
 [Phase 4 validation](docs/phase-4-validation.md) and
 [ADR 0006](docs/adr/0006-planet-surface-topology-and-lod.md). Complete operator/Linux/
 remote-CI and profiling acceptance remain open. Full-planet CPU preparation misses
-the review target; measured revisiting must preserve topology, ownership and precision.
-Phase 5 has not begun.
+the review target; this approximately 11 ms full-view limitation is accepted as the
+measured baseline. Phase 5 development is permitted with Phase 4 architecture
+frozen; outstanding operator/platform acceptance must be completed before a later
+release-quality milestone. Terrain workload evidence must precede any proposed
+architectural response to the preparation miss. Phase 5 implementation has not begun.
 
 ## Phase 5 — Procedural base terrain
 
@@ -2956,6 +2959,19 @@ Topics:
 - stable LOD transitions.
 
 No vegetation or terrain editing yet.
+
+The [implementation-ready Phase 5 specification](MUNDARIS_PHASE_5_PROCEDURAL_TERRAIN_GENERATION.md)
+defines body-fixed direction queries, explicit seed/configuration/version identity,
+five physical scale bands, analytic derivatives and conservative displacement/error
+certificates. Its baseline is CPU generation on demand with bounded reusable f64
+body-fixed patch geometry, not per-frame procedural regeneration. Canonical displaced
+boundary ownership and a temporary common-refinement morph reproduce the actual
+stitched old/new meshes while retaining Phase 4 addressing, balance, stitching,
+precision and handoff semantics. World owns terrain truth; app orchestrates bounded
+generation/cache readiness; renderer owns disposable representation and current-view
+conversion. GPU generation, editing, tectonics and stateful erosion remain deferred.
+These are design decisions, not implementation or validation evidence; ADR 0007 is
+planned for the implementation review.
 
 ## Phase 6 — Terrain representation and edit prototype
 

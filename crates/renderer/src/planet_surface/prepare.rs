@@ -36,15 +36,40 @@ pub struct SurfacePreparationReport {
     #[cfg(feature = "surface-profile")]
     pub profile: SurfacePreparationProfile,
 }
-/// Opt-in CPU stages. Sample work includes canonical keys, f64 evaluation,
-/// source conversion, normals, narrowing and shared-boundary lookup.
+/// Opt-in CPU stages. Regular samples have patch-batched conversion,
+/// classification and narrowing timers, avoiding clocks inside vertex loops.
+/// Parent timings include these children; do not add them twice.
 #[cfg(feature = "surface-profile")]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SurfacePreparationProfile {
+    /// Calling-thread CPU for the whole regular append, not only sample work.
+    /// Last append batch only; the app clock covers the aggregate preparation.
+    /// OS accounting resolution can be coarse.
+    pub regular_thread_cpu_last_batch: Option<std::time::Duration>,
+    /// Whole transition append CPU: setup, interpolation, conversion,
+    /// classification, clipping, packing and growth, for the last batch.
+    pub transition_thread_cpu_last_batch: Option<std::time::Duration>,
+    /// Parent covering boundary setup, shared lookup, and associated staging.
     pub boundary: std::time::Duration,
+    /// Canonical shared-boundary key construction, sorting and compaction.
+    pub boundary_keys: std::time::Duration,
+    /// Boundary lookup/narrowing work within sample processing.
+    pub boundary_narrow: Option<std::time::Duration>,
     pub setup: std::time::Duration,
+    /// Parent duration for regular coordinate conversion and classification.
     pub samples: std::time::Duration,
+    pub coordinate_conversion: Option<std::time::Duration>,
+    /// Generated terrain classification. Smooth-sphere diagnostic octahedral
+    /// coordinates are computed with canonical directions in conversion instead.
+    pub classification: Option<std::time::Duration>,
+    /// Lookup includes cache key matching and equality validation.
+    pub proof_lookup: std::time::Duration,
+    /// Cache miss proof work, including cache insertion.
+    pub proof_calculation: std::time::Duration,
     pub proof: std::time::Duration,
+    /// Wall time inside owned-vector growth calls (also included in parent stages).
+    /// No allocator/driver allocation inference is made for zero-growth frames.
+    pub allocation: std::time::Duration,
     pub packing: std::time::Duration,
     pub grouping: std::time::Duration,
     pub total: std::time::Duration,
@@ -52,7 +77,8 @@ pub struct SurfacePreparationProfile {
     pub clipped_patch_proofs: usize,
     /// Number of owned vectors whose capacity grew, not allocator calls.
     pub capacity_growths: usize,
-    /// Transition-only preparation stages, separate from regular patch preparation.
+    /// Parent CPU transform/classify duration for transition vertices. Interpolation
+    /// is included; finer children are intentionally not isolated per vertex.
     pub transition_samples: std::time::Duration,
     pub transition_clipping: std::time::Duration,
     pub transition_packing: std::time::Duration,
@@ -203,6 +229,21 @@ fn physical_budget(p: DVec3) -> f64 {
         f64::INFINITY
     }
 }
+pub(super) fn encode_octahedral(direction: DVec3) -> [f32; 2] {
+    // Octahedral encoding is invariant to positive scale; the radial direction is
+    // already available, so avoid another per-sample normalization.
+    let denominator = direction.abs().element_sum().max(1e-30);
+    let mut p = direction / denominator;
+    let sign_not_zero = |x: f64| if x >= 0.0 { 1.0 } else { -1.0 };
+    if p.z < 0.0 {
+        p = DVec3::new(
+            (1.0 - p.y.abs()) * sign_not_zero(p.x),
+            (1.0 - p.x.abs()) * sign_not_zero(p.y),
+            p.z,
+        );
+    }
+    [p.x as f32, p.y as f32]
+}
 impl SurfaceStaging {
     fn boundary_capacity_bytes(&self) -> usize {
         self.boundary_keys.capacity() * std::mem::size_of::<u128>()
@@ -229,8 +270,14 @@ impl SurfaceStaging {
             .unwrap_or(512)
             .min(limit);
         if patches != 0 && desired > self.proof_cache.capacity() {
+            #[cfg(feature = "surface-profile")]
+            let started = std::time::Instant::now();
             self.proof_cache
                 .reserve_exact(desired - self.proof_cache.len());
+            #[cfg(feature = "surface-profile")]
+            {
+                self.report.profile.allocation += started.elapsed();
+            }
         }
         // Allocator capacity, rather than requested capacity, is authoritative.
         // This optional disposable optimization can never reject valid geometry.
@@ -258,7 +305,13 @@ impl SurfaceStaging {
                 .min(available);
             #[cfg(feature = "surface-profile")]
             let old = self.fallback.capacity();
+            #[cfg(feature = "surface-profile")]
+            let started = std::time::Instant::now();
             self.fallback.reserve_exact(target - self.fallback.len());
+            #[cfg(feature = "surface-profile")]
+            {
+                self.report.profile.allocation += started.elapsed();
+            }
             #[cfg(feature = "surface-profile")]
             {
                 self.report.profile.fallback_growths += 1;
@@ -282,6 +335,8 @@ impl SurfaceStaging {
         style: SurfaceStyle,
     ) -> Result<(), RenderPreparationError> {
         #[cfg(feature = "surface-profile")]
+        let thread_timer = super::CpuStageTimer::new();
+        #[cfg(feature = "surface-profile")]
         let transition_growths_before = self.report.profile.fallback_growths;
         #[cfg(feature = "surface-profile")]
         let transition_bytes_before = self.fallback.len();
@@ -304,6 +359,7 @@ impl SurfaceStaging {
             let mut normals = [DVec3::ZERO; 3];
             let mut elevations = [0.0; 3];
             let mut classifications = [[0.0; 4]; 3];
+            let mut radial_directions = [DVec3::ZERO; 3];
             let mut colors = [body.color; 3];
             for (i, vertex) in triangle.iter().enumerate() {
                 let sample = vertex.sample(fraction)?;
@@ -315,14 +371,16 @@ impl SurfaceStaging {
                     .metres();
                 normals[i] = sample.normal_body;
                 let radial = sample.position_body_m.normalize_or_zero();
+                radial_directions[i] = radial;
+                let oct = encode_octahedral(radial);
                 classifications[i] = [
                     (sample.position_body_m.length() - body.reference_radius_m) as f32,
                     radial
                         .cross(sample.normal_body)
                         .length()
                         .atan2(radial.dot(sample.normal_body)) as f32,
-                    0.0,
-                    0.0,
+                    oct[0],
+                    oct[1],
                 ];
                 elevations[i] =
                     vertex.old_elevation + (vertex.new_elevation - vertex.old_elevation) * fraction;
@@ -410,11 +468,28 @@ impl SurfaceStaging {
                                     as f32,
                                 0.0,
                             ])
-                            .chain(std::array::from_fn::<_, 4, _>(|axis| {
-                                classifications[0][axis] * v.weights.x as f32
-                                    + classifications[1][axis] * v.weights.y as f32
-                                    + classifications[2][axis] * v.weights.z as f32
-                            })),
+                            .chain({
+                                let radial = radial_directions[0] * v.weights.x
+                                    + radial_directions[1] * v.weights.y
+                                    + radial_directions[2] * v.weights.z;
+                                let oct = if self.lighting.mode()
+                                    == crate::planet_surface::TerrainRenderMode::Natural
+                                {
+                                    encode_octahedral(radial)
+                                } else {
+                                    [0.0; 2]
+                                };
+                                [
+                                    classifications[0][0] * v.weights.x as f32
+                                        + classifications[1][0] * v.weights.y as f32
+                                        + classifications[2][0] * v.weights.z as f32,
+                                    classifications[0][1] * v.weights.x as f32
+                                        + classifications[1][1] * v.weights.y as f32
+                                        + classifications[2][1] * v.weights.z as f32,
+                                    oct[0],
+                                    oct[1],
+                                ]
+                            }),
                     );
                 }
                 self.report.morph_triangles += 1;
@@ -444,6 +519,10 @@ impl SurfaceStaging {
             + self.instances.capacity()
             + self.fallback.capacity()
             + self.records.capacity() * std::mem::size_of::<(u8, [u8; 64])>();
+        #[cfg(feature = "surface-profile")]
+        {
+            self.report.profile.transition_thread_cpu_last_batch = thread_timer.thread_elapsed();
+        }
         if self.report.allocated_staging_bytes > STAGING_CAP
             || self.report.boundary_bytes > BOUNDARY_CAP
         {
@@ -561,11 +640,13 @@ impl SurfaceStaging {
             return Err(RenderPreparationError::InvalidBudget);
         }
         #[cfg(feature = "surface-profile")]
-        let total_start = std::time::Instant::now();
+        let total_start = super::CpuStageTimer::new();
         #[cfg(feature = "surface-profile")]
         let capacities = self.profile_capacities();
         #[cfg(feature = "surface-profile")]
         let stage_start = std::time::Instant::now();
+        #[cfg(feature = "surface-profile")]
+        let boundary_keys_start = std::time::Instant::now();
         // Canonical tuples are shared within one source/radius batch. Another
         // body has the same unit tuples but different observer-relative samples.
         self.boundary_keys.clear();
@@ -576,7 +657,13 @@ impl SurfaceStaging {
                 + self.boundary_ready.capacity() * std::mem::size_of::<bool>(),
         );
         if needed > self.boundary_keys.capacity() {
+            #[cfg(feature = "surface-profile")]
+            let started = std::time::Instant::now();
             self.boundary_keys.reserve_exact(needed);
+            #[cfg(feature = "surface-profile")]
+            {
+                self.report.profile.allocation += started.elapsed();
+            }
         }
         for patch in patches {
             for index in 0..GRID_SAMPLES {
@@ -612,6 +699,10 @@ impl SurfaceStaging {
             read = end;
         }
         self.boundary_keys.truncate(write);
+        #[cfg(feature = "surface-profile")]
+        {
+            self.report.profile.boundary_keys += boundary_keys_start.elapsed();
+        }
         self.boundary_samples.clear();
         self.boundary_ready.clear();
         self.drop_proofs_for_boundary_growth(
@@ -621,10 +712,22 @@ impl SurfaceStaging {
                 + self.boundary_ready.capacity().max(write) * std::mem::size_of::<bool>(),
         );
         if write > self.boundary_samples.capacity() {
+            #[cfg(feature = "surface-profile")]
+            let started = std::time::Instant::now();
             self.boundary_samples.reserve_exact(write);
+            #[cfg(feature = "surface-profile")]
+            {
+                self.report.profile.allocation += started.elapsed();
+            }
         }
         if write > self.boundary_ready.capacity() {
+            #[cfg(feature = "surface-profile")]
+            let started = std::time::Instant::now();
             self.boundary_ready.reserve_exact(write);
+            #[cfg(feature = "surface-profile")]
+            {
+                self.report.profile.allocation += started.elapsed();
+            }
         }
         self.boundary_samples.resize(write, ([0.0; 3], [0.0; 3]));
         self.boundary_ready.resize(write, false);
@@ -673,16 +776,34 @@ impl SurfaceStaging {
             return Err(RenderPreparationError::InvalidBudget);
         }
         if needed_samples > self.samples.capacity() {
+            #[cfg(feature = "surface-profile")]
+            let started = std::time::Instant::now();
             self.samples
                 .reserve_exact(needed_samples - self.samples.len());
+            #[cfg(feature = "surface-profile")]
+            {
+                self.report.profile.allocation += started.elapsed();
+            }
         }
         if needed_instances > self.instances.capacity() {
+            #[cfg(feature = "surface-profile")]
+            let started = std::time::Instant::now();
             self.instances
                 .reserve_exact(needed_instances - self.instances.len());
+            #[cfg(feature = "surface-profile")]
+            {
+                self.report.profile.allocation += started.elapsed();
+            }
         }
         if needed_records > self.records.capacity() {
+            #[cfg(feature = "surface-profile")]
+            let started = std::time::Instant::now();
             self.records
                 .reserve_exact(needed_records - self.records.len());
+            #[cfg(feature = "surface-profile")]
+            {
+                self.report.profile.allocation += started.elapsed();
+            }
         }
         if self.allocated_outgoing_bytes() > STAGING_CAP {
             return Err(RenderPreparationError::InvalidBudget);
@@ -698,6 +819,7 @@ impl SurfaceStaging {
         // radial slope is analytic for generated samples; reconciled edges use
         // their interpolated visual normal and are therefore diagnostic estimates.
         let mut classifications = [[0.0f32; 4]; GRID_SAMPLES];
+        let mut radial_directions = [DVec3::ZERO; GRID_SAMPLES];
         // Instance buckets are appended as a complete batch. Rebucket aggregate
         // instances after appending; sample bases are unaffected by their order.
         self.records.clear();
@@ -721,14 +843,58 @@ impl SurfaceStaging {
             if patch.stitch_mask > 15 {
                 return Err(RenderPreparationError::InvalidDebugGeometry);
             }
+            #[cfg(feature = "surface-profile")]
+            let conversion_start = std::time::Instant::now();
             for index in 0..GRID_SAMPLES {
-                let i = index as u32 % 17;
-                let j = index as u32 / 17;
-                let key = patch
-                    .address
-                    .sample_key(i, j, 16)
-                    .map_err(|_| RenderPreparationError::InvalidDebugGeometry)?;
                 if let Some(geometry) = geometry {
+                    let sample = geometry[patch_index].samples()[index];
+                    positions[index] = prepared
+                        .view_displacement(FramePosition::new(
+                            source,
+                            LocalPosition::try_metres(sample.position_body_m)?,
+                        ))?
+                        .metres();
+                    // Terrain shading and normal diagnostics use body-fixed axes.
+                    // Position conversion remains source-centred and camera-relative.
+                    normals[index] = sample.normal_body;
+                } else {
+                    let i = index as u32 % 17;
+                    let j = index as u32 / 17;
+                    let key = patch
+                        .address
+                        .sample_key(i, j, 16)
+                        .map_err(|_| RenderPreparationError::InvalidDebugGeometry)?;
+                    let direction = key.direction();
+                    positions[index] = prepared
+                        .view_displacement(FramePosition::new(
+                            source,
+                            LocalPosition::try_metres(direction.unit() * radius)?,
+                        ))?
+                        .metres();
+                    normals[index] = prepared.view_direction(direction)?.unit();
+                    let oct = if geometry.is_some()
+                        || self.lighting.mode() == crate::planet_surface::TerrainRenderMode::Natural
+                    {
+                        radial_directions[index] = direction.unit();
+                        encode_octahedral(direction.unit())
+                    } else {
+                        [0.0; 2]
+                    };
+                    classifications[index] = [0.0, 0.0, oct[0], oct[1]];
+                }
+            }
+            #[cfg(feature = "surface-profile")]
+            {
+                *self
+                    .report
+                    .profile
+                    .coordinate_conversion
+                    .get_or_insert_default() += conversion_start.elapsed();
+            }
+            #[cfg(feature = "surface-profile")]
+            let classification_start = std::time::Instant::now();
+            if let Some(geometry) = geometry {
+                for index in 0..GRID_SAMPLES {
                     let sample = geometry[patch_index].samples()[index];
                     if style.elevation_colors && !style.lod_colors {
                         let extent = geometry[patch_index].extent();
@@ -740,36 +906,36 @@ impl SurfaceStaging {
                                 as f32
                         };
                     }
-                    positions[index] = prepared
-                        .view_displacement(FramePosition::new(
-                            source,
-                            LocalPosition::try_metres(sample.position_body_m)?,
-                        ))?
-                        .metres();
-                    // Terrain shading and normal diagnostics use body-fixed axes.
-                    // Position conversion remains source-centred and camera-relative.
-                    normals[index] = sample.normal_body;
                     let radial = sample.position_body_m.normalize_or_zero();
+                    radial_directions[index] = radial;
+                    let oct = encode_octahedral(radial);
                     classifications[index] = [
                         (sample.position_body_m.length() - radius) as f32,
                         radial
                             .cross(sample.normal_body)
                             .length()
                             .atan2(radial.dot(sample.normal_body)) as f32,
-                        0.0,
-                        0.0,
+                        oct[0],
+                        oct[1],
                     ];
-                } else {
-                    let direction = key.direction();
-                    positions[index] = prepared
-                        .view_displacement(FramePosition::new(
-                            source,
-                            LocalPosition::try_metres(direction.unit() * radius)?,
-                        ))?
-                        .metres();
-                    normals[index] = prepared.view_direction(direction)?.unit();
-                    classifications[index] = [0.0, 0.0, 0.0, 0.0];
                 }
+            }
+            #[cfg(feature = "surface-profile")]
+            {
+                *self.report.profile.classification.get_or_insert_default() +=
+                    classification_start.elapsed();
+            }
+            #[cfg(feature = "surface-profile")]
+            let narrowing_start = std::time::Instant::now();
+            for index in 0..GRID_SAMPLES {
+                let i = index as u32 % 17;
+                let j = index as u32 / 17;
+                // Recompute this pure tuple in the narrowing batch rather than
+                // adding a second patch-sized stack buffer to the staging bound.
+                let key = patch
+                    .address
+                    .sample_key(i, j, 16)
+                    .map_err(|_| RenderPreparationError::InvalidDebugGeometry)?;
                 let packed = (
                     positions[index].as_vec3().to_array(),
                     normals[index].as_vec3().to_array(),
@@ -794,6 +960,11 @@ impl SurfaceStaging {
                     return Err(RenderPreparationError::InvalidDebugGeometry);
                 }
             }
+            #[cfg(feature = "surface-profile")]
+            {
+                *self.report.profile.boundary_narrow.get_or_insert_default() +=
+                    narrowing_start.elapsed();
+            }
             let indices = topology.indices(patch.stitch_mask);
             #[cfg(feature = "surface-profile")]
             {
@@ -806,6 +977,8 @@ impl SurfaceStaging {
                 projection.vertical_fov_rad().to_bits(),
                 projection.near_m().to_bits(),
             );
+            #[cfg(feature = "surface-profile")]
+            let proof_lookup_start = std::time::Instant::now();
             let proof_slot = self
                 .proof_cache
                 .iter()
@@ -818,6 +991,10 @@ impl SurfaceStaging {
                     && same_gpu_positions(&entry.gpu_positions, &gpu_positions))
                 .then_some(entry.result)
             });
+            #[cfg(feature = "surface-profile")]
+            {
+                self.report.profile.proof_lookup += proof_lookup_start.elapsed();
+            }
             let (fallback, whole_proof) = if let Some(result) = cached {
                 self.report.proof_cache_hits += 1;
                 self.report.max_component_error_m =
@@ -830,6 +1007,8 @@ impl SurfaceStaging {
                     .max(result.gpu_pixels);
                 (result.fallback, result.whole)
             } else {
+                #[cfg(feature = "surface-profile")]
+                let proof_calculation_start = std::time::Instant::now();
                 self.report.proof_cache_misses += 1;
                 let previous_errors = [
                     self.report.max_component_error_m,
@@ -977,6 +1156,10 @@ impl SurfaceStaging {
                         self.proof_cursor = (self.proof_cursor + 1) % self.proof_cache.len();
                     }
                 }
+                #[cfg(feature = "surface-profile")]
+                {
+                    self.report.profile.proof_calculation += proof_calculation_start.elapsed();
+                }
                 (fallback, whole_proof)
             };
             #[cfg(not(feature = "surface-profile"))]
@@ -1086,26 +1269,42 @@ impl SurfaceStaging {
                                             as f32,
                                         0.0,
                                     ])
-                                    .chain([
-                                        triangle
+                                    .chain({
+                                        let radial = triangle
                                             .iter()
                                             .zip(v.weights.to_array())
-                                            .map(|(&j, t)| {
-                                                f64::from(classifications[usize::from(j)][0]) * t
-                                            })
-                                            .sum::<f64>()
-                                            as f32,
-                                        triangle
-                                            .iter()
-                                            .zip(v.weights.to_array())
-                                            .map(|(&j, t)| {
-                                                f64::from(classifications[usize::from(j)][1]) * t
-                                            })
-                                            .sum::<f64>()
-                                            as f32,
-                                        0.0,
-                                        0.0,
-                                    ]),
+                                            .map(|(&j, t)| radial_directions[usize::from(j)] * t)
+                                            .sum::<DVec3>();
+                                        let oct = if self.lighting.mode()
+                                            == crate::planet_surface::TerrainRenderMode::Natural
+                                        {
+                                            encode_octahedral(radial)
+                                        } else {
+                                            [0.0; 2]
+                                        };
+                                        [
+                                            triangle
+                                                .iter()
+                                                .zip(v.weights.to_array())
+                                                .map(|(&j, t)| {
+                                                    f64::from(classifications[usize::from(j)][0])
+                                                        * t
+                                                })
+                                                .sum::<f64>()
+                                                as f32,
+                                            triangle
+                                                .iter()
+                                                .zip(v.weights.to_array())
+                                                .map(|(&j, t)| {
+                                                    f64::from(classifications[usize::from(j)][1])
+                                                        * t
+                                                })
+                                                .sum::<f64>()
+                                                as f32,
+                                            oct[0],
+                                            oct[1],
+                                        ]
+                                    }),
                             );
                         }
                         self.report.fallback_triangles += 1;
@@ -1142,7 +1341,8 @@ impl SurfaceStaging {
                         } else {
                             0
                         }
-                        | if geometry.is_some() { 4 } else { 0 },
+                        | if geometry.is_some() { 4 } else { 0 }
+                        | if style.lod_colors { 8 } else { 0 },
                 ]
                 .into_iter()
                 .zip(record[..16].as_chunks_mut::<4>().0)
@@ -1204,7 +1404,8 @@ impl SurfaceStaging {
                 .zip(self.profile_capacities())
                 .filter(|(before, after)| after > before)
                 .count();
-            self.report.profile.total += total_start.elapsed();
+            self.report.profile.total += total_start.wall_elapsed();
+            self.report.profile.regular_thread_cpu_last_batch = total_start.thread_elapsed();
         }
         Ok(())
     }
@@ -1233,6 +1434,32 @@ mod tests {
     use super::*;
     use mundaris_math::{surface::*, *};
     use std::num::NonZeroU64;
+    #[test]
+    fn octahedral_round_trip_remains_continuous_across_lower_hemisphere_folds() {
+        for direction in [
+            DVec3::new(1e-12, -0.7, -0.7),
+            DVec3::new(-1e-12, -0.7, -0.7),
+            DVec3::new(0.7, 1e-12, -0.7),
+            DVec3::new(0.7, -1e-12, -0.7),
+            DVec3::new(0.0, 0.0, -1.0),
+        ] {
+            let encoded = encode_octahedral(direction);
+            let mut decoded = DVec3::new(
+                f64::from(encoded[0]),
+                f64::from(encoded[1]),
+                1.0 - f64::from(encoded[0]).abs() - f64::from(encoded[1]).abs(),
+            );
+            if decoded.z < 0.0 {
+                let sign = |v: f64| if v >= 0.0 { 1.0 } else { -1.0 };
+                decoded = DVec3::new(
+                    (1.0 - decoded.y.abs()) * sign(decoded.x),
+                    (1.0 - decoded.x.abs()) * sign(decoded.y),
+                    decoded.z,
+                );
+            }
+            assert!(direction.normalize().dot(decoded.normalize()) > 0.9999999);
+        }
+    }
     fn patch(face: CubeFace, topology: &SurfaceTopology) -> ActiveSurfacePatch {
         let address = CubePatchAddress::root(face);
         ActiveSurfacePatch {
@@ -1664,6 +1891,106 @@ mod tests {
         );
     }
     #[test]
+    fn clipped_material_coordinates_reconstruct_the_body_point() {
+        let tree = FrameTree::new(NonZeroU64::new(503).unwrap());
+        let root = tree.root();
+        let radius = 6.4e6;
+        let topology = SurfaceTopology::new();
+        let patch = patch(CubeFace::PositiveZ, &topology);
+        let [a, b, c] = topology.indices(0).as_chunks::<3>().0[272].map(|i| {
+            patch
+                .address
+                .sample_direction(u32::from(i % 17), u32::from(i / 17), 16)
+                .unwrap()
+                .unit()
+                * radius
+        });
+        let normal = (b - a).cross(c - a).normalize();
+        let observer = (a + b + c) / 3.0 + normal * 0.11;
+        let orientation =
+            UnitRotation::try_from_quaternion(glam::DQuat::from_rotation_arc(DVec3::Z, normal))
+                .unwrap();
+        let view = PreparedView::new(
+            &tree.evaluate(),
+            FramePose::new(
+                FramePosition::new(root, LocalPosition::try_metres(observer).unwrap()),
+                orientation,
+            ),
+            crate::RenderPrecisionBudget::near_debug(),
+        )
+        .unwrap();
+        let projection = CelestialProjection::try_new(1280, 800, 1.0, 0.1).unwrap();
+        let samples = (0..GRID_SAMPLES)
+            .map(|index| {
+                let direction = patch
+                    .address
+                    .sample_direction(index as u32 % 17, index as u32 / 17, 16)
+                    .unwrap()
+                    .unit();
+                super::super::SurfaceGeometrySample {
+                    position_body_m: direction * radius,
+                    normal_body: direction,
+                }
+            })
+            .collect();
+        let geometry = super::super::GeneratedSurfacePatch::new(
+            patch.address,
+            radius,
+            0.0,
+            samples,
+            super::super::SurfaceExtent::smooth(radius),
+            Default::default(),
+        )
+        .unwrap();
+        let body = crate::CelestialRenderBody {
+            body_fixed_frame: root,
+            reference_radius_m: radius,
+            color: [0.2, 0.5, 1.0, 1.0],
+            unlit: false,
+            selected: false,
+        };
+        let mut storage = SurfaceStaging {
+            lighting: super::super::TerrainLighting::default()
+                .with_mode(super::super::TerrainRenderMode::Natural),
+            ..Default::default()
+        };
+        storage
+            .append_generated(
+                &view,
+                projection,
+                body,
+                &[patch],
+                &[&geometry],
+                &topology,
+                SurfaceStyle::default(),
+            )
+            .unwrap();
+        assert!(storage.report.fallback_triangles > 0);
+        assert!(storage.samples.is_empty());
+        let focal = 1.0 / (0.5_f64).tan();
+        for vertex in storage.fallback.as_chunks::<80>().0 {
+            let value = |offset: usize| {
+                f64::from(f32::from_le_bytes(
+                    vertex[offset..offset + 4].try_into().unwrap(),
+                ))
+            };
+            // Homogeneous clipping may rescale the record. Undo projection by
+            // its near/z factor rather than assuming clip.w is a metre depth.
+            let scale = projection.near_m() / value(8);
+            let body_point = observer
+                + orientation.quaternion()
+                    * DVec3::new(
+                        value(0) * scale * 1.6 / focal,
+                        value(4) * scale / focal,
+                        -value(12) * scale,
+                    );
+            let expected = encode_octahedral(body_point.normalize());
+            assert!((value(72) - f64::from(expected[0])).abs() < 2e-6);
+            assert!((value(76) - f64::from(expected[1])).abs() < 2e-6);
+        }
+    }
+
+    #[test]
     fn generated_flat_matches_sphere_and_displacement_changes_packed_samples() {
         let tree = FrameTree::new(NonZeroU64::new(1).unwrap());
         let root = tree.root();
@@ -1809,6 +2136,11 @@ mod tests {
                 .zip(generated.samples.as_chunks::<48>().0)
             {
                 assert_eq!(&a[16..28], &b[16..28]);
+                assert_eq!(
+                    &a[40..48],
+                    &b[40..48],
+                    "body material coordinates swam with the observer"
+                );
             }
             assert_ne!(&rotated.samples[..12], &generated.samples[..12]);
         }
