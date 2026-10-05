@@ -4,7 +4,10 @@ use glam::DVec3;
 use mundaris_simulation::{
     ConicClass, GRAVITATIONAL_CONSTANT_M3_KG_S2 as G, TwoBodyElements, osculating_elements,
 };
-use mundaris_world::{BodyId, CelestialSystem, SimulationInstant};
+use mundaris_world::{
+    BodyId, CelestialMotionDefinition, CelestialSystem, CelestialTranslation, EllipticOrbit,
+    SimulationInstant,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrbitGuideReference {
@@ -20,10 +23,39 @@ pub struct OrbitGuide {
     pub sampled_time: SimulationInstant,
     pub revision: u64,
     pub elements: Option<TwoBodyElements>,
+    /// Authored ellipse used directly for prescribed-motion navigation geometry.
+    pub authored_orbit: Option<EllipticOrbit>,
     pub perturbation_ratio: Option<f64>,
     pub diagnostic: Option<String>,
 }
 impl OrbitGuide {
+    pub fn has_geometry(&self) -> bool {
+        self.authored_orbit.is_some()
+            || self
+                .elements
+                .is_some_and(|e| e.class() == ConicClass::Elliptic)
+    }
+    pub fn bounds_m(&self) -> Result<Option<[DVec3; 2]>> {
+        if let Some(orbit) = self.authored_orbit {
+            let rotation = orbit.plane_to_system().quaternion();
+            let x = rotation * DVec3::X * orbit.semi_major_axis_m();
+            let y = rotation
+                * DVec3::Y
+                * (orbit.semi_major_axis_m()
+                    * ((1.0 - orbit.eccentricity()) * (1.0 + orbit.eccentricity())).sqrt());
+            let center = -x * orbit.eccentricity();
+            let extent = DVec3::new(x.x.hypot(y.x), x.y.hypot(y.y), x.z.hypot(y.z));
+            ensure!(
+                center.is_finite() && extent.is_finite(),
+                "unrepresentable authored guide bounds"
+            );
+            return Ok(Some([center - extent, center + extent]));
+        }
+        self.elements
+            .filter(|e| e.class() == ConicClass::Elliptic)
+            .map(|e| e.elliptic_bounds_m().map_err(anyhow::Error::new))
+            .transpose()
+    }
     /// Start at 64 segments and deterministically double until screen chord error
     /// meets 0.5 physical pixels, or the caller's bounded cap reports coarse geometry.
     pub fn tessellate(
@@ -33,6 +65,36 @@ impl OrbitGuide {
         output: &mut Vec<DVec3>,
     ) -> Result<bool> {
         ensure!(cap == 512 || cap == 1024, "invalid tessellation cap");
+        if let Some(orbit) = self.authored_orbit {
+            let mut segments = 64;
+            loop {
+                let mut coarse = false;
+                for i in 0..segments {
+                    let a = authored_position(
+                        orbit,
+                        i as f64 * std::f64::consts::TAU / segments as f64,
+                    );
+                    let b = authored_position(
+                        orbit,
+                        (i + 1) as f64 * std::f64::consts::TAU / segments as f64,
+                    );
+                    let m = authored_position(
+                        orbit,
+                        (i as f64 + 0.5) * std::f64::consts::TAU / segments as f64,
+                    );
+                    match (project(a)?, project(b)?, project(m)?) {
+                        (Some(a), Some(b), Some(m)) => coarse |= screen_chord_error(a, b, m) > 0.5,
+                        (None, None, None) => {}
+                        _ => coarse = true,
+                    }
+                }
+                if !coarse || segments >= cap {
+                    self.vertices(segments, output)?;
+                    return Ok(coarse);
+                }
+                segments *= 2;
+            }
+        }
         let Some(elements) = self.elements.filter(|e| e.class() == ConicClass::Elliptic) else {
             output.clear();
             return Ok(false);
@@ -70,6 +132,15 @@ impl OrbitGuide {
             "invalid guide segment budget"
         );
         output.clear();
+        if let Some(orbit) = self.authored_orbit {
+            for i in 0..=segments {
+                output.push(authored_position(
+                    orbit,
+                    i as f64 * std::f64::consts::TAU / segments as f64,
+                ));
+            }
+            return Ok(());
+        }
         if let Some(e) = self.elements
             && e.class() == ConicClass::Elliptic
         {
@@ -81,6 +152,13 @@ impl OrbitGuide {
         }
         Ok(())
     }
+}
+fn authored_position(orbit: EllipticOrbit, eccentric_anomaly: f64) -> DVec3 {
+    let e = orbit.eccentricity();
+    let a = orbit.semi_major_axis_m();
+    let (sin_e, cos_e) = eccentric_anomaly.sin_cos();
+    orbit.plane_to_system().quaternion()
+        * DVec3::new(a * (cos_e - e), a * (1.0 - e * e).sqrt() * sin_e, 0.0)
 }
 pub(crate) fn screen_chord_error(a: [f64; 2], b: [f64; 2], p: [f64; 2]) -> f64 {
     let delta = [b[0] - a[0], b[1] - a[1]];
@@ -184,6 +262,7 @@ impl OrbitGuides {
                 sampled_time: system.sample_time(),
                 revision: system.revision(),
                 elements: None,
+                authored_orbit: None,
                 perturbation_ratio: None,
                 diagnostic: None,
             };
@@ -204,6 +283,58 @@ impl OrbitGuides {
                 }
             } else {
                 guide.diagnostic = Some("No automatic reference; choose an explicit pair".into());
+            }
+            next.push(guide);
+        }
+        self.guides = next;
+    }
+    /// Rebuild navigation guides from authored prescribed translations, without
+    /// deriving osculating/gravitational elements.
+    pub fn update_analytic(
+        &mut self,
+        system: &CelestialSystem,
+        definition: &CelestialMotionDefinition,
+    ) {
+        let mut next = Vec::with_capacity(system.body_count());
+        for motion in definition.definitions() {
+            let authored_orbit = match motion.translation {
+                CelestialTranslation::Elliptic(orbit) => Some(orbit),
+                CelestialTranslation::Stationary(_) => None,
+            };
+            let automatic = authored_orbit.map(EllipticOrbit::reference);
+            let policy = self
+                .overrides
+                .iter()
+                .find(|e| e.0 == motion.body)
+                .map_or(OrbitGuideReference::Automatic, |e| e.1);
+            let requested = match policy {
+                OrbitGuideReference::Automatic => automatic,
+                OrbitGuideReference::Explicit(id) => Some(id),
+                OrbitGuideReference::None => None,
+            };
+            let matches = authored_orbit.is_none_or(|orbit| Some(orbit.reference()) == requested);
+            let mut guide = OrbitGuide {
+                body: motion.body,
+                reference: requested,
+                automatic_reference: automatic,
+                sampled_time: system.sample_time(),
+                revision: system.revision(),
+                elements: None,
+                authored_orbit: authored_orbit.filter(|_| matches),
+                perturbation_ratio: None,
+                diagnostic: None,
+            };
+            if let (Some(orbit), Some(reference)) = (authored_orbit, requested) {
+                if reference != orbit.reference() {
+                    guide.diagnostic = Some(format!(
+                        "Explicit reference {reference:?} does not match authored orbit reference {:?}; authored guide unavailable",
+                        orbit.reference()
+                    ));
+                }
+            } else if authored_orbit.is_none() && requested.is_some() {
+                guide.diagnostic = Some("Stationary body has no authored orbit geometry".into());
+            } else if requested.is_none() && authored_orbit.is_some() {
+                guide.diagnostic = Some("No guide reference selected".into());
             }
             next.push(guide);
         }

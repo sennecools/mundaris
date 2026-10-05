@@ -4,13 +4,19 @@
 pub mod celestial_camera;
 pub mod celestial_labels;
 pub mod celestial_selection;
+pub mod developer_capture;
+pub mod developer_snapshot;
 pub mod gravity_fixtures;
 mod gravity_orbits;
 pub mod interactive_clock;
+pub mod motion_session;
 pub mod orbit_guides;
 pub mod planet_surface;
 pub mod planet_terrain;
 pub mod playback_metrics;
+#[cfg(feature = "terrain-capture")]
+pub mod sky_capture;
+pub mod sky_definition;
 pub mod solar_system;
 pub mod surface_probe;
 pub mod system_view;

@@ -84,7 +84,8 @@ fn clearance_zoom_reaches_metres_and_free_flight_has_no_inertia() {
     camera.focus(&pair, id, false, true).unwrap();
     camera.orbit_zoom([0.0; 2], 1e5).unwrap();
     assert_eq!(camera.clearance_m(), 1.0);
-    camera.orbit_zoom([0.0; 2], -1.25_f64.ln() / 0.001).unwrap();
+    // Wheel units are now normalized notches, not the superseded raw-pixel gain.
+    camera.orbit_zoom([0.0; 2], -1.0).unwrap();
     assert!((camera.clearance_m() - 1.25).abs() < 1e-7);
     assert!(camera.distance_m() > radius);
     camera.enter_free_flight(&pair).unwrap();
@@ -227,7 +228,13 @@ fn refocus_from_free_flight_looking_away_avoids_old_body() {
         .update_navigation(
             &pair,
             &NavigationInput {
-                drag: [std::f64::consts::PI / 0.005, 0.0],
+                drag: [
+                    std::f64::consts::PI
+                        / camera
+                            .navigation_diagnostics()
+                            .local_radians_per_logical_pixel,
+                    0.0,
+                ],
                 ..Default::default()
             },
             Duration::ZERO,

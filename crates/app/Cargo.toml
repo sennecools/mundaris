@@ -6,7 +6,7 @@ publish = false
 
 [features]
 surface-profile = ["mundaris_renderer/surface-profile"]
-terrain-capture = ["mundaris_renderer/terrain-capture"]
+terrain-capture = ["mundaris_renderer/terrain-capture", "dep:png"]
 
 [dependencies]
 anyhow.workspace = true
@@ -16,6 +16,9 @@ mundaris_math = { path = "../math" }
 mundaris_renderer = { path = "../renderer" }
 mundaris_simulation = { path = "../simulation" }
 mundaris_world = { path = "../world" }
+png = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 winit.workspace = true
@@ -63,6 +66,10 @@ required-features = ["terrain-capture"]
 name = "solar_system_capture"
 required-features = ["terrain-capture"]
 
+[[example]]
+name = "developer_capture"
+required-features = ["terrain-capture"]
+
 [[bench]]
 name = "planet_terrain_view"
 harness = false
@@ -70,6 +77,10 @@ harness = false
 [[bench]]
 name = "terrain_lighting"
 harness = false
+
+[[example]]
+name = "sky_capture"
+required-features = ["terrain-capture"]
 
 [lints]
 workspace = true

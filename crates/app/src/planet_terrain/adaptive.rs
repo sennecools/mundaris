@@ -340,6 +340,40 @@ impl AdaptiveTerrainCover {
             self.active = output.cover;
         }
     }
+    fn display_duration(
+        mesh: &SurfaceTransition,
+        input: &SurfaceViewInput<'_, '_>,
+        ordinary: Duration,
+    ) -> Result<Duration> {
+        if ordinary.is_zero() {
+            return Ok(Duration::ZERO);
+        }
+        let source = input.view.prepare_source(input.body_fixed_frame)?;
+        let origin = source.observer_in_source().metres();
+        let axes = [glam::DVec3::X, glam::DVec3::Y, glam::DVec3::Z].map(|axis| {
+            mundaris_math::Direction3::try_new(axis)
+                .map_err(|_| anyhow::anyhow!("invalid camera basis"))
+                .and_then(|direction| {
+                    source
+                        .view_direction(direction)
+                        .map(|d| d.unit())
+                        .map_err(Into::into)
+                })
+        });
+        let [x, y, z] = axes;
+        let (x, y, z) = (x?, y?, z?);
+        let rotation = glam::DQuat::from_mat3(&glam::DMat3::from_cols(x, y, z));
+        let pixels = mesh.projected_displacement_pixels(input.projection, origin, rotation);
+        if !pixels.is_finite() || pixels >= 8.0 {
+            return Ok(ordinary);
+        }
+        let floor = Duration::from_millis(64).min(ordinary);
+        // Geometry alone does not certify invisible shading/classification
+        // changes. Keep a continuous positive visual interval for all shortened
+        // transitions; this floor is a policy, not a perceptual acceptance proof.
+        let fraction = (pixels / 8.0).clamp(0.0, 1.0);
+        Ok(floor + ordinary.saturating_sub(floor).mul_f64(fraction))
+    }
     pub(crate) fn abandon_construction(&mut self, cache: &mut TerrainPatchCache) {
         if let Some(id) = self.construction.take() {
             cache.abandon_cover(id);
@@ -520,7 +554,13 @@ impl AdaptiveTerrainCover {
             && let Some(output) = self.queued.take()
         {
             self.queued_parent = None;
-            self.publish_output(output, self.queued_duration);
+            let duration = output
+                .transition
+                .as_ref()
+                .map_or(Ok(self.queued_duration), |mesh| {
+                    Self::display_duration(mesh, input, self.queued_duration)
+                })?;
+            self.publish_output(output, duration);
         }
         cache.unpin_body(identity.body);
         for p in &self.active {
@@ -774,7 +814,17 @@ impl AdaptiveTerrainCover {
                                 self.queued_parent = completed_parent;
                                 self.queued = Some(output);
                             } else {
-                                self.publish_output(output, self.construction_duration);
+                                let duration = output.transition.as_ref().map_or(
+                                    Ok(self.construction_duration),
+                                    |mesh| {
+                                        Self::display_duration(
+                                            mesh,
+                                            input,
+                                            self.construction_duration,
+                                        )
+                                    },
+                                )?;
+                                self.publish_output(output, duration);
                             }
                         }
                         Err(error)
@@ -1039,7 +1089,13 @@ impl AdaptiveTerrainCover {
                                 self.queued_parent = completed_parent;
                                 self.queued = Some(output);
                             } else {
-                                self.publish_output(output, self.morph_duration);
+                                let duration = output
+                                    .transition
+                                    .as_ref()
+                                    .map_or(Ok(self.morph_duration), |mesh| {
+                                        Self::display_duration(mesh, input, self.morph_duration)
+                                    })?;
+                                self.publish_output(output, duration);
                             }
                         }
                         Err(RenderPreparationError::InvalidBudget) => {
@@ -1361,6 +1417,115 @@ mod tests {
     use std::num::NonZeroU64;
 
     #[test]
+    fn publication_view_selects_duration_but_never_instantly_switches_normals() {
+        let topology = SurfaceTopology::new();
+        let addresses: Vec<_> = mundaris_math::surface::CubeFace::ALL
+            .into_iter()
+            .map(mundaris_math::surface::CubePatchAddress::root)
+            .collect();
+        let active = active_surface_cover(&addresses, &topology).unwrap();
+        let make_surface = |normal_change: f64| {
+            let patches: Vec<_> = addresses
+                .iter()
+                .map(|&address| {
+                    GeneratedSurfacePatch::new(
+                        address,
+                        1000.0,
+                        1.0,
+                        (0..GRID_SAMPLES)
+                            .map(|index| {
+                                let radial = address
+                                    .sample_direction(index as u32 % 17, index as u32 / 17, 16)
+                                    .unwrap()
+                                    .unit();
+                                SurfaceGeometrySample {
+                                    position_body_m: radial * 1000.0,
+                                    normal_body: (radial
+                                        + normal_change * (DVec3::X - radial * radial.x))
+                                        .normalize(),
+                                }
+                            })
+                            .collect(),
+                        SurfaceExtent {
+                            min_height_m: -1.0,
+                            max_height_m: 1.0,
+                            guaranteed_opaque_radius_m: 0.0,
+                        },
+                        SurfaceErrorContributions::default(),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            StitchedSurface::build(&active, &patches.iter().collect::<Vec<_>>(), &topology).unwrap()
+        };
+        let old = make_surface(0.0);
+        let new = Arc::new(make_surface(0.1));
+        let mesh = SurfaceTransition::build(
+            &active,
+            &old,
+            &active,
+            &new,
+            &topology,
+            TRANSITION_RESERVATION,
+        )
+        .unwrap();
+        assert!(!mesh.triangles().is_empty());
+        assert_eq!(mesh.max_displacement_m(), 0.0);
+        let tree = FrameTree::new(NonZeroU64::new(511).unwrap());
+        let evaluation = tree.evaluate();
+        let make_view = |distance| {
+            PreparedView::new(
+                &evaluation,
+                FramePose::new(
+                    FramePosition::new(
+                        tree.root(),
+                        LocalPosition::try_metres(DVec3::Z * distance).unwrap(),
+                    ),
+                    UnitRotation::identity(),
+                ),
+                RenderPrecisionBudget::near_debug(),
+            )
+            .unwrap()
+        };
+        let far = make_view(1e6);
+        let close = make_view(1000.1);
+        let far_input = SurfaceViewInput {
+            view: &far,
+            body_fixed_frame: tree.root(),
+            reference_radius_m: 1000.0,
+            projection: CelestialProjection::try_new(320, 240, 1.0, 0.1).unwrap(),
+        };
+        let close_input = SurfaceViewInput {
+            view: &close,
+            ..far_input
+        };
+        let ordinary = Duration::from_millis(150);
+        let far_duration =
+            AdaptiveTerrainCover::display_duration(&mesh, &far_input, ordinary).unwrap();
+        assert!(far_duration >= Duration::from_millis(64) && far_duration < ordinary);
+        let publication_duration =
+            AdaptiveTerrainCover::display_duration(&mesh, &close_input, ordinary).unwrap();
+        assert_eq!(
+            publication_duration, ordinary,
+            "new publication view must invalidate a prior short estimate"
+        );
+        let mut coordinator = AdaptiveTerrainCover::default();
+        coordinator.publish_output(
+            workers::CoverOutput {
+                surface: new,
+                cover: active,
+                transition: Some(mesh),
+                stitch_cpu: Duration::ZERO,
+                morph_cpu: Duration::ZERO,
+            },
+            publication_duration,
+        );
+        coordinator.set_morph_duration(Duration::ZERO).unwrap();
+        assert_eq!(coordinator.active_morph_duration(), Some(ordinary));
+        assert_eq!(coordinator.transition().unwrap().1, 0.0);
+    }
+
+    #[test]
     fn overlay_budget_rejection_retains_source_and_freezes_private_target() {
         let mut world = CelestialSystem::new(NonZeroU64::new(82).unwrap(), SimulationInstant::ZERO);
         let body = world
@@ -1572,11 +1737,11 @@ mod tests {
         assert!(cover.last_construction_budget < TRANSITION_RESERVATION + 8 * 1024 * 1024);
         assert!(cache.resident_bytes() + cache.external_bytes <= cache.cap_bytes);
         cache.cap_bytes = TERRAIN_CPU_CAP_BYTES;
+        let captured_duration = cover.active_morph_duration().unwrap();
+        assert!(captured_duration >= Duration::from_millis(64));
+        assert!(captured_duration <= Duration::from_millis(150));
         cover.set_morph_duration(Duration::ZERO).unwrap();
-        assert_eq!(
-            cover.active_morph_duration(),
-            Some(Duration::from_millis(150))
-        );
+        assert_eq!(cover.active_morph_duration(), Some(captured_duration));
         cover
             .update_with_elapsed(
                 &mut cache,
@@ -1585,7 +1750,7 @@ mod tests {
                 &refined,
                 64,
                 None,
-                Duration::from_millis(150),
+                captured_duration,
             )
             .unwrap();
         assert!(!cover.transition_deferred);

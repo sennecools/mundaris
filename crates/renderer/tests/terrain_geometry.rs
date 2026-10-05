@@ -39,11 +39,31 @@ fn generated_grid16_is_domain_free_and_reports_resident_sample_storage() {
     assert_eq!(geometry.error().total_m().unwrap(), 0.0);
     assert_eq!(
         geometry.resident_heap_bytes(),
-        289 * 2 * std::mem::size_of::<DVec3>()
+        289 * 2 * std::mem::size_of::<DVec3>() + 2 * std::mem::size_of::<usize>()
     );
     assert_eq!(
         geometry.resident_heap_capacity_bytes(),
         geometry.resident_heap_bytes()
+    );
+}
+
+#[test]
+fn generated_patch_clone_shares_samples_and_reports_arc_metadata() {
+    let address = CubePatchAddress::root(CubeFace::PositiveZ);
+    let patch = GeneratedSurfacePatch::new(
+        address,
+        10.0,
+        0.0,
+        flat_samples(address, 10.0),
+        SurfaceExtent::smooth(10.0),
+        SurfaceErrorContributions::default(),
+    )
+    .unwrap();
+    let clone = patch.clone();
+    assert!(patch.shares_sample_storage_with(&clone));
+    assert_eq!(
+        patch.resident_heap_bytes(),
+        289 * 2 * std::mem::size_of::<DVec3>() + 2 * std::mem::size_of::<usize>()
     );
 }
 

@@ -156,7 +156,15 @@ impl ApplicationHandler for MundarisApp {
             return;
         };
 
-        let repaint = renderer.on_window_event(&event);
+        let scene_consumed = self
+            .gravity_demo
+            .as_mut()
+            .is_some_and(|demo| demo.on_window_event(&event));
+        let repaint = if scene_consumed {
+            true
+        } else {
+            renderer.on_window_event(&event)
+        };
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => renderer.resize(size.width, size.height),

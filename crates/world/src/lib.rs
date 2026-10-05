@@ -6,11 +6,13 @@
 #![forbid(unsafe_code)]
 
 mod body;
+mod celestial_motion;
 mod frame_projection;
 mod system;
 pub mod terrain;
 
 pub use body::*;
+pub use celestial_motion::*;
 pub use frame_projection::*;
 pub use mundaris_math::SimulationInstant;
 pub use system::*;

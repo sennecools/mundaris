@@ -1,6 +1,6 @@
 //! Exact local triangle overlays of two valid stitched surfaces.
 use super::{ActiveSurfacePatch, StitchedSurface, SurfaceGeometrySample, SurfaceTopology};
-use crate::RenderPreparationError;
+use crate::{CelestialProjection, RenderPreparationError};
 use mundaris_math::surface::CubePatchAddress;
 use std::mem::size_of;
 #[cfg(feature = "surface-profile")]
@@ -937,6 +937,107 @@ impl SurfaceTransition {
     pub fn max_displacement_m(&self) -> f64 {
         self.max_displacement_m
     }
+    /// Conservative projected displacement of the entire affine morph field.
+    /// The observer is in body coordinates; rotation maps body to camera axes.
+    /// A triangle whose endpoint hull is outside a common frustum plane cannot
+    /// appear at any fraction. Other near-plane ambiguity returns infinity.
+    pub fn projected_displacement_pixels(
+        &self,
+        projection: CelestialProjection,
+        observer_body_m: glam::DVec3,
+        camera_from_body: glam::DQuat,
+    ) -> f64 {
+        if !observer_body_m.is_finite()
+            || !camera_from_body.is_finite()
+            || (camera_from_body.length_squared() - 1.0).abs() > 1e-12
+        {
+            return f64::INFINITY;
+        }
+        let mut min_depth = f64::INFINITY;
+        let mut max_x = 0.0_f64;
+        let mut max_y = 0.0_f64;
+        let mut displacement = 0.0_f64;
+        let planes = projection.frustum_planes();
+        for triangle in &self.triangles {
+            let positions = triangle.map(|v| {
+                [
+                    camera_from_body * (v.old.position_body_m - observer_body_m),
+                    camera_from_body * (v.new.position_body_m - observer_body_m),
+                ]
+            });
+            // Covers subtraction, quaternion arithmetic and bound reductions.
+            // Inflate by body/observer magnitudes, not only the small difference.
+            let magnitude =
+                triangle
+                    .iter()
+                    .fold(observer_body_m.abs().max_element().max(1.0), |m, v| {
+                        m.max(v.old.position_body_m.abs().max_element())
+                            .max(v.new.position_body_m.abs().max_element())
+                    });
+            let margin = (512.0 * f64::EPSILON * magnitude).next_up();
+            if positions.iter().flatten().any(|p| !p.is_finite()) {
+                return f64::INFINITY;
+            }
+            if planes.iter().any(|(normal, offset)| {
+                positions
+                    .iter()
+                    .flatten()
+                    .all(|p| normal.dot(*p) + offset < -4.0 * margin)
+            }) {
+                continue;
+            }
+            for (vertex, [old, new]) in triangle.iter().zip(positions) {
+                let old_depth = -old.z;
+                let new_depth = -new.z;
+                min_depth = min_depth
+                    .min((old_depth - margin).next_down())
+                    .min((new_depth - margin).next_down());
+                max_x = max_x
+                    .max((old.x.abs() + margin).next_up())
+                    .max((new.x.abs() + margin).next_up());
+                max_y = max_y
+                    .max((old.y.abs() + margin).next_up())
+                    .max((new.y.abs() + margin).next_up());
+                displacement = displacement.max(((new - old).length() + 4.0 * margin).next_up());
+                let old_n = vertex.old.normal_body;
+                let new_n = vertex.new.normal_body;
+                let old_len = old_n.length();
+                let new_len = new_n.length();
+                if !old_n.is_finite()
+                    || !new_n.is_finite()
+                    || !old_len.is_finite()
+                    || !new_len.is_finite()
+                    || old_len < 1e-10
+                    || new_len < 1e-10
+                    || old_n.dot(new_n) / (old_len * new_len) <= 0.0
+                {
+                    return f64::INFINITY;
+                }
+            }
+        }
+        if displacement == 0.0 {
+            return 0.0;
+        }
+        let near = projection.near_m();
+        if !min_depth.is_finite()
+            || !displacement.is_finite()
+            || min_depth <= near
+            || min_depth - displacement <= near
+        {
+            return f64::INFINITY;
+        }
+        let depth = (min_depth - displacement).next_down();
+        // Jacobian norm of (x/depth,y/depth) on the endpoint/interpolation
+        // envelope. Endpoint convexity bounds both spatial barycentrics and time.
+        // Each positive bound operation rounds outward; the inflated depth also
+        // protects a projected duration from catastrophic near-plane cancellation.
+        let focal = projection.focal_pixels().next_up();
+        let rx = ((max_x + displacement).next_up() / depth).next_up();
+        let ry = ((max_y + displacement).next_up() / depth).next_up();
+        let lever = (1.0 + (rx * rx).next_up()).next_up();
+        let lever = (lever + (ry * ry).next_up()).next_up().sqrt().next_up();
+        (((focal * displacement.next_up()).next_up() / depth).next_up() * lever).next_up()
+    }
     pub fn resident_bytes(&self) -> usize {
         size_of::<Self>()
             + self.triangles.capacity() * size_of::<[TransitionVertex; 3]>()
@@ -952,6 +1053,83 @@ mod tests {
         GeneratedSurfacePatch, SurfaceErrorContributions, SurfaceExtent, active_surface_cover,
     };
     use mundaris_math::surface::CubeFace;
+
+    #[test]
+    fn projected_envelope_handles_large_local_origins_near_crossings_and_normals() {
+        use glam::DVec3;
+        let projection = CelestialProjection::try_new(800, 600, 1.0, 0.1).unwrap();
+        let reference = SurfaceTriangleReference {
+            address: CubePatchAddress::root(CubeFace::PositiveZ),
+            indices: [0, 1, 2],
+            weights: [1.0, 0.0, 0.0],
+        };
+        for radius in [400_000.0, 6_371_000.0, 100_000_000.0] {
+            let origin = DVec3::Z * radius;
+            let observer = origin + DVec3::Z * 1000.0;
+            let triangles = vec![
+                [
+                    DVec3::new(-20.0, -10.0, 0.0),
+                    DVec3::new(20.0, -10.0, 0.0),
+                    DVec3::new(0.0, 20.0, 0.0),
+                ]
+                .map(|offset| TransitionVertex {
+                    old: SurfaceGeometrySample {
+                        position_body_m: origin + offset,
+                        normal_body: DVec3::Z,
+                    },
+                    new: SurfaceGeometrySample {
+                        position_body_m: origin + offset + DVec3::new(0.01, 0.02, 0.03),
+                        normal_body: DVec3::new(0.1, 0.0, 1.0).normalize(),
+                    },
+                    old_reference: reference,
+                    new_reference: reference,
+                    old_elevation: 0.0,
+                    new_elevation: 0.03,
+                }),
+            ];
+            let mut mesh = SurfaceTransition {
+                triangles,
+                affected_old: vec![],
+                affected_new: vec![],
+                max_displacement_m: 1.0,
+                #[cfg(feature = "surface-profile")]
+                profile: SurfaceTransitionProfile::default(),
+            };
+            let bound =
+                mesh.projected_displacement_pixels(projection, observer, glam::DQuat::IDENTITY);
+            assert!(bound.is_finite() && bound > 0.0);
+            for vertex in mesh.triangles.iter().flatten() {
+                let start = vertex.old.position_body_m - observer;
+                for t in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                    let point = vertex
+                        .old
+                        .position_body_m
+                        .lerp(vertex.new.position_body_m, t)
+                        - observer;
+                    let delta = glam::DVec2::new(
+                        point.x / -point.z - start.x / -start.z,
+                        point.y / -point.z - start.y / -start.z,
+                    )
+                    .length()
+                        * projection.focal_pixels();
+                    assert!(delta <= bound);
+                }
+            }
+            assert!(
+                mesh.projected_displacement_pixels(
+                    projection,
+                    origin + DVec3::Z * 0.12,
+                    glam::DQuat::IDENTITY
+                )
+                .is_infinite()
+            );
+            mesh.triangles[0][0].new.normal_body = -DVec3::Z;
+            assert!(
+                mesh.projected_displacement_pixels(projection, observer, glam::DQuat::IDENTITY)
+                    .is_infinite()
+            );
+        }
+    }
 
     #[test]
     fn integer_separation_agrees_with_exact_clipping_for_every_stitch_mask() {

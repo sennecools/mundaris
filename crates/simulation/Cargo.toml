@@ -21,5 +21,9 @@ harness = false
 name = "fixed_steps"
 harness = false
 
+[[bench]]
+name = "analytic_motion"
+harness = false
+
 [lints]
 workspace = true

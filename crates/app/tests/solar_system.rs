@@ -7,6 +7,77 @@ use std::num::NonZeroU64;
 fn ns(value: u64) -> NonZeroU64 {
     NonZeroU64::new(value).unwrap()
 }
+
+#[test]
+fn analytic_authored_periods_preserve_original_setup_pacing_and_spin() {
+    use mundaris_app::motion_session::AnalyticSession;
+    for preset in [
+        SolarSystemPreset::gameplay(),
+        SolarSystemPreset::real_scale(),
+    ] {
+        let legacy = preset.create(ns(81)).unwrap();
+        let legacy_bodies = bodies(&legacy);
+        let (mut analytic, definition) = preset.create_analytic(ns(82)).unwrap();
+        let session = AnalyticSession::new(&mut analytic, definition).unwrap();
+        for (i, content) in SOLAR_SYSTEM_CONTENT.iter().enumerate().skip(1) {
+            let parent = if content.identity == SolarBody::Moon {
+                3
+            } else {
+                0
+            };
+            let mut mass = legacy_bodies[parent].properties().mass_kg()
+                + legacy_bodies[i].properties().mass_kg();
+            if content.identity == SolarBody::Earth {
+                mass += legacy_bodies[4].properties().mass_kg();
+            }
+            let distance = content.real_orbital_distance_m * preset.orbital_distance_scale;
+            let expected = std::f64::consts::TAU * distance / (G * mass / distance).sqrt();
+            let orbit = match session.definition().definitions()[i].translation {
+                mundaris_world::CelestialTranslation::Elliptic(orbit) => orbit,
+                _ => panic!("non-central solar body must orbit"),
+            };
+            assert!(
+                (orbit.period_seconds() / expected - 1.0).abs() < 1e-14,
+                "{} pacing",
+                content.name
+            );
+            assert_eq!(
+                orbit.mean_anomaly_at_epoch_radians(),
+                content.orbital_phase_rad
+            );
+        }
+        for (legacy, current) in legacy.bodies().zip(analytic.bodies()) {
+            assert_eq!(legacy.1.name(), current.1.name());
+            assert_eq!(legacy.1.properties(), current.1.properties());
+            assert_eq!(legacy.1.terrain(), current.1.terrain());
+            // The prescribed producer normalizes composed rotations, including
+            // the zero-angle epoch spin. Compare the convention geometrically;
+            // return-to-T bitwise reproducibility is a separate regression.
+            for axis in [glam::DVec3::X, glam::DVec3::Y, glam::DVec3::Z] {
+                assert!(
+                    (legacy.1.state().body_to_system().quaternion() * axis
+                        - current.1.state().body_to_system().quaternion() * axis)
+                        .length()
+                        < 1e-14
+                );
+            }
+            assert!(
+                (legacy
+                    .1
+                    .state()
+                    .angular_velocity_in_system()
+                    .radians_per_second()
+                    - current
+                        .1
+                        .state()
+                        .angular_velocity_in_system()
+                        .radians_per_second())
+                .length()
+                    < 1e-18
+            );
+        }
+    }
+}
 fn bodies(system: &mundaris_world::CelestialSystem) -> Vec<&mundaris_world::CelestialBody> {
     system.bodies().map(|(_, body)| body).collect()
 }

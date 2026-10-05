@@ -50,7 +50,7 @@ impl SystemViewBounds {
                     && g.reference.is_some_and(|r| {
                         matches!(scope, OverviewScope::WholeSystem) || included.contains(&r)
                     })
-                    && g.elements.is_some_and(|e| e.semi_major_axis_m().is_some())
+                    && g.has_geometry()
             })
         {
             let body = system.body(included[0])?;
@@ -99,8 +99,8 @@ impl SystemViewBounds {
             {
                 continue;
             }
-            if let (Some(reference), Some(elements)) = (g.reference, g.elements)
-                && let Ok([a, b]) = elements.elliptic_bounds_m()
+            if let Some(reference) = g.reference
+                && let Some([a, b]) = g.bounds_m()?
             {
                 let offset = system.body(reference)?.state().center_in_system().metres() - anchor;
                 min = min.min(offset + a);

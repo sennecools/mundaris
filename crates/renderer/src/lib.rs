@@ -12,6 +12,7 @@ mod debug;
 mod gpu_profile;
 pub mod planet_surface;
 mod planetary;
+pub mod sky;
 #[cfg(feature = "terrain-capture")]
 pub mod terrain_capture;
 mod view;
@@ -99,6 +100,13 @@ impl Renderer {
             .map_or_else(Default::default, |renderer| {
                 renderer.last_surface_upload_profile()
             })
+    }
+    /// Last submitted sky upload accounting; unavailable before first submission.
+    pub fn last_sky_resource_report(&self) -> Option<sky::SkyResourceReport> {
+        self.celestial.as_ref().and_then(|r| {
+            let report = r.last_sky_resource_report();
+            (report.catalogue_upload_count > 0).then_some(report)
+        })
     }
     /// Creates a surface and GPU device for the supplied native window.
     pub fn new(window: Arc<Window>) -> Result<Self, RendererError> {

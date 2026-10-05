@@ -147,7 +147,18 @@ fn density(p: vec3<f32>, height: f32) -> f32 {
     }
     // Scalar extinction is a compact approximation to wavelength-dependent
     // transmission; scattering itself retains Rayleigh/Mie wavelength behaviour.
-    let alpha=clamp(1.0-exp(-optical*0.5*(beta.x+beta.z)),0.0,0.95);
+    var alpha=clamp(1.0-exp(-optical*0.5*(beta.x+beta.z)),0.0,0.95);
+    // Decorative sky is not calibrated stellar radiance. Scalar extinction alone
+    // leaves it visible over daylight scattering in this bounded LDR composition.
+    // Suppress only zero-depth sky near a lit surface; foreground transmission,
+    // night/airless views and observers above the atmosphere remain unchanged.
+    if (depth==0.0) {
+        let altitude_fraction=clamp((length(env.observer_radius.xyz)-1.0)/height,0.0,1.0);
+        let near_surface=1.0-smoothstep(0.2,0.8,altitude_fraction);
+        let daylight=smoothstep(-0.12,0.15,dot(normalize(env.observer_radius.xyz),sun));
+        let decorative_visibility=mix(1.0,0.0005,near_surface*daylight);
+        alpha=1.0-(1.0-alpha)*decorative_visibility;
+    }
     let rgb=scattering/max(alpha,1e-5);
     var out=vec4<f32>(rgb,alpha);
     if (env.options.z==0u) { out=vec4<f32>(srgb_encode(rgb),out.a); }

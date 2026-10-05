@@ -37,6 +37,8 @@ pub struct GpuProfile {
     /// Same measurement as `atmosphere_pass`, also available under the layer name.
     pub atmosphere: Option<std::time::Duration>,
     pub remaining_celestial: Option<std::time::Duration>,
+    /// Distant background and finite-star draws only, excluding upload/readback.
+    pub sky: Option<std::time::Duration>,
 }
 
 pub(crate) fn decode(ticks: &[u64], period_nanoseconds: f32, scope_mask: u16) -> GpuProfile {
@@ -62,6 +64,9 @@ pub(crate) fn decode(ticks: &[u64], period_nanoseconds: f32, scope_mask: u16) ->
         clouds: scoped(6, 6),
         atmosphere: scoped(1, 1),
         remaining_celestial: scoped(7, 7),
+        // A zero elapsed interval cannot establish sky work on the cold query;
+        // retain unavailable semantics rather than publishing a fabricated win.
+        sky: scoped(8, 8).filter(|elapsed| !elapsed.is_zero()),
     }
 }
 
@@ -88,7 +93,7 @@ pub(crate) fn availability(features: wgpu::Features) -> TimestampAvailability {
     }
 }
 
-/// Queries for three pass totals and five scopes inside the main pass.
+/// Queries for three pass totals and six scopes inside the main pass.
 pub(crate) struct CelestialQueries {
     pub set: wgpu::QuerySet,
     inside_passes: bool,
@@ -103,7 +108,7 @@ impl CelestialQueries {
                 set: device.create_query_set(&wgpu::QuerySetDescriptor {
                     label: Some("Mundaris celestial timestamps"),
                     ty: wgpu::QueryType::Timestamp,
-                    count: 16,
+                    count: QUERY_COUNT,
                 }),
                 inside_passes: device
                     .features()
@@ -136,7 +141,7 @@ impl CelestialQueries {
     }
 }
 
-pub(crate) const QUERY_COUNT: u32 = 16;
+pub(crate) const QUERY_COUNT: u32 = 18;
 
 /// One bounded native readback slot. A pending mapping makes the next frame skip
 /// query use rather than waiting for or overwriting the in-flight result.
@@ -228,13 +233,14 @@ mod tests {
 
     #[test]
     fn profile_exposes_available_pass_and_inside_pass_scopes() {
-        let profile = decode(&(0..16).collect::<Vec<u64>>(), 2.0, 0b1111_1111);
+        let profile = decode(&(0..18).collect::<Vec<u64>>(), 2.0, 0b1_1111_1111);
         let two_ns = Some(std::time::Duration::from_nanos(2));
         assert_eq!(profile.celestial_pass, two_ns);
         assert_eq!(profile.atmosphere_pass, two_ns);
         assert_eq!(profile.terrain, two_ns);
         assert_eq!(profile.ocean, two_ns);
         assert_eq!(profile.clouds, two_ns);
+        assert_eq!(profile.sky, two_ns);
     }
 
     #[test]
@@ -247,6 +253,7 @@ mod tests {
         assert_eq!(profile.atmosphere_pass, None);
         assert_eq!(profile.terrain, None);
         assert_eq!(profile.transition_fallback, None);
+        assert_eq!(profile.sky, None);
     }
 
     #[test]

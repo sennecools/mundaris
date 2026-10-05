@@ -200,6 +200,12 @@ impl TrailHistory {
             )
         })
     }
+    /// Exact timestamps retained in chronological publication order.
+    pub fn retained_times_s(&self) -> Vec<f64> {
+        (0..self.len)
+            .map(|i| self.samples[(self.head + i) % self.capacity()].time_s)
+            .collect()
+    }
     pub fn retained_ticks(&self) -> Vec<u64> {
         (0..self.len)
             .map(|i| self.samples[(self.head + i) % self.capacity()].tick)
@@ -212,6 +218,40 @@ impl TrailHistory {
         self.last_commit = tick;
         self.direction = 0;
         self.push(tick, system);
+    }
+    /// Reset analytic history at an explicit discontinuity (seek/reset/load/rate change).
+    pub fn clear_and_seed_analytic(&mut self, system: &CelestialSystem) {
+        self.head = 0;
+        self.len = 0;
+        self.branch = 0;
+        self.direction = 0;
+        self.last_commit = system.revision();
+        self.push(system.revision(), system);
+    }
+    /// Record one complete synchronized analytic publication, with no tick stride.
+    pub fn record_analytic_publication(&mut self, system: &CelestialSystem) {
+        let time = system.sample_time().seconds_since_epoch();
+        let previous = self.samples[(self.head + self.len - 1) % self.capacity()].time_s;
+        if time == previous {
+            return;
+        }
+        let direction = if time > previous {
+            1
+        } else if time < previous {
+            -1
+        } else {
+            0
+        };
+        if direction != 0 && self.direction != 0 && direction != self.direction {
+            self.clear_and_seed_analytic(system);
+            self.direction = direction;
+            return;
+        }
+        if direction != 0 {
+            self.direction = direction;
+        }
+        self.last_commit = system.revision();
+        self.push(system.revision(), system);
     }
     pub fn set_mode(
         &mut self,

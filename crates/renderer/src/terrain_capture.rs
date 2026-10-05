@@ -148,9 +148,25 @@ impl TerrainCaptureRenderer {
         &mut self,
         frame: &CelestialFrame<'_, '_, '_>,
     ) -> Result<Vec<u8>, RenderPreparationError> {
+        // Capture fixtures must report invalid production draw state as a test
+        // failure, not panic during backend teardown. Pop on every Result path.
+        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let result = self.render_inner(frame);
+        if let Some(error) = pollster::block_on(self.device.pop_error_scope()) {
+            return Err(RenderPreparationError::GpuProgress(error.to_string()));
+        }
+        result
+    }
+
+    fn render_inner(
+        &mut self,
+        frame: &CelestialFrame<'_, '_, '_>,
+    ) -> Result<Vec<u8>, RenderPreparationError> {
         frame.validate()?;
-        if frame.projection().viewport() != [self.width, self.height]
-            || frame.projection().origin() != [0, 0]
+        let [x, y] = frame.projection().origin();
+        let [w, h] = frame.projection().viewport();
+        if x.checked_add(w).is_none_or(|end| end > self.width)
+            || y.checked_add(h).is_none_or(|end| end > self.height)
         {
             return Err(RenderPreparationError::InvalidProjection);
         }
@@ -293,6 +309,10 @@ impl TerrainCaptureRenderer {
     /// Last CPU-side terrain upload bytes, capacity, growth and wait accounting.
     pub fn last_terrain_upload_profile(&self) -> crate::gpu_profile::CpuUploadProfile {
         self.renderer.last_surface_upload_profile()
+    }
+    /// Same-submission sky residency and upload accounting, excluding readback.
+    pub fn last_sky_resource_report(&self) -> crate::sky::SkyResourceReport {
+        self.renderer.last_sky_resource_report()
     }
 
     pub fn width(&self) -> u32 {

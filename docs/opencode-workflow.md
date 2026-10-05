@@ -1,10 +1,56 @@
 # OpenCode orchestration
 
+## Reviewer / Plan mode
+
+The user normally talks to **Plan** as Mundaris's reviewer, technical director, and
+architect, then hands an agreed task to a separate **Build**/implementation session.
+`AGENTS.md` defines both roles, user authority, evidence hierarchy, claim vocabulary,
+and discussion-first behavior. The reviewer is a technical partner, not just a prompt
+generator. A discussion does not authorize source changes.
+
+Project-local `.opencode/agents/plan.md` overrides the built-in `plan` ID using the
+documented OpenCode V2 Markdown agent mechanism. Selecting **Plan** in this repository
+loads its reviewer prompt and permissions automatically; no invented mode hook,
+`instructions` setting, or additional reviewer alias is used. It does **not** switch
+an existing Build session to Plan, change the default agent, or choose a model.
+Select Plan explicitly (or use `opencode run --agent plan` for a CLI session).
+
+The profile denies actions by default, then allows reads/search, discussion questions,
+skills/web research, Git inspection, and public OpenCode metadata inspection for
+authentication verification. Edits (including built-in plan-file exceptions), editing
+children, arbitrary shell commands, and unconfigured mutation/MCP tools remain denied.
+`luna-explore` discovery is allowed; `luna-review` / `luna-tests` require approval since
+focused trusted checks can execute code and write build artifacts. Verify the existing
+ChatGPT OAuth connection before delegation; stop delegation on ambiguity. No editing
+worker or general child is allowed from Plan. Read-only does not imply an OS sandbox:
+Git allowlists must be used only for inspection, without write flags/redirection or
+external helpers, and child permissions are their own profiles.
+
+Reviewer startup: read `AGENTS.md`, then [REVIEWER_CONTEXT.md](REVIEWER_CONTEXT.md),
+check repository status, inspect a relevant latest report only when useful, read
+mechanics-reference sections/source as needed, then talk to the user. Do not load all
+large evidence files every message. Use [REVIEW_HANDOFF.md](REVIEW_HANDOFF.md) for an
+implementation report and relevant portions of [REVIEW_CHECKLIST.md](REVIEW_CHECKLIST.md)
+for verification. Context is a dated orientation index, not acceptance authority.
+
+Example: user asks "Shouldn't the GPU do this?" -> reviewer checks ownership and
+current measurements, discusses suitable GPU/CPU work -> user agrees to one narrow
+task -> separate coding agent implements and provides evidence -> reviewer inspects
+the diff, snapshots, captures, and timings, then discusses the result/next step.
+
+Supported mechanism: [V2 agents](https://opencode.ai/v2/docs/agents) and
+[V2 permissions](https://opencode.ai/v2/docs/permissions). Verify effective discovery
+with `opencode debug agents` after loading/reloading project configuration. Behavioral
+instructions steer conversation; permission inspection alone does not prove every
+future conversational response or native runtime outcome.
+
 ## Responsibilities and models
 
-`AGENTS.md` supplies persistent project rules. The current primary owns architecture,
-dependency ordering, shared APIs, difficult numerical/debugging decisions, integration,
-and final correctness. For substantial tasks, delegate practical independent work;
+`AGENTS.md` supplies persistent project rules. In an implementation session, the
+current primary owns architecture, dependency ordering, shared APIs, difficult
+numerical/debugging decisions, integration, and final correctness within agreed scope.
+In Plan, it owns technical discussion and independent review, not source edits.
+For substantial tasks, delegate practical independent work within the active role;
 prefer concurrent read-only investigations, usually 3–6 when genuinely useful.
 Never create duplicate work merely to increase concurrency.
 

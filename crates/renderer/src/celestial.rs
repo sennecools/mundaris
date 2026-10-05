@@ -305,6 +305,7 @@ pub fn select_marker(markers: &[CelestialMarker], point: [f32; 2]) -> Option<usi
 
 #[derive(Default)]
 pub struct CelestialStaging {
+    sky: Option<crate::sky::SkyPrepared>,
     surface: crate::planet_surface::SurfaceStaging,
     vertices: Vec<u8>,
     uniforms: Vec<u8>,
@@ -327,6 +328,7 @@ pub(crate) struct PlanetaryDraw {
 }
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CelestialPreparationReport {
+    pub sky: Option<crate::sky::SkyPreparationReport>,
     pub surface: crate::planet_surface::SurfacePreparationReport,
     pub triangles: usize,
     pub markers: usize,
@@ -366,6 +368,7 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
         staging.centers.clear();
         staging.surface.clear();
         staging.planetary.clear();
+        staging.sky = None;
         Self {
             view,
             staging,
@@ -508,6 +511,32 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
     }
 
     /// Content projection used for this frame, including viewport and origin.
+    pub fn set_distant_sky(
+        &mut self,
+        inertial_frame: FrameId,
+        definition: std::sync::Arc<crate::sky::SkyDefinition>,
+        settings: crate::sky::SkySettings,
+    ) -> Result<(), RenderPreparationError> {
+        let prepared = crate::sky::SkyPrepared::new(
+            self.view,
+            inertial_frame,
+            definition,
+            settings,
+            self.projection,
+        );
+        match prepared {
+            Ok(sky) => {
+                self.staging.sky = Some(sky);
+                Ok(())
+            }
+            Err(error) => {
+                self.failed = true;
+                Err(error)
+            }
+        }
+    }
+
+    /// Content projection used for this frame, including viewport and origin.
     pub fn projection(&self) -> CelestialProjection {
         self.projection
     }
@@ -531,6 +560,7 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
             .filter(|d| d.config.atmosphere_enabled)
             .count();
         CelestialPreparationReport {
+            sky: self.staging.sky.as_ref().map(|s| s.report()),
             surface: self.staging.surface.report,
             planetary_ocean_draws,
             planetary_cloud_draws,
@@ -927,6 +957,7 @@ fn pack(position: [f32; 3], normal: [f32; 3], bytes: &mut Vec<u8>, normal_w: f32
 }
 
 pub(crate) struct CelestialRenderer {
+    sky: crate::sky::SkyRenderer,
     surface: crate::planet_surface::PlanetSurfaceRenderer,
     sphere_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
@@ -950,6 +981,9 @@ pub(crate) struct CelestialRenderer {
     depth: wgpu::TextureView,
 }
 impl CelestialRenderer {
+    pub(crate) fn last_sky_resource_report(&self) -> crate::sky::SkyResourceReport {
+        self.sky.report()
+    }
     pub(crate) fn last_surface_upload_profile(&self) -> crate::gpu_profile::CpuUploadProfile {
         self.surface.last_upload_profile()
     }
@@ -983,6 +1017,7 @@ impl CelestialRenderer {
             &[&projection_layout, &uniform_layout],
             include_str!("shaders/celestial.wgsl"),
             false,
+            "Celestial spheres reverse-Z pipeline",
         );
         let line_pipeline = pipeline(
             device,
@@ -990,6 +1025,7 @@ impl CelestialRenderer {
             &[&projection_layout],
             include_str!("shaders/celestial_trails.wgsl"),
             true,
+            "Celestial history reverse-Z pipeline",
         );
         let polyline_pipeline = pipeline(
             device,
@@ -997,6 +1033,7 @@ impl CelestialRenderer {
             &[],
             include_str!("shaders/celestial_lines.wgsl"),
             true,
+            "Celestial styled curves reverse-Z pipeline",
         );
         let indices = buffer(
             device,
@@ -1013,6 +1050,7 @@ impl CelestialRenderer {
         let planetary = crate::planetary::PlanetaryRenderer::new(device, format);
         let planetary_depth = planetary.atmosphere_group(device, &depth);
         Self {
+            sky: crate::sky::SkyRenderer::new(device, format),
             surface: crate::planet_surface::PlanetSurfaceRenderer::new(
                 device,
                 queue,
@@ -1063,6 +1101,7 @@ impl CelestialRenderer {
     ) -> Result<u16, RenderPreparationError> {
         frame.validate()?;
         let storage = &frame.staging;
+        self.sky.upload(device, queue, storage.sky.as_ref());
         self.surface.upload(device, queue, &storage.surface)?;
         self.planetary
             .upload(queue, &storage.planetary, frame.projection);
@@ -1140,21 +1179,23 @@ impl CelestialRenderer {
         let [w, h] = frame.projection.viewport();
         pass.set_viewport(x as f32, y as f32, w as f32, h as f32, 0.0, 1.0);
         pass.set_scissor_rect(x, y, w, h);
-        pass.set_pipeline(&self.sphere_pipeline);
-        pass.set_bind_group(0, &self.projection_group, &[]);
-        pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
+        if let Some(sky) = &storage.sky {
+            let drawn = sky.report().stars_drawn || sky.report().background_drawn;
+            if drawn && let Some(queries) = timestamps.filter(|q| q.inside_passes()) {
+                queries.write_scope(&mut pass, 8);
+            }
+            self.sky.draw(&mut pass, sky);
+            if drawn && let Some(queries) = timestamps.filter(|q| q.inside_passes()) {
+                queries.end_scope(&mut pass, 8);
+            }
+        }
         if !storage.draws.is_empty()
             && let Some(queries) = timestamps.filter(|q| q.inside_passes())
         {
             queries.write_scope(&mut pass, 7);
         }
         for (i, &start) in storage.draws.iter().enumerate() {
-            pass.set_bind_group(1, &self.uniform_group, &[(i as u32) * 256]);
-            pass.set_vertex_buffer(
-                0,
-                self.vertices
-                    .slice(start as u64 * 32..(start as u64 + 642) * 32),
-            );
+            self.bind_sphere_state(&mut pass, i as u32, start);
             pass.draw_indexed(0..3840, 0, 0..1);
         }
         if !storage.draws.is_empty()
@@ -1229,13 +1270,11 @@ impl CelestialRenderer {
             overlays.set_viewport(x as f32, y as f32, w as f32, h as f32, 0.0, 1.0);
             overlays.set_scissor_rect(x, y, w, h);
             if !storage.lines.is_empty() {
-                overlays.set_pipeline(&self.line_pipeline);
-                overlays.set_vertex_buffer(0, self.lines.slice(..));
+                self.bind_history_state(&mut overlays);
                 overlays.draw(0..(storage.lines.len() / 32) as u32, 0..1);
             }
             if !storage.polylines.is_empty() {
-                overlays.set_pipeline(&self.polyline_pipeline);
-                overlays.set_vertex_buffer(0, self.polylines.slice(..));
+                self.bind_polyline_state(&mut overlays);
                 overlays.draw(0..(storage.polylines.len() / 32) as u32, 0..1);
             }
         }
@@ -1251,6 +1290,13 @@ impl CelestialRenderer {
             scope_mask |= 1 << 2;
         }
         if let Some(queries) = timestamps.filter(|q| q.inside_passes()) {
+            if storage
+                .sky
+                .as_ref()
+                .is_some_and(|s| s.report().stars_drawn || s.report().background_drawn)
+            {
+                scope_mask |= 1 << 8;
+            }
             if !storage.surface.instances.is_empty() {
                 scope_mask |= 1 << 3;
             }
@@ -1269,6 +1315,32 @@ impl CelestialRenderer {
             let _ = queries;
         }
         Ok(scope_mask)
+    }
+
+    // Each section owns its complete draw state. In particular, a new pass has
+    // no bindings, and planetary group 0 is not the celestial projection group.
+    fn bind_sphere_state(&self, pass: &mut wgpu::RenderPass<'_>, draw: u32, start: u32) {
+        pass.set_pipeline(&self.sphere_pipeline);
+        pass.set_bind_group(0, &self.projection_group, &[]);
+        pass.set_bind_group(1, &self.uniform_group, &[draw * 256]);
+        pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
+        pass.set_vertex_buffer(
+            0,
+            self.vertices
+                .slice(start as u64 * 32..(start as u64 + 642) * 32),
+        );
+    }
+
+    fn bind_history_state(&self, pass: &mut wgpu::RenderPass<'_>) {
+        pass.set_pipeline(&self.line_pipeline);
+        pass.set_bind_group(0, &self.projection_group, &[]);
+        pass.set_vertex_buffer(0, self.lines.slice(..));
+    }
+
+    fn bind_polyline_state(&self, pass: &mut wgpu::RenderPass<'_>) {
+        // Styled curves already contain clip positions and have no bind groups.
+        pass.set_pipeline(&self.polyline_pipeline);
+        pass.set_vertex_buffer(0, self.polylines.slice(..));
     }
 }
 fn buffer(
@@ -1364,6 +1436,7 @@ fn pipeline(
     layouts: &[&wgpu::BindGroupLayout],
     source: &str,
     lines: bool,
+    label: &str,
 ) -> wgpu::RenderPipeline {
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("Celestial debug pipeline layout"),
@@ -1375,7 +1448,7 @@ fn pipeline(
         source: wgpu::ShaderSource::Wgsl(source.into()),
     });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("Celestial reverse-Z pipeline"),
+        label: Some(label),
         layout: Some(&layout),
         vertex: wgpu::VertexState {
             module: &shader,

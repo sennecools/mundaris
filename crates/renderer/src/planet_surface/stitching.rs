@@ -21,11 +21,12 @@ impl StitchedSurface {
     /// Conservative allocated-capacity peak for construction, excluding inputs.
     pub fn construction_bytes(patches: usize) -> usize {
         size_of::<Self>()
-            // Reuse temporarily holds raw boundary scratch and its cloned result.
+            // A new sample Arc briefly coexists with its constructor's Vec.
             + GRID_SAMPLES * size_of::<SurfaceGeometrySample>()
             + patches
                 * (size_of::<GeneratedSurfacePatch>()
                     + GRID_SAMPLES * size_of::<SurfaceGeometrySample>()
+                    + 2 * size_of::<usize>()
                     + 64 * size_of::<BoundaryReference>()
                     + size_of::<CubePatchAddress>()
                     + size_of::<u8>())
@@ -99,7 +100,8 @@ impl StitchedSurface {
         for (at, patch) in patches.iter().enumerate() {
             let source = geometry[at];
             let raw = source.samples();
-            let mut samples = raw.to_vec();
+            let mut samples = [raw[0]; GRID_SAMPLES];
+            samples.copy_from_slice(raw);
             for j in 0..=16 {
                 for i in 0..=16 {
                     if i == 0 || i == 16 || j == 0 || j == 16 {
@@ -118,8 +120,8 @@ impl StitchedSurface {
             let reusable = previous.and_then(|(old, old_raw)| {
                 let old_at = old
                     .patches
-                    .iter()
-                    .position(|p| p.address() == patch.address)?;
+                    .binary_search_by_key(&patch.address, |p| p.address())
+                    .ok()?;
                 let old_patch = &old.patches[old_at];
                 let raw_old = *old_raw.get(old_at)?;
                 (old.masks.get(old_at).copied() == Some(patch.stitch_mask)
@@ -212,11 +214,15 @@ impl StitchedSurface {
             }
             let mut error = source.error();
             error.boundary_constraint_m = (error.boundary_constraint_m + perturbation).next_up();
+            if samples.iter().zip(raw).all(|(&a, &b)| sample_exact(a, b)) {
+                output.push(source.with_shared_sample_bounds(extent, error)?);
+                continue;
+            }
             output.push(GeneratedSurfacePatch::new(
                 source.address(),
                 source.reference_radius_m(),
                 source.footprint_m(),
-                samples,
+                samples.into(),
                 extent,
                 error,
             )?);
@@ -260,10 +266,11 @@ fn raw_geometry_equal(a: &GeneratedSurfacePatch, b: &GeneratedSurfacePatch) -> b
         && extent_exact(a.extent(), b.extent())
         && error_exact(a.error(), b.error())
         && a.samples().len() == b.samples().len()
-        && a.samples()
-            .iter()
-            .zip(b.samples())
-            .all(|(&x, &y)| sample_exact(x, y))
+        && (a.shares_sample_storage_with(b)
+            || a.samples()
+                .iter()
+                .zip(b.samples())
+                .all(|(&x, &y)| sample_exact(x, y)))
 }
 
 fn extent_exact(a: super::SurfaceExtent, b: super::SurfaceExtent) -> bool {

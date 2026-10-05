@@ -6,8 +6,8 @@
 | --- | --- |
 | `mundaris_core` | Small, dependency-light foundations shared by multiple systems when a concrete need exists. |
 | `mundaris_math` | Checked f64 SI coordinates and working-epoch time value, rigid transforms, runtime frame tree, LCA evaluation and instantaneous derivative conversion using `glam`. |
-| `mundaris_world` | Authoritative celestial properties/kinematics, one coherent sample instant, transactional mutations and derived body/frame associations. |
-| `mundaris_simulation` | Serial Newtonian gravity/KDK, integer fixed ticks, admitted demand, bounded snapshots/replay and numerical diagnostics. |
+| `mundaris_world` | Authoritative celestial properties/kinematics, validated prescribed-motion definitions, one coherent sample instant, transactional mutations and derived body/frame associations. |
+| `mundaris_simulation` | Bounded direct analytic motion sampling; serial Newtonian gravity/KDK, integer fixed ticks, admitted demand, bounded snapshots/replay and numerical diagnostics. |
 | `mundaris_renderer` | GPU presentation infrastructure and disposable visual representations. |
 | `mundaris_app` | Native process, event loop, logging, and top-level subsystem composition. |
 
@@ -74,6 +74,41 @@ revision and exact sample time, retaining both immutable borrows through render
 preparation/submission. App projects once after pumping; failure pauses and
 suppresses celestial drawing, retaining valid physics. Fresh projection namespaces
 are remapped through body identity/attachment role rather than persisted FrameId.
+
+## Phase 5.13A prescribed celestial motion
+
+World's immutable `CelestialMotionDefinition` validates a complete namespaced set
+of stationary/elliptic translations plus independent `AxialSpin`. An iterative
+single-parent traversal derives reference-before-child order, regardless of body
+insertion order. Orbital-plane orientation uses system axes; references add only
+center position/velocity. Explicit authored periods do not change with mass/radius.
+
+Simulation's concrete `AnalyticMotionProducer` owns that definition and reusable
+dense candidate states. It reduces elapsed time by the period, solves bounded
+elliptic Kepler motion, derives analytic velocity and local-axis spin, then commits
+the entire candidate at one instant. No integration/replay precedes a seek. Errors
+preserve authority, time and revision; external celestial revisions/appends reject
+stale bindings. Its own commits advance the binding; terrain-only edits remain
+independent. Default solver limit is 64, configurable 1–128. See
+[ADR 0007](adr/0007-prescribed-celestial-motion.md) and the
+[phase specification](../MUNDARIS_PHASE_5_13A_ANALYTIC_CELESTIAL_MOTION.md) for the
+bounded time/parameter envelope and evidence requirements.
+
+Each independent system evaluates locally, without a galactic offset. Future
+universe location → system-local state → body-local content → observer-relative
+rendering is a boundary, not implemented universe addressing/streaming. The producer
+is not mass-consistent N-body gravity or a calendar ephemeris.
+
+Phase 5.13B's concrete app-owned `MotionSession` selects analytic motion for both
+solar presets and retains `FixedStepRunner` for the hierarchy/circular scenarios.
+`TimeController` requests signed fractional instants; complete world sampling then
+coherent frame publication precede navigation/render preparation. Unchanged valid
+times are not sampled again. Failed targets retain authority and pause; failed
+frame publication retains the complete sample but suppresses incoherent drawing.
+Atomic supported edits explicitly reconstruct the immutable binding without
+changing periods. Analytic guides use authored ellipses, trails record only
+successful synchronized publications, and snapshot schema 3 separates motion-mode
+diagnostics. See [analytic playback](ANALYTIC_PLAYBACK.md).
 
 ## State and representation boundaries
 

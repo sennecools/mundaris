@@ -1,4 +1,9 @@
 //! Composition of authoritative physics, coherent projection and disposable debug views.
+use crate::developer_snapshot::{
+    DeveloperSnapshot, PerformanceSnapshot, RenderingSnapshot, SnapshotInput, format_bytes,
+    format_distance, format_milliseconds, render_mode_name,
+};
+use crate::motion_session::{AnalyticSession, MotionSession, MotionSnapshot};
 use crate::planet_surface::*;
 use crate::{celestial_camera::*, gravity_fixtures::*, trails::*};
 use crate::{
@@ -22,6 +27,7 @@ enum Command {
     ValidationRoute,
     LookBody(BodyId),
     SurfaceInspection,
+    BodyOrbit,
     SurfaceHorizon,
     Clearance(f64),
     TerrainGuard(Option<f64>),
@@ -31,6 +37,7 @@ enum Command {
     ResumeAdmission,
     Single(bool),
     Seek(u64),
+    SeekSeconds(f64),
     CancelSeek,
     Reset,
     Load(GravityFixture),
@@ -42,6 +49,8 @@ enum Command {
     FreeFlight,
     GuideReference(OrbitGuideReference),
     Navigation(NavigationInput),
+    TimedNavigation(Instant, NavigationInput),
+    CancelNavigation,
     GapThreshold(Duration),
     FilteredOverview(Vec<BodyId>),
     Reexpress(bool),
@@ -54,13 +63,18 @@ enum Command {
     TerrainPreview(bool),
     TrailReference(BodyId),
 }
+mod analytic_validation;
+mod developer_ui;
+mod navigation_input;
 struct Controls {
+    snapshot_export_status: Option<String>,
     terrain_preview: bool,
     sun_from_star: bool,
     terrain_lighting: TerrainLighting,
     planetary_ocean: bool,
     planetary_clouds: bool,
     planetary_atmosphere: bool,
+    sky: mundaris_renderer::sky::SkySettings,
     terrain_morph_ms: u64,
     surface_bounds: bool,
     surface_style: SurfaceStyle,
@@ -84,6 +98,14 @@ struct Controls {
     full_trails: bool,
     manual_speed: f64,
     navigation: NavigationInput,
+    viewport_input: navigation_input::ViewportInput,
+    input_focused: bool,
+    pixels_per_point: f64,
+    native_events: bool,
+    keyboard_blocked: bool,
+    ui_context: Option<egui::Context>,
+    scene_layer: Option<egui::LayerId>,
+    viewport_ready: bool,
     viewport: Option<([u32; 2], [u32; 2])>,
     layout: LabelLayout,
     placed: Vec<PlacedLabel>,
@@ -96,12 +118,14 @@ struct Controls {
 impl Controls {
     fn new(body: &CelestialBody) -> Self {
         Self {
+            snapshot_export_status: None,
             terrain_preview: false,
             sun_from_star: false,
             terrain_lighting: terrain_lighting_from_environment(),
             planetary_ocean: true,
             planetary_clouds: true,
             planetary_atmosphere: true,
+            sky: mundaris_renderer::sky::SkySettings::default(),
             terrain_morph_ms: std::env::var("MUNDARIS_TERRAIN_MORPH_MS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -134,6 +158,14 @@ impl Controls {
             full_trails: false,
             manual_speed: 1.0,
             navigation: NavigationInput::default(),
+            viewport_input: navigation_input::ViewportInput::default(),
+            input_focused: true,
+            pixels_per_point: 1.0,
+            native_events: false,
+            keyboard_blocked: false,
+            ui_context: None,
+            scene_layer: None,
+            viewport_ready: false,
             viewport: None,
             layout: LabelLayout::default(),
             placed: Vec::new(),
@@ -158,16 +190,22 @@ impl Controls {
 }
 
 pub struct GravityOrbitsDemo {
+    sky_definition: std::sync::Arc<mundaris_renderer::sky::SkyDefinition>,
+    navigation_snapshot_path: Option<std::path::PathBuf>,
+    navigation_wall_at: Option<Instant>,
+    developer_frame_number: u64,
     terrain_clearance: Option<crate::terrain_inspection::TerrainClearance>,
     ready_mesh_probe: Option<crate::surface_probe::ReadyMeshProbe>,
     clearance_query_us: f64,
     terrain: crate::terrain_population::TerrainPopulation,
     scenario: GravityFixture,
     validation_route: Option<SurfaceValidationRoute>,
+    solar_validation: Option<(Duration, usize)>,
+    analytic_validation: Option<analytic_validation::Route>,
     surfaces: Vec<PlanetSurfaceSession>,
     surface_owners: Vec<bool>,
     system: CelestialSystem,
-    runner: FixedStepRunner,
+    motion: MotionSession,
     projection: CelestialFrameProjection,
     camera: CelestialCamera,
     ids: Vec<BodyId>,
@@ -186,11 +224,11 @@ pub struct GravityOrbitsDemo {
     seeking: bool,
     last_wall: Option<Instant>,
     hidden: bool,
-    diagnostics: SystemDiagnostics,
-    baseline: DiagnosticBaseline,
+    diagnostics: Option<SystemDiagnostics>,
+    baseline: Option<DiagnosticBaseline>,
     sampled_tick: u64,
     diagnostic_elapsed: Duration,
-    advance: SimulationAdvanceReport,
+    advance: Option<SimulationAdvanceReport>,
     achieved_rate: Option<f64>,
     achieved_elapsed: Duration,
     achieved_anchor_s: f64,
@@ -278,6 +316,70 @@ fn terrain_lighting_configuration(mode: Option<&str>, sun: Option<&str>) -> Terr
 }
 
 impl GravityOrbitsDemo {
+    /// Read-only authority and publication access for diagnostics/regression fixtures.
+    pub fn world(&self) -> &CelestialSystem {
+        &self.system
+    }
+    pub fn frames(&self) -> &CelestialFrameProjection {
+        &self.projection
+    }
+    pub fn camera(&self) -> &CelestialCamera {
+        &self.camera
+    }
+    pub fn motion_snapshot(&self) -> MotionSnapshot {
+        self.motion.snapshot(&self.system)
+    }
+    pub fn trail_times_s(&self) -> Vec<f64> {
+        self.trails.retained_times_s()
+    }
+    pub fn guides(&self) -> &[OrbitGuide] {
+        self.guides.guides()
+    }
+    pub fn seek_seconds(&mut self, seconds: f64) -> Result<()> {
+        self.command(Command::SeekSeconds(seconds))
+    }
+    pub fn set_playback_rate(&mut self, rate: f64) -> Result<()> {
+        self.command(Command::Rate(rate))
+    }
+    pub fn set_paused(&mut self, paused: bool) -> Result<()> {
+        self.command(Command::Pause(paused))
+    }
+    pub fn single_step(&mut self, forward: bool) -> Result<()> {
+        self.command(Command::Single(forward))
+    }
+    pub fn reset_motion(&mut self) -> Result<()> {
+        self.command(Command::Reset)
+    }
+    pub fn select_body(&mut self, body: BodyId) -> Result<()> {
+        self.command(Command::Select(body))
+    }
+    pub fn focus_selected(&mut self, body_fixed: bool) -> Result<()> {
+        self.command(Command::Focus {
+            fixed: body_fixed,
+            fit: true,
+        })
+    }
+    pub fn enter_surface_navigation(&mut self) -> Result<()> {
+        self.command(Command::SurfaceInspection)
+    }
+    pub fn edit_selected_mass(&mut self, mass_kg: f64) -> Result<()> {
+        self.command(Command::Mass(mass_kg))
+    }
+    pub fn edit_selected_radius(&mut self, radius_m: f64) -> Result<()> {
+        self.command(Command::Radius(radius_m))
+    }
+    pub fn edit_selected_velocity(&mut self, velocity: DVec3) -> Result<()> {
+        self.command(Command::Velocity(velocity))
+    }
+    pub fn rename_selected(&mut self, name: &str) -> Result<()> {
+        self.command(Command::Rename(name.into()))
+    }
+    pub fn set_guide_reference(&mut self, reference: OrbitGuideReference) -> Result<()> {
+        self.command(Command::GuideReference(reference))
+    }
+    pub fn set_relative_trails(&mut self, relative: bool) -> Result<()> {
+        self.command(Command::TrailMode(relative))
+    }
     pub fn new() -> Result<Self> {
         let mut demo = Self::create(GravityFixture::Hierarchy, 1, 1)?;
         if std::env::var("MUNDARIS_PHASE4_VALIDATE").as_deref() == Ok("1") {
@@ -297,6 +399,14 @@ impl GravityOrbitsDemo {
         };
         let mut demo = Self::create(scenario, 1, 1)?;
         demo.command(Command::TerrainPreview(true))?;
+        if std::env::var("MUNDARIS_SOLAR_VALIDATE").as_deref() == Ok("1") {
+            demo.solar_validation = Some((Duration::ZERO, 0));
+        }
+        if std::env::var("MUNDARIS_ANALYTIC_VALIDATE").as_deref() == Ok("1") {
+            demo.analytic_validation = Some(analytic_validation::Route::new(
+                std::env::var_os("MUNDARIS_ANALYTIC_VALIDATE_READY").map(std::path::PathBuf::from),
+            ));
+        }
         Ok(demo)
     }
     /// Optional operator route through the same production controls and renderer.
@@ -306,7 +416,9 @@ impl GravityOrbitsDemo {
             "surface route requires the hierarchy fixture"
         );
         let physical_target = self
-            .runner
+            .motion
+            .newtonian()
+            .ok_or_else(|| anyhow::anyhow!("route requires Newtonian history"))?
             .tick()
             .checked_add(20)
             .ok_or_else(|| anyhow::anyhow!("validation tick overflow"))?;
@@ -324,21 +436,44 @@ impl GravityOrbitsDemo {
         system_namespace: u64,
         tree_namespace: u64,
     ) -> Result<Self> {
-        let system = scenario.create(
-            NonZeroU64::new(system_namespace)
-                .ok_or_else(|| anyhow::anyhow!("zero system namespace"))?,
-        )?;
-        let mut runner =
-            FixedStepRunner::new(&system, SimulationConfig::try_new(scenario.fixed_step_s())?)?;
-        runner.set_rate(PlaybackRate::try_multiplier(1000.0)?);
+        let namespace = NonZeroU64::new(system_namespace)
+            .ok_or_else(|| anyhow::anyhow!("zero system namespace"))?;
+        let (system, motion) = match scenario {
+            GravityFixture::GameplaySolarSystem | GravityFixture::RealSolarSystem => {
+                let preset = if scenario == GravityFixture::RealSolarSystem {
+                    crate::solar_system::SolarSystemPreset::real_scale()
+                } else {
+                    crate::solar_system::SolarSystemPreset::gameplay()
+                };
+                let (mut system, definition) = preset.create_analytic(namespace)?;
+                let analytic = AnalyticSession::new(&mut system, definition)?;
+                (system, MotionSession::Analytic(Box::new(analytic)))
+            }
+            _ => {
+                let system = scenario.create(namespace)?;
+                let mut runner = FixedStepRunner::new(
+                    &system,
+                    SimulationConfig::try_new(scenario.fixed_step_s())?,
+                )?;
+                runner.set_rate(PlaybackRate::try_multiplier(1000.0)?);
+                (system, MotionSession::Newtonian(Box::new(runner)))
+            }
+        };
         let projection = CelestialFrameProjection::build(
             &system,
             NonZeroU64::new(tree_namespace)
                 .ok_or_else(|| anyhow::anyhow!("zero tree namespace"))?,
         )?;
-        let diagnostics = system_diagnostics(&system)?;
+        let diagnostics = if motion.is_analytic() {
+            None
+        } else {
+            Some(system_diagnostics(&system)?)
+        };
         let mut guides = OrbitGuides::default();
-        guides.update(&system);
+        match &motion {
+            MotionSession::Analytic(a) => guides.update_analytic(&system, a.definition()),
+            MotionSession::Newtonian(_) => guides.update(&system),
+        }
         let bounds = SystemViewBounds::calculate(
             &system,
             &OverviewScope::WholeSystem,
@@ -375,7 +510,7 @@ impl GravityOrbitsDemo {
             controls.sun_from_star = std::env::var("MUNDARIS_TERRAIN_SUN").is_err();
             controls.surface_style.elevation_colors = true;
         }
-        let advance = runner.report();
+        let advance = motion.newtonian().map(FixedStepRunner::report);
         let trails = TrailHistory::new(&system, scenario.trail_stride())?;
         let enabled = match scenario {
             GravityFixture::Hierarchy => vec![ids[1], ids[2]],
@@ -390,16 +525,23 @@ impl GravityOrbitsDemo {
             .map(|id| PlanetSurfaceSession::new(id, 2048))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
+            sky_definition: crate::sky_definition::default_sky()?,
+            navigation_snapshot_path: std::env::var_os("MUNDARIS_NAVIGATION_SNAPSHOT")
+                .map(std::path::PathBuf::from),
+            navigation_wall_at: None,
+            developer_frame_number: 0,
             terrain_clearance: None,
             ready_mesh_probe: None,
             clearance_query_us: 0.0,
             terrain: crate::terrain_population::TerrainPopulation::interactive()?,
             scenario,
             validation_route: None,
+            solar_validation: None,
+            analytic_validation: None,
             surfaces,
             surface_owners: Vec::new(),
             system,
-            runner,
+            motion,
             projection,
             camera,
             ids,
@@ -419,7 +561,7 @@ impl GravityOrbitsDemo {
             last_wall: None,
             hidden: false,
             diagnostics,
-            baseline: DiagnosticBaseline(diagnostics),
+            baseline: diagnostics.map(DiagnosticBaseline),
             sampled_tick: 0,
             diagnostic_elapsed: Duration::ZERO,
             advance,
@@ -447,33 +589,262 @@ impl GravityOrbitsDemo {
     pub fn set_lifecycle_drawable(&mut self, drawable: bool) {
         self.clock.set_drawable(drawable);
         if !drawable || self.hidden {
-            self.runner.set_lifecycle_suspended(!drawable);
+            self.motion.set_lifecycle_suspended(!drawable);
             self.last_wall = None;
             self.hidden = !drawable;
             self.achieved_elapsed = Duration::ZERO;
             self.achieved_rate = None;
             self.achieved_anchor_s = self.system.sample_time().seconds_since_epoch();
-            self.advance = self.runner.report();
+            self.advance = self.motion.newtonian().map(FixedStepRunner::report);
             self.metrics.reset();
             self.camera.cancel_transition();
+            self.cancel_navigation_input();
         }
     }
     pub fn reset_wall_capture(&mut self) {
         self.last_wall = None;
         self.clock.reset_capture();
     }
+    fn cancel_navigation_input(&mut self) {
+        self.controls.viewport_input.cancel();
+        self.controls.navigation = NavigationInput::default();
+        self.controls.gesture_start = None;
+        self.controls.gesture_dragged = false;
+        self.controls.approach = None;
+        self.controls
+            .pending
+            .retain(|c| !matches!(c, Command::Navigation(_) | Command::TimedNavigation(..)));
+        self.navigation_wall_at = None;
+        self.camera.cancel_transition();
+    }
+    /// Native lifecycle hook; camera policy and cancellation remain app-owned.
+    pub fn on_window_event(&mut self, event: &winit::event::WindowEvent) -> bool {
+        use winit::{
+            event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
+            keyboard::{KeyCode, PhysicalKey},
+        };
+        self.controls.native_events = true;
+        match event {
+            winit::event::WindowEvent::Focused(focused) => {
+                self.controls.input_focused = *focused;
+                self.cancel_navigation_input();
+                self.reset_wall_capture();
+            }
+            winit::event::WindowEvent::Resized(_)
+            | winit::event::WindowEvent::ScaleFactorChanged { .. } => {
+                self.controls.viewport_ready = false;
+                self.cancel_navigation_input();
+                self.reset_wall_capture();
+            }
+            _ => {}
+        }
+        if !self.controls.input_focused || self.hidden || !self.controls.viewport_ready {
+            return false;
+        }
+        if let WindowEvent::KeyboardInput { event, .. } = event
+            && event.state == ElementState::Pressed
+            && !event.repeat
+            && self.controls.viewport_input.owns_keyboard()
+            && !self
+                .controls
+                .ui_context
+                .as_ref()
+                .is_some_and(|c| c.wants_keyboard_input() || c.memory(|m| m.focused().is_some()))
+        {
+            let command = match event.physical_key {
+                PhysicalKey::Code(KeyCode::KeyF) => Some(Command::Focus {
+                    fixed: false,
+                    fit: false,
+                }),
+                PhysicalKey::Code(KeyCode::KeyI) => Some(Command::SurfaceInspection),
+                PhysicalKey::Code(KeyCode::KeyH) => Some(Command::SurfaceHorizon),
+                PhysicalKey::Code(KeyCode::Home) => Some(Command::Overview),
+                PhysicalKey::Code(KeyCode::Escape) => Some(Command::FreeFlight),
+                PhysicalKey::Code(KeyCode::Tab) => {
+                    let at = self.selected_index();
+                    let next = if self.controls.viewport_input.boost_active() {
+                        (at + self.ids.len() - 1) % self.ids.len()
+                    } else {
+                        (at + 1) % self.ids.len()
+                    };
+                    Some(Command::Select(self.ids[next]))
+                }
+                _ => None,
+            };
+            if let Some(command) = command {
+                self.controls.pending.push_back(command);
+                return true;
+            }
+        }
+        let scale = self.controls.pixels_per_point;
+        let point = |p: winit::dpi::PhysicalPosition<f64>| {
+            egui::pos2((p.x / scale) as f32, (p.y / scale) as f32)
+        };
+        let translated = match event {
+            WindowEvent::CursorMoved { position, .. } => {
+                Some(egui::Event::PointerMoved(point(*position)))
+            }
+            WindowEvent::CursorLeft { .. } => Some(egui::Event::PointerGone),
+            WindowEvent::MouseInput { state, button, .. } => {
+                let button = match button {
+                    MouseButton::Left => Some(egui::PointerButton::Primary),
+                    MouseButton::Right => Some(egui::PointerButton::Secondary),
+                    _ => None,
+                };
+                button.and_then(|button| {
+                    self.controls.viewport_input.pointer_position().map(|pos| {
+                        egui::Event::PointerButton {
+                            pos,
+                            button,
+                            pressed: *state == ElementState::Pressed,
+                            modifiers: egui::Modifiers::default(),
+                        }
+                    })
+                })
+            }
+            WindowEvent::MouseWheel { delta, .. } => Some(match delta {
+                MouseScrollDelta::LineDelta(x, y) => egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(*x, *y),
+                    modifiers: egui::Modifiers::default(),
+                },
+                MouseScrollDelta::PixelDelta(p) => egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2((p.x / scale) as f32, (p.y / scale) as f32),
+                    modifiers: egui::Modifiers::default(),
+                },
+            }),
+            WindowEvent::KeyboardInput { event, .. } => {
+                let key = match event.physical_key {
+                    PhysicalKey::Code(KeyCode::KeyW) => Some(egui::Key::W),
+                    PhysicalKey::Code(KeyCode::KeyS) => Some(egui::Key::S),
+                    PhysicalKey::Code(KeyCode::KeyA) => Some(egui::Key::A),
+                    PhysicalKey::Code(KeyCode::KeyD) => Some(egui::Key::D),
+                    PhysicalKey::Code(KeyCode::KeyQ) => Some(egui::Key::Q),
+                    PhysicalKey::Code(KeyCode::KeyE) => Some(egui::Key::E),
+                    _ => None,
+                };
+                key.map(|key| egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: event.state == ElementState::Pressed,
+                    repeat: event.repeat,
+                    modifiers: egui::Modifiers::default(),
+                })
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.controls
+                    .viewport_input
+                    .set_boost(modifiers.state().shift_key());
+                Some(egui::Event::Key {
+                    key: egui::Key::F12,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: egui::Modifiers {
+                        shift: modifiers.state().shift_key(),
+                        ..Default::default()
+                    },
+                })
+            }
+            _ => None,
+        };
+        if let Some(event) = translated {
+            let (origin, size) = self.controls.viewport.unwrap_or(([320, 110], [960, 662]));
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(
+                    (origin[0] as f64 / scale) as f32,
+                    (origin[1] as f64 / scale) as f32,
+                ),
+                egui::vec2(
+                    (size[0] as f64 / scale) as f32,
+                    (size[1] as f64 / scale) as f32,
+                ),
+            );
+            let context = self.controls.ui_context.clone();
+            let layer = self.controls.scene_layer;
+            let pointer_blocked = |p: egui::Pos2| {
+                context.as_ref().is_some_and(|c| c.layer_id_at(p) != layer)
+                    || self.controls.placed.iter().any(|label| {
+                        label
+                            .rect
+                            .contains([(p.x as f64) * scale, (p.y as f64) * scale])
+                    })
+            };
+            if let egui::Event::PointerButton {
+                pos, pressed: true, ..
+            } = event
+                && rect.contains(pos)
+                && !pointer_blocked(pos)
+                && let Some(context) = &context
+            {
+                context.memory_mut(|m| {
+                    if let Some(id) = m.focused() {
+                        m.surrender_focus(id);
+                    }
+                });
+            }
+            let blocked = context
+                .as_ref()
+                .map_or(self.controls.keyboard_blocked, |c| {
+                    c.wants_keyboard_input() || c.memory(|m| m.focused().is_some())
+                });
+            let inputs = self.controls.viewport_input.events(
+                &[event],
+                rect,
+                matches!(
+                    self.camera.mode(),
+                    CameraMode::SurfaceInspection | CameraMode::FreeFlight
+                ),
+                blocked,
+                pointer_blocked,
+                self.controls.manual_speed,
+            );
+            let at = Instant::now();
+            for input in inputs {
+                self.controls
+                    .pending
+                    .push_back(Command::TimedNavigation(at, input));
+            }
+        }
+        false
+    }
+    fn advance_navigation_wall_to(&mut self, at: Instant) -> Result<()> {
+        let elapsed = self.navigation_wall_at.map_or(Duration::ZERO, |previous| {
+            at.saturating_duration_since(previous)
+        });
+        self.navigation_wall_at = Some(at);
+        self.controls.navigation.speed_multiplier = self.controls.manual_speed;
+        if elapsed > self.clock.threshold() {
+            self.cancel_navigation_input();
+            return Ok(());
+        }
+        self.camera.update_navigation(
+            &self.projection.coherent_view(&self.system)?,
+            &self.controls.navigation,
+            elapsed,
+        )
+    }
     fn seed_trails(&mut self) {
-        self.trails.clear_and_seed(
-            self.runner.branch_generation(),
-            self.runner.tick(),
-            &self.system,
-        );
+        if let Some(runner) = self.motion.newtonian() {
+            self.trails
+                .clear_and_seed(runner.branch_generation(), runner.tick(), &self.system);
+        } else {
+            self.trails.clear_and_seed_analytic(&self.system);
+        }
     }
     fn reseed_diagnostics(&mut self) -> Result<()> {
         self.metrics.reset();
-        self.diagnostics = system_diagnostics(&self.system)?;
-        self.baseline = DiagnosticBaseline(self.diagnostics);
-        self.sampled_tick = self.runner.tick();
+        if self.motion.is_analytic() {
+            return Ok(());
+        }
+        self.diagnostics = Some(system_diagnostics(&self.system)?);
+        self.baseline = self.diagnostics.map(DiagnosticBaseline);
+        self.sampled_tick = self
+            .motion
+            .newtonian()
+            .ok_or_else(|| anyhow::anyhow!("Newtonian diagnostics unavailable"))?
+            .tick();
         self.diagnostic_elapsed = Duration::ZERO;
         self.achieved_elapsed = Duration::ZERO;
         self.achieved_rate = None;
@@ -481,20 +852,35 @@ impl GravityOrbitsDemo {
         Ok(())
     }
     fn sample_diagnostics(&mut self) -> Result<()> {
-        self.diagnostics = system_diagnostics(&self.system)?;
-        self.sampled_tick = self.runner.tick();
+        if self.motion.is_analytic() {
+            return Ok(());
+        }
+        self.diagnostics = Some(system_diagnostics(&self.system)?);
+        self.sampled_tick = self
+            .motion
+            .newtonian()
+            .ok_or_else(|| anyhow::anyhow!("Newtonian diagnostics unavailable"))?
+            .tick();
         self.diagnostic_elapsed = Duration::ZERO;
         Ok(())
     }
     fn refresh_report_metadata(&mut self) {
-        self.advance = SimulationAdvanceReport {
-            work_steps: self.advance.work_steps,
-            forward_steps: self.advance.forward_steps,
-            restored_steps: self.advance.restored_steps,
-            force_passes: self.advance.force_passes,
-            pair_evaluations: self.advance.pair_evaluations,
-            ..self.runner.report()
-        };
+        if let (Some(runner), Some(previous)) = (self.motion.newtonian(), self.advance) {
+            self.advance = Some(SimulationAdvanceReport {
+                work_steps: previous.work_steps,
+                forward_steps: previous.forward_steps,
+                restored_steps: previous.restored_steps,
+                force_passes: previous.force_passes,
+                pair_evaluations: previous.pair_evaluations,
+                ..runner.report()
+            });
+        }
+    }
+    fn update_guides(&mut self) {
+        match &self.motion {
+            MotionSession::Newtonian(_) => self.guides.update(&self.system),
+            MotionSession::Analytic(a) => self.guides.update_analytic(&self.system, a.definition()),
+        }
     }
     fn command(&mut self, command: Command) -> Result<()> {
         let id = self
@@ -513,6 +899,11 @@ impl GravityOrbitsDemo {
                 );
                 self.camera
                     .enter_surface_inspection(&self.projection.coherent_view(&self.system)?, id)?;
+                self.controls.approach = None;
+            }
+            Command::BodyOrbit => {
+                self.camera
+                    .enter_body_orbit(&self.projection.coherent_view(&self.system)?, id)?;
                 self.controls.approach = None;
             }
             Command::SurfaceHorizon => self.camera.look_surface_horizon()?,
@@ -540,7 +931,7 @@ impl GravityOrbitsDemo {
                 self.controls.approach = Some((start.max(2.0).ln(), 2.0_f64.ln(), Duration::ZERO));
             }
             Command::Pause(paused) => {
-                self.runner.set_paused(paused);
+                self.motion.set_paused(paused);
                 self.seeking = false;
                 self.sample_diagnostics()?;
                 self.metrics.reset();
@@ -549,36 +940,74 @@ impl GravityOrbitsDemo {
             }
             Command::Rate(rate) => {
                 let rate = PlaybackRate::try_multiplier(rate)?;
-                if self.runner.rate().multiplier().signum() != rate.multiplier().signum() {
+                if self.motion.rate().multiplier().signum() != rate.multiplier().signum() {
                     self.seed_trails();
                 }
-                self.runner.set_rate(rate);
+                self.motion.set_rate(rate);
                 self.metrics.reset();
             }
-            Command::ResumeAdmission => self.runner.resume_admission(),
+            Command::ResumeAdmission => self.motion.newtonian_mut()?.resume_admission(),
             Command::Single(forward) => {
                 self.metrics.reset();
-                self.runner.single_step(forward)?;
+                match &mut self.motion {
+                    MotionSession::Newtonian(runner) => runner.single_step(forward)?,
+                    MotionSession::Analytic(a) => {
+                        let changed = a.single(forward, &mut self.system)?;
+                        self.publish();
+                        if changed && self.coherent {
+                            self.trails.record_analytic_publication(&self.system);
+                        }
+                        self.update_guides();
+                        self.reset_wall_capture();
+                    }
+                }
                 self.seeking = false;
             }
             Command::Seek(tick) => {
                 self.metrics.reset();
-                self.runner.seek_tick(tick)?;
+                self.motion.newtonian_mut()?.seek_tick(tick)?;
                 self.seed_trails();
-                self.seeking = tick != self.runner.tick();
+                self.seeking = tick != self.motion.newtonian_mut()?.tick();
                 if !self.seeking {
                     self.sample_diagnostics()?;
                 }
             }
+            Command::SeekSeconds(seconds) => {
+                match &mut self.motion {
+                    MotionSession::Analytic(a) => {
+                        a.seek_seconds(seconds, &mut self.system)?;
+                    }
+                    MotionSession::Newtonian(runner) => {
+                        let preview = runner.quantize_seek_seconds(seconds)?;
+                        return self.command(Command::Seek(preview.tick));
+                    }
+                }
+                self.publish();
+                if self.coherent {
+                    self.seed_trails();
+                }
+                self.cancel_navigation_input();
+                self.reset_wall_capture();
+                self.seeking = false;
+                self.update_guides();
+            }
             Command::CancelSeek => {
                 self.metrics.reset();
-                self.runner.cancel_seek();
+                self.motion.newtonian_mut()?.cancel_seek();
                 self.seeking = false;
                 self.sample_diagnostics()?;
             }
             Command::Reset => {
                 self.metrics.reset();
-                self.runner.reset_branch(&mut self.system)?;
+                match &mut self.motion {
+                    MotionSession::Newtonian(runner) => runner.reset_branch(&mut self.system)?,
+                    MotionSession::Analytic(a) => {
+                        a.reset(&mut self.system)?;
+                        self.publish();
+                        self.cancel_navigation_input();
+                        self.reset_wall_capture();
+                    }
+                }
                 self.seed_trails();
                 self.seeking = false;
                 self.reseed_diagnostics()?;
@@ -643,7 +1072,7 @@ impl GravityOrbitsDemo {
             }
             Command::GuideReference(reference) => {
                 self.guides.set_reference(&self.system, id, reference)?;
-                self.guides.update(&self.system);
+                self.update_guides();
             }
             Command::Navigation(input) => {
                 if input.drag != [0.0; 2]
@@ -653,8 +1082,30 @@ impl GravityOrbitsDemo {
                     self.auto_fit = false;
                     self.controls.approach = None;
                 }
-                self.controls.navigation = input;
+                let projection = self.content_projection(0.1)?;
+                self.camera
+                    .set_navigation_projection(projection, self.controls.pixels_per_point)?;
+                if input.drag != [0.0; 2] || input.scroll_notches != 0.0 {
+                    self.camera.update_navigation(
+                        &self.projection.coherent_view(&self.system)?,
+                        &NavigationInput {
+                            translation: DVec3::ZERO,
+                            ..input
+                        },
+                        Duration::ZERO,
+                    )?;
+                }
+                self.controls.navigation = NavigationInput {
+                    drag: [0.0; 2],
+                    scroll_notches: 0.0,
+                    ..input
+                };
             }
+            Command::TimedNavigation(at, input) => {
+                self.advance_navigation_wall_to(at)?;
+                self.command(Command::Navigation(input))?;
+            }
+            Command::CancelNavigation => self.cancel_navigation_input(),
             Command::GapThreshold(threshold) => {
                 anyhow::ensure!(
                     self.clock.set_threshold(threshold),
@@ -694,27 +1145,39 @@ impl GravityOrbitsDemo {
             }
             Command::Mass(mass) => {
                 let radius = self.system.body(id)?.properties().reference_radius_m();
-                self.runner.edit_properties(
-                    &mut self.system,
-                    id,
-                    BodyProperties::new(mass, radius)?,
-                )?;
+                let properties = BodyProperties::new(mass, radius)?;
+                match &mut self.motion {
+                    MotionSession::Newtonian(runner) => {
+                        runner.edit_properties(&mut self.system, id, properties)?
+                    }
+                    MotionSession::Analytic(a) => {
+                        a.edit_properties(&mut self.system, id, properties)?
+                    }
+                }
                 self.seed_trails();
                 self.seeking = false;
                 self.reseed_diagnostics()?;
             }
             Command::Radius(radius) => {
                 let mass = self.system.body(id)?.properties().mass_kg();
-                self.runner.edit_properties(
-                    &mut self.system,
-                    id,
-                    BodyProperties::new(mass, radius)?,
-                )?;
+                let properties = BodyProperties::new(mass, radius)?;
+                match &mut self.motion {
+                    MotionSession::Newtonian(runner) => {
+                        runner.edit_properties(&mut self.system, id, properties)?
+                    }
+                    MotionSession::Analytic(a) => {
+                        a.edit_properties(&mut self.system, id, properties)?
+                    }
+                }
                 self.seed_trails();
                 self.seeking = false;
                 self.reseed_diagnostics()?;
             }
             Command::Velocity(velocity) => {
+                anyhow::ensure!(
+                    !self.motion.is_analytic(),
+                    "Velocity edits are unavailable in prescribed motion: velocity is the authored trajectory derivative. Load a Newtonian scenario to edit velocity."
+                );
                 let old = *self.system.body(id)?.state();
                 let state = BodyState::new(
                     old.center_in_system(),
@@ -722,12 +1185,17 @@ impl GravityOrbitsDemo {
                     old.body_to_system(),
                     old.angular_velocity_in_system(),
                 );
-                self.runner.edit_state(&mut self.system, id, state)?;
+                self.motion
+                    .newtonian_mut()?
+                    .edit_state(&mut self.system, id, state)?;
                 self.seed_trails();
                 self.seeking = false;
                 self.reseed_diagnostics()?;
             }
-            Command::Rename(name) => self.runner.rename(&mut self.system, id, &name)?,
+            Command::Rename(name) => match &mut self.motion {
+                MotionSession::Newtonian(runner) => runner.rename(&mut self.system, id, &name)?,
+                MotionSession::Analytic(a) => a.rename(&mut self.system, id, &name)?,
+            },
             Command::TerrainPreview(enabled) => {
                 if enabled
                     && !matches!(
@@ -761,28 +1229,25 @@ impl GravityOrbitsDemo {
                 } else {
                     TrailMode::Inertial
                 };
-                self.trails.set_mode(
-                    mode,
-                    self.runner.branch_generation(),
-                    self.runner.tick(),
-                    &self.system,
-                )?;
+                self.trails.set_mode(mode, 0, 0, &self.system)?;
                 self.controls.relative_trails = relative;
             }
             Command::TrailReference(reference) => {
                 self.trails.set_mode(
                     TrailMode::SimultaneousBodyRelative(reference),
-                    self.runner.branch_generation(),
-                    self.runner.tick(),
+                    0,
+                    0,
                     &self.system,
                 )?;
                 self.controls.relative_trails = true;
             }
         }
-        self.advance = self.runner.report();
+        self.advance = self.motion.newtonian().map(FixedStepRunner::report);
         Ok(())
     }
     fn publish(&mut self) {
+        let started = Instant::now();
+        let changed = self.projection.represented_revision() != self.system.revision();
         let result = (|| -> Result<()> {
             if self.projection.represented_revision() != self.system.revision() {
                 self.projection.publish(&self.system)?;
@@ -792,14 +1257,23 @@ impl GravityOrbitsDemo {
         })();
         self.coherent = result.is_ok();
         if let Err(error) = result {
-            self.runner.set_paused(true);
+            self.motion.set_paused(true);
+            if let MotionSession::Analytic(a) = &mut self.motion {
+                a.frame_failed(&error);
+            }
             self.diagnostic = Some(format!(
                 "Projection failed; celestial drawing suppressed: {error}. Rebuild projection to retry."
             ));
+        } else if let MotionSession::Analytic(a) = &mut self.motion
+            && (changed || a.published_time() != self.system.sample_time())
+        {
+            a.frame_published(&self.system, started.elapsed());
         }
     }
     /// Host duration is explicit and captured once. Surface retries never reuse it.
     pub fn update(&mut self, elapsed: Duration) {
+        analytic_validation::advance(self, elapsed);
+        self.advance_solar_validation(elapsed);
         self.advance_surface_validation(elapsed);
         while let Some(command) = self.controls.pending.pop_front() {
             match self.command(command) {
@@ -809,11 +1283,12 @@ impl GravityOrbitsDemo {
         }
         let elapsed = if self.hidden { Duration::ZERO } else { elapsed };
         let elapsed = if elapsed > self.clock.threshold() {
-            self.runner.set_paused(true);
+            self.motion.set_paused(true);
             self.metrics.reset();
             self.camera.cancel_transition();
             self.controls.navigation = NavigationInput::default();
             self.controls.approach = None;
+            self.cancel_navigation_input();
             self.gap_diagnostic = Some(format!(
                 "Interactive clock gap {:.3} wall s; no catch-up requested. Pending demand cancelled. Resume explicitly.",
                 elapsed.as_secs_f64()
@@ -826,114 +1301,137 @@ impl GravityOrbitsDemo {
         if !self.coherent {
             self.publish();
             if !self.coherent {
-                self.advance = self.runner.report();
+                self.advance = self.motion.newtonian().map(FixedStepRunner::report);
                 return;
             }
         }
-        if let Err(error) = self.runner.admit_wall_elapsed(elapsed) {
-            self.runner.set_paused(true);
-            self.diagnostic = Some(error.to_string());
-        }
-        let branch = self.runner.branch_generation();
-        let seeking = self.seeking;
-        let measuring = !self.runner.paused() && !self.hidden && !seeking;
-        let authority_before = self.system.sample_time().seconds_since_epoch();
-        let replay_before = self.runner.report().replay_remaining.is_some();
-        let trails = &mut self.trails;
-        let started = Instant::now();
-        let mut total = [0u64; 5];
-        let mut limit = 1;
-        let cap = self.runner.config().work_limit().min(512);
-        self.cpu_limited = false;
-        self.count_limited = false;
-        let result = loop {
-            let result =
-                self.runner
-                    .pump_with_work_limit(&mut self.system, limit, |tick, world| {
-                        if !seeking {
-                            trails.record_committed(branch, tick, world);
-                        }
-                    });
-            let report = match &result {
-                Ok(report) => *report,
-                Err(error) => *error.report,
+        if self.motion.is_analytic() {
+            let sampled = match &mut self.motion {
+                MotionSession::Analytic(a) => a.advance(elapsed, &mut self.system),
+                MotionSession::Newtonian(_) => unreachable!("mode checked"),
             };
-            total[0] += u64::from(report.work_steps);
-            total[1] += u64::from(report.forward_steps);
-            total[2] += u64::from(report.restored_steps);
-            total[3] += u64::from(report.force_passes);
-            total[4] += report.pair_evaluations;
-            if result.is_err()
-                || report.work_steps == 0
-                || (report.backlog_ticks == 0 && report.replay_remaining.is_none())
-            {
-                break result;
+            match sampled {
+                Ok(changed) => {
+                    self.publish();
+                    if changed && self.coherent {
+                        self.trails.record_analytic_publication(&self.system);
+                    }
+                }
+                Err(error) => {
+                    self.diagnostic = Some(error.to_string());
+                    self.cancel_navigation_input();
+                }
             }
-            if total[0] >= u64::from(cap) {
-                self.count_limited = true;
-                break result;
-            }
-            if started.elapsed() >= Duration::from_millis(4) {
-                self.cpu_limited = true;
-                break result;
-            }
-            let remaining = cap - total[0] as u32;
-            let per = started.elapsed().as_secs_f64() / total[0] as f64;
-            let affordable = ((0.004 - started.elapsed().as_secs_f64()) / per.max(1e-9))
-                .floor()
-                .max(1.0) as u32;
-            limit = remaining.min(32).min(affordable);
-        };
-        self.pump_ms = started.elapsed().as_secs_f64() * 1000.0;
-        self.advance = match result {
-            Ok(report) => report,
-            Err(error) => {
+        } else {
+            let runner = match &mut self.motion {
+                MotionSession::Newtonian(r) => r,
+                _ => unreachable!("mode checked"),
+            };
+            if let Err(error) = runner.admit_wall_elapsed(elapsed) {
+                runner.set_paused(true);
                 self.diagnostic = Some(error.to_string());
+            }
+            let branch = runner.branch_generation();
+            let seeking = self.seeking;
+            let measuring = !runner.paused() && !self.hidden && !seeking;
+            let authority_before = self.system.sample_time().seconds_since_epoch();
+            let replay_before = runner.report().replay_remaining.is_some();
+            let trails = &mut self.trails;
+            let started = Instant::now();
+            let mut total = [0u64; 5];
+            let mut limit = 1;
+            let cap = runner.config().work_limit().min(512);
+            self.cpu_limited = false;
+            self.count_limited = false;
+            let result = loop {
+                let result = runner.pump_with_work_limit(&mut self.system, limit, |tick, world| {
+                    if !seeking {
+                        trails.record_committed(branch, tick, world);
+                    }
+                });
+                let report = match &result {
+                    Ok(report) => *report,
+                    Err(error) => *error.report,
+                };
+                total[0] += u64::from(report.work_steps);
+                total[1] += u64::from(report.forward_steps);
+                total[2] += u64::from(report.restored_steps);
+                total[3] += u64::from(report.force_passes);
+                total[4] += report.pair_evaluations;
+                if result.is_err()
+                    || report.work_steps == 0
+                    || (report.backlog_ticks == 0 && report.replay_remaining.is_none())
+                {
+                    break result;
+                }
+                if total[0] >= u64::from(cap) {
+                    self.count_limited = true;
+                    break result;
+                }
+                if started.elapsed() >= Duration::from_millis(4) {
+                    self.cpu_limited = true;
+                    break result;
+                }
+                let remaining = cap - total[0] as u32;
+                let per = started.elapsed().as_secs_f64() / total[0] as f64;
+                let affordable = ((0.004 - started.elapsed().as_secs_f64()) / per.max(1e-9))
+                    .floor()
+                    .max(1.0) as u32;
+                limit = remaining.min(32).min(affordable);
+            };
+            self.pump_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let mut advance = match result {
+                Ok(report) => report,
+                Err(error) => {
+                    self.diagnostic = Some(error.to_string());
+                    self.seeking = false;
+                    *error.report
+                }
+            };
+            advance.work_steps = total[0] as u32;
+            advance.forward_steps = total[1] as u32;
+            advance.restored_steps = total[2] as u32;
+            advance.force_passes = total[3] as u32;
+            advance.pair_evaluations = total[4];
+            self.advance = Some(advance);
+            if advance.work_steps > 0 && self.pump_ms > 0.0 {
+                self.throughput_steps_s = Some(advance.work_steps as f64 * 1000.0 / self.pump_ms);
+            }
+            if self.seeking && advance.backlog_ticks == 0 && advance.replay_remaining.is_none() {
+                self.seed_trails();
                 self.seeking = false;
-                *error.report
+                if let Err(error) = self.sample_diagnostics() {
+                    self.diagnostic = Some(error.to_string());
+                }
+                self.achieved_elapsed = Duration::ZERO;
+                self.achieved_anchor_s = self.system.sample_time().seconds_since_epoch();
+                self.achieved_rate = None;
             }
-        };
-        self.advance.work_steps = total[0] as u32;
-        self.advance.forward_steps = total[1] as u32;
-        self.advance.restored_steps = total[2] as u32;
-        self.advance.force_passes = total[3] as u32;
-        self.advance.pair_evaluations = total[4];
-        if self.advance.work_steps > 0 && self.pump_ms > 0.0 {
-            self.throughput_steps_s = Some(self.advance.work_steps as f64 * 1000.0 / self.pump_ms);
+            self.publish();
+            let private_work = advance.work_steps > advance.forward_steps + advance.restored_steps;
+            if measuring && !replay_before && !private_work && advance.replay_remaining.is_none() {
+                self.metrics.record(
+                    elapsed,
+                    self.system.sample_time().seconds_since_epoch() - authority_before,
+                );
+            } else if replay_before || private_work || advance.replay_remaining.is_some() {
+                self.metrics.reset();
+            }
+            self.achieved_rate = self
+                .metrics
+                .measurement(
+                    self.scenario.fixed_step_s(),
+                    self.motion.rate().multiplier(),
+                )
+                .map(|m| m.achieved_rate);
         }
-        if self.seeking
-            && self.advance.backlog_ticks == 0
-            && self.advance.replay_remaining.is_none()
-        {
-            self.seed_trails();
-            self.seeking = false;
-            if let Err(error) = self.sample_diagnostics() {
+        self.update_guides();
+        if self.coherent {
+            if self.controls.native_events
+                && let Err(error) = self.advance_navigation_wall_to(Instant::now())
+            {
                 self.diagnostic = Some(error.to_string());
             }
-            self.achieved_elapsed = Duration::ZERO;
-            self.achieved_anchor_s = self.system.sample_time().seconds_since_epoch();
-            self.achieved_rate = None;
-        }
-        self.publish();
-        self.guides.update(&self.system);
-        let private_work =
-            self.advance.work_steps > self.advance.forward_steps + self.advance.restored_steps;
-        if measuring && !replay_before && !private_work && self.advance.replay_remaining.is_none() {
-            self.metrics.record(
-                elapsed,
-                self.system.sample_time().seconds_since_epoch() - authority_before,
-            );
-        } else if replay_before || private_work || self.advance.replay_remaining.is_some() {
-            self.metrics.reset();
-        }
-        self.achieved_rate = self
-            .metrics
-            .measurement(
-                self.runner.config().fixed_step_s(),
-                self.runner.rate().multiplier(),
-            )
-            .map(|m| m.achieved_rate);
-        if self.coherent {
             if let Some((start, end, at)) = &mut self.controls.approach {
                 *at = at.saturating_add(elapsed);
                 let t = (at.as_secs_f64() / 30.0).clamp(0.0, 1.0);
@@ -967,7 +1465,11 @@ impl GravityOrbitsDemo {
                     .coherent_view(&self.system)
                     .expect("coherence checked"),
                 &input,
-                elapsed,
+                if self.controls.native_events {
+                    Duration::ZERO
+                } else {
+                    elapsed
+                },
             ) {
                 self.camera.cancel_transition();
                 self.diagnostic = Some(error.to_string());
@@ -1009,19 +1511,71 @@ impl GravityOrbitsDemo {
                 .map_err(anyhow::Error::new)
                 .and_then(|pair| self.camera.refresh_navigation_constraint(&pair))
         {
-            self.runner.set_paused(true);
+            self.motion.set_paused(true);
             self.diagnostic = Some(error.to_string());
         }
         self.diagnostic_elapsed = self.diagnostic_elapsed.saturating_add(elapsed);
         if (self.diagnostic_elapsed >= Duration::from_millis(250)
-            || (self.runner.paused() && self.advance.work_steps > 0))
+            || (self.motion.paused() && self.advance.is_some_and(|a| a.work_steps > 0)))
             && let Err(error) = self.sample_diagnostics()
         {
-            self.runner.set_paused(true);
+            self.motion.set_paused(true);
             self.diagnostic = Some(error.to_string());
         }
         self.refresh_report_metadata();
     }
+    // Opt-in native exercise of the ordinary Solar controls, not a second
+    // renderer. Default launches remain unmodified; hidden/gap time is excluded.
+    fn advance_solar_validation(&mut self, elapsed: Duration) {
+        if self.hidden || elapsed > self.clock.threshold() {
+            return;
+        }
+        let Some((at, next)) = &mut self.solar_validation else {
+            return;
+        };
+        *at = at.saturating_add(elapsed);
+        let checkpoints = [2.0, 6.0, 12.0, 14.0, 18.0, 20.0, 24.0, 28.0];
+        if *next < checkpoints.len() && at.as_secs_f64() >= checkpoints[*next] {
+            tracing::info!(
+                step = *next,
+                elapsed_s = at.as_secs_f64(),
+                "Solar native validation route"
+            );
+            match *next {
+                0 => self.controls.pending.push_back(Command::Focus {
+                    fixed: false,
+                    fit: false,
+                }),
+                1 => self
+                    .controls
+                    .pending
+                    .push_back(Command::Clearance(10_000.0)),
+                2 => self.controls.pending.push_back(Command::SurfaceInspection),
+                3 => self.controls.pending.push_back(Command::SurfaceHorizon),
+                4 => {}
+                5 => self
+                    .controls
+                    .pending
+                    .push_back(Command::Navigation(NavigationInput::default())),
+                6 => self.controls.pending.push_back(Command::Focus {
+                    fixed: false,
+                    fit: true,
+                }),
+                7 => self.controls.pending.push_back(Command::Overview),
+                _ => unreachable!("fixed Solar validation route"),
+            }
+            *next += 1;
+        }
+        if (18.0..20.0).contains(&at.as_secs_f64()) {
+            self.controls
+                .pending
+                .push_back(Command::Navigation(NavigationInput {
+                    translation: DVec3::X,
+                    ..Default::default()
+                }));
+        }
+    }
+
     fn advance_surface_validation(&mut self, elapsed: Duration) {
         if self.hidden || elapsed > self.clock.threshold() {
             return;
@@ -1115,7 +1669,10 @@ impl GravityOrbitsDemo {
         // Distinct opportunities commit twenty real h60 steps. Twenty queued Single
         // commands in one opportunity would only request the same next tick.
         if (67.0..70.0).contains(&route.elapsed.as_secs_f64())
-            && self.runner.tick() < route.physical_target
+            && self
+                .motion
+                .newtonian()
+                .is_some_and(|r| r.tick() < route.physical_target)
         {
             self.controls.pending.push_back(Command::Single(true));
         }
@@ -1197,6 +1754,7 @@ impl GravityOrbitsDemo {
             return Ok(());
         }
         self.set_lifecycle_drawable(true);
+        self.developer_frame_number = self.developer_frame_number.saturating_add(1);
         let now = Instant::now();
         let elapsed = self
             .last_wall
@@ -1250,16 +1808,11 @@ impl GravityOrbitsDemo {
         self.prepare_visuals()?;
         let selected_index = self.selected_index();
         let pair = self.projection.coherent_view(&self.system)?;
-        let query_started = Instant::now();
-        self.terrain_clearance = self
-            .camera
-            .focused_body()
-            .map(|body| {
-                crate::terrain_inspection::terrain_clearance(&pair, self.camera.pose(), body)
-            })
-            .transpose()?
-            .flatten();
-        self.clearance_query_us = query_started.elapsed().as_secs_f64() * 1e6;
+        self.camera
+            .set_navigation_projection(self.content_projection(0.1)?, scale)?;
+        self.controls.pixels_per_point = scale;
+        self.terrain_clearance = self.camera.recorded_terrain_clearance();
+        self.clearance_query_us = self.camera.navigation_diagnostics().terrain_query_us;
         self.ready_mesh_probe = None;
         let view = PreparedView::new(
             &pair.evaluation(),
@@ -1316,25 +1869,6 @@ impl GravityOrbitsDemo {
         {
             self.ready_mesh_probe =
                 crate::surface_probe::ready_mesh_probe(&self.terrain.cover, terrain.location)?;
-            if let (Some(minimum), Some(mesh)) =
-                (self.controls.terrain_guard_m, self.ready_mesh_probe)
-            {
-                // A filtered ready mesh need not coincide with complete terrain.
-                // Guard both surfaces, including the currently published morph.
-                if self.camera.enforce_radial_clearance(
-                    &pair,
-                    terrain.body,
-                    terrain.surface_radius_m.max(mesh.radius_m),
-                    minimum,
-                )? {
-                    self.terrain_clearance = crate::terrain_inspection::terrain_clearance(
-                        &pair,
-                        self.camera.pose(),
-                        terrain.body,
-                    )?;
-                    self.diagnostic = Some("Debug terrain guard moved the observer above both complete terrain and the published mesh; not collision physics.".into());
-                }
-            }
         }
         if let Some(terrain) = self.terrain_clearance {
             clearance = terrain.clearance_m;
@@ -1437,6 +1971,11 @@ impl GravityOrbitsDemo {
             }
         }
         let prepared = (|| -> Result<()> {
+            frame.set_distant_sky(
+                pair.projection().tree().root(),
+                std::sync::Arc::clone(&self.sky_definition),
+                self.controls.sky,
+            )?;
             for session in &self.surfaces {
                 let index = self
                     .ids
@@ -1444,8 +1983,8 @@ impl GravityOrbitsDemo {
                     .position(|&id| id == session.body())
                     .expect("surface body");
                 if self.surface_owners[index] {
-                    if self.controls.terrain_preview
-                        && self.terrain.active_body() == Some(session.body())
+                    if self.terrain.active_body() == Some(session.body())
+                        && self.terrain.cover.ready()
                     {
                         let mut style = self.controls.surface_style;
                         if matches!(
@@ -1613,7 +2152,7 @@ impl GravityOrbitsDemo {
         })();
         let preparation_ms = started.elapsed().as_secs_f64() * 1000.0;
         if let Err(error) = prepared {
-            self.runner.set_paused(true);
+            self.motion.set_paused(true);
             self.refresh_report_metadata();
             self.diagnostic = Some(format!(
                 "Render preparation failed; no partial celestial frame uploaded: {error}"
@@ -1624,9 +2163,89 @@ impl GravityOrbitsDemo {
             return Ok(());
         }
         let report = frame.report();
+        let performance = PerformanceSnapshot {
+            preparation_ms: Some(preparation_ms),
+            upload_bytes: Some(report.surface.uploaded_bytes as u64),
+            ..Default::default()
+        }
+        .with_gpu(renderer.latest_gpu_profile(), "latest_completed");
+        #[cfg(feature = "surface-profile")]
+        let performance = PerformanceSnapshot {
+            update_ms: Some(update_ms),
+            frame_cpu_ms: Some(update_ms + preparation_ms),
+            terrain_update_ms: Some(self.terrain.profile.total.as_secs_f64() * 1000.0),
+            terrain_preparation_ms: Some(report.surface.profile.total.as_secs_f64() * 1000.0),
+            ..performance
+        };
+        let mut snapshot = DeveloperSnapshot::collect(SnapshotInput {
+            navigation: Some(NavigationDiagnostics {
+                window_focused: Some(
+                    self.controls.input_focused
+                        && self
+                            .controls
+                            .ui_context
+                            .as_ref()
+                            .is_none_or(|c| c.input(|i| i.focused)),
+                ),
+                viewport_keyboard_owned: Some(self.controls.viewport_input.owns_keyboard()),
+                viewport_gesture_owned: Some(self.controls.viewport_input.owns_gesture()),
+                ..self.camera.navigation_diagnostics()
+            }),
+            pair: &pair,
+            pose: self.camera.pose(),
+            camera_mode: self.camera.mode(),
+            selected_body: self.selection.selected(),
+            focused_body: self.camera.focused_body(),
+            reference_body: self
+                .camera
+                .focused_body()
+                .or(self.terrain_clearance.map(|c| c.body))
+                .or(self.selection.selected()),
+            frame_number: self.developer_frame_number,
+            paused: self.motion.paused(),
+            simulation_speed: self.motion.rate().multiplier(),
+            motion: Some(self.motion.snapshot(&self.system)),
+            projection,
+            terrain: &self.terrain,
+            terrain_clearance_m: self.terrain_clearance.map(|c| c.clearance_m),
+            drawn_mesh_clearance_m: self
+                .terrain_clearance
+                .zip(self.ready_mesh_probe)
+                .map(|(c, m)| c.camera_radius_m - m.radius_m),
+            rendering: RenderingSnapshot {
+                terrain_render_mode: render_mode_name(self.controls.terrain_lighting.mode()).into(),
+                terrain_enabled: self.controls.terrain_preview,
+                ocean_enabled: self.controls.planetary_ocean,
+                clouds_enabled: self.controls.planetary_clouds,
+                atmosphere_enabled: self.controls.planetary_atmosphere,
+                patch_borders_enabled: self.controls.surface_style.borders,
+                lod_colors_enabled: self.controls.surface_style.lod_colors,
+                navigation_markers_enabled: self.controls.markers,
+                ..Default::default()
+            }
+            .with_draw_report(report),
+            performance,
+        })?;
+        if let Some(sky) = report.sky {
+            snapshot.sky = Some(crate::developer_snapshot::SkySnapshot::collect(
+                &self.sky_definition,
+                self.controls.sky,
+                sky,
+                renderer.last_sky_resource_report(),
+                renderer.latest_gpu_profile(),
+                "latest_submitted (may be previous frame)",
+                "latest_completed (may be previous frame)",
+            ));
+        }
+        // Opt-in native evidence scratch export of this exact prepared state.
+        // Disabled for ordinary launches; collection remains observational.
+        if let Some(path) = &self.navigation_snapshot_path {
+            snapshot.write_json(path)?;
+        }
         // Split borrows retain the coherent world/projection and prepared tree view
         // until submission. UI queues commands; it never mutates that borrowed state.
         let info = UiInfo {
+            snapshot: Some(&snapshot),
             terrain_clearance: self.terrain_clearance,
             ready_mesh_probe: self.ready_mesh_probe,
             clearance_query_us: self.clearance_query_us,
@@ -1638,13 +2257,17 @@ impl GravityOrbitsDemo {
             surfaces: &self.surfaces,
             system: &self.system,
             projection: &self.projection,
-            runner: &self.runner,
+            motion: &self.motion,
+            runner: self.motion.newtonian(),
             camera: &self.camera,
             ids: &self.ids,
             selected: selected_index,
             diagnostic: self.diagnostic.as_deref(),
             diagnostics: self.diagnostics,
-            drift: self.baseline.drift(self.diagnostics),
+            drift: self
+                .baseline
+                .zip(self.diagnostics)
+                .map(|(baseline, diagnostic)| baseline.drift(diagnostic)),
             sampled_tick: self.sampled_tick,
             advance: self.advance,
             achieved_rate: self.achieved_rate,
@@ -1662,10 +2285,10 @@ impl GravityOrbitsDemo {
             celestial_projection: projection,
             guides: self.guides.guides(),
             bounds: &self.bounds,
-            measurement: self.metrics.measurement(
-                self.runner.config().fixed_step_s(),
-                self.runner.rate().multiplier(),
-            ),
+            measurement: self.motion.newtonian().and_then(|r| {
+                self.metrics
+                    .measurement(r.config().fixed_step_s(), r.rate().multiplier())
+            }),
             cpu_limited: self.cpu_limited,
             count_limited: self.count_limited,
             gap_diagnostic: self.gap_diagnostic.as_deref(),
@@ -1714,6 +2337,7 @@ impl GravityOrbitsDemo {
             .expect("valid content projection");
         (
             UiInfo {
+                snapshot: None,
                 terrain_clearance: self.terrain_clearance,
                 ready_mesh_probe: self.ready_mesh_probe,
                 clearance_query_us: self.clearance_query_us,
@@ -1725,13 +2349,17 @@ impl GravityOrbitsDemo {
                 surfaces: &self.surfaces,
                 system: &self.system,
                 projection: &self.projection,
-                runner: &self.runner,
+                motion: &self.motion,
+                runner: self.motion.newtonian(),
                 camera: &self.camera,
                 ids: &self.ids,
                 selected,
                 diagnostic: self.diagnostic.as_deref(),
                 diagnostics: self.diagnostics,
-                drift: self.baseline.drift(self.diagnostics),
+                drift: self
+                    .baseline
+                    .zip(self.diagnostics)
+                    .map(|(baseline, diagnostic)| baseline.drift(diagnostic)),
                 sampled_tick: self.sampled_tick,
                 advance: self.advance,
                 achieved_rate: self.achieved_rate,
@@ -1749,10 +2377,10 @@ impl GravityOrbitsDemo {
                 celestial_projection,
                 guides: self.guides.guides(),
                 bounds: &self.bounds,
-                measurement: self.metrics.measurement(
-                    self.runner.config().fixed_step_s(),
-                    self.runner.rate().multiplier(),
-                ),
+                measurement: self.motion.newtonian().and_then(|r| {
+                    self.metrics
+                        .measurement(r.config().fixed_step_s(), r.rate().multiplier())
+                }),
                 cpu_limited: self.cpu_limited,
                 count_limited: self.count_limited,
                 gap_diagnostic: self.gap_diagnostic.as_deref(),
@@ -1827,8 +2455,8 @@ impl GravityOrbitsDemo {
             if self.controls.guide_visible
                 && included
                 && let Some(g) = self.guides.guides().iter().find(|g| g.body == id)
-                && let (Some(reference), Some(e)) = (g.reference, g.elements)
-                && e.class() == ConicClass::Elliptic
+                && let Some(reference) = g.reference
+                && g.has_geometry()
             {
                 if !matches!(self.scope, OverviewScope::WholeSystem)
                     && !self.bounds.included().contains(&reference)
@@ -1866,7 +2494,54 @@ impl GravityOrbitsDemo {
     }
 }
 
+#[cfg(test)]
+mod analytic_publication_tests {
+    use super::*;
+    #[test]
+    fn analytic_frame_failure_retains_sampled_authority_and_last_published_time() {
+        let mut demo = GravityOrbitsDemo::solar_system(false).unwrap();
+        if let MotionSession::Analytic(a) = &mut demo.motion {
+            a.seek_seconds(42.5, &mut demo.system).unwrap();
+        }
+        let before = demo
+            .system
+            .bodies()
+            .map(|(_, b)| b.clone())
+            .collect::<Vec<_>>();
+        let revision = demo.system.revision();
+        let other = GravityFixture::GameplaySolarSystem
+            .create(NonZeroU64::new(2).unwrap())
+            .unwrap();
+        demo.projection =
+            CelestialFrameProjection::build(&other, NonZeroU64::new(2).unwrap()).unwrap();
+        demo.publish();
+        assert!(!demo.coherent);
+        assert!(demo.motion.paused());
+        assert_eq!(demo.system.revision(), revision);
+        assert_eq!(demo.system.sample_time().seconds_since_epoch(), 42.5);
+        assert_eq!(
+            demo.system
+                .bodies()
+                .map(|(_, b)| b.clone())
+                .collect::<Vec<_>>(),
+            before
+        );
+        assert_eq!(demo.motion_snapshot().published_time_s, 0.0);
+        assert!(demo.motion_snapshot().latest_failure.is_some());
+        demo.update(Duration::from_millis(16));
+        assert!(!demo.coherent);
+        assert_eq!(demo.system.revision(), revision);
+        demo.command(Command::Rebuild).unwrap();
+        demo.publish();
+        assert!(demo.coherent);
+        assert_eq!(demo.motion_snapshot().published_time_s, 42.5);
+        assert!(demo.motion_snapshot().latest_failure.is_none());
+        assert!(demo.motion.paused());
+    }
+}
+
 struct UiInfo<'a> {
+    snapshot: Option<&'a crate::developer_snapshot::DeveloperSnapshot>,
     terrain_clearance: Option<crate::terrain_inspection::TerrainClearance>,
     ready_mesh_probe: Option<crate::surface_probe::ReadyMeshProbe>,
     clearance_query_us: f64,
@@ -1878,15 +2553,16 @@ struct UiInfo<'a> {
     surfaces: &'a [PlanetSurfaceSession],
     system: &'a CelestialSystem,
     projection: &'a CelestialFrameProjection,
-    runner: &'a FixedStepRunner,
+    motion: &'a MotionSession,
+    runner: Option<&'a FixedStepRunner>,
     camera: &'a CelestialCamera,
     ids: &'a [BodyId],
     selected: usize,
     diagnostic: Option<&'a str>,
-    diagnostics: SystemDiagnostics,
-    drift: DiagnosticDrift,
+    diagnostics: Option<SystemDiagnostics>,
+    drift: Option<DiagnosticDrift>,
     sampled_tick: u64,
-    advance: SimulationAdvanceReport,
+    advance: Option<SimulationAdvanceReport>,
     achieved_rate: Option<f64>,
     throughput: Option<f64>,
     pump_ms: f64,
@@ -1915,7 +2591,11 @@ fn draw_engineering_ui(
     markers: &[CelestialMarker],
 ) {
     egui::SidePanel::left("celestial body inspector").exact_width(320.0).resizable(false).show(context,|ui| {
-        ui.heading("Celestial system");
+        egui::ScrollArea::vertical().show(ui,|ui| {
+        developer_ui::left(ui, controls, info);
+        ui.separator();
+        ui.collapsing("Advanced engine diagnostics", |ui| {
+        ui.heading("Navigation / guide internals");
         for (i,&id) in info.ids.iter().enumerate() {
             let body=info.system.body(id).expect("mapped body");
             let focused=info.camera.focused_body()==Some(id);
@@ -1941,13 +2621,13 @@ fn draw_engineering_ui(
             }
             if ui.button("Fit checked bodies + selection").clicked(){controls.pending.push_back(Command::FilteredOverview(controls.filter_ids.clone()));}
         });
-        if ui.button("Free flight / unfocus (Esc)").clicked(){controls.pending.push_back(Command::FreeFlight);}
+        if ui.button("Advanced Free Flight / unfocus (Esc)").clicked(){controls.pending.push_back(Command::FreeFlight);}
         ui.label(format!("Control: {:?}",info.camera.mode()));
         ui.small("Orbit: left drag / wheel. Flight: WASD, Q/E, right drag, Shift boost.");
-        ui.add(egui::Slider::new(&mut controls.manual_speed,1e-3..=1e3).logarithmic(true).text("Flight speed multiplier"));
+        ui.add(egui::Slider::new(&mut controls.manual_speed,1e-3..=1e3).logarithmic(true).text("User speed multiplier (×)"));
         ui.small(format!("Navigation speed {} / wall s",compact_distance(info.camera.flight_speed_m_s())));
         ui.checkbox(&mut controls.markers,"Navigation markers");ui.checkbox(&mut controls.labels,"Labels");ui.checkbox(&mut controls.guide_visible,"Instantaneous orbit guides");ui.checkbox(&mut controls.trails,"Committed historical trails");
-        let guide_count=if controls.guide_visible{info.guides.iter().filter(|g|g.elements.is_some_and(|e|e.class()==ConicClass::Elliptic)&&g.reference.is_some()).count()}else{0};
+        let guide_count=if controls.guide_visible{info.guides.iter().filter(|g|(g.authored_orbit.is_some() || g.elements.is_some_and(|e|e.class()==ConicClass::Elliptic))&&g.reference.is_some()).count()}else{0};
         ui.small(format!("{guide_count} available guides · sampled {:.3} simulation s",info.system.sample_time().seconds_since_epoch()));
         ui.small("Coincident markers: repeat click to cycle every candidate.");
         let selected_id=info.ids[info.selected];
@@ -1971,54 +2651,58 @@ fn draw_engineering_ui(
         if info.coarse_curves>0 {ui.colored_label(egui::Color32::YELLOW,format!("{} coarse curves: display cap prevents 0.5 px tolerance",info.coarse_curves));}
         if info.camera.mode()==CameraMode::BodyOrbit {ui.label(format!("Reference-sphere clearance {}",compact_distance(info.camera.clearance_m())));}
         egui::ScrollArea::vertical().show(ui,|ui|{ui.collapsing("Engineering / authoring",|ui| {
+        if let (Some(runner), Some(advance)) = (info.runner, info.advance) {
         ui.label("Newtonian point masses / fixed KDK / debug celestial shading");
-        ui.label(format!("Branch {} / tick {} → target {} / h {} s",info.advance.branch_generation,info.advance.tick,info.advance.target_tick,info.runner.config().fixed_step_s()));
-        ui.label(format!("Requested {:.3} s / authoritative {:.3} s",info.advance.requested_time.seconds_since_epoch(),info.system.sample_time().seconds_since_epoch()));
-        ui.label(format!("Requested {}x / achieved {} / {:?}",info.runner.rate().multiplier(),info.achieved_rate.map_or_else(||"not yet measured".into(),|r|format!("{r:.3}x (wall sample)")),info.advance.status));
-        ui.label(format!("Pending {} ticks / {:.3} s (fraction {:.3} s)",info.advance.backlog_ticks,info.advance.pending_simulation_seconds,info.advance.fractional_seconds));
-        ui.label(format!("Latest update: {} work / {} forward / {} restore; {:.3} ms",info.advance.work_steps,info.advance.forward_steps,info.advance.restored_steps,info.pump_ms));
-        ui.label(format!("Latest rejected demand {:.3} s / latest explicit cancellation {:.3} s",info.advance.rejected_simulation_seconds,info.advance.cancelled_simulation_seconds));
-        if let Some(remaining)=info.advance.replay_remaining {
+        ui.label(format!("Branch {} / tick {} → target {} / h {} s",advance.branch_generation,advance.tick,advance.target_tick,runner.config().fixed_step_s()));
+        ui.label(format!("Requested {:.3} s / authoritative {:.3} s",advance.requested_time.seconds_since_epoch(),info.system.sample_time().seconds_since_epoch()));
+        ui.label(format!("Requested {}x / achieved {} / {:?}",runner.rate().multiplier(),info.achieved_rate.map_or_else(||"not yet measured".into(),|r|format!("{r:.3}x (wall sample)")),advance.status));
+        ui.label(format!("Pending {} ticks / {:.3} s (fraction {:.3} s)",advance.backlog_ticks,advance.pending_simulation_seconds,advance.fractional_seconds));
+        ui.label(format!("Latest update: {} work / {} forward / {} restore; {:.3} ms",advance.work_steps,advance.forward_steps,advance.restored_steps,info.pump_ms));
+        ui.label(format!("Latest rejected demand {:.3} s / latest explicit cancellation {:.3} s",advance.rejected_simulation_seconds,advance.cancelled_simulation_seconds));
+        if let Some(remaining)=advance.replay_remaining {
             ui.colored_label(egui::Color32::YELLOW,format!("Private replay: {remaining} work remaining, estimate {}",info.throughput.map_or_else(||"unmeasured".into(),|rate|format!("{:.2} wall s",remaining as f64/rate))));
             if ui.button("Cancel seek/replay (retain live world)").clicked() {controls.pending.push_back(Command::CancelSeek);}
         }
-        ui.label(format!("History ticks {:?}, {} live + {} private replay bytes; snapshots restore / positive-step replay",info.advance.retained_ticks,info.advance.history_payload_bytes,info.advance.replay_history_payload_bytes));
+        ui.label(format!("History ticks {:?}, {} live + {} private replay bytes; snapshots restore / positive-step replay",advance.retained_ticks,advance.history_payload_bytes,advance.replay_history_payload_bytes));
         ui.horizontal(|ui| {
-            if ui.button(if info.runner.paused() {"Resume"} else {"Pause (cancel debt)"}).clicked() {controls.pending.push_back(Command::Pause(!info.runner.paused()));}
+            if ui.button(if runner.paused() {"Resume"} else {"Pause (cancel debt)"}).clicked() {controls.pending.push_back(Command::Pause(!runner.paused()));}
             if ui.button("Single +").clicked() {controls.pending.push_back(Command::Single(true));}
             if ui.button("Single −").clicked() {controls.pending.push_back(Command::Single(false));}
         });
         ui.horizontal_wrapped(|ui| {for rate in [-1000.0,-10.0,-1.0,0.1,1.0,10.0,100.0,1000.0,10000.0,100000.0,1000000.0,1000000000.0] {
             if ui.button(format!("{rate}x")).clicked() {controls.pending.push_back(Command::Rate(rate));}
         }});
-        if info.advance.status==PlaybackStatus::DemandHaltedOverload {
+        if advance.status==PlaybackStatus::DemandHaltedOverload {
             ui.colored_label(egui::Color32::LIGHT_RED,"Demand halted: overload. Admitted debt drains at fixed h.");
             if ui.button("Resume demand admission (retains debt)").clicked() {controls.pending.push_back(Command::ResumeAdmission);}
         }
-        ui.add(egui::DragValue::new(&mut controls.seek_seconds).speed(info.runner.config().fixed_step_s()).suffix(" seek s"));
-        match info.runner.quantize_seek_seconds(controls.seek_seconds) {
+        ui.add(egui::DragValue::new(&mut controls.seek_seconds).speed(runner.config().fixed_step_s()).suffix(" seek s"));
+        match runner.quantize_seek_seconds(controls.seek_seconds) {
             Ok(preview)=>{
                 ui.label(format!("Nearest tick {} / {:.3} s / delta {:+.3} s",preview.tick,preview.resulting_seconds,preview.quantization_delta_s));
                 if ui.button("Confirm seek (paused)").clicked() {controls.pending.push_back(Command::Seek(preview.tick));}
             }
             Err(error)=>{ui.colored_label(egui::Color32::LIGHT_RED,error.to_string());}
         }
+        }
         if ui.button("Reset branch baseline (IDs / focus retained)").clicked() {controls.pending.push_back(Command::Reset);}
         ui.horizontal_wrapped(|ui| {for (label,fixture) in [("Gameplay Solar System",GravityFixture::GameplaySolarSystem),("Real-scale Solar reference",GravityFixture::RealSolarSystem),("Load original hierarchy",GravityFixture::Hierarchy),("Load circular oracle",GravityFixture::Circular)] {if ui.button(label).clicked() {controls.pending.push_back(Command::Load(fixture));}}});
         ui.separator();
-        ui.label(format!("{} bodies / {} pairs / {} new force passes this update",info.system.body_count(),pair_count(info.system.body_count()).expect("valid count"),info.advance.force_passes));
+        if let (Some(advance), Some(diagnostics), Some(drift)) = (info.advance, info.diagnostics, info.drift) {
+        ui.label(format!("{} bodies / {} pairs / {} new force passes this update",info.system.body_count(),pair_count(info.system.body_count()).expect("valid count"),advance.force_passes));
         ui.label(format!("{} far / {} surface owners · terrain active: {}",info.system.body_count()-info.owned_surface_count,info.owned_surface_count,info.terrain_body.and_then(|id|info.system.body(id).ok()).map_or("none",|body|body.name())));
-        ui.label(format!("Diagnostic sample tick {} / {:.3} s",info.sampled_tick,info.diagnostics.sampled_time.seconds_since_epoch()));
-        ui.label(format!("E {:.8e} J / drift {:.3e} J / normalized {:.3e}{}",info.diagnostics.total_energy_j(),info.drift.energy_j,info.drift.relative_energy,if info.drift.uses_near_zero_energy_scale {" (K0+|U0| scale)"} else {" (|E0| scale)"}));
-        ui.label(format!("P drift {:.3e} kg m/s / P/Qp {:.3e}",info.drift.momentum_kg_m_s.length(),info.drift.normalized_momentum));
-        ui.label(format!("Lcom drift {:.3e} kg m²/s / L/Ql {:.3e}",info.drift.angular_momentum_kg_m2_s.length(),info.drift.normalized_angular_momentum));
-        ui.label(format!("COM residual {:.3e} m / COM {:?} m",info.drift.com_residual_m.length(),info.diagnostics.center_of_mass_m));
+        ui.label(format!("Diagnostic sample tick {} / {:.3} s",info.sampled_tick,diagnostics.sampled_time.seconds_since_epoch()));
+        ui.label(format!("E {:.8e} J / drift {:.3e} J / normalized {:.3e}{}",diagnostics.total_energy_j(),drift.energy_j,drift.relative_energy,if drift.uses_near_zero_energy_scale {" (K0+|U0| scale)"} else {" (|E0| scale)"}));
+        ui.label(format!("P drift {:.3e} kg m/s / P/Qp {:.3e}",drift.momentum_kg_m_s.length(),drift.normalized_momentum));
+        ui.label(format!("Lcom drift {:.3e} kg m²/s / L/Ql {:.3e}",drift.angular_momentum_kg_m2_s.length(),drift.normalized_angular_momentum));
+        ui.label(format!("COM residual {:.3e} m / COM {:?} m",drift.com_residual_m.length(),diagnostics.center_of_mass_m));
         if info.ids.len()==3 {
             let planet=info.system.body(info.ids[1]).expect("fixture planet");let moon=info.system.body(info.ids[2]).expect("fixture moon");
             let distance=(moon.state().center_in_system().metres()-planet.state().center_in_system().metres()).length();
             let speed=(moon.state().center_velocity_in_system().metres_per_second()-planet.state().center_velocity_in_system().metres_per_second()).length();
             let energy=0.5*speed*speed-GRAVITATIONAL_CONSTANT_M3_KG_S2*(planet.properties().mass_kg()+moon.properties().mass_kg())/distance;
             ui.label(format!("Moon relative: {distance:.6e} m / {speed:.6e} m/s / local Kepler {energy:.6e} J/kg (not conserved with third body)"));
+        }
         }
         ui.separator();
         ui.horizontal_wrapped(|ui| {for (i,&id) in info.ids.iter().enumerate() {if ui.selectable_label(i==info.selected,info.system.body(id).expect("fixture body").name()).clicked() {controls.pending.push_back(Command::Select(id));}}});
@@ -2038,11 +2722,14 @@ fn draw_engineering_ui(
             ui.text_edit_singleline(&mut controls.name);if ui.button("Apply name (retain history)").clicked() {controls.pending.push_back(Command::Rename(controls.name.clone()));}
             ui.text_edit_singleline(&mut controls.mass);if ui.button("Apply mass kg").clicked() {match controls.mass.parse() {Ok(value)=>controls.pending.push_back(Command::Mass(value)),Err(error)=>{ui.colored_label(egui::Color32::LIGHT_RED,format!("{error}"));}}}
             ui.text_edit_singleline(&mut controls.radius);if ui.button("Apply radius m (geometry only)").clicked() {match controls.radius.parse() {Ok(value)=>controls.pending.push_back(Command::Radius(value)),Err(error)=>{ui.colored_label(egui::Color32::LIGHT_RED,format!("{error}"));}}}
+            if info.motion.is_analytic() { ui.small("Velocity edits unavailable: prescribed trajectories determine velocity. Load a Newtonian scenario to edit it. Periods are independent of mass/radius edits."); }
+            ui.add_enabled_ui(!info.motion.is_analytic(), |ui| {
             for value in &mut controls.velocity {ui.text_edit_singleline(value);}
             if ui.button("Apply system velocity m/s").clicked() {
                 let values=controls.velocity.iter().map(|v|v.parse::<f64>()).collect::<std::result::Result<Vec<_>,_>>();
                 match values {Ok(v)=>controls.pending.push_back(Command::Velocity(DVec3::new(v[0],v[1],v[2]))),Err(error)=>{ui.colored_label(egui::Color32::LIGHT_RED,error.to_string());}}
             }
+            });
         });
         ui.checkbox(&mut controls.markers,"Navigation markers (no physical size change)");ui.checkbox(&mut controls.labels,"Labels");ui.checkbox(&mut controls.trails,"Actual committed-history trails");
         let mut relative=controls.relative_trails;if ui.checkbox(&mut relative,"Simultaneous history relative to selected body").changed() {controls.pending.push_back(Command::TrailMode(relative));}
@@ -2065,7 +2752,10 @@ fn draw_engineering_ui(
                 else {ui.colored_label(egui::Color32::LIGHT_RED,"Clock threshold must be finite and within 1..60000 ms");}
             }
         });
-        });});
+        });
+        });
+        });
+    });
     });
 }
 
@@ -2075,18 +2765,23 @@ fn draw_ui(
     info: &UiInfo<'_>,
     markers: &[CelestialMarker],
 ) {
-    if info.camera.focused_body().is_some() {
-        egui::Window::new("Planet surface / inspection").default_pos(egui::pos2(335.0,120.0)).default_width(360.0).vscroll(true).show(context,|ui| {
-            ui.label(if controls.terrain_preview {"Procedural terrain checkpoint · adaptive ready cover"} else {"Smooth sphere · zero terrain height · one connected body"});
-            if info.ids.len()==3 && ui.button("Run legacy integrated validation route").clicked() {controls.pending.push_back(Command::ValidationRoute);}
+    egui::SidePanel::right("planet surface / inspection").default_width(300.0).resizable(true).show(context,|ui| {
+            egui::ScrollArea::vertical().show(ui,|ui| {
+            developer_ui::right(ui, controls, info);
+            ui.separator();
+            ui.collapsing("Advanced terrain diagnostics", |ui| {
+            if info.camera.focused_body().is_some() {
             let id=info.camera.focused_body().expect("focused surface");
             let pair=info.projection.coherent_view(info.system).expect("coherent UI");
+            ui.collapsing("Camera precision / clearance / navigation", |ui| {
+            ui.label(if controls.terrain_preview {"Procedural terrain checkpoint · adaptive ready cover"} else {"Smooth sphere · zero terrain height · one connected body"});
+            if info.ids.len()==3 && ui.button("Run legacy integrated validation route").clicked() {controls.pending.push_back(Command::ValidationRoute);}
             if let Some(c)=info.terrain_clearance {
                 ui.strong(format!("Terrain clearance: {:+.2} m",c.clearance_m));
                 if c.clearance_m<0.0 {ui.colored_label(egui::Color32::RED,"INSIDE TERRAIN (complete field)");}
                 else {ui.label("Above complete displaced terrain");}
                 ui.monospace(format!("Centre distance {:.3} m\nSphere altitude {:+.3} m\nTerrain elevation {:+.3} m\nDisplaced radius {:.3} m\nAnalytic slope {:.2}°",c.camera_radius_m,c.sphere_altitude_m,c.terrain_elevation_m,c.surface_radius_m,c.slope_angle_rad.to_degrees()));
-                ui.small(format!("Body {} · direction {:?} · direct complete-footprint query {:.1} µs",info.system.body(id).expect("body").name(),c.location.direction().unit(),info.clearance_query_us));
+                ui.small(format!("Body {} · direction {:?} · cumulative controller complete-query time {:.1} µs",info.system.body(id).expect("body").name(),c.location.direction().unit(),info.clearance_query_us));
                 if let Some(mesh)=info.ready_mesh_probe {
                     let clearance=c.camera_radius_m-mesh.radius_m;
                     ui.strong(format!("Drawn mesh clearance: {clearance:+.2} m"));
@@ -2099,7 +2794,7 @@ fn draw_ui(
                         if ui.selectable_label(controls.terrain_guard_m==minimum,label).clicked() {controls.pending.push_back(Command::TerrainGuard(minimum));}
                     }
                 });
-                ui.small("Guard uses max(complete terrain, published mesh); radial debug navigation, not collision. Quality-pending mesh may prevent exact requested clearance.");
+                ui.small("Guard protects sampled complete-terrain radial clearance (reference-sphere fallback when unavailable), not collision. Pending drawn mesh may intersect the observer; it does not clamp navigation.");
             } else if info.system.body(id).is_ok_and(|body|body.terrain().is_none()) {
                 ui.label("Non-terrain / far-only body: no rocky terrain query");
                 if let Ok(clearance)=info.camera.measured_clearance(&pair,id) {ui.label(format!("Reference-sphere altitude {}",compact_distance(clearance)));}
@@ -2110,7 +2805,7 @@ fn draw_ui(
                 if ui.button("Approach clearance target").clicked() {controls.pending.push_back(Command::Clearance(controls.clearance_target));}
                 if info.camera.mode()==CameraMode::BodyOrbit && ui.button("Continuous 30 s approach to 2 m").clicked() {controls.pending.push_back(Command::Approach);}
                 ui.horizontal_wrapped(|ui| {for clearance in [1e11,1e5,1e4,1e3,100.0,10.0,2.0] {if ui.button(compact_distance(clearance)).clicked() {controls.pending.push_back(Command::Clearance(clearance));}}});
-                if info.camera.mode()==CameraMode::BodyOrbit && ui.button("Surface inspection (I): co-rotating attachment").clicked() {controls.pending.push_back(Command::SurfaceInspection);}
+                if info.camera.mode()==CameraMode::BodyOrbit && ui.button("Surface Navigation (I): co-rotating attachment").clicked() {controls.pending.push_back(Command::SurfaceInspection);}
             }
             if info.camera.mode()==CameraMode::SurfaceInspection {
                 ui.small("Co-rotating; zero relative simulation derivative. WASD/QE editor offsets, right-drag look; optional displaced-terrain guard.");
@@ -2119,6 +2814,8 @@ fn draw_ui(
                 if ui.button("Single physical step +h").clicked() {controls.pending.push_back(Command::Single(true));}
                 ui.horizontal_wrapped(|ui| {for &target in info.ids {if target!=id&&ui.button(format!("Look at {}",info.system.body(target).expect("body").name())).clicked() {controls.pending.push_back(Command::LookBody(target));}}});
             }
+            });
+            ui.collapsing("Debug rendering / lighting", |ui| {
             ui.checkbox(&mut controls.surface_style.borders,"Patch borders");ui.checkbox(&mut controls.surface_style.lod_colors,"LOD colours");ui.checkbox(&mut controls.surface_style.face_colors,"Face IDs / colours");ui.checkbox(&mut controls.surface_style.underside,"No-cull underside diagnostic");
             ui.checkbox(&mut controls.surface_bounds,"Bounds / normal envelope axes (bounded)");
             let mut preview=controls.terrain_preview;
@@ -2177,10 +2874,20 @@ fn draw_ui(
                     let value = controls.terrain_lighting;
                     if let Ok(updated) = TerrainLighting::try_new(value.sun_direction_body(), value.ambient_strength().min(1.0 - diffuse), diffuse, value.mode()) { controls.terrain_lighting = updated; }
                 }
+            }
+            });
+            if controls.terrain_preview {
                 let c=info.terrain_cache;let w=info.terrain_work;
+                ui.collapsing("Cache", |ui| {
                 ui.monospace(format!("Terrain: {} resident, {} pending; {} vertices / {} patches this frame, {:.3} ms; {:.2} MiB (peak {:.2}); evictions {}",c.resident_patches,w.pending_patches,w.vertices_generated,w.patches_completed,w.elapsed.as_secs_f64()*1000.0,c.resident_bytes as f64/1048576.0,c.peak_bytes as f64/1048576.0,c.evictions));
+                ui.small(format!("Hits {} · misses {} · evictions {}", c.hits, c.misses, c.evictions));
+                });
                 let cover=info.terrain_cover;
                 let d=cover.convergence;
+                ui.collapsing("LOD", |ui| {
+                ui.label("Desired LOD").on_hover_text("The camera-radial level the error model currently wants.");
+                ui.label("Ready LOD").on_hover_text("Highest camera-radial level whose raw terrain is resident; not necessarily displayed.");
+                ui.label("Displayed / source LOD").on_hover_text("Level currently contributing to the rendered source surface. Radial, not whole-view quality.");
                 ui.monospace(format!("Desired local LOD: {:?}\nReady local LOD: {:?}\nRendered source LOD: {:?}",d.desired_local_lod,d.ready_local_lod,d.rendered_local_lod));
                 ui.monospace(format!("Useful target LOD: {:?} · certificate target: {:?}\nDesired width {:.6} m · Grid16 spacing {:.6} m\nRendered spacing {:.6} m · evaluator footprint {:.6} m\nConservative pixel footprint {:.6} m · depth floor {:.6} m",d.useful_target_lod,d.certificate_limited_target_lod,d.desired_patch_width_m,d.desired_sample_spacing_m,d.rendered_sample_spacing_m,d.terrain_footprint_m,d.pixel_footprint_m,d.projected_depth_floor_m));
                 let px=d.desired_error_pixels;
@@ -2197,10 +2904,18 @@ fn draw_ui(
                 if !d.target_certifiable {ui.colored_label(egui::Color32::YELLOW,"Local pixel target not certifiable by LOD30; not merely queued work");}
                 else if cover.report.budget_constrained {ui.label("Local target certifiable; current refinement resource-constrained");}
                 else if d.rendered_local_lod<d.desired_local_lod {ui.label("Local target certifiable; generation / replacement pending");}
+                });
+                ui.collapsing("Workers / raw timings", |ui| {
+                ui.small(format!("Workers {}/{} busy · queue {} · pending {}", c.worker_jobs, c.worker_count, c.queued_patches, w.pending_patches));
+                ui.small(format!("Scheduling {:.3} ms · raw publication {:.3} ms · cover publication {:.3} ms · diagnostic {:.3} ms", w.scheduling.as_secs_f64()*1000.0, w.publication.as_secs_f64()*1000.0, cover.result_publication.as_secs_f64()*1000.0, d.diagnostic_cpu.as_secs_f64()*1000.0));
+                });
+                ui.collapsing("Memory", |ui| {
                 ui.small(format!("Worker reservations {:.2} MiB · stacks/scratch {:.2} MiB · completed cover reservation {:.2} MiB · cancellations {}",
                     c.worker_reserved_bytes as f64/1048576.0,c.worker_fixed_bytes as f64/1048576.0,c.completed_unpublished_bytes as f64/1048576.0,c.cancellations));
                 if cover.transition_deferred {ui.colored_label(egui::Color32::YELLOW,"Transition reservation cannot fit replacement; complete source retained. Reset terrain or explicitly change morph duration to retry.");}
                 ui.small(format!("Accounted aggregate {:.2} MiB / peak {:.2} MiB; {} pinned. Selector {:.3} ms / stitching {:.3} ms / morph construction {:.3} ms",(c.resident_bytes+c.external_bytes) as f64/1048576.0,c.peak_aggregate_bytes as f64/1048576.0,c.pinned_patches,cover.selection_preparation.as_secs_f64()*1000.0,cover.stitch_preparation.as_secs_f64()*1000.0,cover.morph_preparation.as_secs_f64()*1000.0));
+                });
+                ui.collapsing("Transitions / source coverage", |ui| {
                 if let Some((mesh,fraction))=cover.transition() {
                     ui.small(format!("One synchronized morph: {:.1}% / {} overlay triangles; source {} / target {} changed leaves; remaining displacement {:.3} m",fraction*100.0,mesh.triangles().len(),mesh.affected_old().len(),mesh.affected_new().len(),mesh.max_displacement_m()*(1.0-fraction)));
                 }
@@ -2216,7 +2931,9 @@ fn draw_ui(
                     ui.small("Hue repeats every 12 levels; numeric LOD readouts disambiguate.");
                 }
                 ui.label("Adaptive displaced stitching / ready-cover morphs; terrain-under-camera query is independent of patch UV.");
+                });
             }
+            ui.collapsing("Bounds / per-body LOD / precision", |ui| {
             if let Some(pointer)=context.input(|i|i.pointer.hover_pos()) {
                 let pixels=[f64::from(pointer.x*context.pixels_per_point()),f64::from(pointer.y*context.pixels_per_point())];
                 if let Some(session)=info.surfaces.iter().find(|s|s.body()==id)&&let Ok(Some(patch))=session.hovered_patch(&pair,info.camera.pose(),info.celestial_projection,pixels) {ui.monospace(format!("Pointer patch {patch:?}"));}
@@ -2232,41 +2949,49 @@ fn draw_ui(
             }
             let r=info.report.surface;ui.small(format!("{} draws / {} samples / {} clipped fallback + {} morph triangles / {} upload bytes",r.draws,r.samples,r.fallback_triangles,r.morph_triangles,r.uploaded_bytes));
             ui.small(format!("Narrowing {:.4e} px / GPU projection {:.4e} px · staging {} bytes",r.max_projected_error_pixels,r.max_gpu_projection_error_pixels,r.allocated_staging_bytes));
+            });
+            }
+            });
+            });
         });
-    }
-    egui::TopBottomPanel::top("exact playback and navigation").exact_height(110.0).show(context,|ui| {
+    egui::TopBottomPanel::top("exact playback and navigation").show(context,|ui| {
         ui.horizontal(|ui|{
             ui.heading("Mundaris");
-            if ui.button(if info.runner.paused(){"▶ Resume"}else{"⏸ Pause / cancel debt"}).clicked(){controls.pending.push_back(Command::Pause(!info.runner.paused()));}
+            if ui.button(if info.motion.paused(){"▶ Resume"}else{"⏸ Pause"}).clicked(){controls.pending.push_back(Command::Pause(!info.motion.paused()));}
+            ui.small(if info.motion.is_analytic(){"Prescribed analytic motion"}else{"Newtonian motion"});
             if ui.button("Whole system (Home)").clicked(){controls.pending.push_back(Command::Overview);}
             if ui.button("Previous focus").clicked(){controls.pending.push_back(Command::Select(info.ids[(info.selected+info.ids.len()-1)%info.ids.len()]));controls.pending.push_back(Command::Focus{fixed:false,fit:false});}
             if ui.button("Next focus").clicked(){controls.pending.push_back(Command::Select(info.ids[(info.selected+1)%info.ids.len()]));controls.pending.push_back(Command::Focus{fixed:false,fit:false});}
         });
+        ui.collapsing("Advanced playback status", |ui| {
+        if let (Some(runner), Some(advance)) = (info.runner, info.advance) {
         ui.horizontal(|ui|{
-            ui.strong(format!("Requested {}×",info.runner.rate().multiplier()));
+            ui.strong(format!("Requested {}×",runner.rate().multiplier()));
                 ui.strong(info.measurement.map_or_else(||"Achieved: warming / paused / replaying".into(),|m|if m.tick_limited{format!("Achieved {:.1}× ({:.1}s; tick-limited), segment {:.2}× / {:.1}s",m.achieved_rate,m.window_s,m.segment_rate,m.segment_wall_s)}else{format!("Achieved {:.1}× ({:.1}s)",m.achieved_rate,m.window_s)}));
-            ui.label(format!("{:?} · {:?}{}",info.advance.status,info.camera.mode(),if info.camera.transitioning(){" · transitioning"}else{""}));
+            ui.label(format!("{:?} · {:?}{}",advance.status,info.camera.mode(),if info.camera.transitioning(){" · transitioning"}else{""}));
         });
         ui.horizontal(|ui|{
-            ui.label(format!("Baseline exact · full N-body KDK · h={}s · authority {:.2} days · requested {:.2} days",info.runner.config().fixed_step_s(),info.advance.authoritative_time.seconds_since_epoch()/86400.0,info.advance.requested_time.seconds_since_epoch()/86400.0));
-            ui.label(format!("Pending {} ticks · last {} work{}{}",info.advance.backlog_ticks,info.advance.work_steps,if info.cpu_limited{" · CPU budget limited"}else{""},if info.count_limited{" · opportunity count limited"}else{""}));
-            if info.advance.backlog_ticks==0 && !info.runner.paused() && info.runner.rate().multiplier()>0.0 {
-                let wait=(info.runner.config().fixed_step_s()-info.advance.fractional_seconds)/info.runner.rate().multiplier();
+            ui.label(format!("Baseline exact · full N-body KDK · h={}s · authority {:.2} days · requested {:.2} days",runner.config().fixed_step_s(),advance.authoritative_time.seconds_since_epoch()/86400.0,advance.requested_time.seconds_since_epoch()/86400.0));
+            ui.label(format!("Pending {} ticks · last {} work{}{}",advance.backlog_ticks,advance.work_steps,if info.cpu_limited{" · CPU budget limited"}else{""},if info.count_limited{" · opportunity count limited"}else{""}));
+            if advance.backlog_ticks==0 && !runner.paused() && runner.rate().multiplier()>0.0 {
+                let wait=(runner.config().fixed_step_s()-advance.fractional_seconds)/runner.rate().multiplier();
                 if wait>0.5 {ui.small(format!("Next committed step in {wait:.1} wall s"));}
             }
         });
         ui.horizontal(|ui|{
             for rate in [1.0,100.0,1000.0,10000.0,100000.0,1000000.0] {if ui.button(format!("{rate}×")).clicked(){controls.pending.push_back(Command::Rate(rate));}}
             ui.add(egui::DragValue::new(&mut controls.custom_rate).speed(1000.0).prefix("Custom "));if ui.button("Set").clicked(){controls.pending.push_back(Command::Rate(controls.custom_rate));}
-            if info.advance.status==PlaybackStatus::DemandHaltedOverload {
+            if advance.status==PlaybackStatus::DemandHaltedOverload {
                 ui.colored_label(egui::Color32::LIGHT_RED,"Admission halted; fixed-h debt drains");
-                if ui.button("Lower rate").clicked(){controls.pending.push_back(Command::Rate(info.runner.rate().multiplier()/10.0));}
+                if ui.button("Lower rate").clicked(){controls.pending.push_back(Command::Rate(runner.rate().multiplier()/10.0));}
                 if ui.button("Resume admission").clicked(){controls.pending.push_back(Command::ResumeAdmission);}
             }
         });
+        } else { ui.small("Direct analytic sampling: no integration backlog, force passes, replay or conservation-fidelity claim."); }
+        });
     });
     egui::TopBottomPanel::bottom("celestial semantics legend").exact_height(28.0).show(context,|ui|{
-        ui.horizontal(|ui|{ui.small("Dashed = instantaneous two-body ORBIT GUIDE · Solid/fading = committed HISTORY · Rings/labels = navigation overlays");
+        ui.horizontal(|ui|{ui.small(if info.motion.is_analytic(){"Dashed = authored ORBIT GUIDE · Solid/fading = published HISTORY · Rings/labels = navigation overlays"}else{"Dashed = instantaneous two-body ORBIT GUIDE · Solid/fading = committed HISTORY · Rings/labels = navigation overlays"});
             if let Some(gap)=info.gap_diagnostic {ui.colored_label(egui::Color32::YELLOW,gap);}else if let Some(error)=info.diagnostic {ui.colored_label(egui::Color32::LIGHT_RED,error);}
         });
     });
@@ -2274,9 +2999,12 @@ fn draw_ui(
     let scale = context.pixels_per_point();
     egui::CentralPanel::default().frame(egui::Frame::NONE).show(context,|ui|{
         let rect=ui.max_rect();
+        controls.ui_context=Some(context.clone());
+        controls.scene_layer=Some(ui.layer_id());
         let origin=[(rect.min.x*scale).round().max(0.0) as u32,(rect.min.y*scale).round().max(0.0) as u32];
         let size=[(rect.width()*scale).round().max(1.0) as u32,(rect.height()*scale).round().max(1.0) as u32];
         controls.viewport=Some((origin,size));
+        controls.viewport_ready=origin==info.celestial_projection.origin() && size==info.celestial_projection.viewport();
         let viewport=ScreenRect{min:origin.map(f64::from),max:[(origin[0]+size[0]) as f64,(origin[1]+size[1]) as f64]};
         let response=ui.allocate_rect(rect,egui::Sense::click_and_drag());
         let mut inputs=Vec::new();let mut texts=Vec::new();
@@ -2328,18 +3056,25 @@ fn draw_ui(
             }
         }
         if input.pointer.primary_released(){controls.gesture_start=None;}
-        let inside=input.pointer.hover_pos().is_some_and(|p|rect.contains(p)&&context.layer_id_at(p)==Some(ui.layer_id()));
         let local_look=matches!(info.camera.mode(),CameraMode::FreeFlight|CameraMode::SurfaceInspection);
-        let drag=if inside && ((!local_look&&controls.gesture_dragged&&input.pointer.primary_down())||(local_look&&input.pointer.secondary_down())) {input.pointer.delta()}else{egui::Vec2::ZERO};
-        let mut translation=DVec3::ZERO;
-        if !context.wants_keyboard_input()&&local_look {
-            for (key,axis) in [(egui::Key::W,-DVec3::Z),(egui::Key::S,DVec3::Z),(egui::Key::A,-DVec3::X),(egui::Key::D,DVec3::X),(egui::Key::Q,-DVec3::Y),(egui::Key::E,DVec3::Y)] {if input.key_down(key){translation+=axis;}}
+        let keyboard_blocked=context.wants_keyboard_input() || context.memory(|m|m.focused().is_some());
+        controls.keyboard_blocked=keyboard_blocked;
+        if !input.focused || !controls.input_focused {
+            controls.pending.push_back(Command::CancelNavigation);
+        } else if !controls.native_events {
+            let deltas=controls.viewport_input.events(&input.events,rect,local_look,keyboard_blocked,
+                |p| context.layer_id_at(p)!=Some(ui.layer_id()) || controls.placed.iter().any(|l|
+                    l.rect.contains([(p.x*scale) as f64,(p.y*scale) as f64])),
+                controls.manual_speed);
+            for delta in deltas {controls.pending.push_back(Command::Navigation(delta));}
         }
-        let wheel=if inside{input.raw_scroll_delta.y as f64}else{0.0};
-        if local_look && wheel!=0.0 {controls.manual_speed=(controls.manual_speed*(wheel/50.0*2.0_f64.ln()).exp()).clamp(1e-3,1e3);}
-        controls.pending.push_back(Command::Navigation(NavigationInput{drag:[drag.x as f64,drag.y as f64],scroll_notches:if local_look{0.0}else{wheel/50.0},translation,speed_multiplier:controls.manual_speed*if input.modifiers.shift{4.0}else{1.0}}));
     });
-    if !context.wants_keyboard_input() {
+    if !controls.native_events
+        && controls.input_focused
+        && context.input(|i| i.focused)
+        && !context.wants_keyboard_input()
+        && !context.memory(|m| m.focused().is_some())
+    {
         context.input(|input| {
             if input.key_pressed(egui::Key::I) {
                 controls.pending.push_back(Command::SurfaceInspection);
@@ -2374,6 +3109,88 @@ fn draw_ui(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn native_focus_resize_and_hidden_resume_cancel_navigation_without_replay() {
+        use super::*;
+        let mut demo = GravityOrbitsDemo::solar_system(false).unwrap();
+        demo.command(Command::Focus {
+            fixed: false,
+            fit: true,
+        })
+        .unwrap();
+        for _ in 0..60 {
+            demo.update(Duration::from_millis(20));
+        }
+        demo.command(Command::SurfaceInspection).unwrap();
+        demo.command(Command::Navigation(NavigationInput {
+            scroll_notches: 0.5,
+            translation: DVec3::X,
+            ..Default::default()
+        }))
+        .unwrap();
+        assert!(demo.camera.navigation_diagnostics().pending_forward_m > 0.0);
+        let pose = demo.camera.pose();
+        demo.on_window_event(&winit::event::WindowEvent::Focused(false));
+        assert_eq!(demo.controls.navigation.translation, DVec3::ZERO);
+        assert_eq!(demo.camera.navigation_diagnostics().pending_forward_m, 0.0);
+        demo.on_window_event(&winit::event::WindowEvent::Focused(true));
+        demo.update(Duration::ZERO);
+        assert_eq!(
+            demo.camera.pose().position().local(),
+            pose.position().local()
+        );
+        demo.command(Command::Navigation(NavigationInput {
+            translation: DVec3::Y,
+            ..Default::default()
+        }))
+        .unwrap();
+        demo.on_window_event(&winit::event::WindowEvent::Resized(
+            winit::dpi::PhysicalSize::new(1920, 1080),
+        ));
+        assert_eq!(demo.controls.navigation.translation, DVec3::ZERO);
+        demo.command(Command::Navigation(NavigationInput {
+            translation: DVec3::Y,
+            ..Default::default()
+        }))
+        .unwrap();
+        demo.set_lifecycle_drawable(false);
+        demo.set_lifecycle_drawable(true);
+        demo.update(Duration::ZERO);
+        assert_eq!(
+            demo.camera.pose().position().local(),
+            pose.position().local()
+        );
+        println!(
+            "native lifecycle hook: focus loss/gain, resize, hidden/resume: cancelled targets and held keys; position replay=0"
+        );
+    }
+    #[test]
+    fn solar_native_route_is_opt_in_uses_controls_and_excludes_hidden_time() {
+        use super::*;
+        let mut demo = GravityOrbitsDemo::solar_system(false).unwrap();
+        assert!(demo.solar_validation.is_none());
+        let revision = demo.system.revision();
+        let instant = demo.system.sample_time();
+        demo.solar_validation = Some((Duration::ZERO, 0));
+        demo.controls.pending.clear();
+        for _ in 0..20 {
+            demo.advance_solar_validation(Duration::from_millis(100));
+        }
+        assert!(matches!(
+            demo.controls.pending.front(),
+            Some(Command::Focus { .. })
+        ));
+        let before = demo.solar_validation;
+        demo.hidden = true;
+        demo.advance_solar_validation(Duration::from_millis(100));
+        assert_eq!(demo.solar_validation, before);
+        demo.hidden = false;
+        demo.advance_solar_validation(demo.clock.threshold() + Duration::from_secs(1));
+        assert_eq!(demo.solar_validation, before);
+        assert_eq!(demo.system.revision(), revision);
+        assert_eq!(demo.system.sample_time(), instant);
+    }
+
+    #[test]
     fn solar_development_starts_paused_with_earth_selected_and_no_terrain_work() {
         use super::*;
         let demo = GravityOrbitsDemo::solar_system(false).unwrap();
@@ -2395,7 +3212,7 @@ mod tests {
         );
         assert_eq!(demo.surfaces.len(), 5);
         assert!(demo.controls.terrain_preview);
-        assert!(demo.runner.paused());
+        assert!(demo.motion.paused());
         assert_eq!(demo.camera.mode(), CameraMode::SystemOrbit);
         assert_eq!(demo.terrain.active_body(), None);
         assert_eq!(demo.terrain.cache.pending(), 0);
@@ -2436,7 +3253,7 @@ mod tests {
             demo.update(Duration::from_millis(32));
         }
         assert_eq!(demo.ids, ids);
-        assert_eq!(demo.runner.tick(), 20);
+        assert_eq!(demo.motion.newtonian().unwrap().tick(), 20);
         assert_eq!(demo.system.sample_time().seconds_since_epoch(), 1200.0);
         assert_ne!(*demo.system.body(ids[1]).unwrap().state(), initial);
         assert_eq!(demo.camera.focused_body(), Some(ids[1]));
@@ -2456,9 +3273,9 @@ mod tests {
         demo.command(Command::Rate(1e6)).unwrap();
         demo.command(Command::Pause(false)).unwrap();
         demo.update(Duration::from_millis(100));
-        assert!(demo.advance.backlog_ticks > 0);
+        assert!(demo.advance.unwrap().backlog_ticks > 0);
         let revision = demo.system.revision();
-        let tick = demo.runner.tick();
+        let tick = demo.motion.newtonian().unwrap().tick();
         let pose = demo.camera.pose();
         let assert_inspection_pose = |actual: FramePose| {
             assert_eq!(actual.position(), pose.position());
@@ -2477,9 +3294,9 @@ mod tests {
         demo.update(Duration::from_secs(36000));
         assert_eq!(demo.system.revision(), revision);
         assert_inspection_pose(demo.camera.pose());
-        assert_eq!(demo.runner.tick(), tick);
-        assert_eq!(demo.advance.backlog_ticks, 0);
-        assert!(demo.runner.paused());
+        assert_eq!(demo.motion.newtonian().unwrap().tick(), tick);
+        assert_eq!(demo.advance.unwrap().backlog_ticks, 0);
+        assert!(demo.motion.paused());
         assert!(demo.gap_diagnostic.is_some());
         demo.set_lifecycle_drawable(false);
         demo.update(Duration::from_secs(36000));
@@ -2491,10 +3308,10 @@ mod tests {
         demo.command(Command::Rate(1.0)).unwrap();
         demo.command(Command::Pause(false)).unwrap();
         demo.update(Duration::ZERO);
-        assert_eq!(demo.runner.tick(), tick);
+        assert_eq!(demo.motion.newtonian().unwrap().tick(), tick);
         demo.command(Command::Single(true)).unwrap();
         demo.update(Duration::ZERO);
-        assert_eq!(demo.runner.tick(), tick + 1);
+        assert_eq!(demo.motion.newtonian().unwrap().tick(), tick + 1);
         assert_inspection_pose(demo.camera.pose());
         assert!(demo.projection.coherent_view(&demo.system).is_ok());
         assert!(demo.diagnostic.is_none(), "{:?}", demo.diagnostic);
@@ -2545,7 +3362,7 @@ mod tests {
                 for _ in 0..3750 {
                     demo.update(Duration::from_millis(16));
                 }
-                while demo.advance.backlog_ticks > 0 {
+                while demo.advance.unwrap().backlog_ticks > 0 {
                     demo.update(Duration::ZERO);
                 }
                 let achieved = demo
@@ -2557,19 +3374,22 @@ mod tests {
                     (60.0 * rate / fixture.fixed_step_s()).floor() * fixture.fixed_step_s();
                 if rate * 0.016 / fixture.fixed_step_s() <= 512.0 {
                     assert_eq!(authority, expected);
-                    assert_eq!(demo.advance.rejected_simulation_seconds, 0.0);
+                    assert_eq!(demo.advance.unwrap().rejected_simulation_seconds, 0.0);
                 } else {
                     assert!(authority < expected);
-                    assert!(demo.advance.rejected_simulation_seconds > 0.0);
+                    assert!(demo.advance.unwrap().rejected_simulation_seconds > 0.0);
                 }
-                assert_eq!(demo.runner.config().fixed_step_s(), fixture.fixed_step_s());
-                assert_eq!(demo.advance.backlog_ticks, 0);
+                assert_eq!(
+                    demo.motion.newtonian().unwrap().config().fixed_step_s(),
+                    fixture.fixed_step_s()
+                );
+                assert_eq!(demo.advance.unwrap().backlog_ticks, 0);
                 eprintln!(
                     "exact fixture={fixture:?} requested={rate}x accounted_wall=60s achieved_window={}x window={}s authority={}s pending={} CPU_wall={}s",
                     achieved.achieved_rate,
                     achieved.window_s,
                     authority,
-                    demo.advance.backlog_ticks,
+                    demo.advance.unwrap().backlog_ticks,
                     started.elapsed().as_secs_f64()
                 );
             }
@@ -2581,7 +3401,7 @@ mod tests {
         demo.command(Command::Pause(false)).unwrap();
         demo.command(Command::Rate(1e6)).unwrap();
         demo.update(Duration::from_millis(100));
-        assert!(demo.advance.backlog_ticks > 0);
+        assert!(demo.advance.unwrap().backlog_ticks > 0);
         let states: Vec<_> = demo
             .system
             .bodies()
@@ -2599,9 +3419,9 @@ mod tests {
             states
         );
         assert_eq!(demo.camera.pose(), pose);
-        assert!(demo.runner.paused());
-        assert_eq!(demo.advance.backlog_ticks, 0);
-        assert!(demo.advance.cancelled_simulation_seconds > 0.0);
+        assert!(demo.motion.paused());
+        assert_eq!(demo.advance.unwrap().backlog_ticks, 0);
+        assert!(demo.advance.unwrap().cancelled_simulation_seconds > 0.0);
         assert!(demo.gap_diagnostic.is_some());
         assert!(demo.metrics.measurement(60.0, 1e6).is_none());
         demo.command(Command::Pause(false)).unwrap();
@@ -2642,8 +3462,8 @@ mod tests {
         demo.command(Command::Pause(false)).unwrap();
         demo.command(Command::Rate(1000000.0)).unwrap();
         demo.update(Duration::from_millis(100));
-        assert_eq!(demo.runner.tick(), 512);
-        assert!(demo.advance.backlog_ticks > 0);
+        assert_eq!(demo.motion.newtonian().unwrap().tick(), 512);
+        assert!(demo.advance.unwrap().backlog_ticks > 0);
         assert!(demo.projection.coherent_view(&demo.system).is_ok());
         let state = *demo.system.body(ids[1]).unwrap().state();
         let revision = demo.system.revision();
@@ -2651,7 +3471,7 @@ mod tests {
         assert!(demo.command(Command::Mass(f64::NAN)).is_err());
         assert_eq!(demo.system.revision(), revision);
         assert_eq!(demo.trails.retained_ticks(), history);
-        assert!(!demo.runner.paused());
+        assert!(!demo.motion.paused());
         demo.command(Command::Pause(true)).unwrap();
         demo.command(Command::Focus {
             fixed: false,
@@ -2664,27 +3484,27 @@ mod tests {
         assert_eq!(demo.system.revision(), revision);
         assert_eq!(demo.trails.retained_ticks(), history);
         demo.command(Command::Mass(6e24)).unwrap();
-        assert!(demo.runner.paused());
-        assert_eq!(demo.runner.tick(), 0);
+        assert!(demo.motion.paused());
+        assert_eq!(demo.motion.newtonian().unwrap().tick(), 0);
         assert_eq!(*demo.system.body(ids[1]).unwrap().state(), state);
         assert_eq!(demo.trails.sample_count(), 1);
         demo.update(Duration::ZERO);
         assert!(demo.projection.coherent_view(&demo.system).is_ok());
         demo.command(Command::Seek(3000)).unwrap();
         demo.update(Duration::ZERO);
-        assert!(demo.advance.replay_remaining.is_some());
+        assert!(demo.advance.unwrap().replay_remaining.is_some());
         assert_eq!(demo.trails.sample_count(), 1);
         demo.command(Command::CancelSeek).unwrap();
-        assert_eq!(demo.runner.tick(), 0);
+        assert_eq!(demo.motion.newtonian().unwrap().tick(), 0);
         demo.command(Command::Seek(3000)).unwrap();
         while demo.seeking {
             demo.update(Duration::ZERO);
         }
-        assert_eq!(demo.runner.tick(), 3000);
+        assert_eq!(demo.motion.newtonian().unwrap().tick(), 3000);
         assert_eq!(demo.trails.sample_count(), 1);
         demo.command(Command::Reset).unwrap();
         assert_eq!(demo.ids, ids);
-        assert_eq!(demo.runner.tick(), 0);
+        assert_eq!(demo.motion.newtonian().unwrap().tick(), 0);
         assert_eq!(*demo.system.body(ids[1]).unwrap().state(), state);
         demo.command(Command::Load(GravityFixture::Circular))
             .unwrap();
@@ -2697,17 +3517,17 @@ mod tests {
         demo.command(Command::Pause(false)).unwrap();
         demo.set_lifecycle_drawable(false);
         demo.update(Duration::from_secs(1000000));
-        assert_eq!(demo.runner.tick(), 0);
+        assert_eq!(demo.motion.newtonian().unwrap().tick(), 0);
         demo.set_lifecycle_drawable(true);
         demo.update(Duration::ZERO);
-        assert_eq!(demo.advance.backlog_ticks, 0);
+        assert_eq!(demo.advance.unwrap().backlog_ticks, 0);
         demo.command(Command::Load(GravityFixture::Circular))
             .unwrap();
         demo.command(Command::Velocity(-DVec3::X * 900000.0))
             .unwrap();
         demo.command(Command::Single(true)).unwrap();
         demo.update(Duration::ZERO);
-        assert_eq!(demo.runner.tick(), 0);
+        assert_eq!(demo.motion.newtonian().unwrap().tick(), 0);
         assert_eq!(demo.trails.sample_count(), 1);
         assert!(demo.diagnostic.is_some());
         assert!(demo.projection.coherent_view(&demo.system).is_ok());
@@ -2780,10 +3600,13 @@ mod tests {
         demo.command(Command::Pause(false)).unwrap();
         demo.update(Duration::from_millis(100));
         assert!(!demo.coherent);
-        assert!(demo.runner.paused());
-        assert!(demo.advance.forward_steps > 0);
-        assert_eq!(demo.advance.status, PlaybackStatus::Paused);
-        assert_eq!(demo.advance.requested_time, demo.system.sample_time());
+        assert!(demo.motion.paused());
+        assert!(demo.advance.unwrap().forward_steps > 0);
+        assert_eq!(demo.advance.unwrap().status, PlaybackStatus::Paused);
+        assert_eq!(
+            demo.advance.unwrap().requested_time,
+            demo.system.sample_time()
+        );
         let revision = demo.system.revision();
         demo.command(Command::Rebuild).unwrap();
         demo.update(Duration::ZERO);

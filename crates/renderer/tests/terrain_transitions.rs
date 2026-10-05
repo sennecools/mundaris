@@ -382,3 +382,92 @@ fn multi_face_and_child_refinement_transitions_are_bounded_and_finite() {
     check_transition(one.clone(), two.clone());
     check_transition(two, one);
 }
+
+#[test]
+fn projected_displacement_bound_is_view_dependent_and_near_plane_conservative() {
+    let topology = SurfaceTopology::new();
+    let roots: Vec<_> = CubeFace::ALL
+        .into_iter()
+        .map(CubePatchAddress::root)
+        .collect();
+    let mut split = Vec::new();
+    for root in &roots {
+        if root.face() == CubeFace::PositiveX {
+            split.extend(root.children().unwrap());
+        } else {
+            split.push(*root);
+        }
+    }
+    let (old_cover, old) = surface(&roots, &topology, 0.0);
+    let (new_cover, new) = surface(&split, &topology, 2.0);
+    let transition = SurfaceTransition::build(
+        &old_cover,
+        &old,
+        &new_cover,
+        &new,
+        &topology,
+        16 * 1024 * 1024,
+    )
+    .unwrap();
+    let projection = mundaris_renderer::CelestialProjection::try_new(640, 480, 1.0, 0.1).unwrap();
+    let identity = glam::DQuat::IDENTITY;
+    let near_view = transition.projected_displacement_pixels(
+        projection,
+        DVec3::new(1012.1, 0.0, 0.0),
+        glam::DQuat::from_rotation_y(-std::f64::consts::FRAC_PI_2),
+    );
+    assert!(near_view.is_infinite());
+    let far =
+        transition.projected_displacement_pixels(projection, DVec3::new(0.0, 0.0, 1.0e7), identity);
+    let closer = transition.projected_displacement_pixels(
+        projection,
+        DVec3::new(0.0, 0.0, 2000.0),
+        identity,
+    );
+    assert!(far.is_finite() && closer.is_finite());
+    assert!(closer > far);
+    for (observer, rotation) in [
+        (DVec3::Z * 2000.0, identity),
+        (DVec3::Z * 2000.0, glam::DQuat::from_rotation_y(0.25)),
+        (
+            DVec3::new(1800.0, 100.0, 400.0),
+            glam::DQuat::from_rotation_y(-1.2),
+        ),
+    ] {
+        let bound = transition.projected_displacement_pixels(projection, observer, rotation);
+        assert!(bound.is_finite());
+        for triangle in transition.triangles() {
+            for weights in [DVec3::X, DVec3::Y, DVec3::Z, DVec3::splat(1.0 / 3.0)] {
+                let old = triangle
+                    .iter()
+                    .zip(weights.to_array())
+                    .fold(DVec3::ZERO, |sum, (v, w)| sum + w * v.old.position_body_m);
+                let new = triangle
+                    .iter()
+                    .zip(weights.to_array())
+                    .fold(DVec3::ZERO, |sum, (v, w)| sum + w * v.new.position_body_m);
+                let start = rotation * (old - observer);
+                for t in [0.0, 0.1, 0.5, 0.9, 1.0] {
+                    let point = rotation * (old.lerp(new, t) - observer);
+                    if projection
+                        .frustum_planes()
+                        .iter()
+                        .any(|(n, o)| n.dot(point) + o < 0.0)
+                    {
+                        continue;
+                    }
+                    let focal = projection.focal_pixels();
+                    let delta = glam::DVec2::new(
+                        focal * point.x / -point.z - focal * start.x / -start.z,
+                        focal * point.y / -point.z - focal * start.y / -start.z,
+                    )
+                    .length();
+                    assert!(
+                        delta <= bound,
+                        "sampled affine displacement {delta} exceeds {bound}"
+                    );
+                }
+            }
+        }
+    }
+}

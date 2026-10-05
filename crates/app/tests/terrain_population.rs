@@ -1,4 +1,4 @@
-use glam::DVec3;
+use glam::{DQuat, DVec3};
 use mundaris_app::{planet_surface::*, solar_system::*, terrain_population::TerrainPopulation};
 use mundaris_math::*;
 use mundaris_renderer::*;
@@ -213,6 +213,145 @@ fn near_earth_roots_exclusively_own_surface_and_teleports_reuse_unpinned_cache()
     assert_eq!(population.cache.report().pinned_patches, 0);
     assert_eq!(population.work.vertices_generated, 0);
     assert!(!population.cover.ready());
+}
+
+#[test]
+fn precision_marker_keeps_ready_terrain_owner_until_far_representation_is_ready() {
+    check_deferred_far_handoff(true);
+}
+
+#[test]
+fn disabling_terrain_defers_handoff_until_far_representation_is_ready() {
+    check_deferred_far_handoff(false);
+}
+
+fn check_deferred_far_handoff(terrain_enabled: bool) {
+    let (world, frames, mut sessions, requests) = system();
+    let mut population = TerrainPopulation::new().unwrap();
+    let earth_index = SolarBody::Earth as usize;
+    let earth = requests[earth_index];
+    let earth_id = world.bodies().nth(earth_index).unwrap().0;
+    let radius = earth.reference_radius_m;
+    let projection =
+        CelestialProjection::try_new(WIDTH, HEIGHT, 60.0_f64.to_radians(), 0.1).unwrap();
+    let sphere = Icosphere::new();
+
+    // Build and publish a complete ready surface at the near orbital observer.
+    let pair = frames.coherent_view(&world).unwrap();
+    let view = observer(
+        &pair,
+        earth.body_fixed_frame,
+        DVec3::Z * (radius + 600_000.0),
+    );
+    let mut owners = vec![false; requests.len()];
+    population
+        .update(
+            &pair,
+            &view,
+            projection,
+            &requests,
+            &mut sessions,
+            &mut owners,
+            &sphere,
+            true,
+            Duration::ZERO,
+            1734,
+            None,
+            Duration::from_millis(16),
+        )
+        .unwrap();
+    assert_eq!(population.active_body(), Some(earth_id));
+    assert!(population.cover.ready());
+    assert!(owners[earth_index]);
+    let storage = population.cover.surface().unwrap() as *const _;
+
+    // Turn the camera sideways. The large far sphere crosses the near plane and
+    // cannot be prepared, regardless of the displaced cover's visible patches.
+    let pair = frames.coherent_view(&world).unwrap();
+    let orientation =
+        UnitRotation::try_from_quaternion(DQuat::from_rotation_y(std::f64::consts::FRAC_PI_2))
+            .unwrap();
+    let view = PreparedView::new(
+        &pair.evaluation(),
+        FramePose::new(
+            FramePosition::new(
+                earth.body_fixed_frame,
+                LocalPosition::try_metres(DVec3::Z * (radius + 2_000.0)).unwrap(),
+            ),
+            orientation,
+        ),
+        RenderPrecisionBudget::near_debug(),
+    )
+    .unwrap();
+    let mut far = CelestialStaging::default();
+    let mut probe = CelestialFrame::new(&view, &mut far, projection, &sphere);
+    probe.append_bodies(&[earth]).unwrap();
+    assert_eq!(
+        probe.markers()[0].representation,
+        SphereRepresentation::PrecisionMarker
+    );
+
+    let mut owners = vec![false; requests.len()];
+    population
+        .update(
+            &pair,
+            &view,
+            projection,
+            &requests,
+            &mut sessions,
+            &mut owners,
+            &sphere,
+            terrain_enabled,
+            Duration::ZERO,
+            0,
+            None,
+            Duration::from_millis(16),
+        )
+        .unwrap();
+    assert_eq!(population.active_body(), Some(earth_id));
+    assert!(population.cover.ready());
+    assert_eq!(population.cover.surface().unwrap() as *const _, storage);
+    assert!(
+        owners[earth_index],
+        "ready surface remains the exclusive owner"
+    );
+    let mut observations = CelestialStaging::default();
+    let mut frame = CelestialFrame::new(&view, &mut observations, projection, &sphere);
+    frame
+        .append_body_observations(&[earth], &[owners[earth_index]])
+        .unwrap();
+    assert_eq!(
+        frame.markers()[0].representation,
+        SphereRepresentation::Surface
+    );
+    assert_eq!(
+        frame.report().triangles,
+        0,
+        "Earth's far sphere is suppressed"
+    );
+
+    // Once a far representation is ready, coverage is relinquished.
+    let pair = frames.coherent_view(&world).unwrap();
+    let view = observer(&pair, earth.body_fixed_frame, DVec3::Z * 6.0e11);
+    let mut owners = vec![false; requests.len()];
+    population
+        .update(
+            &pair,
+            &view,
+            projection,
+            &requests,
+            &mut sessions,
+            &mut owners,
+            &sphere,
+            terrain_enabled,
+            Duration::ZERO,
+            0,
+            None,
+            Duration::from_millis(16),
+        )
+        .unwrap();
+    assert_eq!(population.active_body(), None);
+    assert!(owners.iter().all(|&owner| !owner));
 }
 
 #[test]

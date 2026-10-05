@@ -20,6 +20,17 @@ These constraints preserve room for future experiments. They do not prescribe a 
 
 ## Independent systems and representations
 
+- Prescribed analytic trajectories have explicit authored periods independent of
+  mass/reference radius. Orbit references contribute center position/velocity, not
+  spin; body-local axial spin publishes orientation and system-axis angular velocity.
+- Complete analytic samples depend only on immutable definitions and requested
+  time. Bounded solver/time/arithmetic failures and stale bindings cannot publish
+  partial authority or change its revision/instant. Existing integrated gravity
+  and its replay contract remain separate, intact producers.
+- Independent namespaced star systems evaluate system-locally. Distant rendering,
+  universe placement/addressing and streaming are distinct concerns, not inferred
+  from the existence of a per-system frame projection.
+
 - **Independent layers:** terrain, vegetation, water, atmosphere, simulation, and rendering are separate systems. Do not bake vegetation into terrain meshes or let the renderer own world state.
 - **Hierarchical LOD:** reduce representation quality continuously with distance. An individual may disappear only when its contribution has transitioned into a higher-level aggregate representation.
 - **Multi-scale generation:** planetary structure, regional terrain, and local detail are meaningful scales. One noise function should not be stretched to every scale.

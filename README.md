@@ -67,7 +67,24 @@ does not generate terrain for all planets. Sun and gas/ice giants stay simple
 far-body spheres. Use Home for system overview, select any named body and Focus/
 Fit physical body for deterministic navigation; Earth, Moon and Mars have distinct
 terrain definitions. `--real-solar-system` uses near-real radii/orbital lengths
-through the same engine code (circular initial states, not an ephemeris).
+through the same engine code (prescribed circular motion, not an ephemeris).
+
+Normal launch and both solar presets use **prescribed analytic motion**, initially
+paused at `1000×`. Signed fractional seeks and reverse playback sample directly;
+single-step samples ±60 seconds and Reset returns to the authored epoch. Explicit
+periods retain the original preset pacing and do not change with mass/radius edits.
+The approved stationary-Sun/Earth-centered policy, orbital/spin inventory, mode
+boundaries and evidence limits are documented in [analytic playback](docs/ANALYTIC_PLAYBACK.md).
+The original hierarchy/circular fixtures remain Newtonian with unchanged fixed-step
+integration and replay. Scenario loading creates a new session; there is no live
+conversion between histories. Velocity editing is unavailable in prescribed mode.
+
+The default decorative sky uses a seeded, versioned finite-star catalogue and
+cached procedural nebulae/dust, with a broken galactic backbone and off-band
+structures. Version 4's visual composition is **accepted for now** by the user;
+native capture, warm performance and remaining engineering gates are tracked
+separately in the [sky checkpoint](docs/PHASE_5_13C_R_SKY_COMPOSITION_REPORT.md).
+This is presentation content, not an addressable astronomical universe.
 
 The original `--gravity-orbits` fixture retains an opt-in **terrain checkpoint
 preview** in the surface panel. Enable it there, or set `MUNDARIS_PHASE5_TERRAIN=1` before
@@ -184,6 +201,17 @@ route**. The optional terrain checkpoint uses this same route; physical atmosphe
 simulation and terrain collision/navigation remain unimplemented.
 
 ## Quality checks
+
+For the fast developer review package, run `./scripts/ai-check.ps1`. It saves Git
+state, focused results, and a deterministic PNG/JSON pair in a fresh
+`target/ai-check/` run directory. This is **not full validation**. Native UI summaries
+and capture JSON share one developer snapshot; commands, schema, fixtures and
+evidence limits are in [AI development interface](docs/AI_DEVELOPMENT_INTERFACE.md).
+
+The stronger `./scripts/validate.ps1 -IncludeGpu` records the full quality matrix
+in a fresh `target/full-validation/` directory (omit `-IncludeGpu` on headless
+hosts). Existing acceptance scripts remain separate; neither command establishes
+native interaction or visual acceptance on its own.
 
 ```bash
 cargo fmt --all -- --check

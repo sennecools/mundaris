@@ -3,6 +3,7 @@
 
 #![forbid(unsafe_code)]
 
+mod analytic_motion;
 mod diagnostics;
 mod gravity;
 mod history;
@@ -10,6 +11,7 @@ mod integrator;
 mod orbital_elements;
 mod runner;
 mod time;
+pub use analytic_motion::*;
 pub use diagnostics::*;
 pub use gravity::*;
 pub use integrator::*;

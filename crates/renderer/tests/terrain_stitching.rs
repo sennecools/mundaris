@@ -52,6 +52,13 @@ fn full_root_cover_reconciles_shared_edges_deterministically() {
     let stitched = StitchedSurface::build(&active, &refs, &topology).unwrap();
     assert_eq!(stitched.patches().len(), 6);
     assert!(
+        stitched
+            .patches()
+            .iter()
+            .zip(&geometry)
+            .all(|(constrained, raw)| constrained.shares_sample_storage_with(raw))
+    );
+    assert!(
         stitched.resident_bytes()
             >= 6 * GRID_SAMPLES * std::mem::size_of::<SurfaceGeometrySample>()
     );
@@ -87,12 +94,42 @@ fn full_root_cover_reconciles_shared_edges_deterministically() {
     }
 }
 
+#[test]
+fn unchanged_rebuild_shares_immutable_sample_allocations() {
+    let topology = SurfaceTopology::new();
+    let addresses: Vec<_> = CubeFace::ALL
+        .into_iter()
+        .map(CubePatchAddress::root)
+        .collect();
+    let active = active_surface_cover(&addresses, &topology).unwrap();
+    let raw: Vec<_> = addresses.iter().copied().map(fixture).collect();
+    let refs: Vec<_> = raw.iter().collect();
+    let first = StitchedSurface::build(&active, &refs, &topology).unwrap();
+    let second =
+        StitchedSurface::build_reusing(&active, &refs, &topology, Some((&first, &refs))).unwrap();
+    assert_eq!(second.reused_patches(), addresses.len());
+    for (before, after) in first.patches().iter().zip(second.patches()) {
+        assert!(before.shares_sample_storage_with(after));
+        assert!(before.shares_sample_storage_with(&before.clone()));
+    }
+}
+
 fn exercise_cover(addresses: Vec<CubePatchAddress>) {
     let topology = SurfaceTopology::new();
     let active = active_surface_cover(&addresses, &topology).unwrap();
     let geometry: Vec<_> = addresses.iter().copied().map(fixture).collect();
     let refs: Vec<_> = geometry.iter().collect();
     let stitched = StitchedSurface::build(&active, &refs, &topology).unwrap();
+    if addresses.iter().any(|a| a.level() != addresses[0].level()) {
+        assert!(
+            stitched
+                .patches()
+                .iter()
+                .zip(&geometry)
+                .any(|(constrained, raw)| !constrained.shares_sample_storage_with(raw)),
+            "changed mixed-level boundary grids must own distinct allocations"
+        );
+    }
     let mut canonical = std::collections::BTreeMap::new();
     let mut incidence = std::collections::BTreeMap::<(u128, u128), (usize, i32)>::new();
     for patch in stitched.patches() {

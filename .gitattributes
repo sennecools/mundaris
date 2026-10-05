@@ -9,3 +9,13 @@
 *.bin binary
 *.capture binary
 *.trace binary
+
+# Captured evidence is fingerprinted byte-for-byte, including original line ends.
+# Do not normalize raw diagnostics or retained starting-source copies on commit.
+docs/evidence/phase511e/** -text
+docs/evidence/phase512a/** -text
+docs/evidence/phase512b/** -text
+docs/evidence/phase513a/** -text
+docs/evidence/phase513b/** -text
+docs/evidence/phase513c/** -text
+docs/evidence/phase513cr/** -text

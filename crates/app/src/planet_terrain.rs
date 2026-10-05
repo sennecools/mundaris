@@ -586,7 +586,7 @@ impl TerrainPatchCache {
             + self.building.as_ref().map_or(0, |b| {
                 b.samples.capacity() * size_of::<SurfaceGeometrySample>()
                     + size_of::<GeneratedSurfacePatch>()
-                    + 2 * size_of::<usize>()
+                    + 4 * size_of::<usize>() // outer patch Arc and final sample Arc
             })
             + self
                 .workers
@@ -953,7 +953,7 @@ impl TerrainPatchCache {
                 }
                 let bytes = GRID_SAMPLES * size_of::<SurfaceGeometrySample>()
                     + size_of::<GeneratedSurfacePatch>()
-                    + 2 * size_of::<usize>();
+                    + 4 * size_of::<usize>();
                 let admission_cap = self.soft_admission_cap();
                 while self.entries.len() >= self.max_entries
                     || self.resident_bytes() + self.external_bytes + bytes > admission_cap

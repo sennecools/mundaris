@@ -124,24 +124,31 @@ impl TerrainPopulation {
         }
         #[cfg(feature = "surface-profile")]
         let handoff_started = std::time::Instant::now();
+        let mut retaining_source = false;
         if self.active_body != candidate {
             if let Some(old) = self.active_body {
                 let index = index_of(old)?;
                 let mut probe = CelestialFrame::new(view, &mut self.far_probe, projection, sphere);
                 probe.append_bodies(&[requests[index]])?;
-                anyhow::ensure!(
-                    far_ready(probe.markers()[0].representation),
-                    "source far replacement not ready"
-                );
-                self.cache.cancel_body_work(old);
+                if far_ready(probe.markers()[0].representation) {
+                    self.cache.cancel_body_work(old);
+                } else {
+                    // The whole far sphere can cross the near plane while its
+                    // displaced bound is outside the view. A marker is not a
+                    // completed opaque replacement: retain coverage and retry.
+                    candidate = Some(old);
+                    retaining_source = true;
+                }
             }
-            self.cover.abandon_construction(&mut self.cache);
-            self.cover = AdaptiveTerrainCover::default();
-            anyhow::ensure!(
-                self.cache.reserve_external(0),
-                "inactive cache reservation failed"
-            );
-            self.active_body = candidate;
+            if self.active_body != candidate {
+                self.cover.abandon_construction(&mut self.cache);
+                self.cover = AdaptiveTerrainCover::default();
+                anyhow::ensure!(
+                    self.cache.reserve_external(0),
+                    "inactive cache reservation failed"
+                );
+                self.active_body = candidate;
+            }
         }
         #[cfg(feature = "surface-profile")]
         {
@@ -160,6 +167,18 @@ impl TerrainPopulation {
                 projection,
             };
             let world_body = pair.system().body(session.body())?;
+            if retaining_source
+                && !terrain_enabled
+                && self.active_body == Some(session.body())
+                && world_body.terrain().is_some()
+                && self.cover.ready()
+            {
+                // A disabled terrain request is not permission to remove its
+                // last drawable owner before far preparation succeeds.
+                self.cover.prepare_visible(&input)?;
+                owners[index] = session.state() == SurfaceRepresentationState::Surface;
+                continue;
+            }
             if terrain_enabled && world_body.terrain().is_some() {
                 if self.active_body == Some(session.body()) {
                     let definition = world_body

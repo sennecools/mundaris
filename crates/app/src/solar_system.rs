@@ -239,6 +239,78 @@ impl SolarSystemPreset {
         }
     }
 
+    /// Prescribed periods retain the original Newtonian preset's setup pacing.
+    /// Base values are frozen from the original catalogue gravity/radius inputs;
+    /// preset scaling follows the same radius/distance scaling as the setup orbit.
+    pub fn orbital_period_s(self, body: SolarBody) -> f64 {
+        let base_period_s = match body {
+            SolarBody::Sun => 0.0,
+            SolarBody::Mercury => 7_603_291.579_640_426,
+            SolarBody::Venus => 19_421_516.906_539_556,
+            SolarBody::Earth => 31_569_669.976_44,
+            SolarBody::Moon => 2_359_041.447_532_198_4,
+            SolarBody::Mars => 59_376_327.099_254_39,
+            SolarBody::Jupiter => 374_654_349.471_237_1,
+            SolarBody::Saturn => 936_313_251.368_567_2,
+            SolarBody::Uranus => 2_656_215_444.752_847_7,
+            SolarBody::Neptune => 5_199_727_113.931_417,
+        };
+        base_period_s * self.orbital_distance_scale.powf(1.5) / self.body_radius_scale
+    }
+
+    /// Construct complete prescribed motion without changing the legacy Newtonian
+    /// initialization path or its state/terrain/spin authoring.
+    pub fn create_analytic(
+        self,
+        namespace: NonZeroU64,
+    ) -> anyhow::Result<(CelestialSystem, CelestialMotionDefinition)> {
+        let system = self.create(namespace)?;
+        let mut definitions = Vec::with_capacity(system.body_count());
+        for (i, (id, body)) in system.bodies().enumerate() {
+            let content = &SOLAR_SYSTEM_CONTENT[i];
+            let translation = if content.identity == SolarBody::Sun {
+                CelestialTranslation::Stationary(body.state().center_in_system())
+            } else {
+                let reference = system
+                    .bodies()
+                    .nth(index(content.orbit_parent.ok_or_else(|| {
+                        anyhow::anyhow!("non-central body is missing its orbit reference")
+                    })?))
+                    .map(|(reference, _)| reference)
+                    .ok_or_else(|| anyhow::anyhow!("orbit reference is missing"))?;
+                let plane = UnitRotation::from_axis_angle(
+                    Direction3::try_new(DVec3::X)?,
+                    content.orbital_inclination_rad,
+                )?;
+                CelestialTranslation::Elliptic(EllipticOrbit::new(
+                    reference,
+                    content.real_orbital_distance_m * self.orbital_distance_scale,
+                    0.0,
+                    plane,
+                    self.orbital_period_s(content.identity),
+                    content.orbital_phase_rad,
+                    SimulationInstant::ZERO,
+                )?)
+            };
+            let tilt = UnitRotation::from_axis_angle(
+                Direction3::try_new(DVec3::X)?,
+                std::f64::consts::FRAC_PI_2 + content.axial_tilt_rad,
+            )?;
+            definitions.push(BodyMotion {
+                body: id,
+                translation,
+                spin: AxialSpin::new(
+                    tilt,
+                    Direction3::try_new(DVec3::Y)?,
+                    TAU / content.rotation_period_s,
+                    SimulationInstant::ZERO,
+                )?,
+            });
+        }
+        let definition = CelestialMotionDefinition::new(&system, &definitions)?;
+        Ok((system, definition))
+    }
+
     pub fn create(self, namespace: NonZeroU64) -> anyhow::Result<CelestialSystem> {
         anyhow::ensure!(
             self.body_radius_scale.is_finite()
