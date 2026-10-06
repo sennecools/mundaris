@@ -49,6 +49,18 @@ the cause is not yet established. See the
 the live capture at
 `native/captures/12764-1791251339393283700-4-moon-orbit/`.
 
+**Planetary resident terrain (2026-10-06):** ordinary `--solar-system` and
+`--real-solar-system` launches now use the six-face resident regional runtime;
+`--legacy-terrain` selects the earlier adaptive path for comparison. The
+implementation is present, while native acceptance is pending the [Slice 2D
+report](docs/PLANET_TERRAIN_SLICE_2D_REPORT.md). To compare the developer-enabled
+release paths, run:
+
+```powershell
+cargo run --locked --release -p mundaris_app --features developer-tools --bin mundaris_app -- --solar-system --dev-interface
+cargo run --locked --release -p mundaris_app --features developer-tools --bin mundaris_app -- --solar-system --dev-interface --legacy-terrain
+```
+
 ## Prerequisites
 
 Development-agent setup: [Codex with Luna subagents](docs/codex-workflow.md) or

@@ -131,7 +131,7 @@ try {
     $snapshotOk = $false
     try {
         $snapshot = Get-Content -LiteralPath (Join-Path $runDirectory "$Scene.json") -Raw | ConvertFrom-Json
-        if ($snapshot.schema_version -ne 5 -or $snapshot.capture.scene -ne $Scene -or $snapshot.capture.image -ne "$Scene.png") { throw 'Capture snapshot association mismatch.' }
+        if ($snapshot.schema_version -ne 6 -or $snapshot.capture.scene -ne $Scene -or $snapshot.capture.image -ne "$Scene.png") { throw 'Capture snapshot association mismatch.' }
         $expectedMode = switch ($Scene) { 'solar-overview' { 'system_orbit' } 'earth-close' { 'surface_inspection' } default { 'body_orbit' } }
         $expectedFocus = switch ($Scene) { 'solar-overview' { $null } 'moon-orbit' { 4 } default { 3 } }
         if ($snapshot.general.camera_mode -ne $expectedMode -or $snapshot.general.focused_body.index -ne $expectedFocus) { throw 'Capture camera/body fixture mismatch.' }

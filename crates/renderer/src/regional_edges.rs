@@ -438,3 +438,658 @@ fn weight_vertices(vertices: &[BoundaryVertex], weights: &[f64]) -> BoundaryVert
     }
     result
 }
+
+/// Incremental canonical boundary preparation for immutable resident covers.
+/// The cache retains only the latest cover, and clears itself on any failure.
+#[derive(Default)]
+pub struct RegionalBoundaryCache {
+    tiles: BTreeMap<CubePatchAddress, Arc<TileData>>,
+    sources:
+        std::collections::HashMap<CubeSampleKey, BTreeMap<(u8, CubePatchAddress), SampleRecord>>,
+    canonical: BTreeMap<CubeSampleKey, SampleRecord>,
+    samples: std::collections::HashMap<CubePatchAddress, std::collections::HashSet<CubeSampleKey>>,
+    dependencies:
+        std::collections::HashMap<CubePatchAddress, std::collections::HashSet<CubeSampleKey>>,
+    dependents:
+        std::collections::HashMap<CubeSampleKey, std::collections::HashSet<CubePatchAddress>>,
+    boundaries: BTreeMap<CubePatchAddress, TileBoundary>,
+    last_rebuilt: usize,
+}
+
+impl RegionalBoundaryCache {
+    pub fn build(
+        &mut self,
+        tiles: &BTreeMap<CubePatchAddress, Arc<TileData>>,
+    ) -> Result<BTreeMap<CubePatchAddress, TileBoundary>, TileGeometryError> {
+        let result = self.update(tiles, 1);
+        if result.is_err() {
+            *self = Self::default();
+        }
+        result
+    }
+
+    /// Build a boundary cover while calculating independent dirty tile
+    /// boundaries on at most two scoped workers. Cache/index mutation remains
+    /// serialized, and results are applied in address order for determinism.
+    /// Worker counts outside 1..=2 are rejected and clear this candidate cache.
+    pub fn build_parallel(
+        &mut self,
+        tiles: &BTreeMap<CubePatchAddress, Arc<TileData>>,
+        max_workers: usize,
+    ) -> Result<BTreeMap<CubePatchAddress, TileBoundary>, TileGeometryError> {
+        if !(1..=2).contains(&max_workers) {
+            *self = Self::default();
+            return Err(TileGeometryError::InvalidTile);
+        }
+        let result = self.update(tiles, max_workers);
+        if result.is_err() {
+            *self = Self::default();
+        }
+        result
+    }
+
+    pub fn last_rebuilt_count(&self) -> usize {
+        self.last_rebuilt
+    }
+
+    /// Retained buffers and index storage, excluding aliased tile payloads.
+    /// Tree-node overhead is conservatively accounted per entry; this is not RSS.
+    pub fn accounted_owned_bytes(&self) -> usize {
+        use std::mem::size_of;
+        fn hash_bytes<K, V>(capacity: usize) -> usize {
+            capacity * (size_of::<K>() + size_of::<V>() + 1)
+        }
+        let source_entries = self.sources.values().map(BTreeMap::len).sum::<usize>();
+        let sample_capacity = self
+            .samples
+            .values()
+            .map(|keys| keys.capacity())
+            .sum::<usize>();
+        let dependency_capacity = self
+            .dependencies
+            .values()
+            .map(|keys| keys.capacity())
+            .sum::<usize>();
+        let dependent_capacity = self
+            .dependents
+            .values()
+            .map(|keys| keys.capacity())
+            .sum::<usize>();
+        self.boundaries
+            .values()
+            .map(|boundary| {
+                size_of::<TileBoundary>()
+                    + 64
+                    + boundary
+                        .edges
+                        .iter()
+                        .map(|edge| edge.capacity() * size_of::<BoundaryVertex>())
+                        .sum::<usize>()
+            })
+            .sum::<usize>()
+            + self.tiles.len() * (size_of::<CubePatchAddress>() + size_of::<Arc<TileData>>() + 64)
+            + source_entries
+                * (size_of::<(u8, CubePatchAddress)>() + size_of::<SampleRecord>() + 64)
+            + self.canonical.len() * (size_of::<CubeSampleKey>() + size_of::<SampleRecord>() + 64)
+            + hash_bytes::<CubeSampleKey, BTreeMap<(u8, CubePatchAddress), SampleRecord>>(
+                self.sources.capacity(),
+            )
+            + hash_bytes::<CubePatchAddress, std::collections::HashSet<CubeSampleKey>>(
+                self.samples.capacity() + self.dependencies.capacity(),
+            )
+            + hash_bytes::<CubeSampleKey, std::collections::HashSet<CubePatchAddress>>(
+                self.dependents.capacity(),
+            )
+            + hash_bytes::<CubeSampleKey, ()>(sample_capacity + dependency_capacity)
+            + hash_bytes::<CubePatchAddress, ()>(dependent_capacity)
+    }
+
+    fn update(
+        &mut self,
+        tiles: &BTreeMap<CubePatchAddress, Arc<TileData>>,
+        max_workers: usize,
+    ) -> Result<BTreeMap<CubePatchAddress, TileBoundary>, TileGeometryError> {
+        use std::collections::HashSet;
+        let first = tiles
+            .values()
+            .next()
+            .ok_or(TileGeometryError::InvalidTile)?;
+        for (address, tile) in tiles {
+            if tile.key.address != *address
+                || !tile.key.cells.is_power_of_two()
+                || tile.key.cells != first.key.cells
+                || !same_authority(tile, first)
+            {
+                return Err(TileGeometryError::InvalidTile);
+            }
+        }
+        validate_cover_edges(tiles)?;
+        let removed: Vec<_> = self
+            .tiles
+            .iter()
+            .filter_map(|(address, tile)| {
+                (!tiles
+                    .get(address)
+                    .is_some_and(|next| Arc::ptr_eq(tile, next)))
+                .then_some(*address)
+            })
+            .collect();
+        let added: Vec<_> = tiles
+            .iter()
+            .filter_map(|(address, tile)| {
+                (!self
+                    .tiles
+                    .get(address)
+                    .is_some_and(|old| Arc::ptr_eq(tile, old)))
+                .then_some(*address)
+            })
+            .collect();
+        let mut changed_keys = HashSet::new();
+        let mut dirty: HashSet<_> = added.iter().copied().collect();
+        for address in &removed {
+            if let Some(keys) = self.samples.remove(address) {
+                for key in keys {
+                    changed_keys.insert(key);
+                    if let Some(sources) = self.sources.get_mut(&key) {
+                        sources.remove(&(address.level(), *address));
+                    }
+                }
+            }
+            self.boundaries.remove(address);
+        }
+        for address in &added {
+            let tile = &tiles[address];
+            tile.validate()?;
+            let mut keys = HashSet::new();
+            for edge in PatchEdge::ALL {
+                for along in 0..=tile.key.cells {
+                    let grid = edge.grid(along, tile.key.cells);
+                    let key = canonical_sample_key(*address, grid, tile.key.cells)?;
+                    if keys.insert(key) {
+                        self.sources
+                            .entry(key)
+                            .or_default()
+                            .insert((address.level(), *address), sample_record(tile, grid)?);
+                        changed_keys.insert(key);
+                    }
+                }
+            }
+            self.samples.insert(*address, keys);
+        }
+        // Dependencies include both coarse interpolation endpoints, including
+        // the zero-weight endpoint. Topology changes can change the owner even
+        // when the winning endpoint happens to have the same value.
+        for key in &changed_keys {
+            if let Some(dependents) = self.dependents.get(key) {
+                dirty.extend(dependents);
+            }
+            if let Some(record) = self
+                .sources
+                .get(key)
+                .and_then(|sources| sources.values().next())
+            {
+                self.canonical.insert(*key, record.clone());
+            } else {
+                self.canonical.remove(key);
+                self.sources.remove(key);
+            }
+        }
+        // Explicitly include all touching old/new edge neighbors. This covers
+        // a coarse owner change even when its sample dependencies are replaced.
+        for address in removed.iter().chain(&added) {
+            for edge in PatchEdge::ALL {
+                let neighbor = address.neighbor(edge).address;
+                for candidate in std::iter::once(neighbor)
+                    .chain(neighbor.parent())
+                    .chain(neighbor.children().into_iter().flatten())
+                {
+                    if tiles.contains_key(&candidate) {
+                        dirty.insert(candidate);
+                    }
+                }
+            }
+        }
+        for address in removed.iter().chain(dirty.iter()) {
+            if let Some(keys) = self.dependencies.remove(address) {
+                for key in keys {
+                    if let Some(dependents) = self.dependents.get_mut(&key) {
+                        dependents.remove(address);
+                        if dependents.is_empty() {
+                            self.dependents.remove(&key);
+                        }
+                    }
+                }
+            }
+        }
+        self.last_rebuilt = 0;
+        let mut dirty: Vec<_> = dirty.into_iter().collect();
+        dirty.retain(|address| tiles.contains_key(address));
+        dirty.sort_unstable();
+        let rebuilt = calculate_dirty_boundaries(&dirty, tiles, &self.canonical, max_workers)?;
+        for (address, boundary, keys) in rebuilt {
+            for key in &keys {
+                self.dependents.entry(*key).or_default().insert(address);
+            }
+            self.dependencies.insert(address, keys);
+            self.boundaries.insert(address, boundary);
+            self.last_rebuilt += 1;
+        }
+        self.tiles = tiles.clone();
+        Ok(self.boundaries.clone())
+    }
+}
+
+fn calculate_dirty_boundaries(
+    dirty: &[CubePatchAddress],
+    tiles: &BTreeMap<CubePatchAddress, Arc<TileData>>,
+    canonical: &BTreeMap<CubeSampleKey, SampleRecord>,
+    max_workers: usize,
+) -> Result<
+    Vec<(
+        CubePatchAddress,
+        TileBoundary,
+        std::collections::HashSet<CubeSampleKey>,
+    )>,
+    TileGeometryError,
+> {
+    if max_workers == 1 || dirty.len() < 2 {
+        return calculate_dirty_subset(dirty, tiles, canonical);
+    }
+
+    let midpoint = dirty.len().div_ceil(2);
+    let (first_addresses, second_addresses) = dirty.split_at(midpoint);
+    let (first, second) = std::thread::scope(|scope| {
+        let first_addresses = first_addresses.to_vec();
+        let first_worker = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn_scoped(scope, move || {
+                calculate_dirty_subset(&first_addresses, tiles, canonical)
+            })
+            .map_err(|_| TileGeometryError::InvalidTile)?;
+        let second_addresses = second_addresses.to_vec();
+        let second_worker = match std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn_scoped(scope, move || {
+                calculate_dirty_subset(&second_addresses, tiles, canonical)
+            }) {
+            Ok(worker) => worker,
+            Err(_) => {
+                let _ = first_worker.join();
+                return Err(TileGeometryError::InvalidTile);
+            }
+        };
+        let first_result = first_worker
+            .join()
+            .map_err(|_| TileGeometryError::InvalidTile);
+        let second_result = second_worker
+            .join()
+            .map_err(|_| TileGeometryError::InvalidTile);
+        let first = first_result??;
+        let second = second_result??;
+        Ok((first, second))
+    })?;
+
+    let mut rebuilt = first;
+    rebuilt.extend(second);
+    rebuilt.sort_unstable_by_key(|(address, _, _)| *address);
+    Ok(rebuilt)
+}
+
+fn calculate_dirty_subset(
+    addresses: &[CubePatchAddress],
+    tiles: &BTreeMap<CubePatchAddress, Arc<TileData>>,
+    canonical: &BTreeMap<CubeSampleKey, SampleRecord>,
+) -> Result<
+    Vec<(
+        CubePatchAddress,
+        TileBoundary,
+        std::collections::HashSet<CubeSampleKey>,
+    )>,
+    TileGeometryError,
+> {
+    let mut rebuilt = Vec::with_capacity(addresses.len());
+    for address in addresses {
+        let Some(tile) = tiles.get(address) else {
+            continue;
+        };
+        let (boundary, keys) = cached_tile_boundary(*address, tile, tiles, canonical)?;
+        rebuilt.push((*address, boundary, keys));
+    }
+    Ok(rebuilt)
+}
+
+fn cached_tile_boundary(
+    address: CubePatchAddress,
+    tile: &TileData,
+    tiles: &BTreeMap<CubePatchAddress, Arc<TileData>>,
+    canonical: &BTreeMap<CubeSampleKey, SampleRecord>,
+) -> Result<(TileBoundary, std::collections::HashSet<CubeSampleKey>), TileGeometryError> {
+    let n = tile.key.cells;
+    let mut dependencies = std::collections::HashSet::new();
+    let mut edges: [Vec<BoundaryVertex>; 4] =
+        std::array::from_fn(|_| Vec::with_capacity(n as usize + 1));
+    for edge in PatchEdge::ALL {
+        let neighbor = address.neighbor(edge);
+        let coarse =
+            find_coarse_neighbor(tiles, neighbor.address, neighbor.edge, neighbor.reversed);
+        for along in 0..=n {
+            let vertex = if let Some((owner_address, owner_edge, reversed, child_half)) =
+                coarse.filter(|(owner_address, _, _, _)| owner_address.level() < address.level())
+            {
+                let owner = tiles
+                    .get(&owner_address)
+                    .ok_or(TileGeometryError::InvalidTile)?;
+                let local_t = f64::from(along) / f64::from(n);
+                let owner_t =
+                    (f64::from(child_half) + if reversed { 1.0 - local_t } else { local_t }) * 0.5;
+                let coordinate = owner_t.clamp(0.0, 1.0) * f64::from(n);
+                let i0 = (coordinate.floor() as u32).min(n);
+                let i1 = (i0 + 1).min(n);
+                dependencies.insert(canonical_sample_key(
+                    owner_address,
+                    owner_edge.grid(i0, n),
+                    n,
+                )?);
+                dependencies.insert(canonical_sample_key(
+                    owner_address,
+                    owner_edge.grid(i1, n),
+                    n,
+                )?);
+                interpolate_edge(owner, owner_edge, owner_t, canonical, tile)?
+            } else {
+                let key = canonical_sample_key(address, edge.grid(along, n), n)?;
+                dependencies.insert(key);
+                canonical
+                    .get(&key)
+                    .ok_or(TileGeometryError::InvalidTile)?
+                    .for_tile(tile)?
+            };
+            edges[edge_index(edge)].push(vertex);
+        }
+    }
+    Ok((TileBoundary { edges }, dependencies))
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use crate::{TILE_FILTER_VERSION, TILE_FORMAT_VERSION, TileKey, TileTexel};
+    use mundaris_math::surface::CubeFace;
+
+    fn tile(address: CubePatchAddress, cells: u32) -> Arc<TileData> {
+        let side = cells + 3;
+        let [x, y] = address.coordinates();
+        let count = 2.0_f64.powi(i32::from(address.level()));
+        let texels = (0..side)
+            .flat_map(|j| {
+                (0..side).map(move |i| {
+                    let u = (f64::from(x) + (f64::from(i) - 1.0) / f64::from(cells)) / count;
+                    let v = (f64::from(y) + (f64::from(j) - 1.0) / f64::from(cells)) / count;
+                    let a = (0.22 + 0.04 * u) as f32;
+                    let b = (0.31 - 0.03 * u) as f32;
+                    let c = (0.12 + 0.02 * v) as f32;
+                    TileTexel {
+                        radial_offset_m: (3.0 * (9.0 * u).sin() + 2.0 * (7.0 * v).cos()) as f32,
+                        material: [a, b, c, 1.0 - a - b - c],
+                    }
+                })
+            })
+            .collect();
+        Arc::new(TileData {
+            key: TileKey {
+                body_identity: 911,
+                definition_words: vec![7, 19, 23],
+                radius_bits: 70_000_000.0_f64.to_bits(),
+                surface_revision: 3,
+                material_revision: 5,
+                format_version: TILE_FORMAT_VERSION,
+                filter_version: TILE_FILTER_VERSION,
+                address,
+                cells,
+            },
+            anchor_radius_m: 70_000_000.0,
+            min_max_radial_offset_m: [-5.0, 5.0],
+            texels,
+        })
+    }
+
+    #[test]
+    fn incremental_boundaries_match_reference_through_cross_face_split_merge_and_stale_retry() {
+        for cells in [2, 8, 32, 64] {
+            let mut tiles: BTreeMap<_, _> = CubeFace::ALL
+                .into_iter()
+                .map(|face| {
+                    let address = CubePatchAddress::root(face);
+                    (address, tile(address, cells))
+                })
+                .collect();
+            let roots = tiles.clone();
+            let mut cache = RegionalBoundaryCache::default();
+            let mut parallel_cache = RegionalBoundaryCache::default();
+            assert_eq!(
+                cache.build(&tiles).unwrap(),
+                build_boundaries(&tiles).unwrap()
+            );
+            assert_eq!(
+                parallel_cache.build_parallel(&tiles, 2).unwrap(),
+                cache.boundaries
+            );
+            let mut history = vec![tiles.clone()];
+            let corner_parent = CubePatchAddress::root(CubeFace::PositiveZ);
+            let mut corner_split = tiles.clone();
+            corner_split.remove(&corner_parent);
+            for child in corner_parent.children().unwrap() {
+                corner_split.insert(child, tile(child, cells));
+            }
+            assert!(validate_cover_edges(&corner_split).is_ok());
+            let corner_expected = build_boundaries(&corner_split).unwrap();
+            assert_eq!(cache.build(&corner_split).unwrap(), corner_expected);
+            assert_eq!(
+                parallel_cache.build_parallel(&corner_split, 2).unwrap(),
+                corner_expected
+            );
+            assert_eq!(
+                parallel_cache.build_parallel(&tiles, 2).unwrap(),
+                build_boundaries(&tiles).unwrap()
+            );
+            assert_eq!(
+                parallel_cache.build_parallel(&corner_split, 2).unwrap(),
+                corner_expected
+            );
+            tiles = corner_split;
+            history.push(tiles.clone());
+            let mut random = 123456789_u64;
+            for _ in 0..90 {
+                random ^= random << 13;
+                random ^= random >> 7;
+                random ^= random << 17;
+                let address = *tiles.keys().nth(random as usize % tiles.len()).unwrap();
+                if address.level() >= 3 {
+                    continue;
+                }
+                let mut next = tiles.clone();
+                next.remove(&address);
+                for child in address.children().unwrap() {
+                    next.insert(child, tile(child, cells));
+                }
+                if validate_cover_edges(&next).is_err() {
+                    continue;
+                }
+                let expected = build_boundaries(&next).unwrap();
+                assert_eq!(cache.build(&next).unwrap(), expected);
+                assert_eq!(parallel_cache.build_parallel(&next, 2).unwrap(), expected);
+                // Stale candidates may be discarded; rebuilding from the old
+                // acknowledged cover must undo every cached ownership change.
+                assert_eq!(
+                    cache.build(&tiles).unwrap(),
+                    build_boundaries(&tiles).unwrap()
+                );
+                assert_eq!(
+                    parallel_cache.build_parallel(&tiles, 2).unwrap(),
+                    cache.boundaries
+                );
+                assert_eq!(cache.build(&next).unwrap(), expected);
+                assert_eq!(parallel_cache.build_parallel(&next, 2).unwrap(), expected);
+                tiles = next;
+                history.push(tiles.clone());
+            }
+            for previous in history.into_iter().rev() {
+                assert_eq!(
+                    cache.build(&previous).unwrap(),
+                    build_boundaries(&previous).unwrap()
+                );
+                assert_eq!(
+                    parallel_cache.build_parallel(&previous, 2).unwrap(),
+                    cache.boundaries
+                );
+                assert_eq!(cache.tiles.len(), previous.len());
+                assert_eq!(cache.boundaries.len(), previous.len());
+                assert_eq!(cache.dependencies.len(), previous.len());
+                assert!(
+                    cache
+                        .dependents
+                        .values()
+                        .flatten()
+                        .all(|address| previous.contains_key(address))
+                );
+            }
+            assert_eq!(cache.tiles.len(), roots.len());
+            cache.build(&roots).unwrap();
+            parallel_cache.build_parallel(&roots, 2).unwrap();
+            assert_eq!(cache.last_rebuilt_count(), 0);
+            assert_eq!(parallel_cache.last_rebuilt_count(), 0);
+        }
+    }
+
+    #[test]
+    fn boundary_cache_checks_changed_payload_authority_and_recovers_after_failure() {
+        let address = CubePatchAddress::root(CubeFace::PositiveZ);
+        let mut tiles = BTreeMap::from([(address, tile(address, 8))]);
+        let mut cache = RegionalBoundaryCache::default();
+        let mut parallel_cache = RegionalBoundaryCache::default();
+        cache.build(&tiles).unwrap();
+        parallel_cache.build_parallel(&tiles, 2).unwrap();
+        let mut changed = (*tiles[&address]).clone();
+        changed.texels[9].radial_offset_m += 1.0;
+        tiles.insert(address, Arc::new(changed));
+        assert_eq!(
+            cache.build(&tiles).unwrap(),
+            build_boundaries(&tiles).unwrap()
+        );
+        assert_eq!(
+            parallel_cache.build_parallel(&tiles, 2).unwrap(),
+            cache.boundaries
+        );
+        assert_eq!(cache.last_rebuilt_count(), 1);
+        let valid = tiles.clone();
+        let mut invalid = (*tiles[&address]).clone();
+        invalid.texels[0].material[0] = f32::NAN;
+        tiles.insert(address, Arc::new(invalid));
+        assert!(cache.build(&tiles).is_err());
+        assert!(parallel_cache.build_parallel(&tiles, 2).is_err());
+        assert!(cache.tiles.is_empty() && cache.sources.is_empty() && cache.canonical.is_empty());
+        assert!(parallel_cache.tiles.is_empty() && parallel_cache.sources.is_empty());
+        assert_eq!(
+            cache.build(&valid).unwrap(),
+            build_boundaries(&valid).unwrap()
+        );
+        assert_eq!(
+            parallel_cache.build_parallel(&valid, 2).unwrap(),
+            cache.boundaries
+        );
+        let other = CubePatchAddress::root(CubeFace::NegativeZ);
+        let mut invalid = (*tile(other, 8)).clone();
+        invalid.key.surface_revision += 1;
+        tiles = valid;
+        tiles.insert(other, Arc::new(invalid));
+        assert!(cache.build(&tiles).is_err());
+        assert!(parallel_cache.build_parallel(&tiles, 2).is_err());
+    }
+
+    #[test]
+    fn parallel_boundary_cache_rejects_unsupported_worker_counts_and_recovers() {
+        let address = CubePatchAddress::root(CubeFace::PositiveZ);
+        let tiles = BTreeMap::from([(address, tile(address, 8))]);
+        let mut cache = RegionalBoundaryCache::default();
+        assert_eq!(
+            cache.build_parallel(&tiles, 1).unwrap(),
+            build_boundaries(&tiles).unwrap()
+        );
+        for workers in [0, 3, usize::MAX] {
+            assert_eq!(
+                cache.build_parallel(&tiles, workers),
+                Err(TileGeometryError::InvalidTile)
+            );
+            assert!(cache.tiles.is_empty());
+            assert_eq!(
+                cache.build(&tiles).unwrap(),
+                build_boundaries(&tiles).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn a_local_edit_rebuilds_only_boundary_dependents_in_a_large_cover() {
+        let mut tiles = BTreeMap::new();
+        for face in CubeFace::ALL {
+            for x in 0..8 {
+                for y in 0..8 {
+                    let address = CubePatchAddress::try_new(face, 3, x, y).unwrap();
+                    tiles.insert(address, tile(address, 8));
+                }
+            }
+        }
+        let mut cache = RegionalBoundaryCache::default();
+        cache.build(&tiles).unwrap();
+        let parent = CubePatchAddress::try_new(CubeFace::PositiveZ, 3, 0, 0).unwrap();
+        tiles.remove(&parent);
+        for child in parent.children().unwrap() {
+            tiles.insert(child, tile(child, 8));
+        }
+        assert_eq!(
+            cache.build(&tiles).unwrap(),
+            build_boundaries(&tiles).unwrap()
+        );
+        assert!(cache.last_rebuilt_count() < 24);
+        cache.build(&tiles).unwrap();
+        assert_eq!(cache.last_rebuilt_count(), 0);
+    }
+
+    #[test]
+    #[ignore = "matched CPU boundary preparation benchmark"]
+    fn boundary_publication_cpu_benchmark() {
+        let mut tiles = BTreeMap::new();
+        for face in CubeFace::ALL {
+            for x in 0..16 {
+                for y in 0..16 {
+                    let address = CubePatchAddress::try_new(face, 4, x, y).unwrap();
+                    tiles.insert(address, tile(address, 32));
+                }
+            }
+        }
+        let parent = CubePatchAddress::try_new(CubeFace::PositiveZ, 4, 0, 0).unwrap();
+        let mut target = tiles.clone();
+        target.remove(&parent);
+        for child in parent.children().unwrap() {
+            target.insert(child, tile(child, 32));
+        }
+        let mut cache = RegionalBoundaryCache::default();
+        cache.build(&tiles).unwrap();
+        for iteration in 0..5 {
+            let started = std::time::Instant::now();
+            let expected = build_boundaries(&target).unwrap();
+            let reference_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let started = std::time::Instant::now();
+            let actual = cache.build(&target).unwrap();
+            let owned_bytes = cache.accounted_owned_bytes();
+            let cached_ms = started.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(actual, expected);
+            eprintln!(
+                "boundary benchmark iteration={iteration} cells=32 cover={} reference_ms={reference_ms:.4} cached_ms={cached_ms:.4} rebuilt={} accounted_cache_bytes={owned_bytes}",
+                target.len(),
+                cache.last_rebuilt_count()
+            );
+            cache.build(&tiles).unwrap();
+        }
+    }
+}

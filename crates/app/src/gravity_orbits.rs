@@ -72,12 +72,14 @@ mod frame_host;
 #[cfg(feature = "developer-tools")]
 mod hierarchy_fixture;
 mod navigation_input;
-#[cfg(feature = "developer-tools")]
+mod planetary;
 mod regional_fixture;
+pub(crate) use regional_fixture::RegionalFrameHistory;
 #[cfg(feature = "developer-tools")]
 mod resident_fixture;
 mod visual_controls;
 struct Controls {
+    performance_lab: crate::performance_lab::PerformanceLab,
     #[cfg(feature = "developer-tools")]
     automation_owner: Option<String>,
     #[cfg(feature = "developer-tools")]
@@ -133,6 +135,15 @@ struct Controls {
 impl Controls {
     fn new(body: &CelestialBody) -> Self {
         Self {
+            performance_lab: {
+                let mut lab = crate::performance_lab::PerformanceLab::default();
+                lab.open = std::env::var("MUNDARIS_PERFORMANCE_LAB").is_ok_and(|s| s == "1");
+                lab.enabled = lab.open || std::env::var("MUNDARIS_PROFILE").is_ok_and(|s| s == "1");
+                crate::engine_profile::set_enabled(lab.enabled);
+                crate::engine_profile::set_budget_ns("Frame", Some(100_000_000));
+                crate::engine_profile::set_budget_ns("Adoption", Some(2_000_000));
+                lab
+            },
             #[cfg(feature = "developer-tools")]
             automation_owner: None,
             #[cfg(feature = "developer-tools")]
@@ -209,6 +220,12 @@ impl Controls {
 }
 
 pub struct GravityOrbitsDemo {
+    profile_sampler: crate::performance_capture::ProfileSampler,
+    performance_capture: crate::performance_capture::PerformanceCapture,
+    profile_sample_at: Option<Instant>,
+    profile_snapshot: Option<std::sync::Arc<serde_json::Value>>,
+    diagnostic_capture_request: Option<String>,
+    lab_benchmark: Option<(Vec<f64>, usize, Instant)>,
     #[cfg(feature = "developer-tools")]
     developer_session: Option<String>,
     #[cfg(feature = "developer-tools")]
@@ -231,6 +248,7 @@ pub struct GravityOrbitsDemo {
     ready_mesh_probe: Option<crate::surface_probe::ReadyMeshProbe>,
     clearance_query_us: f64,
     terrain: crate::terrain_population::TerrainPopulation,
+    planetary: planetary::PlanetaryTerrain,
     scenario: GravityFixture,
     validation_route: Option<SurfaceValidationRoute>,
     solar_validation: Option<(Duration, usize)>,
@@ -349,6 +367,60 @@ fn terrain_lighting_configuration(mode: Option<&str>, sun: Option<&str>) -> Terr
 }
 
 impl GravityOrbitsDemo {
+    #[cfg(feature = "developer-tools")]
+    pub(crate) fn take_diagnostic_capture_request(&mut self) -> Option<String> {
+        self.diagnostic_capture_request.take()
+    }
+
+    fn start_lab_benchmark(
+        &mut self,
+        route: crate::performance_lab::BenchmarkScenario,
+    ) -> Result<()> {
+        let Some(moon) = self.ids.iter().copied().find(|id| {
+            self.system
+                .body(*id)
+                .is_ok_and(|body| body.name() == "Moon")
+        }) else {
+            self.diagnostic = Some("Moon benchmark requires a Solar System preset".into());
+            return Ok(());
+        };
+        self.command(Command::Pause(true))?;
+        self.command(Command::Select(moon))?;
+        self.command(Command::Focus {
+            fixed: true,
+            fit: true,
+        })?;
+        self.command(Command::LookBody(moon))?;
+        self.command(Command::SurfaceInspection)?;
+        let clearances = match route {
+            crate::performance_lab::BenchmarkScenario::MoonCloseInspection => vec![25.0],
+            _ => route
+                .clearance_checkpoints_km()
+                .iter()
+                .map(|km| km * 1000.0)
+                .collect(),
+        };
+        self.lab_benchmark = Some((clearances, 0, Instant::now() - Duration::from_secs(31)));
+        Ok(())
+    }
+
+    fn advance_lab_benchmark(&mut self) -> Result<()> {
+        let Some((clearances, next, at)) = &mut self.lab_benchmark else {
+            return Ok(());
+        };
+        if at.elapsed() < Duration::from_secs(30) {
+            return Ok(());
+        }
+        let Some(clearance) = clearances.get(*next).copied() else {
+            self.lab_benchmark = None;
+            return Ok(());
+        };
+        *next += 1;
+        *at = Instant::now();
+        self.performance_capture.request();
+        self.command(Command::Clearance(clearance))
+    }
+
     /// Read-only authority and publication access for diagnostics/regression fixtures.
     pub fn world(&self) -> &CelestialSystem {
         &self.system
@@ -441,6 +513,11 @@ impl GravityOrbitsDemo {
             ));
         }
         Ok(demo)
+    }
+    /// Explicit comparison backend for native terrain acceptance routes.
+    pub fn use_legacy_terrain(&mut self) {
+        self.planetary.enabled = false;
+        self.planetary.runtime.disable();
     }
     /// Optional operator route through the same production controls and renderer.
     pub fn start_surface_validation(&mut self) -> Result<()> {
@@ -577,10 +654,20 @@ impl GravityOrbitsDemo {
                 .map(std::path::PathBuf::from),
             navigation_wall_at: None,
             developer_frame_number: 0,
+            performance_capture: crate::performance_capture::PerformanceCapture::from_environment(),
+            profile_sample_at: None,
+            profile_sampler: crate::performance_capture::ProfileSampler::default(),
+            profile_snapshot: None,
+            diagnostic_capture_request: None,
+            lab_benchmark: None,
             terrain_clearance: None,
             ready_mesh_probe: None,
             clearance_query_us: 0.0,
             terrain: crate::terrain_population::TerrainPopulation::interactive()?,
+            planetary: planetary::PlanetaryTerrain::new(matches!(
+                scenario,
+                GravityFixture::GameplaySolarSystem | GravityFixture::RealSolarSystem
+            )),
             scenario,
             validation_route: None,
             solar_validation: None,
@@ -1852,11 +1939,18 @@ impl GravityOrbitsDemo {
         }
         self.set_lifecycle_drawable(true);
         self.developer_frame_number = self.developer_frame_number.saturating_add(1);
+        crate::engine_profile::set_enabled(self.controls.performance_lab.enabled);
+        if crate::engine_profile::is_enabled() {
+            renderer.request_profile_timing();
+        }
+        crate::engine_profile::begin_frame(self.developer_frame_number);
+        let frame_span = crate::engine_profile::span("Frame");
         let now = Instant::now();
         let elapsed = self
             .last_wall
             .map_or(Duration::ZERO, |previous| now.duration_since(previous));
         self.last_wall = Some(now);
+        let host_frame_started = Instant::now();
         let elapsed = fixed_elapsed.unwrap_or_else(|| match self.clock.classify(elapsed) {
             ClockInterval::Accepted(elapsed) => elapsed,
             ClockInterval::Hidden => Duration::ZERO,
@@ -1864,7 +1958,10 @@ impl GravityOrbitsDemo {
         });
         #[cfg(feature = "surface-profile")]
         let update_started = Instant::now();
-        self.update(elapsed);
+        {
+            let _span = crate::engine_profile::span("Simulation");
+            self.update(elapsed);
+        }
         #[cfg(feature = "surface-profile")]
         let update_ms = update_started.elapsed().as_secs_f64() * 1000.0;
         if !self.coherent {
@@ -1907,6 +2004,7 @@ impl GravityOrbitsDemo {
             }
         }
         let started = Instant::now();
+        let preparation_span = crate::engine_profile::span("Renderer preparation");
         #[cfg(feature = "developer-tools")]
         let visual_prep_context = if self.resident_tile.enabled {
             "resident tile fixture failed during orbit visual preparation"
@@ -2015,7 +2113,48 @@ impl GravityOrbitsDemo {
         let resident_fixture_active = self.resident_tile.enabled;
         #[cfg(not(feature = "developer-tools"))]
         let resident_fixture_active = false;
-        if !resident_fixture_active {
+        let planetary_active = self.planetary.enabled && !resident_fixture_active;
+        let mut planetary_candidate = if planetary_active && self.controls.terrain_preview {
+            self.terrain.resident_candidate(
+                &pair,
+                &view,
+                projection,
+                &self.requests,
+                &mut self.surfaces,
+            )?
+        } else {
+            None
+        };
+        if planetary_active
+            && self.controls.terrain_preview
+            && self.planetary.runtime.has_coverage()
+            && let Some(old) = self.planetary.body
+            && planetary_candidate != Some(old)
+            && let Some(index) = self.ids.iter().position(|&id| id == old)
+            && !self.terrain.resident_far_ready(
+                &view,
+                projection,
+                self.requests[index],
+                &self.sphere,
+            )?
+        {
+            planetary_candidate = Some(old);
+        }
+        let mut planetary_binding_ready = false;
+        if let Some(body) = planetary_candidate {
+            let identity = self
+                .ids
+                .iter()
+                .position(|&id| id == body)
+                .ok_or_else(|| anyhow::anyhow!("resident body association missing"))?
+                as u64
+                + 1;
+            planetary_binding_ready = self.planetary.bind(body, identity, &pair)?;
+        }
+        if planetary_active && planetary_candidate.is_none() {
+            self.planetary.runtime.suspend();
+        }
+        if !resident_fixture_active && !planetary_active {
             self.terrain.update(
                 &pair,
                 &view,
@@ -2104,7 +2243,11 @@ impl GravityOrbitsDemo {
             readability = Some(palette);
         }
         if self.controls.sun_from_star
-            && let Some(active) = self.terrain.active_body()
+            && let Some(active) = if planetary_active {
+                self.planetary.body
+            } else {
+                self.terrain.active_body()
+            }
         {
             let body = pair.system().body(active)?;
             let star = pair.system().body(self.ids[0])?;
@@ -2129,6 +2272,31 @@ impl GravityOrbitsDemo {
         }
         let mut frame = CelestialFrame::new(&view, &mut self.staging, projection, &self.sphere);
         frame.set_terrain_lighting(lighting);
+        let mut planetary_submitted = false;
+        if planetary_active
+            && planetary_binding_ready
+            && let Some(body) = self.planetary.body
+            && planetary_candidate == Some(body)
+        {
+            let body_frame = pair.projection().frames_for(body)?.body_fixed;
+            if let Some(draw) = self.planetary.prepare(
+                &view,
+                body_frame,
+                projection,
+                lighting,
+                renderer.last_resident_regional_report(),
+                elapsed,
+                renderer.deterministic(),
+            )? {
+                frame.set_resident_regional(draw)?;
+                planetary_submitted = true;
+            }
+            if self.planetary.runtime.has_coverage()
+                && let Some(index) = self.ids.iter().position(|&id| id == body)
+            {
+                self.surface_owners[index] = true;
+            }
+        }
         #[cfg(feature = "developer-tools")]
         let mut resident_validation_draw = None;
         #[cfg(feature = "developer-tools")]
@@ -2217,7 +2385,11 @@ impl GravityOrbitsDemo {
                     self.resident_tile.enabled && self.resident_tile.body == Some(session.body());
                 #[cfg(not(feature = "developer-tools"))]
                 let resident_fixture_owns_body = false;
-                if self.surface_owners[index] && resident_fixture_owns_body {
+                let planetary_owns_body =
+                    planetary_active && self.planetary.body == Some(session.body());
+                if self.surface_owners[index] && planetary_owns_body {
+                    // Resident draw is already staged. No CPU mesh is packed.
+                } else if self.surface_owners[index] && resident_fixture_owns_body {
                     #[cfg(feature = "developer-tools")]
                     if self.resident_tile.stale_reason.is_none() && self.resident_tile.reference_cpu
                     {
@@ -2414,7 +2586,9 @@ impl GravityOrbitsDemo {
             return Ok(());
         }
         let report = frame.report();
+        drop(preparation_span);
         let performance = PerformanceSnapshot {
+            gpu_timestamp_capability: format!("{:?}", renderer.timestamp_availability()),
             preparation_ms: Some(preparation_ms),
             gpu_source_frame: renderer.gpu_source_frame(),
             upload_bytes: Some(report.surface.uploaded_bytes as u64),
@@ -2478,6 +2652,7 @@ impl GravityOrbitsDemo {
             .with_draw_report(report),
             performance,
         })?;
+        snapshot.engine_profile = self.profile_snapshot.clone();
         if let Some(sky) = report.sky {
             snapshot.sky = Some(crate::developer_snapshot::SkySnapshot::collect(
                 &self.sky_definition,
@@ -2488,6 +2663,14 @@ impl GravityOrbitsDemo {
                 "latest_submitted (may be previous frame)",
                 "latest_completed (may be previous frame)",
             ));
+        }
+        if planetary_active {
+            self.planetary.annotate_previous(
+                &mut snapshot,
+                &self.ids,
+                &self.system,
+                planetary_binding_ready,
+            )?;
         }
         // Opt-in native evidence scratch export of this exact prepared state.
         // Disabled for ordinary launches; collection remains observational.
@@ -2547,11 +2730,19 @@ impl GravityOrbitsDemo {
             coarse_curves: self.coarse_curves,
         };
         let controls = &mut self.controls;
-        #[cfg(feature = "surface-profile")]
         let render_started = Instant::now();
+        let submission_span = crate::engine_profile::span("GPU submission / presentation");
+        let mut ui_build_cpu_ms = 0.0;
         renderer.render_celestial(&frame, |context| {
-            draw_ui(context, controls, &info, frame.markers())
+            let _span = crate::engine_profile::span("UI");
+            let ui_started = Instant::now();
+            draw_ui(context, controls, &info, frame.markers());
+            ui_build_cpu_ms += ui_started.elapsed().as_secs_f64() * 1000.0;
         })?;
+        drop(submission_span);
+        snapshot.performance.render_present_ms =
+            Some(render_started.elapsed().as_secs_f64() * 1000.0);
+        snapshot.performance.ui_build_cpu_ms = Some(ui_build_cpu_ms);
         #[cfg(feature = "developer-tools")]
         if let Some((draw, body_frame)) = resident_validation_draw {
             // Validation follows the real frame submission so its setup cannot
@@ -2773,7 +2964,7 @@ impl GravityOrbitsDemo {
                     .observe(renderer.last_resident_regional_report());
                 if !renderer.deterministic() {
                     self.resident_regional
-                        .record_native_frame(&snapshot.performance);
+                        .record_native_frame(&snapshot.performance, self.developer_frame_number);
                 }
                 snapshot.resident_regional = self.resident_regional.snapshot();
             }
@@ -2792,6 +2983,115 @@ impl GravityOrbitsDemo {
                 .performance
                 .with_gpu(renderer.latest_gpu_profile(), "same_frame_offscreen");
             snapshot.performance.gpu_source_frame = Some(self.developer_frame_number);
+        }
+        if planetary_active {
+            let mut resident_report = renderer.last_resident_regional_report();
+            if !planetary_submitted {
+                resident_report.preparation_micros = 0;
+                resident_report.tile_upload_bytes = 0;
+                resident_report.boundary_upload_bytes = 0;
+                resident_report.metadata_upload_bytes = 0;
+                resident_report.tile_upload_count = 0;
+                resident_report.boundary_upload_count = 0;
+                resident_report.deferred_upload_count = 0;
+                resident_report.transfer_staging_bytes = 0;
+                resident_report.validation_readback_bytes = 0;
+            }
+            let resident_prepare_ms = resident_report.preparation_micros as f64 / 1000.0;
+            snapshot.performance.gpu_preparation_cpu_ms = Some(resident_prepare_ms);
+            snapshot.performance.frame_cpu_ms = snapshot
+                .performance
+                .frame_cpu_ms
+                .map(|cpu| cpu + resident_prepare_ms);
+            snapshot.performance.terrain_preparation_ms = Some(resident_prepare_ms);
+            snapshot.performance.upload_bytes = Some(
+                resident_report.tile_upload_bytes
+                    + resident_report.boundary_upload_bytes
+                    + resident_report.metadata_upload_bytes,
+            );
+            self.planetary.runtime.observe(resident_report);
+            let diagnostics_started = Instant::now();
+            // Retiring the preceding snapshot is diagnostic CPU work too.
+            // Keep it inside the measured host/diagnostic interval rather than
+            // leaving its allocations to be dropped after timing is finalized.
+            #[cfg(feature = "developer-tools")]
+            drop(self.developer_snapshot.take());
+            self.planetary.annotate(
+                &mut snapshot,
+                &self.ids,
+                &self.system,
+                planetary_binding_ready,
+            )?;
+            snapshot.performance.diagnostics_ms =
+                Some(diagnostics_started.elapsed().as_secs_f64() * 1000.0);
+            snapshot.performance.frame_cpu_ms = snapshot.performance.frame_cpu_ms.map(|cpu| {
+                cpu + ui_build_cpu_ms + diagnostics_started.elapsed().as_secs_f64() * 1000.0
+            });
+            snapshot.performance.host_frame_ms =
+                Some(host_frame_started.elapsed().as_secs_f64() * 1000.0);
+        }
+        snapshot.performance.host_frame_ms =
+            Some(host_frame_started.elapsed().as_secs_f64() * 1000.0);
+        drop(frame_span);
+        let profiler_started = Instant::now();
+        if let Some(profile) = self.profile_sampler.poll_value() {
+            self.profile_snapshot = Some(std::sync::Arc::new(profile));
+        }
+        let profile_sample_due = self
+            .profile_sample_at
+            .is_none_or(|at| at.elapsed() >= Duration::from_millis(250));
+        if profile_sample_due {
+            self.profile_sample_at = Some(Instant::now());
+            if crate::engine_profile::is_enabled() {
+                let _ = self.profile_sampler.request();
+            } else {
+                self.profile_snapshot = None;
+            }
+        }
+        snapshot.engine_profile = self.profile_snapshot.clone();
+        let capture_trace = if planetary_active {
+            self.planetary.runtime.trace()
+        } else {
+            #[cfg(feature = "developer-tools")]
+            {
+                self.resident_regional.trace()
+            }
+            #[cfg(not(feature = "developer-tools"))]
+            {
+                None
+            }
+        };
+        if let Some(name) = self
+            .performance_capture
+            .observe_with_trace(&snapshot, capture_trace)
+        {
+            self.diagnostic_capture_request = Some(name);
+        }
+        if std::mem::take(&mut self.controls.performance_lab.capture_requested) {
+            self.performance_capture.request();
+        }
+        if std::mem::take(&mut self.controls.performance_lab.capture_stop_requested) {
+            self.performance_capture.stop();
+        }
+        if let Some(route) = self.controls.performance_lab.benchmark_requested.take() {
+            self.start_lab_benchmark(route)?;
+        }
+        if std::mem::take(&mut self.controls.performance_lab.stop_requested) {
+            self.lab_benchmark = None;
+        }
+        self.advance_lab_benchmark()?;
+        snapshot.performance.profiler_publication_ms =
+            Some(profiler_started.elapsed().as_secs_f64() * 1000.0);
+        snapshot.performance.host_frame_ms =
+            Some(host_frame_started.elapsed().as_secs_f64() * 1000.0);
+        self.controls.performance_lab.observe_frame(&snapshot);
+        if profile_sample_due {
+            self.controls.performance_lab.ingest(&snapshot, None);
+        }
+        if planetary_active && planetary_candidate.is_some() {
+            self.planetary
+                .runtime
+                .record_native_frame(&snapshot.performance, self.developer_frame_number);
         }
         #[cfg(feature = "developer-tools")]
         if self.developer_session.is_some() || renderer.deterministic() {
@@ -3262,6 +3562,13 @@ fn draw_ui(
     info: &UiInfo<'_>,
     markers: &[CelestialMarker],
 ) {
+    if let Some(snapshot) = info.snapshot {
+        controls
+            .performance_lab
+            .draw(context, Some(snapshot), snapshot.engine_profile.as_deref());
+    } else {
+        controls.performance_lab.draw(context, None, None);
+    }
     egui::SidePanel::right("planet surface / inspection").default_width(300.0).resizable(true).show(context,|ui| {
             egui::ScrollArea::vertical().show(ui,|ui| {
             developer_ui::right(ui, controls, info);
@@ -3316,7 +3623,7 @@ fn draw_ui(
             visual_controls::checkbox(ui,controls,visual_controls::Layer::Borders,"Patch borders");visual_controls::checkbox(ui,controls,visual_controls::Layer::LodColors,"LOD colours");ui.checkbox(&mut controls.surface_style.face_colors,"Face IDs / colours");ui.checkbox(&mut controls.surface_style.underside,"No-cull underside diagnostic");
             ui.checkbox(&mut controls.surface_bounds,"Bounds / normal envelope axes (bounded)");
             let mut preview=controls.terrain_preview;
-            if ui.checkbox(&mut preview,"Adaptive terrain with stitched transitions").changed() {controls.pending.push_back(Command::TerrainPreview(preview));}
+            if ui.checkbox(&mut preview,"Adaptive terrain").changed() {controls.pending.push_back(Command::TerrainPreview(preview));}
             if controls.terrain_preview {
                 ui.label("Natural planetary presentation (render-only layers)");
                 visual_controls::checkbox(ui,controls,visual_controls::Layer::Ocean,"Ocean layer (where defined)");

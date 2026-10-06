@@ -491,6 +491,34 @@ impl DeveloperService {
             };
             let _ = p.reply.try_send(response);
         }
+        if drawable
+            && self.capture.is_none()
+            && let Some(name) = demo.take_diagnostic_capture_request()
+        {
+            let command = self.receipt(
+                "accepted",
+                demo.world().revision(),
+                json!({"source":"performance_lab"}),
+            );
+            let id = self.sequence;
+            match renderer
+                .enable_native_capture()
+                .and_then(|()| renderer.request_native_capture(id))
+            {
+                Ok(()) => {
+                    self.capture = Some(Capture {
+                        id,
+                        command,
+                        name,
+                        snapshot: None,
+                        deadline: Instant::now() + Duration::from_secs(30),
+                        publishing: false,
+                        cancelled: Arc::new(AtomicBool::new(false)),
+                    })
+                }
+                Err(error) => self.complete(&command, "failed", json!({"error":error})),
+            }
+        }
     }
     fn handle(
         &mut self,
@@ -893,6 +921,19 @@ fn publish_bundle(mut job: Publish) -> Result<Value> {
         .open(&manifest)?;
     file.write_all(&serde_json::to_vec_pretty(&data)?)?;
     file.sync_all()?;
+    if job.name.starts_with("bad-frame-") {
+        let root = std::env::var_os("MUNDARIS_CAPTURE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("target/terrain-captures"));
+        let destination = root
+            .join(format!("process-{}", std::process::id()))
+            .join(&job.name);
+        fs::create_dir_all(&destination)?;
+        fs::copy(&viewport, destination.join("screenshot.png"))?;
+        fs::copy(&full, destination.join("client.png"))?;
+        fs::copy(&snapshot, destination.join("screenshot-snapshot.json"))?;
+        fs::copy(&manifest, destination.join("screenshot-complete.json"))?;
+    }
     Ok(data)
 }
 

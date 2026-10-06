@@ -9,23 +9,28 @@
 //! height bound, which would make distant tiles appear uniformly close. This
 //! local residual proxy is deterministic but does not certify unsampled error.
 
-use std::cmp::Ordering;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use glam::DVec3;
+use glam::{DMat3, DVec3};
 use mundaris_math::surface::{CubeFace, CubePatchAddress, PatchEdge};
+use mundaris_renderer::CelestialProjection;
+use mundaris_renderer::planet_surface::{PatchMetadata, SurfaceExtent, SurfaceTopology};
 use mundaris_world::terrain::SurfaceGenerator;
 use serde::Serialize;
+
+const BUILD_CANDIDATE_STARVATION_AFTER: Duration = Duration::from_secs(2);
 
 use crate::resident_terrain::{
     ResidentTileBuilder, TileBuildDiagnostics, TileBuildIdentity, TileData, TileKey,
 };
+use crate::terrain_trace::{BlockReason, Stage, TerrainTrace};
 
 /// Prototype limits for one regional selector/scheduler instance.
 #[derive(Debug, Clone)]
@@ -86,6 +91,30 @@ pub struct RegionalView {
     pub projection_scale_px: f64,
 }
 
+#[derive(Clone, Copy)]
+struct PlanetaryView {
+    body_to_view: DMat3,
+    projection: CelestialProjection,
+}
+
+impl PlanetaryView {
+    fn matches(self, other: Option<Self>) -> bool {
+        let Some(other) = other else { return false };
+        // Re-expression of a stationary inspection basis can accumulate only
+        // f64 roundoff. This tolerance is below 1e-10 pixels at ordinary display
+        // scales; actual draw transforms retain their original precision.
+        self.body_to_view
+            .to_cols_array()
+            .iter()
+            .zip(other.body_to_view.to_cols_array())
+            .all(|(a, b)| (*a - b).abs() <= 1.0e-14)
+            && self.projection.viewport() == other.projection.viewport()
+            && self.projection.origin() == other.projection.origin()
+            && self.projection.near_m() == other.projection.near_m()
+            && self.projection.vertical_fov_rad() == other.projection.vertical_fov_rad()
+    }
+}
+
 /// One immutable CPU tile admitted to the app/runtime upload queue.
 #[derive(Debug, Clone)]
 pub struct RegionalUpload {
@@ -134,11 +163,18 @@ pub struct RegionalSnapshot {
     pub cpu_cached_tiles: usize,
     pub cpu_cached_bytes: usize,
     pub worker_queued: usize,
+    pub worker_outstanding: usize,
     pub worker_running: usize,
     pub completion_backlog: usize,
     pub completion_drain_micros: u64,
     pub selection_time_micros: u64,
+    /// Number of selector ticks whose measured wall time exceeded 2 ms.
+    pub selection_budget_overruns: u64,
+    /// True when planetary adaptive selection stopped at its 2 ms deadline.
+    pub selection_budget_exhausted: bool,
     pub scheduler_time_micros: u64,
+    pub publication_discovery_micros: u64,
+    pub frontier_discovery_micros: u64,
     pub cpu_tile_cap: usize,
     pub cpu_byte_cap: usize,
     pub max_desired_patches: usize,
@@ -147,12 +183,24 @@ pub struct RegionalSnapshot {
     pub upload_tile_capacity: usize,
     pub upload_byte_capacity: usize,
     pub estimated_worker_scratch_bytes: usize,
+    /// Current desired-ancestor priority entries retained for frontier discovery.
+    pub frontier_priority_index_entries: usize,
+    /// Conservative configured upper bound for the index and exact-key signature.
+    pub frontier_priority_cache_bytes_upper_bound: usize,
+    /// Current missing eligible generation candidates tracked for fairness.
+    pub build_candidate_wait_entries: usize,
+    /// Config/dependency-derived upper bound for tracked candidate entries.
+    pub build_candidate_wait_entries_upper_bound: usize,
+    /// Conservative allocation bound, including exact-key definition words.
+    pub build_candidate_wait_bytes_upper_bound: usize,
     pub upload_backlog_tiles: usize,
     pub upload_backlog_bytes: usize,
     /// Estimate of completed desired CPU tiles awaiting upload or residency.
     /// This is derived from the bounded CPU cache and excludes queued uploads.
     pub estimated_completed_unpublished_bytes: usize,
     pub publication_candidates: usize,
+    /// Oldest currently eligible publication proposal, in selector ticks.
+    pub publication_backlog_age_ticks: u64,
     pub active_transitions_reported: usize,
     /// Root-area-normalized area-weighted mean projected error, in pixels.
     pub desired_projected_error_px: f64,
@@ -165,9 +213,56 @@ pub struct RegionalSnapshot {
     pub upload_pressure: bool,
     pub publication_pressure: bool,
     pub desired_capacity_pressure: bool,
+    /// True only when every visible desired patch is below its refinement
+    /// threshold and the selector is not constrained by the desired cap.
+    pub target_quality_reached: bool,
+    /// Drawable patches with an available approximate proxy score.
+    pub visible_drawable_proxy_count: usize,
+    /// Drawable patches missing an approximate proxy score.
+    pub missing_drawable_proxy_score_count: usize,
+    pub visible_desired_counterpart_count: usize,
+    /// Existing unweighted summaries use positive-error scores from all drawable patches.
+    pub visible_drawable_proxy_error_max_px: f64,
+    pub visible_drawable_proxy_error_p95_px: f64,
+    pub visible_drawable_proxy_error_over_1px: usize,
+    pub visible_drawable_proxy_error_over_split_threshold: usize,
+    /// Largest scored positive-error proxy among all drawable patches; visibility is
+    /// not applied, and missing drawable scores can make this incomplete.
+    pub worst_proxy: Option<RegionalProxyErrorSnapshot>,
+    /// Largest visible drawable proxy above the split threshold. Missing visible
+    /// proxy scores keep this unset because the worst unresolved patch is unknown.
+    pub worst_visible_unresolved: Option<RegionalProxyErrorSnapshot>,
+    /// At most eight visible drawable patches, sorted by error descending then address.
+    pub visible_drawable_proxy_hotspots: Vec<RegionalDrawableProxyHotspotSnapshot>,
+    /// Projected-area-weighted selector convergence ratio in [0, 1], where 1
+    /// means every visible drawable proxy meets `convergence_target_error_px`.
+    /// This selector measure remains uncertified.
+    pub visible_convergence: Option<f64>,
+    /// Center-screen drawable proxy convergence ratio in [0, 1]; None when the
+    /// center ray misses the body or drawable evidence is missing. Uncertified.
+    pub center_screen_convergence: Option<f64>,
+    /// Center-screen drawable projected proxy error in pixels.
+    pub center_screen_error_px: Option<f64>,
+    /// Split threshold used to normalize both convergence ratios.
+    pub convergence_target_error_px: f64,
+    /// Worst visible drawable proxy error above the target. None when evidence is missing.
+    pub worst_visible_unresolved_error_px: Option<f64>,
+    pub useful_detail_reached: bool,
+    pub useful_detail_proxy_error_threshold_px: f64,
+    pub visible_proxy_error_certified: bool,
+    pub visible_proxy_error_model: &'static str,
+    /// Whole-cover split/merge operations applied by the planetary selector
+    /// during the last tick. Finite-region fixtures report zero.
+    pub planetary_topology_operations: usize,
+    /// Cover leaves scored for planetary refinement during the most recent tick.
+    pub planetary_split_candidates_scanned: usize,
     pub selector_fixed_point_reused: bool,
+    /// No scheduler admission was needed for unchanged, fully resident coverage.
+    pub scheduler_fixed_point_reused: bool,
     pub requests_issued: u64,
     pub jobs_started: u64,
+    /// Successful CPU tile builder completions, including results discarded as stale.
+    pub completed_build_count: u64,
     pub cancelled_before_start: u64,
     pub cancelled_during_work: u64,
     pub stale_completions: u64,
@@ -190,6 +285,46 @@ pub struct RegionalSnapshot {
     pub reuploads: u64,
     pub last_admitted_priorities: Vec<RegionalPrioritySnapshot>,
     pub selector_error_model: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RegionalProxyErrorSnapshot {
+    pub address: String,
+    pub error_px: f64,
+    /// Approximate projected pixel-area weight; not a certified screen-space bound.
+    pub projected_footprint_weight: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RegionalTileKeySnapshot {
+    pub body_identity: u64,
+    pub definition_words: Vec<u64>,
+    pub radius_bits: u64,
+    pub surface_revision: u64,
+    pub material_revision: u64,
+    pub format_version: u32,
+    pub filter_version: u32,
+    pub cells: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RegionalDrawableProxyHotspotSnapshot {
+    pub address: String,
+    pub error_px: f64,
+    /// Approximate projected pixel-area weight; not a certified screen-space bound.
+    pub projected_footprint_weight: f64,
+    pub key: Option<RegionalTileKeySnapshot>,
+    pub parent: Option<String>,
+    pub desired: bool,
+    pub resident: bool,
+    pub cpu_cached: bool,
+    pub upload_queued: bool,
+    pub in_flight: bool,
+    pub in_flight_cancelled: bool,
+    pub publication_parent_blocked: bool,
+    pub upload_allowlisted: Option<bool>,
+    /// Local state only; "none_observed" does not rule out blockers elsewhere.
+    pub blocker_status: &'static str,
 }
 
 /// Settings that materially determine a regional terrain snapshot. Runtime
@@ -330,6 +465,20 @@ struct WorkerPool {
     _worker_count: usize,
 }
 
+#[derive(Default)]
+struct DesiredPriorityIndex {
+    /// Exact ordered key and priority-bit signature; avoids hash-collision reuse.
+    signature: Vec<(CubePatchAddress, u64)>,
+    priorities: HashMap<CubePatchAddress, f64>,
+    revision: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BuildCandidateWait {
+    first_eligible: Instant,
+    last_seen_epoch: u64,
+}
+
 /// Regional adaptive selector and bounded asynchronous CPU tile builder.
 ///
 /// GPU allocation and submission safety remain owned by the renderer. The app
@@ -339,6 +488,12 @@ pub struct RegionalTerrain {
     generator: Arc<SurfaceGenerator>,
     identity: TileBuildIdentity,
     config: RegionalConfig,
+    trace: Arc<TerrainTrace>,
+    planetary_view: Option<PlanetaryView>,
+    last_selection_planetary_view: Option<PlanetaryView>,
+    surface_topology: SurfaceTopology,
+    patch_metadata: RefCell<HashMap<CubePatchAddress, PatchMetadata>>,
+    planetary_scores: RefCell<BTreeMap<CubePatchAddress, (f64, f64, f64, f64)>>,
     workers: WorkerPool,
     completions: Receiver<BuildResult>,
     completion_backlog: Arc<AtomicUsize>,
@@ -350,6 +505,8 @@ pub struct RegionalTerrain {
     resident: BTreeSet<CubePatchAddress>,
     external_pins: BTreeSet<CubePatchAddress>,
     cache: HashMap<TileKey, CacheEntry>,
+    cached_tiles_by_address: HashMap<CubePatchAddress, Arc<TileData>>,
+    blocked_publication_parents: HashSet<CubePatchAddress>,
     cache_bytes: usize,
     cache_clock: u64,
     in_flight: HashMap<TileKey, Arc<BuildToken>>,
@@ -357,6 +514,7 @@ pub struct RegionalTerrain {
     upload_bytes: usize,
     upload_allowlist: Option<BTreeSet<CubePatchAddress>>,
     publications: Vec<RegionalPublication>,
+    publications_dirty: bool,
     last_priorities: Vec<RegionalPrioritySnapshot>,
     publications_this_tick: usize,
     desired_addresses: Vec<CubePatchAddress>,
@@ -364,10 +522,29 @@ pub struct RegionalTerrain {
     selector_can_reuse_fixed_point: bool,
     selector_last_capacity_pressure: bool,
     selector_fixed_point_reused: bool,
+    scheduler_fixed_point_reused: bool,
+    planetary_topology_operations: usize,
+    planetary_split_candidates_scanned: usize,
+    planetary_candidate_cursor: usize,
+    planetary_score_cursor: usize,
+    planetary_merge_index_cover: Vec<CubePatchAddress>,
+    planetary_merge_index_parents: Vec<CubePatchAddress>,
+    planetary_merge_index_leaves: HashSet<CubePatchAddress>,
+    desired_dependency_cache: RefCell<(Vec<CubePatchAddress>, BTreeSet<CubePatchAddress>)>,
+    desired_priority_index: RefCell<DesiredPriorityIndex>,
+    build_candidate_waits: HashMap<TileKey, BuildCandidateWait>,
+    build_candidate_wait_epoch: u64,
+    tile_key_definition_word_count: usize,
+    selector_budget_exhausted: bool,
+    merge_scan_cursor: Option<CubePatchAddress>,
+    cull_scan_cursor: Option<CubePatchAddress>,
+    selector_merge_scan_pending: bool,
     reserved_split_parent: Option<CubePatchAddress>,
     resident_history: HashSet<CubePatchAddress>,
     seen_cache_requests: HashSet<TileKey>,
     stats: Counters,
+    frontier_discovery_micros: Cell<u64>,
+    publication_candidate_ages: HashMap<CubePatchAddress, u64>,
     pressure: Pressure,
 }
 
@@ -375,6 +552,7 @@ pub struct RegionalTerrain {
 struct Counters {
     requests_issued: u64,
     jobs_started: u64,
+    completed_build_count: u64,
     cancelled_before_start: u64,
     cancelled_during_work: u64,
     stale_completions: u64,
@@ -387,7 +565,9 @@ struct Counters {
     build_failures: u64,
     completion_drain_micros: u64,
     selection_time_micros: u64,
+    selection_budget_overruns: u64,
     scheduler_time_micros: u64,
+    publication_discovery_micros: u64,
     cache_hits: u64,
     cache_misses: u64,
     cache_evictions: u64,
@@ -412,6 +592,10 @@ impl RegionalTerrain {
     ) -> Result<Self, RegionalError> {
         validate_config(&config)?;
         let generator = Arc::new(generator);
+        let tile_key_definition_word_count =
+            ResidentTileBuilder::tile_key(&generator, identity, config.roots[0], config.cells)
+                .map(|key| key.definition_words.len())
+                .unwrap_or(0);
         let worker_count = config.worker_count;
         let (job_sender, job_receiver) = mpsc::sync_channel::<BuildJob>(config.queue_cap);
         let (completion_sender, completion_receiver) =
@@ -419,18 +603,46 @@ impl RegionalTerrain {
         let job_receiver = Arc::new(Mutex::new(job_receiver));
         let completion_backlog = Arc::new(AtomicUsize::new(0));
         let worker_running = Arc::new(AtomicUsize::new(0));
+        let trace = Arc::new(TerrainTrace::new());
 
-        for _ in 0..worker_count {
+        for worker_id in 0..worker_count {
             let receiver = Arc::clone(&job_receiver);
             let sender = completion_sender.clone();
             let generator = Arc::clone(&generator);
             let delay = config.worker_delay;
             let running = Arc::clone(&worker_running);
             let backlog = Arc::clone(&completion_backlog);
+            let trace = Arc::clone(&trace);
             thread::Builder::new()
                 .name("regional-terrain-builder".into())
                 .stack_size(4 * 1024 * 1024)
                 .spawn(move || {
+                    const WORKER_NAMES: [&str; 16] = [
+                        "Terrain Worker 0",
+                        "Terrain Worker 1",
+                        "Terrain Worker 2",
+                        "Terrain Worker 3",
+                        "Terrain Worker 4",
+                        "Terrain Worker 5",
+                        "Terrain Worker 6",
+                        "Terrain Worker 7",
+                        "Terrain Worker 8",
+                        "Terrain Worker 9",
+                        "Terrain Worker 10",
+                        "Terrain Worker 11",
+                        "Terrain Worker 12",
+                        "Terrain Worker 13",
+                        "Terrain Worker 14",
+                        "Terrain Worker 15",
+                    ];
+                    let _worker = WORKER_NAMES.get(worker_id).map_or_else(
+                        || {
+                            crate::engine_profile::worker_scope(
+                                0x5445_5252_4149_4e00u64.saturating_add(worker_id as u64),
+                            )
+                        },
+                        |name| crate::engine_profile::worker_scope_named(name),
+                    );
                     loop {
                         let job = {
                             let receiver = receiver
@@ -440,6 +652,7 @@ impl RegionalTerrain {
                         };
                         let Ok(job) = job else { break };
                         if job.token.cancelled.load(AtomicOrdering::Acquire) {
+                            trace.event_key(&job.key, Stage::GenerationCancelled);
                             backlog.fetch_add(1, AtomicOrdering::AcqRel);
                             if sender
                                 .send(BuildResult {
@@ -457,8 +670,11 @@ impl RegionalTerrain {
                             continue;
                         }
                         job.token.started.store(true, AtomicOrdering::Release);
+                        trace.event_key(&job.key, Stage::GenerationStarted);
                         running.fetch_add(1, AtomicOrdering::AcqRel);
                         let started = std::time::Instant::now();
+                        let generation_span =
+                            crate::engine_profile::span("terrain tile generation");
                         let mut remaining = delay;
                         while !remaining.is_zero()
                             && !job.token.cancelled.load(AtomicOrdering::Acquire)
@@ -468,17 +684,29 @@ impl RegionalTerrain {
                             remaining = remaining.saturating_sub(slice);
                         }
                         let result = if job.token.cancelled.load(AtomicOrdering::Acquire) {
+                            trace.event_key(&job.key, Stage::GenerationCancelled);
                             None
                         } else {
-                            ResidentTileBuilder::build(
+                            let build_span = crate::engine_profile::span("terrain tile sampling");
+                            let built = ResidentTileBuilder::build_cached(
                                 &generator,
                                 identity,
                                 job.address,
                                 job.key.cells,
-                            )
-                            .ok()
-                            .map(|(tile, diagnostics)| (Arc::new(tile), diagnostics))
+                            );
+                            drop(build_span);
+                            match built {
+                                Ok((tile, diagnostics)) => {
+                                    trace.event_key(&job.key, Stage::GenerationCompleted);
+                                    Some((Arc::new(tile), diagnostics))
+                                }
+                                Err(_) => {
+                                    trace.event_key(&job.key, Stage::GenerationFailed);
+                                    None
+                                }
+                            }
                         };
+                        drop(generation_span);
                         let elapsed = started.elapsed();
                         running.fetch_sub(1, AtomicOrdering::AcqRel);
                         backlog.fetch_add(1, AtomicOrdering::AcqRel);
@@ -505,6 +733,12 @@ impl RegionalTerrain {
             generator,
             identity,
             config,
+            trace,
+            planetary_view: None,
+            last_selection_planetary_view: None,
+            surface_topology: SurfaceTopology::new(),
+            patch_metadata: RefCell::new(HashMap::new()),
+            planetary_scores: RefCell::new(BTreeMap::new()),
             workers: WorkerPool {
                 sender: job_sender,
                 _worker_count: worker_count,
@@ -523,6 +757,8 @@ impl RegionalTerrain {
             resident: BTreeSet::new(),
             external_pins: BTreeSet::new(),
             cache: HashMap::new(),
+            cached_tiles_by_address: HashMap::new(),
+            blocked_publication_parents: HashSet::new(),
             cache_bytes: 0,
             cache_clock: 0,
             in_flight: HashMap::new(),
@@ -530,6 +766,7 @@ impl RegionalTerrain {
             upload_bytes: 0,
             upload_allowlist: None,
             publications: Vec::new(),
+            publications_dirty: false,
             last_priorities: Vec::new(),
             publications_this_tick: 0,
             desired_addresses: Vec::new(),
@@ -537,10 +774,29 @@ impl RegionalTerrain {
             selector_can_reuse_fixed_point: false,
             selector_last_capacity_pressure: false,
             selector_fixed_point_reused: false,
+            scheduler_fixed_point_reused: false,
+            planetary_topology_operations: 0,
+            planetary_split_candidates_scanned: 0,
+            planetary_candidate_cursor: 0,
+            planetary_score_cursor: 0,
+            planetary_merge_index_cover: Vec::new(),
+            planetary_merge_index_parents: Vec::new(),
+            planetary_merge_index_leaves: HashSet::new(),
+            desired_dependency_cache: RefCell::new((Vec::new(), BTreeSet::new())),
+            desired_priority_index: RefCell::new(DesiredPriorityIndex::default()),
+            build_candidate_waits: HashMap::new(),
+            build_candidate_wait_epoch: 0,
+            tile_key_definition_word_count,
+            selector_budget_exhausted: false,
+            merge_scan_cursor: None,
+            cull_scan_cursor: None,
+            selector_merge_scan_pending: false,
             reserved_split_parent: None,
             resident_history: HashSet::new(),
             seen_cache_requests: HashSet::new(),
             stats: Counters::default(),
+            frontier_discovery_micros: Cell::new(0),
+            publication_candidate_ages: HashMap::new(),
             pressure: Pressure::default(),
         })
     }
@@ -556,23 +812,84 @@ impl RegionalTerrain {
             return Err(RegionalError::InvalidView);
         }
         self.tick = self.tick.saturating_add(1);
+        for age in self.publication_candidate_ages.values_mut() {
+            *age = age.saturating_add(1);
+        }
         self.publications_this_tick = 0;
+        self.stats.publication_discovery_micros = 0;
+        self.scheduler_fixed_point_reused = false;
         self.pressure = Pressure::default();
         self.view = view;
         let phase_started = std::time::Instant::now();
+        let previous_desired = self.desired_addresses.clone();
+        let selector_span = crate::engine_profile::span("terrain desired cover");
         self.select_desired();
-        self.update_split_reservation();
+        drop(selector_span);
+        if crate::engine_profile::is_enabled() && previous_desired != self.desired_addresses {
+            let previous: HashSet<_> = previous_desired.iter().copied().collect();
+            let current: HashSet<_> = self.desired_addresses.iter().copied().collect();
+            for &address in &self.desired_addresses {
+                if !previous.contains(&address)
+                    && let Ok(key) = self.key_for(address)
+                {
+                    self.trace.set_desired(&key, true);
+                }
+            }
+            for address in previous.difference(&current).copied() {
+                self.trace.clear_desired(address);
+            }
+        }
         self.stats.selection_time_micros = phase_started
             .elapsed()
             .as_micros()
             .min(u128::from(u64::MAX)) as u64;
+        if self.planetary_view.is_some() && self.stats.selection_time_micros > 2_000 {
+            self.stats.selection_budget_overruns =
+                self.stats.selection_budget_overruns.saturating_add(1);
+        }
+        let completion_span = crate::engine_profile::span("terrain completion drain");
         self.drain_completions();
+        drop(completion_span);
         self.touch_pinned_cache_entries();
         let scheduler_started = std::time::Instant::now();
+        // An unchanged fixed point with complete resident coverage has no work
+        // to admit. Keep LRU touches and completion draining above; a view,
+        // topology, residency, publication or external-pin change restores the
+        // normal scheduler before any requested dependency can be skipped.
+        if self.planetary_view.is_some()
+            && self.selector_fixed_point_reused
+            && self.desired_addresses == self.drawable
+            && self.is_idle()
+            && self.uploads.is_empty()
+            && self.publications.is_empty()
+            && !self.publications_dirty
+            && self
+                .config
+                .roots
+                .iter()
+                .chain(&self.drawable)
+                .chain(&self.external_pins)
+                .all(|address| self.resident.contains(address))
+        {
+            self.trace
+                .sync_generation_candidates(std::iter::empty::<&TileKey>());
+            self.trace
+                .sync_upload_candidates(std::iter::empty::<&TileKey>());
+            self.reserved_split_parent = None;
+            self.scheduler_fixed_point_reused = true;
+            self.stats.scheduler_time_micros = scheduler_started
+                .elapsed()
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64;
+            return Ok(());
+        }
+        self.update_split_reservation();
         self.cancel_obsolete_work();
         self.admit_builds();
         self.admit_uploads();
-        self.refresh_publications();
+        if self.desired_addresses != previous_desired || self.publications_dirty {
+            self.refresh_publications();
+        }
         self.stats.scheduler_time_micros = scheduler_started
             .elapsed()
             .as_micros()
@@ -586,18 +903,84 @@ impl RegionalTerrain {
         &self.desired_addresses
     }
 
+    /// Measured time spent selecting the desired planetary/finite-region cover
+    /// during the most recent tick, in microseconds.
+    pub fn selection_time_micros(&self) -> u64 {
+        self.stats.selection_time_micros
+    }
+
+    pub(crate) fn completion_drain_time_micros(&self) -> u64 {
+        self.stats.completion_drain_micros
+    }
+
+    pub(crate) fn publication_discovery_time_micros(&self) -> u64 {
+        self.stats.publication_discovery_micros
+    }
+
+    pub(crate) fn frontier_discovery_time_micros(&self) -> u64 {
+        self.frontier_discovery_micros.get()
+    }
+
+    /// Number of successful CPU tile builds completed by workers so far.
+    /// This excludes renderer uploads and includes results later rejected as stale.
+    pub fn completed_build_count(&self) -> u64 {
+        self.stats.completed_build_count
+    }
+
     pub fn drawable(&self) -> &[CubePatchAddress] {
         &self.drawable
+    }
+
+    /// Shared bounded pipeline trace. Native diagnostics sample this separately
+    /// from the hot regional scheduler state.
+    pub(crate) fn trace(&self) -> Arc<TerrainTrace> {
+        Arc::clone(&self.trace)
     }
 
     pub fn config(&self) -> &RegionalConfig {
         &self.config
     }
 
+    /// Attach an optional body-fixed-to-view orientation and projection for
+    /// conservative planetary demand culling. `RegionalView` remains the
+    /// observer-position contract used by finite-region fixtures.
+    pub fn set_planetary_view(
+        &mut self,
+        body_to_view: DMat3,
+        projection: CelestialProjection,
+    ) -> Result<(), RegionalError> {
+        let columns = body_to_view.to_cols_array();
+        if columns.iter().any(|component| !component.is_finite())
+            || (body_to_view.transpose() * body_to_view - DMat3::IDENTITY)
+                .to_cols_array()
+                .iter()
+                .any(|component| component.abs() > 1.0e-6)
+            || (body_to_view.determinant() - 1.0).abs() > 1.0e-6
+        {
+            return Err(RegionalError::InvalidView);
+        }
+        self.planetary_view = Some(PlanetaryView {
+            body_to_view,
+            projection,
+        });
+        Ok(())
+    }
+
+    /// Return to the original finite-region selection policy.
+    pub fn clear_planetary_view(&mut self) {
+        self.planetary_view = None;
+    }
+
+    /// Whether a patch's conservative displaced bounds intersect the current
+    /// frustum and remain above the conservative planetary horizon.
+    pub fn patch_visible(&self, address: CubePatchAddress) -> bool {
+        self.patch_visible_with(address, self.planetary_view)
+    }
+
     pub fn tile(&self, address: CubePatchAddress) -> Option<Arc<TileData>> {
-        let key = self.key_for(address).ok()?;
-        let entry = self.cache.get(&key)?;
-        Some(Arc::clone(&entry.tile))
+        // Each core has immutable world authority and one exact key per address.
+        // Admission verifies that key; eviction removes both indexes together.
+        self.cached_tiles_by_address.get(&address).map(Arc::clone)
     }
 
     /// Insert a caller-provided prebuilt tile into the exact CPU cache.
@@ -643,17 +1026,18 @@ impl RegionalTerrain {
     /// only after the renderer accepts the exact keyed tile.
     pub fn ack_resident(&mut self, address: CubePatchAddress) {
         let newly_resident = self.resident.insert(address);
-        if let Ok(key) = self.key_for(address)
-            && let Some(entry) = self.cache.get_mut(&key)
-        {
-            entry.ever_resident = true;
-        }
         let queued = self
             .uploads
             .iter()
             .position(|upload| upload.address == address);
         if !newly_resident && queued.is_none() {
             return;
+        }
+        self.trace.set_resident(address, true);
+        if let Ok(key) = self.key_for(address)
+            && let Some(entry) = self.cache.get_mut(&key)
+        {
+            entry.ever_resident = true;
         }
         if let Some(index) = queued {
             let upload = self.uploads.remove(index);
@@ -671,8 +1055,16 @@ impl RegionalTerrain {
         {
             self.drawable.clone_from(&self.config.roots);
             self.drawable.sort();
+            for &root in &self.drawable {
+                self.trace.set_drawable(root, true);
+            }
         }
-        self.refresh_publications();
+        if self.planetary_view.is_some() {
+            self.publications.clear();
+            self.publications_dirty = true;
+        } else {
+            self.refresh_publications();
+        }
     }
 
     /// Reflect renderer eviction so future upload admission can restore this tile.
@@ -685,7 +1077,12 @@ impl RegionalTerrain {
             // replacement; publication validation prevents adding holes.
             self.pressure.publication = true;
         }
-        self.refresh_publications();
+        if self.planetary_view.is_some() {
+            self.publications.clear();
+            self.publications_dirty = true;
+        } else {
+            self.refresh_publications();
+        }
     }
 
     /// Cancel queued/delayed requests without waiting for a worker.
@@ -712,14 +1109,317 @@ impl RegionalTerrain {
     /// Return local resident replacements. The returned vector is capped by
     /// both the per-tick publication and transition limits.
     pub fn publication_candidates(&self) -> Vec<RegionalPublication> {
+        self.publications
+            .iter()
+            .filter_map(|candidate| self.materialize_publication(candidate))
+            .collect()
+    }
+
+    /// Return compact local proposals for the native runtime. Covers are empty;
+    /// the caller applies each local delta to its own transaction target.
+    pub(crate) fn publication_local_candidates(&self) -> Vec<RegionalPublication> {
         self.publications.clone()
+    }
+
+    pub(crate) fn publication_locally_current(&self, candidate: &RegionalPublication) -> bool {
+        self.local_publication_valid(candidate, true)
+    }
+
+    /// Current visual priority used to reprioritize prepared local work without
+    /// rescoring tiles. Missing cached scores fall back to stored desired scores.
+    pub(crate) fn publication_priority(&self, candidate: &RegionalPublication) -> f64 {
+        self.cached_publication_priority(candidate)
+    }
+
+    pub(crate) fn publication_candidate_age_ticks(&self, candidate: &RegionalPublication) -> u64 {
+        self.publication_candidate_ages
+            .get(&publication_parent(candidate))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Commit a compact split/merge after local boundary preparation succeeds.
+    /// Independent adoptions do not stale the proposal; its local delta is
+    /// checked against the current drawable cover at the commit point.
+    pub(crate) fn ack_local_publication(
+        &mut self,
+        candidate: &RegionalPublication,
+    ) -> Result<(), RegionalError> {
+        if !self.local_publication_valid(candidate, true) {
+            return Err(RegionalError::InvalidCover);
+        }
+        self.apply_local_publication(candidate)
+    }
+
+    /// Finish a prepared merge after its accepted morph. The current demand may
+    /// have reversed while that morph was displayed; topology and residency are
+    /// still checked before replacing the four drawable children.
+    pub(crate) fn ack_prepared_merge(
+        &mut self,
+        parent: CubePatchAddress,
+        children: [CubePatchAddress; 4],
+    ) -> Result<(), RegionalError> {
+        let candidate = RegionalPublication::Merge {
+            parent,
+            children,
+            cover: Vec::new(),
+        };
+        if !self.local_publication_valid(&candidate, false) {
+            return Err(RegionalError::InvalidCover);
+        }
+        self.apply_local_publication(&candidate)
+    }
+
+    /// Runtime transition ownership can temporarily exclude conflicting parents
+    /// before bounded proposal selection. Publication and transition caps remain
+    /// unchanged; eligible independent regions can proceed while a morph runs.
+    pub(crate) fn set_publication_blocked_parents(&mut self, parents: &[CubePatchAddress]) {
+        let blocked: HashSet<_> = parents.iter().copied().collect();
+        if blocked != self.blocked_publication_parents {
+            self.blocked_publication_parents = blocked;
+            self.publications.clear();
+            self.publications_dirty = true;
+        }
+    }
+
+    pub(crate) fn is_current_publication(&self, candidate: &RegionalPublication) -> bool {
+        self.publication_candidates().contains(candidate)
+    }
+
+    /// Acknowledge a publication previously produced by this core. Exact cache
+    /// membership proves its root identity and complete balanced cover, so the
+    /// trusted path avoids rebuilding the whole-cover validation index.
+    pub(crate) fn ack_publication(
+        &mut self,
+        candidate: &RegionalPublication,
+    ) -> Result<(), RegionalError> {
+        if !self.is_current_publication(candidate) {
+            return Err(RegionalError::InvalidCover);
+        }
+        let local = empty_cover_publication(candidate);
+        self.apply_local_publication(&local)
     }
 
     /// Return locally desired sibling groups whose trial split preserves a
     /// complete balanced cover. Residency is reported but is not required, so
     /// callers can choose upload work before the group is GPU-ready.
     pub fn split_frontiers(&self) -> Vec<RegionalSplitFrontier> {
-        self.split_frontier_groups()
+        let started = std::time::Instant::now();
+        let result = self.split_frontier_groups();
+        self.frontier_discovery_micros
+            .set(started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
+        result
+    }
+
+    /// Balanced coarsening groups whose parent is required by the desired cover.
+    pub fn merge_frontiers(&self) -> Vec<CubePatchAddress> {
+        self.drawable
+            .iter()
+            .filter_map(|child| child.parent())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|parent| {
+                let mut ancestor = Some(*parent);
+                while let Some(address) = ancestor {
+                    if self.desired.contains_key(&address) {
+                        return local_replacement_is_balanced(*parent, false, &self.drawable);
+                    }
+                    ancestor = address.parent();
+                }
+                false
+            })
+            .collect()
+    }
+
+    /// Complete one resident sibling merge against the current valid cover.
+    /// Exact source/replacement membership and outer-edge checks establish the
+    /// same geometry invariant without validating every unaffected leaf again.
+    pub(crate) fn ack_local_merge(
+        &mut self,
+        parent: CubePatchAddress,
+        children: [CubePatchAddress; 4],
+        cover: &[CubePatchAddress],
+    ) -> Result<(), RegionalError> {
+        if parent.children().ok() != Some(children)
+            || !local_replacement_is_balanced(parent, false, &self.drawable)
+        {
+            return Err(RegionalError::InvalidCover);
+        }
+        let mut expected: Vec<_> = self
+            .drawable
+            .iter()
+            .copied()
+            .filter(|p| !children.contains(p))
+            .chain([parent])
+            .collect();
+        expected.sort();
+        if expected != cover {
+            return Err(RegionalError::InvalidCover);
+        }
+        self.ack_drawable_inner(cover, true)
+    }
+
+    fn materialize_publication(
+        &self,
+        candidate: &RegionalPublication,
+    ) -> Option<RegionalPublication> {
+        let mut cover = self.drawable.clone();
+        match candidate {
+            RegionalPublication::Split {
+                parent, children, ..
+            } => {
+                let index = cover.binary_search(parent).ok()?;
+                cover.remove(index);
+                cover.extend(children);
+                cover.sort_unstable();
+            }
+            RegionalPublication::Merge {
+                parent, children, ..
+            } => {
+                for child in children {
+                    let index = cover.binary_search(child).ok()?;
+                    cover.remove(index);
+                }
+                let index = cover.binary_search(parent).err()?;
+                cover.insert(index, *parent);
+            }
+        }
+        Some(match candidate {
+            RegionalPublication::Split {
+                parent, children, ..
+            } => RegionalPublication::Split {
+                parent: *parent,
+                children: *children,
+                cover,
+            },
+            RegionalPublication::Merge {
+                parent, children, ..
+            } => RegionalPublication::Merge {
+                parent: *parent,
+                children: *children,
+                cover,
+            },
+        })
+    }
+
+    fn local_publication_valid(
+        &self,
+        candidate: &RegionalPublication,
+        require_current_demand: bool,
+    ) -> bool {
+        if !candidate.cover().is_empty() {
+            return false;
+        }
+        let (parent, children, split) = match candidate {
+            RegionalPublication::Split {
+                parent, children, ..
+            } => (*parent, *children, true),
+            RegionalPublication::Merge {
+                parent, children, ..
+            } => (*parent, *children, false),
+        };
+        if parent.level() >= self.config.max_level || parent.children().ok() != Some(children) {
+            return false;
+        }
+        let expected_sources_present = if split {
+            self.drawable.binary_search(&parent).is_ok()
+        } else {
+            children
+                .iter()
+                .all(|child| self.drawable.binary_search(child).is_ok())
+                && self.drawable.binary_search(&parent).is_err()
+        };
+        if !expected_sources_present {
+            return false;
+        }
+        if require_current_demand {
+            let demand_matches = if split {
+                self.desired
+                    .keys()
+                    .any(|address| parent.contains(*address) && *address != parent)
+            } else {
+                std::iter::successors(Some(parent), |address| address.parent())
+                    .any(|address| self.desired.contains_key(&address))
+            };
+            if !demand_matches {
+                return false;
+            }
+        }
+        if !local_replacement_is_balanced(parent, split, &self.drawable) {
+            return false;
+        }
+        true
+    }
+
+    fn apply_local_publication(
+        &mut self,
+        candidate: &RegionalPublication,
+    ) -> Result<(), RegionalError> {
+        let split = matches!(candidate, RegionalPublication::Split { .. });
+        let (parent, children) = match candidate {
+            RegionalPublication::Split {
+                parent, children, ..
+            }
+            | RegionalPublication::Merge {
+                parent, children, ..
+            } => (*parent, *children),
+        };
+        if self.publications_this_tick >= self.config.publication_cap_per_tick {
+            self.pressure.publication = true;
+            return Err(RegionalError::PublicationBudget);
+        }
+        if 1usize > self.config.transition_cap {
+            self.pressure.publication = true;
+            return Err(RegionalError::PublicationBudget);
+        }
+        if children
+            .iter()
+            .any(|address| !self.resident.contains(address))
+            || !self.resident.contains(&parent)
+        {
+            return Err(RegionalError::NotResident);
+        }
+        if split {
+            let index = self
+                .drawable
+                .binary_search(&parent)
+                .map_err(|_| RegionalError::InvalidCover)?;
+            self.drawable.remove(index);
+            for child in children {
+                let index = self
+                    .drawable
+                    .binary_search(&child)
+                    .unwrap_or_else(|index| index);
+                self.drawable.insert(index, child);
+            }
+        } else {
+            for child in children {
+                let index = self
+                    .drawable
+                    .binary_search(&child)
+                    .map_err(|_| RegionalError::InvalidCover)?;
+                self.drawable.remove(index);
+            }
+            let index = self
+                .drawable
+                .binary_search(&parent)
+                .unwrap_or_else(|index| index);
+            self.drawable.insert(index, parent);
+        }
+        // This local replacement changes exactly one parent and its four
+        // children. Recording that delta avoids rescanning the whole cover.
+        self.trace.set_drawable(parent, !split);
+        for child in children {
+            self.trace.set_drawable(child, split);
+        }
+        if self.reserved_split_parent == Some(parent) {
+            self.reserved_split_parent = None;
+        }
+        self.publications_this_tick += 1;
+        self.publications.clear();
+        self.publications_dirty = true;
+        self.pressure.publication = false;
+        Ok(())
     }
 
     /// Validate that `cover` completely and non-overlappingly covers the
@@ -732,41 +1432,67 @@ impl RegionalTerrain {
     /// Publish a complete resident 2:1 cover. No partial or hole-bearing cover
     /// can replace the current drawable set.
     pub fn ack_drawable(&mut self, cover: &[CubePatchAddress]) -> Result<(), RegionalError> {
+        self.ack_drawable_inner(cover, false)
+    }
+
+    fn ack_drawable_inner(
+        &mut self,
+        cover: &[CubePatchAddress],
+        validated_publication: bool,
+    ) -> Result<(), RegionalError> {
         if self.publications_this_tick >= self.config.publication_cap_per_tick {
             self.pressure.publication = true;
             return Err(RegionalError::PublicationBudget);
         }
-        if !valid_cover(&self.config.roots, cover, self.config.max_level) {
+        if !validated_publication && !valid_cover(&self.config.roots, cover, self.config.max_level)
+        {
             return Err(RegionalError::InvalidCover);
         }
+        let cover_set: HashSet<_> = cover.iter().copied().collect();
         if cover.iter().any(|address| !self.resident.contains(address)) {
             return Err(RegionalError::NotResident);
         }
+        let drawable_set: HashSet<_> = self.drawable.iter().copied().collect();
         let changed = cover
             .iter()
-            .filter(|address| !self.drawable.contains(address))
+            .filter(|address| !drawable_set.contains(address))
             .count()
             + self
                 .drawable
                 .iter()
-                .filter(|address| !cover.contains(address))
+                .filter(|address| !cover_set.contains(address))
                 .count();
         if changed.div_ceil(5) > self.config.transition_cap {
             self.pressure.publication = true;
             return Err(RegionalError::PublicationBudget);
         }
+        for address in self.drawable.iter().copied() {
+            if !cover_set.contains(&address) {
+                self.trace.set_drawable(address, false);
+            }
+        }
         self.drawable = cover.to_vec();
         self.drawable.sort();
+        for &address in &self.drawable {
+            if !drawable_set.contains(&address) {
+                self.trace.set_drawable(address, true);
+            }
+        }
         if self.reserved_split_parent.is_some_and(|parent| {
-            !self.drawable.contains(&parent)
-                && parent.children().is_ok_and(|children| {
-                    children.iter().all(|child| self.drawable.contains(child))
-                })
+            !cover_set.contains(&parent)
+                && parent
+                    .children()
+                    .is_ok_and(|children| children.iter().all(|child| cover_set.contains(child)))
         }) {
             self.reserved_split_parent = None;
         }
         self.publications_this_tick += 1;
-        self.refresh_publications();
+        if validated_publication {
+            self.publications.clear();
+            self.publications_dirty = true;
+        } else {
+            self.refresh_publications();
+        }
         Ok(())
     }
 
@@ -777,23 +1503,40 @@ impl RegionalTerrain {
     }
 
     pub fn snapshot(&self) -> RegionalSnapshot {
+        self.snapshot_inner(true)
+    }
+
+    /// Current scalar evidence without formatting every cover member per frame.
+    /// The ordinary planetary host explicitly labels the omitted detail arrays.
+    pub(crate) fn snapshot_summary(&self) -> RegionalSnapshot {
+        self.snapshot_inner(false)
+    }
+
+    fn snapshot_inner(&self, include_details: bool) -> RegionalSnapshot {
+        // Diagnostics share the current planetary view's score cache. Repeating
+        // projected scoring for every drawable leaf would make evidence itself
+        // a per-frame terrain evaluation workload.
+        let mut diagnostic_scores = HashMap::new();
+        let drawable_addresses: HashSet<_> = self
+            .drawable
+            .iter()
+            .filter(|_| include_details)
+            .copied()
+            .collect();
         let queued_upload_addresses: HashSet<_> =
             self.uploads.iter().map(|upload| upload.address).collect();
         let desired: Vec<_> = self
             .desired
             .iter()
+            .filter(|_| include_details)
             .map(|(address, patch)| {
-                let state = if self.drawable.contains(address) {
+                let state = if drawable_addresses.contains(address) {
                     "drawable"
                 } else if self.resident.contains(address) {
                     "resident"
                 } else if queued_upload_addresses.contains(address) {
                     "queued_upload"
-                } else if self
-                    .key_for(*address)
-                    .ok()
-                    .is_some_and(|key| self.cache.contains_key(&key))
-                {
+                } else if self.cached_tiles_by_address.contains_key(address) {
                     "built_cpu"
                 } else if let Some(token) = self
                     .in_flight
@@ -833,7 +1576,9 @@ impl RegionalTerrain {
         let drawable_error = self
             .drawable
             .iter()
-            .map(|address| patch_area(*address) * self.score(*address).0)
+            .map(|address| {
+                patch_area(*address) * self.selection_score(*address, &mut diagnostic_scores).0
+            })
             .sum::<f64>()
             / root_area;
         let area_debt = (drawable_error - desired_error).max(0.0);
@@ -849,7 +1594,10 @@ impl RegionalTerrain {
                     .desired
                     .get(&upload.address)
                     .map(|patch| patch.priority)
-                    .unwrap_or_else(|| self.score(upload.address).1),
+                    .unwrap_or_else(|| {
+                        self.selection_score(upload.address, &mut diagnostic_scores)
+                            .1
+                    }),
             })
             .collect();
         let mut build_requests: Vec<_> = self
@@ -861,7 +1609,7 @@ impl RegionalTerrain {
                     .desired
                     .get(&key.address)
                     .map(|patch| patch.priority)
-                    .unwrap_or_else(|| self.score(key.address).1),
+                    .unwrap_or_else(|| self.selection_score(key.address, &mut diagnostic_scores).1),
                 state: if token.cancelled.load(AtomicOrdering::Acquire) {
                     "cancelled"
                 } else if token.started.load(AtomicOrdering::Acquire) {
@@ -885,12 +1633,179 @@ impl RegionalTerrain {
             .filter(|address| {
                 !self.resident.contains(address) && !upload_backlog_addresses.contains(address)
             })
-            .filter_map(|address| self.key_for(*address).ok())
-            .filter_map(|key| self.cache.get(&key))
-            .map(|entry| entry.bytes)
+            .filter_map(|address| self.cached_tiles_by_address.get(address))
+            .map(|tile| tile_bytes(tile))
             .sum();
-        let resident: Vec<_> = self.resident.iter().map(|a| format!("{a:?}")).collect();
-        let drawable: Vec<_> = self.drawable.iter().map(|a| format!("{a:?}")).collect();
+        let resident: Vec<_> = self
+            .resident
+            .iter()
+            .filter(|_| include_details)
+            .map(|a| format!("{a:?}"))
+            .collect();
+        let drawable: Vec<_> = self
+            .drawable
+            .iter()
+            .filter(|_| include_details)
+            .map(|a| format!("{a:?}"))
+            .collect();
+        let target_quality_reached = !self.pressure.desired_capacity
+            && (self.planetary_view.is_none() || self.selector_can_reuse_fixed_point)
+            && !self.selector_budget_exhausted
+            && self
+                .desired
+                .values()
+                .all(|patch| patch.projected_error_px <= self.config.split_threshold_px);
+        let mut visible_drawable_errors = Vec::new();
+        let mut visible_drawable_count = 0usize;
+        let mut visible_desired_counterparts = 0usize;
+        let mut missing_drawable_proxy_scores = 0usize;
+        let mut missing_visible_proxy_scores = 0usize;
+        let mut visible_weight = 0.0;
+        let mut converged_weight = 0.0;
+        let mut worst_unresolved = 0.0f64;
+        let mut worst_proxy: Option<(CubePatchAddress, f64)> = None;
+        let mut worst_visible_unresolved: Option<(CubePatchAddress, f64, f64)> = None;
+        let mut visible_proxy_hotspots = Vec::with_capacity(8);
+        for address in &self.drawable {
+            let visible = self.patch_visible(*address);
+            let Some((error, _, _, _)) = diagnostic_scores.get(address).copied() else {
+                missing_drawable_proxy_scores += 1;
+                if visible {
+                    missing_visible_proxy_scores += 1;
+                }
+                continue;
+            };
+            if error > 0.0 {
+                visible_drawable_count += 1;
+                visible_drawable_errors.push(error);
+                if worst_proxy
+                    .as_ref()
+                    .is_none_or(|(current_address, current_error)| {
+                        error.total_cmp(current_error).is_gt()
+                            || (error.total_cmp(current_error).is_eq() && address < current_address)
+                    })
+                {
+                    worst_proxy = Some((*address, error));
+                }
+            }
+            if visible {
+                let weight = self.projected_footprint_weight(*address);
+                if weight.is_finite() && weight > 0.0 {
+                    visible_weight += weight;
+                    converged_weight +=
+                        weight * convergence_ratio(error, self.config.split_threshold_px);
+                }
+                if error > self.config.split_threshold_px {
+                    worst_unresolved = worst_unresolved.max(error);
+                    if worst_visible_unresolved.as_ref().is_none_or(
+                        |(current_address, current_error, _)| {
+                            error.total_cmp(current_error).is_gt()
+                                || (error.total_cmp(current_error).is_eq()
+                                    && address < current_address)
+                        },
+                    ) {
+                        worst_visible_unresolved = Some((
+                            *address,
+                            error,
+                            if weight.is_finite() && weight > 0.0 {
+                                weight
+                            } else {
+                                0.0
+                            },
+                        ));
+                    }
+                }
+                visible_proxy_hotspots.push((
+                    *address,
+                    error,
+                    if weight.is_finite() && weight > 0.0 {
+                        weight
+                    } else {
+                        0.0
+                    },
+                ));
+                visible_proxy_hotspots
+                    .sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                visible_proxy_hotspots.truncate(8);
+            }
+        }
+        let cached_planetary_scores = self.planetary_scores.borrow();
+        for address in self.desired.keys() {
+            if diagnostic_scores
+                .get(address)
+                .is_some_and(|score| score.0 > 0.0)
+                || cached_planetary_scores
+                    .get(address)
+                    .is_some_and(|score| score.0 > 0.0)
+            {
+                visible_desired_counterparts += 1;
+            }
+        }
+        drop(cached_planetary_scores);
+        visible_drawable_errors.sort_by(f64::total_cmp);
+        let proxy_max = visible_drawable_errors.last().copied().unwrap_or(0.0);
+        let proxy_p95 = visible_drawable_errors
+            .len()
+            .checked_sub(1)
+            .map(|last| visible_drawable_errors[((last + 1) * 95).div_ceil(100) - 1])
+            .unwrap_or(0.0);
+        let proxy_over_one = visible_drawable_errors
+            .iter()
+            .filter(|error| **error > 1.0)
+            .count();
+        let proxy_over_split = visible_drawable_errors
+            .iter()
+            .filter(|error| **error > self.config.split_threshold_px)
+            .count();
+        let useful_detail_reached = useful_detail_reached(
+            self.planetary_view.is_some(),
+            visible_drawable_count,
+            missing_drawable_proxy_scores,
+            proxy_max,
+        );
+        let visible_convergence = if visible_weight > 0.0 && missing_visible_proxy_scores == 0 {
+            Some((converged_weight / visible_weight).clamp(0.0, 1.0))
+        } else {
+            None
+        };
+        let center_screen_error_px = self.center_screen_drawable_error(&mut diagnostic_scores);
+        let center_screen_convergence = center_screen_error_px
+            .map(|error| convergence_ratio(error, self.config.split_threshold_px));
+        let worst_visible_unresolved_error_px = if missing_visible_proxy_scores == 0 {
+            Some(worst_unresolved)
+        } else {
+            None
+        };
+        let worst_proxy = worst_proxy.map(|(address, error_px)| RegionalProxyErrorSnapshot {
+            address: format!("{address:?}"),
+            error_px,
+            projected_footprint_weight: self.projected_footprint_weight(address),
+        });
+        let worst_visible_unresolved = if missing_visible_proxy_scores == 0 {
+            worst_visible_unresolved.map(|(address, error_px, projected_footprint_weight)| {
+                RegionalProxyErrorSnapshot {
+                    address: format!("{address:?}"),
+                    error_px,
+                    projected_footprint_weight,
+                }
+            })
+        } else {
+            None
+        };
+        let visible_drawable_proxy_hotspots = visible_proxy_hotspots
+            .into_iter()
+            .map(|(address, error_px, projected_footprint_weight)| {
+                self.drawable_proxy_hotspot(address, error_px, projected_footprint_weight)
+            })
+            .collect();
+        let frontier_priority_index_entries = self.desired_priority_index.borrow().priorities.len();
+        let frontier_priority_cache_bytes_upper_bound =
+            desired_priority_cache_bytes_upper_bound(&self.config);
+        let build_candidate_wait_entries = self.build_candidate_waits.len();
+        let build_candidate_wait_entries_upper_bound =
+            self.build_candidate_wait_entries_upper_bound();
+        let build_candidate_wait_bytes_upper_bound =
+            self.build_candidate_wait_bytes_upper_bound(build_candidate_wait_entries_upper_bound);
         RegionalSnapshot {
             tick: self.tick,
             configuration: RegionalConfigSnapshot {
@@ -921,7 +1836,7 @@ impl RegionalTerrain {
                 prediction_seconds: self.config.prediction_seconds,
                 high_speed_mps: self.config.high_speed_mps,
             },
-            desired_count: desired.len(),
+            desired_count: self.desired.len(),
             desired,
             resident,
             drawable,
@@ -931,12 +1846,21 @@ impl RegionalTerrain {
             drawable_count: self.drawable.len(),
             cpu_cached_tiles: self.cache.len(),
             cpu_cached_bytes: self.cache_bytes,
-            worker_queued: in_flight.saturating_sub(running),
+            worker_queued: self
+                .in_flight
+                .values()
+                .filter(|token| !token.started.load(AtomicOrdering::Acquire))
+                .count(),
+            worker_outstanding: in_flight,
             worker_running: running,
             completion_backlog: self.completion_backlog.load(AtomicOrdering::Acquire),
             completion_drain_micros: self.stats.completion_drain_micros,
             selection_time_micros: self.stats.selection_time_micros,
+            selection_budget_overruns: self.stats.selection_budget_overruns,
+            selection_budget_exhausted: self.selector_budget_exhausted,
             scheduler_time_micros: self.stats.scheduler_time_micros,
+            publication_discovery_micros: self.stats.publication_discovery_micros,
+            frontier_discovery_micros: self.frontier_discovery_micros.get(),
             cpu_tile_cap: self.config.cpu_tile_cap,
             cpu_byte_cap: self.config.cpu_byte_cap,
             max_desired_patches: self.config.max_desired_patches,
@@ -947,11 +1871,23 @@ impl RegionalTerrain {
             estimated_worker_scratch_bytes: self
                 .generator
                 .query_workspace_bytes()
+                .saturating_add(ResidentTileBuilder::query_cache_workspace_bound_bytes())
                 .saturating_mul(self.config.worker_count),
+            frontier_priority_index_entries,
+            frontier_priority_cache_bytes_upper_bound,
+            build_candidate_wait_entries,
+            build_candidate_wait_entries_upper_bound,
+            build_candidate_wait_bytes_upper_bound,
             upload_backlog_tiles: self.uploads.len(),
             upload_backlog_bytes: self.upload_bytes,
             estimated_completed_unpublished_bytes,
             publication_candidates: self.publications.len(),
+            publication_backlog_age_ticks: self
+                .publication_candidate_ages
+                .values()
+                .copied()
+                .max()
+                .unwrap_or(0),
             active_transitions_reported: 0,
             desired_projected_error_px: desired_error,
             drawable_projected_error_px: drawable_error,
@@ -961,9 +1897,33 @@ impl RegionalTerrain {
             upload_pressure: self.pressure.upload,
             publication_pressure: self.pressure.publication,
             desired_capacity_pressure: self.pressure.desired_capacity,
+            target_quality_reached,
+            visible_drawable_proxy_count: visible_drawable_count,
+            missing_drawable_proxy_score_count: missing_drawable_proxy_scores,
+            visible_desired_counterpart_count: visible_desired_counterparts,
+            visible_drawable_proxy_error_max_px: proxy_max,
+            visible_drawable_proxy_error_p95_px: proxy_p95,
+            visible_drawable_proxy_error_over_1px: proxy_over_one,
+            visible_drawable_proxy_error_over_split_threshold: proxy_over_split,
+            worst_proxy,
+            worst_visible_unresolved,
+            visible_drawable_proxy_hotspots,
+            visible_convergence,
+            center_screen_convergence,
+            center_screen_error_px,
+            convergence_target_error_px: self.config.split_threshold_px,
+            worst_visible_unresolved_error_px,
+            useful_detail_reached,
+            useful_detail_proxy_error_threshold_px: 1.0,
+            visible_proxy_error_certified: false,
+            visible_proxy_error_model: "approximate selector proxy; uncertified",
+            planetary_topology_operations: self.planetary_topology_operations,
+            planetary_split_candidates_scanned: self.planetary_split_candidates_scanned,
             selector_fixed_point_reused: self.selector_fixed_point_reused,
+            scheduler_fixed_point_reused: self.scheduler_fixed_point_reused,
             requests_issued: self.stats.requests_issued,
             jobs_started: self.stats.jobs_started,
+            completed_build_count: self.stats.completed_build_count,
             cancelled_before_start: self.stats.cancelled_before_start,
             cancelled_during_work: self.stats.cancelled_during_work,
             stale_completions: self.stats.stale_completions,
@@ -994,6 +1954,145 @@ impl RegionalTerrain {
             .map_err(|_| RegionalError::TileBuild)
     }
 
+    fn drawable_proxy_hotspot(
+        &self,
+        address: CubePatchAddress,
+        error_px: f64,
+        projected_footprint_weight: f64,
+    ) -> RegionalDrawableProxyHotspotSnapshot {
+        let key = self.key_for(address).ok();
+        let token = key.as_ref().and_then(|key| self.in_flight.get(key));
+        let in_flight = token.is_some();
+        let in_flight_cancelled =
+            token.is_some_and(|token| token.cancelled.load(AtomicOrdering::Acquire));
+        let cpu_cached = key.as_ref().is_some_and(|key| self.cache.contains_key(key));
+        let upload_queued = key.as_ref().is_some_and(|key| {
+            self.uploads
+                .iter()
+                .any(|upload| upload.address == address && &upload.tile.key == key)
+        });
+        let parent = address.parent();
+        let publication_parent_blocked =
+            parent.is_some_and(|parent| self.blocked_publication_parents.contains(&parent));
+        let upload_allowlisted = self
+            .upload_allowlist
+            .as_ref()
+            .map(|allowlist| allowlist.contains(&address));
+        let blocker_status = if key.is_none() {
+            "tile_key_unavailable"
+        } else if publication_parent_blocked {
+            "publication_parent_blocked"
+        } else if upload_allowlisted == Some(false) {
+            "upload_not_allowlisted"
+        } else if in_flight_cancelled {
+            "build_cancelled"
+        } else {
+            "none_observed"
+        };
+        let key = key.map(|key| RegionalTileKeySnapshot {
+            body_identity: key.body_identity,
+            definition_words: key.definition_words,
+            radius_bits: key.radius_bits,
+            surface_revision: key.surface_revision,
+            material_revision: key.material_revision,
+            format_version: key.format_version,
+            filter_version: key.filter_version,
+            cells: key.cells,
+        });
+        RegionalDrawableProxyHotspotSnapshot {
+            address: format!("{address:?}"),
+            error_px,
+            projected_footprint_weight,
+            key,
+            parent: parent.map(|parent| format!("{parent:?}")),
+            desired: self.desired.contains_key(&address),
+            resident: self.resident.contains(&address),
+            cpu_cached,
+            upload_queued,
+            in_flight,
+            in_flight_cancelled,
+            publication_parent_blocked,
+            upload_allowlisted,
+            blocker_status,
+        }
+    }
+
+    fn projected_footprint_weight(&self, address: CubePatchAddress) -> f64 {
+        let Some(view) = self.planetary_view else {
+            return 0.0;
+        };
+        let corner = |i, j| address.sample_direction(i, j, 1).ok().map(|d| d.unit());
+        let Some([a, b, c, d]) =
+            (|| Some([corner(0, 0)?, corner(1, 0)?, corner(1, 1)?, corner(0, 1)?]))()
+        else {
+            return 0.0;
+        };
+        let spherical_triangle = |a: DVec3, b: DVec3, c: DVec3| {
+            2.0 * a
+                .dot(b.cross(c))
+                .abs()
+                .atan2(1.0 + a.dot(b) + b.dot(c) + c.dot(a))
+        };
+        let solid_angle = spherical_triangle(a, b, c) + spherical_triangle(a, c, d);
+        let center = (a + b + c + d).normalize_or_zero();
+        let to_camera = self.view.body_position_m - center * self.generator.radius_m();
+        let distance = to_camera.length().max(self.generator.radius_m() * 1.0e-9);
+        let projected = solid_angle
+            * self.generator.radius_m().powi(2)
+            * center.dot(to_camera).max(0.0)
+            * view.projection.focal_pixels().powi(2)
+            / distance.powi(3);
+        if projected.is_finite() {
+            projected
+        } else {
+            0.0
+        }
+    }
+
+    fn center_screen_drawable_error(
+        &self,
+        score_cache: &mut HashMap<CubePatchAddress, (f64, f64, f64, f64)>,
+    ) -> Option<f64> {
+        let view = self.planetary_view?;
+        let origin = self.view.body_position_m;
+        let direction = view.body_to_view.transpose() * DVec3::NEG_Z;
+        let radius = self.generator.radius_m();
+        let half_b = origin.dot(direction);
+        let discriminant = half_b * half_b - (origin.length_squared() - radius * radius);
+        if discriminant < 0.0 {
+            return None;
+        }
+        let distance = -half_b - discriminant.sqrt();
+        if distance <= 0.0 {
+            return None;
+        }
+        let body_direction = (origin + direction * distance).normalize_or_zero();
+        let face = cube_face_for_direction(body_direction);
+        let [normal, u, v] = face.basis();
+        let denominator = body_direction.dot(normal);
+        if denominator <= 0.0 {
+            return None;
+        }
+        let uv = [
+            body_direction.dot(u) / denominator,
+            body_direction.dot(v) / denominator,
+        ];
+        let level = self.config.max_level.min(30);
+        let scale = 1u64 << level;
+        let coordinate = |value: f64| {
+            (((value + 1.0) * 0.5 * scale as f64).floor() as i64).clamp(0, scale as i64 - 1) as u32
+        };
+        let target =
+            CubePatchAddress::try_new(face, level, coordinate(uv[0]), coordinate(uv[1])).ok()?;
+        let drawable = self
+            .drawable
+            .iter()
+            .copied()
+            .find(|patch| patch.contains(target))?;
+        let error = self.selection_score(drawable, score_cache).0;
+        error.is_finite().then_some(error)
+    }
+
     fn touch_pinned_cache_entries(&mut self) {
         let pinned = self.pinned_addresses();
         for entry in self.cache.values_mut() {
@@ -1006,9 +2105,29 @@ impl RegionalTerrain {
 
     fn select_desired(&mut self) {
         self.selector_fixed_point_reused = false;
-        if self.selector_can_reuse_fixed_point && self.last_selection_view == Some(self.view) {
+        self.selector_budget_exhausted = false;
+        self.planetary_split_candidates_scanned = 0;
+        let same_planetary_view = match (self.planetary_view, self.last_selection_planetary_view) {
+            (None, None) => true,
+            (Some(current), Some(previous)) => current.matches(Some(previous)),
+            _ => false,
+        };
+        if self.last_selection_view != Some(self.view) || !same_planetary_view {
+            self.merge_scan_cursor = None;
+            self.cull_scan_cursor = None;
+            self.planetary_scores.borrow_mut().clear();
+        }
+        if self.selector_can_reuse_fixed_point
+            && self.last_selection_view == Some(self.view)
+            && same_planetary_view
+        {
             self.pressure.desired_capacity = self.selector_last_capacity_pressure;
             self.selector_fixed_point_reused = true;
+            return;
+        }
+
+        if self.planetary_view.is_some() {
+            self.select_planetary_desired();
             return;
         }
 
@@ -1065,6 +2184,7 @@ impl RegionalTerrain {
                     proposed,
                     self.config.max_level,
                     self.config.max_desired_patches,
+                    None,
                 ) && balanced.len() > cover.len()
                 {
                     accepted = Some((balanced, total, error, parent, approach, speed));
@@ -1125,6 +2245,411 @@ impl RegionalTerrain {
         self.selector_can_reuse_fixed_point = self.desired_addresses == previous_cover;
         self.selector_last_capacity_pressure = self.pressure.desired_capacity;
         self.last_selection_view = Some(self.view);
+        self.last_selection_planetary_view = self.planetary_view;
+    }
+
+    /// Planetary topology moves toward its current target in a small number of
+    /// complete, balanced cover transactions per tick. The desired cover stays
+    /// complete across all six roots while invisible leaves simply have zero
+    /// refinement priority.
+    fn select_planetary_desired(&mut self) {
+        const SELECTOR_BUDGET: Duration = Duration::from_millis(2);
+        const MAX_TOPOLOGY_OPERATIONS_PER_TICK: usize = 8;
+        const MAX_CANDIDATES_PER_TICK: usize = 8;
+        const MAX_SCORES_PER_TICK: usize = 256;
+        let selection_started = std::time::Instant::now();
+        self.selector_budget_exhausted = false;
+        self.planetary_topology_operations = 0;
+        self.planetary_split_candidates_scanned = 0;
+        self.selector_merge_scan_pending = false;
+
+        let previous: Vec<_> = self.desired.keys().copied().collect();
+        let mut cover = if previous.is_empty() {
+            let mut roots = self.config.roots.clone();
+            roots.sort();
+            roots
+        } else {
+            previous.clone()
+        };
+        let mut score_cache = HashMap::new();
+        let mut selected_priorities = Vec::new();
+        let mut changed = false;
+        let mut operations = 0;
+
+        // Release a fully culled sibling group before spending the frame
+        // budget on refinement scoring. This makes camera retreat responsive.
+        if cover.len() > self.config.roots.len()
+            && selection_started.elapsed() < SELECTOR_BUDGET
+            && let Some((next, priority, error, parent, approach, speed)) = self
+                .best_planetary_merge(&cover, &mut score_cache, selection_started, SELECTOR_BUDGET)
+        {
+            cover = next;
+            changed = true;
+            operations += 1;
+            self.planetary_topology_operations = operations;
+            selected_priorities.push(RegionalPrioritySnapshot {
+                address: format!("{parent:?}"),
+                projected_error_px: error,
+                approach_multiplier: approach,
+                high_speed_multiplier: speed,
+                total: priority,
+            });
+        }
+        let mut candidates = Vec::new();
+        // Score a bounded slice before the full settling bookkeeping below.
+        // A whole-cover "nothing to refine" scan here can consume the deadline
+        // on every tick and permanently starve the last few required splits.
+        if !cover.is_empty() {
+            let start = self.planetary_score_cursor % cover.len();
+            let mut scanned = 0usize;
+            while scanned < cover.len().min(MAX_SCORES_PER_TICK) {
+                if selection_started.elapsed() >= SELECTOR_BUDGET {
+                    self.selector_budget_exhausted = true;
+                    break;
+                }
+                let address = cover[(start + scanned) % cover.len()];
+                scanned += 1;
+                let (error, priority, approach, speed) =
+                    self.selection_score(address, &mut score_cache);
+                if address.level() >= self.config.max_level
+                    || error <= self.config.split_threshold_px
+                    || self.too_transient(address)
+                {
+                    continue;
+                }
+                if let Ok(children) = address.children() {
+                    candidates.push((priority, error, address, children, approach, speed));
+                }
+            }
+            self.planetary_score_cursor = (start + scanned) % cover.len();
+            self.planetary_split_candidates_scanned = scanned;
+        }
+        candidates.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.2.cmp(&b.2)));
+
+        let had_split_candidate = !candidates.is_empty();
+        let mut accepted = None;
+        let mut all_candidates_attempted = false;
+        if had_split_candidate {
+            // A split adds three leaves before balancing. Near capacity no
+            // candidate can fit, so avoid copying and balancing the full cover.
+            if cover.len().saturating_add(3) > self.config.max_desired_patches {
+                self.pressure.desired_capacity = !candidates.is_empty();
+            } else if !candidates.is_empty() {
+                let start = self.planetary_candidate_cursor % candidates.len();
+                let attempts = candidates.len().min(MAX_CANDIDATES_PER_TICK);
+                all_candidates_attempted = attempts == candidates.len();
+                for offset in 0..attempts {
+                    if selection_started.elapsed() >= SELECTOR_BUDGET {
+                        self.selector_budget_exhausted = true;
+                        break;
+                    }
+                    let (priority, error, parent, _children, approach, speed) =
+                        candidates[(start + offset) % candidates.len()];
+                    if let Some(balanced) = balance_planetary_split(
+                        &cover,
+                        parent,
+                        self.config.max_level,
+                        self.config.max_desired_patches,
+                        MAX_TOPOLOGY_OPERATIONS_PER_TICK.saturating_sub(operations),
+                        selection_started,
+                        SELECTOR_BUDGET,
+                    ) && balanced.len() > cover.len()
+                    {
+                        let split_cost = (balanced.len() - cover.len()) / 3;
+                        if split_cost <= MAX_TOPOLOGY_OPERATIONS_PER_TICK {
+                            accepted = Some((
+                                balanced, split_cost, priority, error, parent, approach, speed,
+                            ));
+                            // A successful change invalidates the old ranking.
+                            self.planetary_candidate_cursor = 0;
+                            break;
+                        }
+                    }
+                    if selection_started.elapsed() >= SELECTOR_BUDGET {
+                        self.selector_budget_exhausted = true;
+                        break;
+                    }
+                    self.planetary_candidate_cursor = (start + offset + 1) % candidates.len();
+                }
+                if candidates.len() > attempts && accepted.is_none() {
+                    self.planetary_candidate_cursor = (start + attempts) % candidates.len();
+                }
+            }
+        }
+
+        if let Some((next, split_cost, priority, error, parent, approach, speed)) = accepted {
+            changed = true;
+            operations += split_cost;
+            self.planetary_topology_operations = operations;
+            selected_priorities.push(RegionalPrioritySnapshot {
+                address: format!("{parent:?}"),
+                projected_error_px: error,
+                approach_multiplier: approach,
+                high_speed_multiplier: speed,
+                total: priority,
+            });
+            cover = next;
+        } else {
+            self.pressure.desired_capacity |=
+                had_split_candidate && all_candidates_attempted && !self.selector_budget_exhausted;
+        }
+
+        // Advance the merge cursor once per tick. A second pass can restart a
+        // just-completed scan and erase its completion before settling checks.
+        if selection_started.elapsed() >= SELECTOR_BUDGET {
+            self.selector_budget_exhausted = true;
+        }
+
+        if cover == previous {
+            for (address, (error, priority, _, _)) in &score_cache {
+                if let Some(patch) = self.desired.get_mut(address) {
+                    patch.projected_error_px = *error;
+                    patch.priority = *priority;
+                }
+            }
+        } else {
+            let mut next_desired = BTreeMap::new();
+            for &address in &cover {
+                let (error, priority, _, _) = if let Some(score) =
+                    score_cache.get(&address).copied()
+                {
+                    score
+                } else if let Some(score) = self.planetary_scores.borrow().get(&address).copied() {
+                    score
+                } else if selection_started.elapsed() < SELECTOR_BUDGET {
+                    self.selection_score(address, &mut score_cache)
+                } else {
+                    self.selector_budget_exhausted = true;
+                    self.desired
+                        .get(&address)
+                        .map(|patch| (patch.projected_error_px, patch.priority, 1.0, 1.0))
+                        .or_else(|| {
+                            address
+                                .parent()
+                                .and_then(|parent| self.desired.get(&parent))
+                                .map(|patch| (patch.projected_error_px, patch.priority, 1.0, 1.0))
+                        })
+                        .unwrap_or((self.config.split_threshold_px + 1.0, 0.0, 1.0, 1.0))
+                };
+                next_desired.insert(
+                    address,
+                    RegionalPatchSnapshot {
+                        address: format!("{address:?}"),
+                        level: address.level(),
+                        projected_error_px: error,
+                        priority,
+                        state: "absent",
+                    },
+                );
+            }
+            self.desired = next_desired;
+            self.desired_addresses = cover;
+        }
+        selected_priorities.sort_by(|a, b| {
+            b.total
+                .total_cmp(&a.total)
+                .then_with(|| a.address.cmp(&b.address))
+        });
+        selected_priorities.truncate(self.config.admission_cap_per_tick);
+        self.last_priorities = selected_priorities;
+        let active_addresses: HashSet<_> = self.desired.keys().copied().collect();
+        self.seen_cache_requests
+            .retain(|key| active_addresses.contains(&key.address));
+        if changed {
+            // A topology edit changes the set of possible sibling groups. A
+            // complete subsequent merge scan is required before reuse/settling.
+            self.merge_scan_cursor = None;
+            // Keep the independent culling cursor moving across topology edits;
+            // repeated refinement must not starve obsolete regions later in order.
+            self.selector_merge_scan_pending = true;
+        }
+        let has_more_work = self.desired.iter().any(|(address, patch)| {
+            address.level() < self.config.max_level
+                && patch.projected_error_px > self.config.split_threshold_px
+                && !self.too_transient(*address)
+        });
+        self.selector_can_reuse_fixed_point = !changed
+            && self
+                .desired
+                .keys()
+                .all(|address| self.planetary_scores.borrow().contains_key(address))
+            && (!has_more_work || self.pressure.desired_capacity)
+            && !self.selector_merge_scan_pending;
+        // A completed score/merge pass can be reused even if final bookkeeping
+        // exceeded the deadline. This frame still reports exhaustion; the next
+        // unchanged tick needs no selection work. Incomplete passes cannot reuse.
+        self.selector_last_capacity_pressure = self.pressure.desired_capacity;
+        self.selector_fixed_point_reused = false;
+        self.last_selection_view = Some(self.view);
+        self.last_selection_planetary_view = self.planetary_view;
+    }
+
+    fn best_planetary_merge(
+        &mut self,
+        cover: &[CubePatchAddress],
+        score_cache: &mut HashMap<CubePatchAddress, (f64, f64, f64, f64)>,
+        selection_started: std::time::Instant,
+        selection_budget: Duration,
+    ) -> Option<(Vec<CubePatchAddress>, f64, f64, CubePatchAddress, f64, f64)> {
+        const MAX_MERGE_CANDIDATES_PER_TICK: usize = 8;
+        const MAX_CULLED_GROUPS_PER_TICK: usize = 8;
+        if self.planetary_merge_index_cover != cover {
+            self.planetary_merge_index_cover = cover.to_vec();
+            self.planetary_merge_index_parents = cover
+                .iter()
+                .filter_map(|child| child.parent())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            self.planetary_merge_index_leaves = cover.iter().copied().collect();
+        }
+        let parents = &self.planetary_merge_index_parents;
+        if parents.is_empty() {
+            self.selector_merge_scan_pending = false;
+            self.merge_scan_cursor = None;
+            return None;
+        }
+        let cover_set = &self.planetary_merge_index_leaves;
+        // The current cover's score pass already classified these children.
+        // Retire any fully culled sibling group before spending the bounded
+        // candidate budget on projected-error checks for visible regions.
+        let cull_start = self.cull_scan_cursor.map_or(0, |cursor| {
+            parents.partition_point(|parent| *parent <= cursor)
+        }) % parents.len();
+        let cull_count = parents.len().min(MAX_CULLED_GROUPS_PER_TICK);
+        for offset in 0..cull_count {
+            if selection_started.elapsed() >= selection_budget {
+                self.selector_budget_exhausted = true;
+                break;
+            }
+            let parent = parents[(cull_start + offset) % parents.len()];
+            self.cull_scan_cursor = Some(parent);
+            let Ok(children) = parent.children() else {
+                continue;
+            };
+            if !children.iter().all(|child| cover_set.contains(child))
+                || !children.iter().all(|child| !self.patch_visible(*child))
+                || self.patch_visible(parent)
+                || !planetary_merge_is_balanced(parent, cover_set)
+            {
+                continue;
+            }
+            let mut next: Vec<_> = cover
+                .iter()
+                .copied()
+                .filter(|patch| !children.contains(patch))
+                .chain([parent])
+                .collect();
+            next.sort();
+            self.merge_scan_cursor = Some(parent);
+            self.selector_merge_scan_pending = false;
+            return Some((next, 0.0, 0.0, parent, 1.0, 1.0));
+        }
+        if selection_started.elapsed() >= selection_budget {
+            self.selector_budget_exhausted = true;
+            self.selector_merge_scan_pending = true;
+            return None;
+        }
+        let mut start = self.merge_scan_cursor.map_or(0, |cursor| {
+            parents.partition_point(|parent| *parent <= cursor)
+        });
+        if start == parents.len() {
+            start = 0;
+        }
+        let count = parents.len().min(MAX_MERGE_CANDIDATES_PER_TICK);
+        let scan_completed = start + count >= parents.len();
+        self.selector_merge_scan_pending = !scan_completed;
+        let scanned: Vec<_> = (0..count)
+            .map(|offset| parents[(start + offset) % parents.len()])
+            .collect();
+        self.merge_scan_cursor = scanned.last().copied();
+        for parent in scanned {
+            let Ok(children) = parent.children() else {
+                continue;
+            };
+            if !children.iter().all(|child| cover_set.contains(child)) {
+                continue;
+            }
+            let (error, priority, approach, speed) = self.selection_score(parent, score_cache);
+            if error >= self.config.merge_threshold_px
+                || !planetary_merge_is_balanced(parent, cover_set)
+            {
+                continue;
+            }
+            let mut next: Vec<_> = cover
+                .iter()
+                .copied()
+                .filter(|patch| !children.contains(patch))
+                .chain([parent])
+                .collect();
+            next.sort();
+            return Some((next, priority, error, parent, approach, speed));
+        }
+        None
+    }
+
+    fn patch_visible_with(
+        &self,
+        address: CubePatchAddress,
+        planetary_view: Option<PlanetaryView>,
+    ) -> bool {
+        let Some(planetary_view) = planetary_view else {
+            return true;
+        };
+        let metadata = {
+            let mut cache = self.patch_metadata.borrow_mut();
+            if cache.len() >= self.config.max_desired_patches.saturating_mul(2).max(8192)
+                && !cache.contains_key(&address)
+                && let Some(evicted) = cache.keys().next().copied()
+            {
+                cache.remove(&evicted);
+            }
+            if let Some(metadata) = cache.get(&address).copied() {
+                Some(metadata)
+            } else {
+                PatchMetadata::build(address, &self.surface_topology)
+                    .ok()
+                    .inspect(|metadata| {
+                        cache.insert(address, *metadata);
+                    })
+            }
+        };
+        let Some(metadata) = metadata else {
+            return true;
+        };
+        let radius = self.generator.radius_m();
+        let amplitude = self.generator.conservative_absolute_height_bound_m();
+        let extent = SurfaceExtent {
+            min_height_m: -amplitude,
+            max_height_m: amplitude,
+            guaranteed_opaque_radius_m: 0.0,
+        };
+        let Ok((center_body, bound_radius)) = metadata.ball(radius, extent) else {
+            return true;
+        };
+        let camera_view = planetary_view.body_to_view * self.view.body_position_m;
+        let center_view = planetary_view.body_to_view * center_body - camera_view;
+        if planetary_view
+            .projection
+            .rejects_ball(center_view, bound_radius)
+            .unwrap_or(false)
+        {
+            return false;
+        }
+
+        // The lower radial envelope forms a conservative inscribed occluder for
+        // the closed displaced body. If it cannot reject the patch, retain it.
+        let inner_radius = radius - amplitude;
+        if inner_radius > 0.0
+            && metadata.horizon_reject(
+                self.view.body_position_m,
+                inner_radius,
+                SurfaceExtent::smooth(inner_radius),
+            )
+        {
+            return false;
+        }
+        true
     }
 
     fn selection_score(
@@ -1132,10 +2657,37 @@ impl RegionalTerrain {
         address: CubePatchAddress,
         cache: &mut HashMap<CubePatchAddress, (f64, f64, f64, f64)>,
     ) -> (f64, f64, f64, f64) {
-        *cache.entry(address).or_insert_with(|| self.score(address))
+        if let Some(score) = cache.get(&address).copied() {
+            return score;
+        }
+        if self.planetary_view.is_some()
+            && let Some(score) = self.planetary_scores.borrow().get(&address).copied()
+        {
+            cache.insert(address, score);
+            return score;
+        }
+        let score = self.score(address);
+        cache.insert(address, score);
+        if self.planetary_view.is_some() {
+            let mut scores = self.planetary_scores.borrow_mut();
+            if scores.len() >= self.config.max_desired_patches.saturating_mul(2).max(8192)
+                && !scores.contains_key(&address)
+                && let Some(evicted) = scores
+                    .keys()
+                    .find(|candidate| !self.desired.contains_key(candidate))
+                    .copied()
+            {
+                scores.remove(&evicted);
+            }
+            scores.insert(address, score);
+        }
+        score
     }
 
     fn score(&self, address: CubePatchAddress) -> (f64, f64, f64, f64) {
+        if !self.patch_visible(address) {
+            return (0.0, 0.0, 1.0, 1.0);
+        }
         let [normal, u, v] = address.face().basis();
         let [x, y] = address.coordinates();
         let scale = (1u64 << address.level()) as f64;
@@ -1190,7 +2742,11 @@ impl RegionalTerrain {
         let predicted_distance = (nearest_patch_distance
             - approach_speed * self.config.prediction_seconds)
             .max(clearance);
-        let error_px = geometric_error_m * self.view.projection_scale_px / predicted_distance;
+        let projection_scale_px = self
+            .planetary_view
+            .map(|view| view.projection.focal_pixels())
+            .unwrap_or(self.view.projection_scale_px);
+        let error_px = geometric_error_m * projection_scale_px / predicted_distance;
         let approach_multiplier = 1.0
             + (approach_speed * self.config.prediction_seconds / nearest_patch_distance.max(1.0))
                 .clamp(0.0, 2.0);
@@ -1225,6 +2781,7 @@ impl RegionalTerrain {
         for (key, token) in &self.in_flight {
             if !needed.contains(&key.address) && !token.cancelled.swap(true, AtomicOrdering::AcqRel)
             {
+                self.trace.event_key(key, Stage::Superseded);
                 if token.started.load(AtomicOrdering::Acquire) {
                     self.stats.cancelled_during_work =
                         self.stats.cancelled_during_work.saturating_add(1);
@@ -1237,6 +2794,7 @@ impl RegionalTerrain {
     }
 
     fn admit_builds(&mut self) {
+        let drawable: HashSet<_> = self.drawable.iter().copied().collect();
         let merge_frontier = self.merge_parent_dependencies();
         let addresses: Vec<_> = self.scheduled_dependencies().into_iter().collect();
         let mut candidates = Vec::new();
@@ -1245,7 +2803,7 @@ impl RegionalTerrain {
                 continue;
             }
             if self.reserved_split_parent.is_some_and(|parent| {
-                !self.drawable.contains(&address)
+                !drawable.contains(&address)
                     && !merge_frontier.contains(&address)
                     && parent
                         .children()
@@ -1256,11 +2814,11 @@ impl RegionalTerrain {
             let in_current_frontier = if self.drawable.is_empty() {
                 self.config.roots.contains(&address)
             } else {
-                self.drawable.contains(&address)
+                drawable.contains(&address)
                     || merge_frontier.contains(&address)
                     || address
                         .parent()
-                        .is_some_and(|parent| self.drawable.contains(&parent))
+                        .is_some_and(|parent| drawable.contains(&parent))
             };
             if !in_current_frontier {
                 continue;
@@ -1287,8 +2845,26 @@ impl RegionalTerrain {
             candidates.push((score, address, key));
         }
         candidates.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        let now = Instant::now();
+        self.refresh_build_candidate_waits(&candidates, now);
+        if let Some(index) = oldest_starved_candidate_index(
+            candidates.iter().map(|(_, _, key)| key),
+            &self.build_candidate_waits,
+            now,
+        ) && index > 0
+        {
+            // Promote just the oldest starved key; the rotation keeps every
+            // other candidate in its original score/address order.
+            candidates[..=index].rotate_right(1);
+        }
+        self.trace
+            .sync_generation_candidates(candidates.iter().map(|(_, _, key)| key));
         if !candidates.is_empty() && !self.cpu_cache_can_admit_tile() {
             self.pressure.cpu = true;
+            for (_, address, key) in candidates {
+                self.trace.admit(&key);
+                self.trace.block(address, BlockReason::CpuCapacity);
+            }
             return;
         }
         self.pressure.queue = self.in_flight.len() >= self.config.queue_cap;
@@ -1307,8 +2883,12 @@ impl RegionalTerrain {
                 key: key.clone(),
                 token: Arc::clone(&token),
             };
+            self.trace.admit(&key);
             match self.workers.sender.try_send(job) {
                 Ok(()) => {
+                    self.trace.event_key(&key, Stage::GenerationQueued);
+                    self.trace.unblock(address);
+                    self.build_candidate_waits.remove(&key);
                     self.in_flight.insert(key, token);
                     self.stats.cache_misses = self.stats.cache_misses.saturating_add(1);
                     self.stats.requests_issued = self.stats.requests_issued.saturating_add(1);
@@ -1323,10 +2903,12 @@ impl RegionalTerrain {
                     });
                 }
                 Err(TrySendError::Full(_)) => {
+                    self.trace.block(address, BlockReason::WorkerQueueFull);
                     self.pressure.queue = true;
                     break;
                 }
                 Err(TrySendError::Disconnected(_)) => {
+                    self.trace.block(address, BlockReason::WorkerQueueFull);
                     self.pressure.queue = true;
                     break;
                 }
@@ -1337,10 +2919,32 @@ impl RegionalTerrain {
         }
     }
 
+    fn refresh_build_candidate_waits(
+        &mut self,
+        candidates: &[(f64, CubePatchAddress, TileKey)],
+        now: Instant,
+    ) {
+        self.build_candidate_wait_epoch = self.build_candidate_wait_epoch.wrapping_add(1).max(1);
+        let epoch = self.build_candidate_wait_epoch;
+        for (_, _, key) in candidates {
+            let wait =
+                self.build_candidate_waits
+                    .entry(key.clone())
+                    .or_insert(BuildCandidateWait {
+                        first_eligible: now,
+                        last_seen_epoch: epoch,
+                    });
+            wait.last_seen_epoch = epoch;
+        }
+        self.build_candidate_waits
+            .retain(|_, wait| wait.last_seen_epoch == epoch);
+    }
+
     fn drain_completions(&mut self) {
         let drain_started = std::time::Instant::now();
-        let needed = self.scheduled_dependencies();
+        let mut needed = None;
         while let Ok(result) = self.completions.try_recv() {
+            let needed = needed.get_or_insert_with(|| self.scheduled_dependencies());
             self.completion_backlog.fetch_sub(1, AtomicOrdering::AcqRel);
             self.in_flight.remove(&result.key);
             self.stats.worker_elapsed_micros = self
@@ -1360,8 +2964,12 @@ impl RegionalTerrain {
             }
             if result.token.cancelled.load(AtomicOrdering::Acquire) && !still_needed {
                 self.stats.stale_completions = self.stats.stale_completions.saturating_add(1);
+                self.trace.event_key(&result.key, Stage::StaleCompletion);
+                self.trace.event_key(&result.key, Stage::DiscardedStale);
             }
             if let Some((tile, diagnostics)) = result.result {
+                self.stats.completed_build_count =
+                    self.stats.completed_build_count.saturating_add(1);
                 self.stats.rebuilds = self.stats.rebuilds.saturating_add(1);
                 self.stats.build_time_micros = self.stats.build_time_micros.saturating_add(
                     diagnostics.elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
@@ -1390,69 +2998,26 @@ impl RegionalTerrain {
     }
 
     fn admit_uploads(&mut self) {
-        let merge_frontier = self.merge_parent_dependencies();
-        let queued_addresses: HashSet<_> =
-            self.uploads.iter().map(|upload| upload.address).collect();
-        let mut wanted: BTreeSet<_> = self.desired.keys().copied().collect();
-        wanted.extend(self.config.roots.iter().copied());
-        wanted.extend(self.scheduled_dependencies());
-        let priorities: BTreeMap<_, _> = self
-            .desired
-            .iter()
-            .map(|(address, patch)| (*address, patch.priority))
-            .collect();
-        let mut candidates: Vec<_> = wanted
-            .into_iter()
-            .filter(|address| {
-                !self.resident.contains(address) && !queued_addresses.contains(address)
-            })
-            .filter(|address| {
-                if self.drawable.is_empty() {
-                    self.config.roots.contains(address)
-                } else {
-                    self.drawable.contains(address)
-                        || merge_frontier.contains(address)
-                        || address
-                            .parent()
-                            .is_some_and(|parent| self.drawable.contains(&parent))
-                }
-            })
-            .filter(|address| {
-                self.reserved_split_parent.is_none_or(|parent| {
-                    self.drawable.contains(address)
-                        || merge_frontier.contains(address)
-                        || parent
-                            .children()
-                            .is_ok_and(|children| children.contains(address))
-                })
-            })
-            .filter(|address| {
-                self.upload_allowlist
-                    .as_ref()
-                    .is_none_or(|allowed| allowed.contains(address))
-            })
-            .filter_map(|address| {
-                let key = self.key_for(address).ok()?;
-                let priority = priorities
-                    .get(&address)
-                    .copied()
-                    .unwrap_or_else(|| self.score(address).1);
-                self.cache
-                    .get(&key)
-                    .map(|entry| (priority, address, Arc::clone(&entry.tile)))
-            })
-            .collect();
-        candidates.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        let candidates = self.upload_candidates();
+        self.trace.sync_upload_candidates(
+            self.uploads
+                .iter()
+                .map(|upload| &upload.tile.key)
+                .chain(candidates.iter().map(|(_, _, tile)| &tile.key)),
+        );
         for (_, address, tile) in candidates {
             if self.uploads.len() >= self.config.upload_tile_cap {
+                self.trace.block(address, BlockReason::UploadCapacity);
                 self.pressure.upload = true;
                 break;
             }
             let bytes = tile_bytes(&tile);
             if self.upload_bytes.saturating_add(bytes) > self.config.upload_byte_cap {
+                self.trace.block(address, BlockReason::UploadCapacity);
                 self.pressure.upload = true;
                 continue;
             }
+            self.trace.unblock(address);
             self.uploads.push(RegionalUpload {
                 address,
                 tile,
@@ -1462,44 +3027,158 @@ impl RegionalTerrain {
         }
     }
 
+    fn upload_candidates(&self) -> Vec<(f64, CubePatchAddress, Arc<TileData>)> {
+        let _span = crate::engine_profile::span("Upload candidate indexing");
+        let drawable: HashSet<_> = self.drawable.iter().copied().collect();
+        let merge_frontier = self.merge_parent_dependencies();
+        let desired_ancestor_index = self
+            .reserved_split_parent
+            .is_none()
+            .then(|| self.desired_priority_by_ancestor());
+        let reserved_children = self
+            .reserved_split_parent
+            .and_then(|parent| parent.children().ok());
+        let mut candidates = Vec::new();
+        for (&address, tile) in &self.cached_tiles_by_address {
+            if self.resident.contains(&address)
+                || self.uploads.iter().any(|upload| upload.address == address)
+            {
+                continue;
+            }
+
+            let is_root = self.config.roots.contains(&address);
+            let is_merge_parent = merge_frontier.contains(&address);
+            let is_desired_dependency = if self.reserved_split_parent.is_some() {
+                // scheduled_dependencies() retains exactly these bounded anchors
+                // when a split reservation is active. The caller's original
+                // wanted set also independently includes desired addresses.
+                self.desired.contains_key(&address)
+                    || is_root
+                    || drawable.contains(&address)
+                    || self.external_pins.contains(&address)
+                    || is_merge_parent
+                    || reserved_children.is_some_and(|children| children.contains(&address))
+            } else {
+                // dependency_addresses() includes the desired nodes and their
+                // ancestors only down to the configured root. The ancestor index
+                // is shared with frontier discovery; root clipping preserves the
+                // original finite-region dependency contract.
+                self.desired.contains_key(&address)
+                    || is_root
+                    || is_merge_parent
+                    || (self.config.roots.iter().any(|root| root.contains(address))
+                        && desired_ancestor_index
+                            .as_ref()
+                            .is_some_and(|index| index.contains_key(&address)))
+            };
+            if !is_desired_dependency {
+                continue;
+            }
+            if self.drawable.is_empty() {
+                if !is_root {
+                    continue;
+                }
+            } else if !drawable.contains(&address)
+                && !is_merge_parent
+                && !address
+                    .parent()
+                    .is_some_and(|parent| drawable.contains(&parent))
+            {
+                continue;
+            }
+            if self.reserved_split_parent.is_some()
+                && !drawable.contains(&address)
+                && !is_merge_parent
+                && !reserved_children.is_some_and(|children| children.contains(&address))
+            {
+                continue;
+            }
+            if self
+                .upload_allowlist
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains(&address))
+            {
+                continue;
+            }
+            let Some(priority) = self.desired.get(&address).map(|patch| patch.priority) else {
+                candidates.push((self.score(address).1, address, Arc::clone(tile)));
+                continue;
+            };
+            candidates.push((priority, address, Arc::clone(tile)));
+        }
+        drop(desired_ancestor_index);
+        candidates.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        candidates
+    }
+
     fn refresh_publications(&mut self) {
+        let started = std::time::Instant::now();
+        self.refresh_publications_inner();
+        self.stats.publication_discovery_micros = self
+            .stats
+            .publication_discovery_micros
+            .saturating_add(started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
+    }
+
+    fn refresh_publications_inner(&mut self) {
         self.publications.clear();
-        let publication_limit = self
-            .config
-            .publication_cap_per_tick
-            .min(self.config.transition_cap);
+        self.publications_dirty = false;
+        const MAX_CANDIDATES: usize = 32;
+        const STARVATION_AGE_TICKS: u64 = 32;
+        let publication_limit = if self.planetary_view.is_some() {
+            MAX_CANDIDATES
+        } else {
+            self.config
+                .publication_cap_per_tick
+                .min(self.config.transition_cap)
+                .min(MAX_CANDIDATES)
+        };
         if self.drawable.is_empty() || publication_limit == 0 {
             return;
         }
-        for &parent in &self.drawable {
-            if !self
-                .desired
-                .keys()
-                .any(|desired| parent.contains(*desired) && *desired != parent)
-            {
-                continue;
+        {
+            let mut cached = self.desired_dependency_cache.borrow_mut();
+            if !self.desired.keys().eq(cached.0.iter()) {
+                cached.0 = self.desired.keys().copied().collect();
+                cached.1.clear();
+                for &desired in self.desired.keys() {
+                    let mut cursor = desired;
+                    loop {
+                        if !self.config.roots.iter().any(|root| root.contains(cursor))
+                            || !cached.1.insert(cursor)
+                        {
+                            break;
+                        }
+                        if self.config.roots.contains(&cursor) {
+                            break;
+                        }
+                        let Some(parent) = cursor.parent() else {
+                            break;
+                        };
+                        cursor = parent;
+                    }
+                }
             }
+        }
+        let desired_ancestors = self.desired_dependency_cache.borrow();
+        let mut candidates = Vec::new();
+        let mut current_candidate_parents = HashSet::new();
+        for &parent in &self.drawable {
+            let has_desired_descendant =
+                desired_ancestors.1.contains(&parent) && !self.desired.contains_key(&parent);
             let Ok(children) = parent.children() else {
                 continue;
             };
-            if !self.resident.contains(&parent)
-                || children.iter().any(|child| !self.resident.contains(child))
+            if has_desired_descendant
+                && self.resident.contains(&parent)
+                && children.iter().all(|child| self.resident.contains(child))
+                && local_replacement_is_balanced(parent, true, &self.drawable)
             {
-                continue;
-            }
-            let mut cover: Vec<_> = self
-                .drawable
-                .iter()
-                .copied()
-                .filter(|address| *address != parent)
-                .collect();
-            cover.extend(children);
-            cover.sort();
-            if valid_cover(&self.config.roots, &cover, self.config.max_level) {
-                self.publications.push(RegionalPublication::Split {
+                current_candidate_parents.insert(parent);
+                candidates.push(RegionalPublication::Split {
                     parent,
                     children,
-                    cover,
+                    cover: Vec::new(),
                 });
             }
         }
@@ -1509,47 +3188,85 @@ impl RegionalTerrain {
             .filter_map(|child| child.parent())
             .collect();
         for parent in parents {
-            if !self.desired.keys().any(|desired| desired.contains(parent)) {
-                continue;
-            }
+            let mut ancestor = Some(parent);
+            let desired_contains_parent = std::iter::from_fn(|| {
+                let current = ancestor?;
+                ancestor = current.parent();
+                Some(current)
+            })
+            .any(|address| self.desired.contains_key(&address));
             let Ok(children) = parent.children() else {
                 continue;
             };
-            if !self.resident.contains(&parent)
-                || children.iter().any(|child| !self.drawable.contains(child))
+            if desired_contains_parent
+                && self.resident.contains(&parent)
+                && children
+                    .iter()
+                    .all(|child| self.drawable.binary_search(child).is_ok())
+                && local_replacement_is_balanced(parent, false, &self.drawable)
             {
-                continue;
-            }
-            let mut cover: Vec<_> = self
-                .drawable
-                .iter()
-                .copied()
-                .filter(|address| !children.contains(address))
-                .collect();
-            cover.push(parent);
-            cover.sort();
-            if valid_cover(&self.config.roots, &cover, self.config.max_level) {
-                self.publications.push(RegionalPublication::Merge {
+                current_candidate_parents.insert(parent);
+                candidates.push(RegionalPublication::Merge {
                     parent,
                     children,
-                    cover,
+                    cover: Vec::new(),
                 });
             }
         }
-        self.publications.sort_by(|a, b| {
-            publication_parent(a)
-                .cmp(&publication_parent(b))
-                .then_with(|| match (a, b) {
-                    (RegionalPublication::Split { .. }, RegionalPublication::Merge { .. }) => {
-                        Ordering::Less
-                    }
-                    (RegionalPublication::Merge { .. }, RegionalPublication::Split { .. }) => {
-                        Ordering::Greater
-                    }
-                    _ => Ordering::Equal,
-                })
+        candidates.retain(|candidate| {
+            let parent = publication_parent(candidate);
+            !self.blocked_publication_parents.contains(&parent)
         });
-        self.publications.truncate(publication_limit);
+        for parent in &current_candidate_parents {
+            self.publication_candidate_ages.entry(*parent).or_default();
+        }
+        self.publication_candidate_ages
+            .retain(|parent, _| current_candidate_parents.contains(parent));
+        candidates.sort_by(|a, b| {
+            let parent_a = publication_parent(a);
+            let parent_b = publication_parent(b);
+            let age_a = self
+                .publication_candidate_ages
+                .get(&parent_a)
+                .copied()
+                .unwrap_or(0);
+            let age_b = self
+                .publication_candidate_ages
+                .get(&parent_b)
+                .copied()
+                .unwrap_or(0);
+            let starved_a = age_a >= STARVATION_AGE_TICKS;
+            let starved_b = age_b >= STARVATION_AGE_TICKS;
+            starved_b
+                .cmp(&starved_a)
+                .then_with(|| {
+                    if starved_a && starved_b {
+                        age_b.cmp(&age_a)
+                    } else {
+                        self.cached_publication_priority(b)
+                            .total_cmp(&self.cached_publication_priority(a))
+                    }
+                })
+                .then_with(|| parent_a.cmp(&parent_b))
+        });
+        candidates.truncate(publication_limit);
+        self.publications = candidates;
+    }
+
+    fn cached_publication_priority(&self, candidate: &RegionalPublication) -> f64 {
+        let parent = publication_parent(candidate);
+        self.planetary_scores
+            .borrow()
+            .get(&parent)
+            .map(|score| score.1)
+            .or_else(|| self.desired.get(&parent).map(|patch| patch.priority))
+            .unwrap_or_else(|| match candidate {
+                RegionalPublication::Split { children, .. }
+                | RegionalPublication::Merge { children, .. } => children
+                    .iter()
+                    .filter_map(|child| self.desired.get(child).map(|patch| patch.priority))
+                    .fold(0.0, f64::max),
+            })
     }
 
     fn cache_insert(
@@ -1589,10 +3306,15 @@ impl RegionalTerrain {
                 return CacheInsertResult::Rejected;
             };
             if let Some(removed) = self.cache.remove(&victim) {
+                self.trace.event_key(&victim, Stage::CpuEvicted);
+                self.trace.event_key(&victim, Stage::Evicted);
+                self.cached_tiles_by_address
+                    .remove(&removed.tile.key.address);
                 self.cache_bytes = self.cache_bytes.saturating_sub(removed.bytes);
                 self.seen_cache_requests.remove(&victim);
                 self.stats.cache_evictions = self.stats.cache_evictions.saturating_add(1);
                 if self.resident.remove(&removed.tile.key.address) {
+                    self.trace.set_resident(removed.tile.key.address, false);
                     if self.drawable.contains(&removed.tile.key.address) {
                         self.pressure.publication = true;
                     }
@@ -1608,6 +3330,8 @@ impl RegionalTerrain {
         }
         self.cache_clock = self.cache_clock.saturating_add(1);
         self.cache_bytes += bytes;
+        self.cached_tiles_by_address
+            .insert(tile.key.address, Arc::clone(&tile));
         self.cache.insert(
             key,
             CacheEntry {
@@ -1763,7 +3487,12 @@ impl RegionalTerrain {
         self.reserved_split_parent = candidates
             .into_iter()
             .find(|group| {
-                let needed = anchors.union(&group.children.into_iter().collect()).count();
+                let needed = anchors.len()
+                    + group
+                        .children
+                        .iter()
+                        .filter(|child| !anchors.contains(child))
+                        .count();
                 needed <= self.config.cpu_tile_cap
                     && needed.saturating_mul(tile_bytes) <= self.config.cpu_byte_cap
             })
@@ -1772,31 +3501,19 @@ impl RegionalTerrain {
 
     fn split_frontier_groups(&self) -> Vec<RegionalSplitFrontier> {
         let mut groups = Vec::new();
+        let desired_priority_index = self.desired_priority_by_ancestor();
         for &parent in &self.drawable {
             let Ok(children) = parent.children() else {
                 continue;
             };
             let child_priorities: Vec<_> = children
                 .iter()
-                .map(|child| {
-                    self.desired
-                        .iter()
-                        .filter(|(desired, _)| child.contains(**desired))
-                        .map(|(_, patch)| patch.priority)
-                        .max_by(f64::total_cmp)
-                })
+                .map(|child| desired_priority_index.get(child).copied())
                 .collect();
             if child_priorities.iter().any(Option::is_none) {
                 continue;
             }
-            let mut trial_cover: Vec<_> = self
-                .drawable
-                .iter()
-                .copied()
-                .filter(|address| *address != parent)
-                .collect();
-            trial_cover.extend(children);
-            if !valid_cover(&self.config.roots, &trial_cover, self.config.max_level) {
+            if !local_replacement_is_balanced(parent, true, &self.drawable) {
                 continue;
             }
             let aggregate_priority = child_priorities.iter().flatten().copied().sum::<f64>();
@@ -1804,9 +3521,7 @@ impl RegionalTerrain {
                 .iter()
                 .filter(|child| {
                     self.resident.contains(child)
-                        || self
-                            .key_for(**child)
-                            .is_ok_and(|key| self.cache.contains_key(&key))
+                        || self.cached_tiles_by_address.contains_key(child)
                         || self.uploads.iter().any(|upload| upload.address == **child)
                         || self
                             .key_for(**child)
@@ -1829,28 +3544,103 @@ impl RegionalTerrain {
         groups
     }
 
+    fn desired_priority_by_ancestor(&self) -> std::cell::Ref<'_, HashMap<CubePatchAddress, f64>> {
+        let _priority_index_span = crate::engine_profile::span("GPU frontier priority index");
+        {
+            let mut index = self.desired_priority_index.borrow_mut();
+            let signature_matches = index.signature.len() == self.desired.len()
+                && index.signature.iter().zip(self.desired.iter()).all(
+                    |((cached_address, cached_priority_bits), (address, patch))| {
+                        *cached_address == *address
+                            && *cached_priority_bits == patch.priority.to_bits()
+                    },
+                );
+            if !signature_matches {
+                index.signature.clear();
+                index.priorities.clear();
+                for (&address, patch) in &self.desired {
+                    index.signature.push((address, patch.priority.to_bits()));
+                    let mut ancestor = Some(address);
+                    while let Some(current) = ancestor {
+                        index
+                            .priorities
+                            .entry(current)
+                            .and_modify(|priority| {
+                                if patch.priority.total_cmp(priority).is_gt() {
+                                    *priority = patch.priority;
+                                }
+                            })
+                            .or_insert(patch.priority);
+                        ancestor = current.parent();
+                    }
+                }
+                index.revision = index.revision.wrapping_add(1);
+            }
+        }
+        std::cell::Ref::map(self.desired_priority_index.borrow(), |index| {
+            &index.priorities
+        })
+    }
+
+    /// Monotonic revision for consumers caching summaries of desired priorities.
+    pub(crate) fn desired_priority_revision(&self) -> u64 {
+        // Sampling consumers get a current revision even if no frontier query
+        // ran after the selector last changed desired priorities.
+        drop(self.desired_priority_by_ancestor());
+        self.desired_priority_index.borrow().revision
+    }
+
+    fn build_candidate_wait_entries_upper_bound(&self) -> usize {
+        self.config
+            .max_desired_patches
+            .saturating_mul(usize::from(self.config.max_level) + 1)
+            .saturating_add(self.config.roots.len())
+            .saturating_add(self.external_pins.len())
+            .saturating_add(self.drawable.len().saturating_mul(2))
+            .saturating_add(4)
+            .max(self.build_candidate_waits.capacity())
+    }
+
+    fn build_candidate_wait_bytes_upper_bound(&self, entries_upper_bound: usize) -> usize {
+        // HashMap bucket/control overhead is covered by the factor of two.
+        // Every tracked exact TileKey owns the same immutable definition words.
+        let per_entry = std::mem::size_of::<(TileKey, BuildCandidateWait)>()
+            .saturating_add(self.tile_key_definition_word_count.saturating_mul(8))
+            .saturating_add(16);
+        entries_upper_bound
+            .saturating_mul(per_entry)
+            .saturating_mul(2)
+    }
+
     /// Desired descendants cannot publish directly: every ancestor level must
     /// become resident first so split proposals can advance from the current
     /// drawable cover without holes. Keep that bounded path schedulable and
     /// cancellable as one dependency closure.
     fn dependency_addresses(&self) -> BTreeSet<CubePatchAddress> {
-        let mut dependencies = BTreeSet::new();
-        for &desired in self.desired.keys() {
-            let mut cursor = desired;
-            loop {
-                if !self.config.roots.iter().any(|root| root.contains(cursor)) {
-                    break;
+        let mut cached = self.desired_dependency_cache.borrow_mut();
+        if !self.desired.keys().eq(cached.0.iter()) {
+            cached.0 = self.desired.keys().copied().collect();
+            cached.1.clear();
+            for &desired in self.desired.keys() {
+                let mut cursor = desired;
+                loop {
+                    if !self.config.roots.iter().any(|root| root.contains(cursor))
+                        || !cached.1.insert(cursor)
+                    {
+                        break;
+                    }
+                    if self.config.roots.contains(&cursor) {
+                        break;
+                    }
+                    let Some(parent) = cursor.parent() else {
+                        break;
+                    };
+                    cursor = parent;
                 }
-                dependencies.insert(cursor);
-                if self.config.roots.contains(&cursor) {
-                    break;
-                }
-                let Some(parent) = cursor.parent() else {
-                    break;
-                };
-                cursor = parent;
             }
         }
+        let mut dependencies = cached.1.clone();
+        drop(cached);
         dependencies.extend(self.merge_parent_dependencies());
         dependencies
     }
@@ -1866,7 +3656,16 @@ impl RegionalTerrain {
             .filter_map(|child| child.parent())
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .filter(|parent| self.desired.keys().any(|desired| desired.contains(*parent)))
+            .filter(|parent| {
+                let mut ancestor = Some(*parent);
+                while let Some(address) = ancestor {
+                    if self.desired.contains_key(&address) {
+                        return true;
+                    }
+                    ancestor = address.parent();
+                }
+                false
+            })
             .filter(|parent| {
                 parent
                     .children()
@@ -1933,6 +3732,37 @@ fn patch_area(address: CubePatchAddress) -> f64 {
     4.0f64.powi(-i32::from(address.level()))
 }
 
+fn convergence_ratio(error_px: f64, target_error_px: f64) -> f64 {
+    if error_px <= 0.0 {
+        1.0
+    } else if error_px.is_finite() {
+        (target_error_px / error_px).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn cube_face_for_direction(direction: DVec3) -> CubeFace {
+    let absolute = direction.abs();
+    if absolute.x >= absolute.y && absolute.x >= absolute.z {
+        if direction.x >= 0.0 {
+            CubeFace::PositiveX
+        } else {
+            CubeFace::NegativeX
+        }
+    } else if absolute.y >= absolute.z {
+        if direction.y >= 0.0 {
+            CubeFace::PositiveY
+        } else {
+            CubeFace::NegativeY
+        }
+    } else if direction.z >= 0.0 {
+        CubeFace::PositiveZ
+    } else {
+        CubeFace::NegativeZ
+    }
+}
+
 fn expected_tile_bytes(cells: u32) -> Option<usize> {
     let side = usize::try_from(cells.checked_add(3)?).ok()?;
     side.checked_mul(side)?
@@ -1945,19 +3775,136 @@ fn candidates_remain(
     in_flight: &HashMap<TileKey, Arc<BuildToken>>,
     resident: &BTreeSet<CubePatchAddress>,
 ) -> bool {
+    let cached: HashSet<_> = cache.keys().map(|key| key.address).collect();
+    let pending: HashSet<_> = in_flight.keys().map(|key| key.address).collect();
     desired.keys().any(|address| {
-        !resident.contains(address)
-            && !cache.keys().any(|key| key.address == *address)
-            && !in_flight.keys().any(|key| key.address == *address)
+        !resident.contains(address) && !cached.contains(address) && !pending.contains(address)
     })
 }
 
-fn publication_parent(publication: &RegionalPublication) -> CubePatchAddress {
-    match publication {
-        RegionalPublication::Split { parent, .. } | RegionalPublication::Merge { parent, .. } => {
-            *parent
+fn oldest_starved_candidate_index<'a>(
+    ordered_keys: impl IntoIterator<Item = &'a TileKey>,
+    waits: &HashMap<TileKey, BuildCandidateWait>,
+    now: Instant,
+) -> Option<usize> {
+    let mut oldest: Option<(usize, Instant)> = None;
+    for (index, key) in ordered_keys.into_iter().enumerate() {
+        let Some(wait) = waits.get(key) else {
+            continue;
+        };
+        if now.saturating_duration_since(wait.first_eligible) < BUILD_CANDIDATE_STARVATION_AFTER {
+            continue;
+        }
+        // Keep the earlier score/address candidate on exact timestamp ties.
+        if oldest.is_none_or(|(_, first_eligible)| wait.first_eligible < first_eligible) {
+            oldest = Some((index, wait.first_eligible));
         }
     }
+    oldest.map(|(index, _)| index)
+}
+
+fn planetary_merge_is_balanced(
+    parent: CubePatchAddress,
+    cover: &HashSet<CubePatchAddress>,
+) -> bool {
+    // On a complete balanced six-face cover, the parent has four leaf children.
+    // Across each outer edge, a same-level/coarser neighbor is safe. Otherwise
+    // both touching neighbor children must be leaves: deeper descendants would
+    // differ by at least two levels after the merge. No global index is needed.
+    parent
+        .children()
+        .is_ok_and(|children| children.iter().all(|child| cover.contains(child)))
+        && PatchEdge::ALL.into_iter().all(|edge| {
+            let relation = parent.neighbor(edge);
+            let mut ancestor = Some(relation.address);
+            while let Some(address) = ancestor {
+                if cover.contains(&address) {
+                    return true;
+                }
+                ancestor = address.parent();
+            }
+            relation.address.children().is_ok_and(|children| {
+                children
+                    .into_iter()
+                    .filter(|child| {
+                        let [x, y] = child.coordinates();
+                        match relation.edge {
+                            PatchEdge::UMin => x % 2 == 0,
+                            PatchEdge::UMax => x % 2 == 1,
+                            PatchEdge::VMin => y % 2 == 0,
+                            PatchEdge::VMax => y % 2 == 1,
+                        }
+                    })
+                    .all(|child| cover.contains(&child))
+            })
+        })
+}
+
+// A valid cover can become unbalanced only along the newly split leaf's outer
+// edges. Recursively split any coarser neighbor, with a bounded closure. Keeping
+// the current leaves in one ordered set avoids rebuilding global adjacency for
+// every trial and preserves cross-face neighbor transforms from CubePatchAddress.
+fn balance_planetary_split(
+    cover: &[CubePatchAddress],
+    parent: CubePatchAddress,
+    max_level: u8,
+    max_leaves: usize,
+    max_splits: usize,
+    started: std::time::Instant,
+    budget: Duration,
+) -> Option<Vec<CubePatchAddress>> {
+    // The input is sorted. Test the bounded closure against a small overlay
+    // rather than cloning/indexing the entire cover before any useful work.
+    // The full output copy happens only after the local closure is validated.
+    let mut removed = HashSet::new();
+    let mut added = BTreeSet::new();
+    let mut pending = vec![parent];
+    let mut splits = 0;
+    while let Some(address) = pending.pop() {
+        if started.elapsed() >= budget {
+            return None;
+        }
+        if !added.contains(&address)
+            && (removed.contains(&address) || cover.binary_search(&address).is_err())
+        {
+            continue;
+        }
+        if address.level() >= max_level
+            || splits == max_splits
+            || cover.len().saturating_add((splits + 1) * 3) > max_leaves
+        {
+            return None;
+        }
+        for edge in PatchEdge::ALL {
+            let mut neighbor = Some(address.neighbor(edge).address);
+            while let Some(candidate) = neighbor {
+                if added.contains(&candidate)
+                    || (!removed.contains(&candidate) && cover.binary_search(&candidate).is_ok())
+                {
+                    if candidate.level() < address.level() {
+                        pending.push(candidate);
+                    }
+                    break;
+                }
+                neighbor = candidate.parent();
+            }
+        }
+        if !added.remove(&address) {
+            removed.insert(address);
+        }
+        added.extend(address.children().ok()?);
+        splits += 1;
+    }
+    // Do not discard completed closure work if the unavoidable output copy
+    // exceeds the deadline. The caller records actual elapsed-time overruns.
+    let mut next: Vec<_> = cover
+        .iter()
+        .copied()
+        .filter(|address| !removed.contains(address))
+        .chain(added)
+        .collect();
+    next.sort_unstable();
+    Some(next)
 }
 
 fn balance_cover(
@@ -1965,24 +3912,41 @@ fn balance_cover(
     mut cover: Vec<CubePatchAddress>,
     max_level: u8,
     patch_cap: usize,
+    deadline: Option<(std::time::Instant, Duration)>,
 ) -> Option<Vec<CubePatchAddress>> {
     cover.sort();
     cover.dedup();
     loop {
+        if selector_deadline_expired(deadline) {
+            return None;
+        }
         if cover.len() > patch_cap {
             return None;
         }
-        if !complete_nonoverlapping_cover(roots, &cover, max_level) {
+        let (complete, indexed_cover) = match deadline {
+            Some((started, budget)) => {
+                complete_nonoverlapping_cover_until(roots, &cover, max_level, started, budget)?
+            }
+            None => (
+                complete_nonoverlapping_cover(roots, &cover, max_level),
+                None,
+            ),
+        };
+        if !complete {
             return None;
         }
+        let (cover_set, descendants) = match indexed_cover {
+            Some(index) => index,
+            None => cover_address_index(&cover),
+        };
         let mut too_coarse = BTreeSet::new();
         for &patch in &cover {
+            if selector_deadline_expired(deadline) {
+                return None;
+            }
             for edge in PatchEdge::ALL {
-                for &neighbor in &cover {
-                    if patch != neighbor
-                        && adjacent_across_edge(patch, edge, neighbor)
-                        && patch.level() > neighbor.level() + 1
-                    {
+                for neighbor in adjacent_cover_patches(patch, edge, &cover_set, &descendants) {
+                    if patch.level() > neighbor.level() + 1 {
                         too_coarse.insert(neighbor);
                     }
                 }
@@ -2010,14 +3974,106 @@ fn balance_cover(
     }
 }
 
-fn valid_cover(roots: &[CubePatchAddress], cover: &[CubePatchAddress], max_level: u8) -> bool {
-    complete_nonoverlapping_cover(roots, cover, max_level)
-        && cover.iter().all(|patch| {
-            !cover
-                .iter()
-                .any(|other| patch != other && (patch.contains(*other) || other.contains(*patch)))
+fn selector_deadline_expired(deadline: Option<(std::time::Instant, Duration)>) -> bool {
+    deadline.is_some_and(|(started, budget)| started.elapsed() >= budget)
+}
+
+type CoverAddressIndex = (
+    HashSet<CubePatchAddress>,
+    HashMap<CubePatchAddress, Vec<CubePatchAddress>>,
+);
+
+fn cover_address_index_until(
+    cover: &[CubePatchAddress],
+    started: std::time::Instant,
+    budget: Duration,
+) -> Option<CoverAddressIndex> {
+    let mut cover_set = HashSet::with_capacity(cover.len());
+    let mut descendants = HashMap::<CubePatchAddress, Vec<CubePatchAddress>>::new();
+    for &leaf in cover {
+        if started.elapsed() >= budget {
+            return None;
+        }
+        cover_set.insert(leaf);
+        let mut ancestor = Some(leaf);
+        while let Some(address) = ancestor {
+            descendants.entry(address).or_default().push(leaf);
+            ancestor = address.parent();
+        }
+    }
+    Some((cover_set, descendants))
+}
+
+fn complete_nonoverlapping_cover_until(
+    roots: &[CubePatchAddress],
+    cover: &[CubePatchAddress],
+    max_level: u8,
+    started: std::time::Instant,
+    budget: Duration,
+) -> Option<(bool, Option<CoverAddressIndex>)> {
+    if roots.is_empty() || cover.is_empty() {
+        return Some((false, None));
+    }
+    for patch in cover {
+        if started.elapsed() >= budget {
+            return None;
+        }
+        if patch.level() > max_level {
+            return Some((false, None));
+        }
+    }
+    for (index, root) in roots.iter().enumerate() {
+        if started.elapsed() >= budget {
+            return None;
+        }
+        for other in roots.iter().skip(index + 1) {
+            if root.contains(*other) || other.contains(*root) {
+                return Some((false, None));
+            }
+        }
+    }
+    let (cover_set, descendants) = cover_address_index_until(cover, started, budget)?;
+    if cover_set.len() != cover.len()
+        || cover.iter().any(|patch| {
+            descendants
+                .get(patch)
+                .is_some_and(|leaves| leaves.len() > 1)
         })
-        && cover_is_balanced(cover)
+    {
+        return Some((false, None));
+    }
+    let mut areas = vec![0u128; roots.len()];
+    for patch in cover {
+        if started.elapsed() >= budget {
+            return None;
+        }
+        let Some(root_index) = roots.iter().position(|root| root.contains(*patch)) else {
+            return Some((false, None));
+        };
+        let mut ancestor = patch.parent();
+        while let Some(parent) = ancestor {
+            if cover_set.contains(&parent) {
+                return Some((false, None));
+            }
+            if parent == roots[root_index] {
+                break;
+            }
+            ancestor = parent.parent();
+        }
+        let depth = u32::from(max_level - patch.level());
+        areas[root_index] = areas[root_index].saturating_add(1u128 << (depth * 2));
+    }
+    for (root, area) in roots.iter().zip(areas) {
+        let depth = u32::from(max_level - root.level());
+        if area != 1u128 << (depth * 2) {
+            return Some((false, None));
+        }
+    }
+    Some((true, Some((cover_set, descendants))))
+}
+
+fn valid_cover(roots: &[CubePatchAddress], cover: &[CubePatchAddress], max_level: u8) -> bool {
+    complete_nonoverlapping_cover(roots, cover, max_level) && cover_is_balanced(cover)
 }
 
 fn complete_nonoverlapping_cover(
@@ -2036,56 +4092,183 @@ fn complete_nonoverlapping_cover(
     }) {
         return false;
     }
-    for patch in cover {
-        if !roots.iter().any(|root| root.contains(*patch)) {
-            return false;
-        }
+    let cover_set: HashSet<_> = cover.iter().copied().collect();
+    if cover_set.len() != cover.len() {
+        return false;
     }
-    for root in roots {
-        let leaves: Vec<_> = cover
-            .iter()
-            .filter(|patch| root.contains(**patch))
-            .collect();
-        if leaves.is_empty() {
+    let (_, descendants) = cover_address_index(cover);
+    if cover.iter().any(|patch| {
+        descendants
+            .get(patch)
+            .is_some_and(|leaves| leaves.len() > 1)
+    }) {
+        return false;
+    }
+    let mut areas = vec![0u128; roots.len()];
+    for patch in cover {
+        let Some(root_index) = roots.iter().position(|root| root.contains(*patch)) else {
             return false;
-        }
-        for (index, patch) in leaves.iter().enumerate() {
-            if leaves
-                .iter()
-                .skip(index + 1)
-                .any(|other| patch.contains(**other) || other.contains(**patch))
-            {
+        };
+        let mut ancestor = patch.parent();
+        while let Some(parent) = ancestor {
+            if cover_set.contains(&parent) {
                 return false;
             }
+            if parent == roots[root_index] {
+                break;
+            }
+            ancestor = parent.parent();
         }
+        let depth = u32::from(max_level - patch.level());
+        areas[root_index] = areas[root_index].saturating_add(1u128 << (depth * 2));
+    }
+    for (root, area) in roots.iter().zip(areas) {
         let depth = u32::from(max_level - root.level());
-        let target_area = 1u128
-            .checked_shl(depth.saturating_mul(2))
-            .unwrap_or(u128::MAX);
-        let mut area = 0u128;
-        for patch in leaves {
-            let patch_depth = u32::from(max_level - patch.level());
-            area = area.saturating_add(
-                1u128
-                    .checked_shl(patch_depth.saturating_mul(2))
-                    .unwrap_or(0),
-            );
-        }
-        if area != target_area {
+        if area != 1u128 << (depth * 2) {
             return false;
         }
     }
     true
 }
 
+// Replacing one leaf by its four children, or the reverse, preserves complete
+// nonoverlapping coverage. Only the replacement's outer edges can change balance.
+// Callers supply the current valid cover and reuse its adjacency index.
+#[cfg(test)]
+fn replacement_is_balanced(
+    parent: CubePatchAddress,
+    split: bool,
+    cover: &HashSet<CubePatchAddress>,
+    descendants: &HashMap<CubePatchAddress, Vec<CubePatchAddress>>,
+) -> bool {
+    let Ok(children) = parent.children() else {
+        return false;
+    };
+    if (split && !cover.contains(&parent))
+        || (!split && !children.iter().all(|child| cover.contains(child)))
+    {
+        return false;
+    }
+    PatchEdge::ALL.into_iter().all(|edge| {
+        adjacent_cover_patches(parent, edge, cover, descendants)
+            .into_iter()
+            .all(|neighbor| {
+                if split {
+                    neighbor.level() >= parent.level()
+                } else {
+                    neighbor.level() <= parent.level() + 1
+                }
+            })
+    })
+}
+
+fn publication_parent(publication: &RegionalPublication) -> CubePatchAddress {
+    match publication {
+        RegionalPublication::Split { parent, .. } | RegionalPublication::Merge { parent, .. } => {
+            *parent
+        }
+    }
+}
+
+fn useful_detail_reached(
+    has_planetary_view: bool,
+    visible_drawable_count: usize,
+    missing_drawable_scores: usize,
+    maximum_proxy_error_px: f64,
+) -> bool {
+    has_planetary_view
+        && visible_drawable_count > 0
+        && missing_drawable_scores == 0
+        && maximum_proxy_error_px <= 1.0
+}
+
+fn empty_cover_publication(publication: &RegionalPublication) -> RegionalPublication {
+    match publication {
+        RegionalPublication::Split {
+            parent, children, ..
+        } => RegionalPublication::Split {
+            parent: *parent,
+            children: *children,
+            cover: Vec::new(),
+        },
+        RegionalPublication::Merge {
+            parent, children, ..
+        } => RegionalPublication::Merge {
+            parent: *parent,
+            children: *children,
+            cover: Vec::new(),
+        },
+    }
+}
+
+/// Check only the replacement boundary against a sorted complete balanced
+/// cover. A split can fail only when an outer neighbor is coarser than parent.
+/// A merge can fail only when a touching neighbor is finer than parent+1.
+fn local_replacement_is_balanced(
+    parent: CubePatchAddress,
+    split: bool,
+    cover: &[CubePatchAddress],
+) -> bool {
+    if split {
+        if cover.binary_search(&parent).is_err() {
+            return false;
+        }
+    } else {
+        let Some(children) = parent.children().ok() else {
+            return false;
+        };
+        if !children
+            .iter()
+            .all(|child| cover.binary_search(child).is_ok())
+        {
+            return false;
+        }
+    }
+    PatchEdge::ALL.into_iter().all(|edge| {
+        let relation = parent.neighbor(edge);
+        let mut ancestor = Some(relation.address);
+        while let Some(address) = ancestor {
+            if cover.binary_search(&address).is_ok() {
+                return if split {
+                    address.level() >= parent.level()
+                } else {
+                    address.level() <= parent.level().saturating_add(1)
+                };
+            }
+            ancestor = address.parent();
+        }
+        if split {
+            // A complete cover has finer leaves under this neighbor address.
+            // None can be coarser than the address itself.
+            relation.address.level() >= parent.level()
+        } else {
+            // Current 2:1 balance bounds edge neighbors to at most two leaves
+            // at parent+1. A deeper touching descendant is detected by absence
+            // of one of these required boundary children.
+            relation.address.children().is_ok_and(|children| {
+                children
+                    .into_iter()
+                    .filter(|child| {
+                        let [x, y] = child.coordinates();
+                        match relation.edge {
+                            PatchEdge::UMin => x % 2 == 0,
+                            PatchEdge::UMax => x % 2 == 1,
+                            PatchEdge::VMin => y % 2 == 0,
+                            PatchEdge::VMax => y % 2 == 1,
+                        }
+                    })
+                    .all(|child| cover.binary_search(&child).is_ok())
+            })
+        }
+    })
+}
+
 fn cover_is_balanced(cover: &[CubePatchAddress]) -> bool {
+    let (cover_set, descendants) = cover_address_index(cover);
     for &patch in cover {
         for edge in PatchEdge::ALL {
-            for &neighbor in cover {
-                if patch != neighbor
-                    && adjacent_across_edge(patch, edge, neighbor)
-                    && patch.level().abs_diff(neighbor.level()) > 1
-                {
+            for neighbor in adjacent_cover_patches(patch, edge, &cover_set, &descendants) {
+                if patch.level().abs_diff(neighbor.level()) > 1 {
                     return false;
                 }
             }
@@ -2094,52 +4277,1345 @@ fn cover_is_balanced(cover: &[CubePatchAddress]) -> bool {
     true
 }
 
-fn adjacent_across_edge(
+fn cover_address_index(
+    cover: &[CubePatchAddress],
+) -> (
+    HashSet<CubePatchAddress>,
+    HashMap<CubePatchAddress, Vec<CubePatchAddress>>,
+) {
+    let cover_set: HashSet<_> = cover.iter().copied().collect();
+    let mut descendants = HashMap::<CubePatchAddress, Vec<CubePatchAddress>>::new();
+    for &leaf in cover {
+        let mut ancestor = Some(leaf);
+        while let Some(address) = ancestor {
+            descendants.entry(address).or_default().push(leaf);
+            ancestor = address.parent();
+        }
+    }
+    (cover_set, descendants)
+}
+
+/// Preserve the old descendant maximum for split priority without retaining a
+/// vector of every desired descendant for every ancestor. A child's entry is
+/// the `total_cmp` maximum priority of that child and all desired patches below
+/// it, matching `max_by(f64::total_cmp)` while storing one scalar per ancestor.
+fn desired_priority_cache_bytes_upper_bound(config: &RegionalConfig) -> usize {
+    // Each desired address contributes at most one entry per ancestor level.
+    // Account for spare Vec/hash buckets and hash control bytes conservatively
+    // so diagnostics don't present entry payload size as the whole allocation.
+    let desired_capacity = config.max_desired_patches;
+    let index_entries = desired_capacity.saturating_mul(usize::from(config.max_level) + 1);
+    std::mem::size_of::<DesiredPriorityIndex>()
+        .saturating_add(
+            desired_capacity
+                .saturating_mul(std::mem::size_of::<(CubePatchAddress, u64)>())
+                .saturating_mul(2),
+        )
+        .saturating_add(
+            index_entries
+                .saturating_mul(std::mem::size_of::<(CubePatchAddress, f64)>())
+                .saturating_mul(3),
+        )
+}
+
+fn adjacent_cover_patches(
     patch: CubePatchAddress,
     edge: PatchEdge,
-    neighbor: CubePatchAddress,
-) -> bool {
+    cover: &HashSet<CubePatchAddress>,
+    descendants: &HashMap<CubePatchAddress, Vec<CubePatchAddress>>,
+) -> Vec<CubePatchAddress> {
     let relation = patch.neighbor(edge);
-    if neighbor.level() >= patch.level() {
-        let mut ancestor = neighbor;
-        while ancestor.level() > patch.level() {
-            let Some(parent) = ancestor.parent() else {
-                return false;
-            };
-            ancestor = parent;
+    let mut ancestor = Some(relation.address);
+    while let Some(address) = ancestor {
+        if cover.contains(&address) {
+            return vec![address];
         }
-        if ancestor != relation.address {
-            return false;
-        }
-        let depth = neighbor.level() - patch.level();
-        let [x, y] = neighbor.coordinates();
-        let side = 1u32 << depth;
-        match relation.edge {
-            PatchEdge::UMin => x == 0,
-            PatchEdge::UMax => x + 1 == side,
-            PatchEdge::VMin => y == 0,
-            PatchEdge::VMax => y + 1 == side,
-        }
-    } else {
-        let mut ancestor = patch;
-        while ancestor.level() > neighbor.level() {
-            let Some(parent) = ancestor.parent() else {
-                return false;
-            };
-            ancestor = parent;
-        }
-        let depth = patch.level() - neighbor.level();
-        let [x, y] = patch.coordinates();
-        let side = 1u32 << depth;
-        let lies_on_parent_edge = match edge {
-            PatchEdge::UMin => x % side == 0,
-            PatchEdge::UMax => x % side + 1 == side,
-            PatchEdge::VMin => y % side == 0,
-            PatchEdge::VMax => y % side + 1 == side,
+        ancestor = address.parent();
+    }
+
+    descendants
+        .get(&relation.address)
+        .into_iter()
+        .flatten()
+        .copied()
+        .filter(|candidate| candidate.level() > patch.level())
+        .filter(|candidate| {
+            let depth = candidate.level() - relation.address.level();
+            let side = 1u32 << depth;
+            let [x, y] = candidate.coordinates();
+            match relation.edge {
+                PatchEdge::UMin => x % side == 0,
+                PatchEdge::UMax => x % side == side - 1,
+                PatchEdge::VMin => y % side == 0,
+                PatchEdge::VMax => y % side == side - 1,
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod frontier_tests {
+    use super::*;
+
+    #[test]
+    fn convergence_ratio_normalizes_error_to_the_configured_pixel_target() {
+        let target = 0.15;
+        assert_eq!(convergence_ratio(0.0, target), 1.0);
+        assert_eq!(convergence_ratio(target * 0.5, target), 1.0);
+        assert_eq!(convergence_ratio(target, target), 1.0);
+        assert_eq!(convergence_ratio(target * 2.0, target), 0.5);
+        assert_eq!(convergence_ratio(f64::INFINITY, target), 0.0);
+        assert_eq!(convergence_ratio(f64::NAN, target), 0.0);
+    }
+
+    fn test_generator() -> SurfaceGenerator {
+        use mundaris_world::terrain::{
+            SurfaceAlgorithm, SurfaceDefinition, TerrainIdentity, TerrainSeed,
         };
-        if !lies_on_parent_edge {
-            return false;
+        let definition = SurfaceDefinition::generated(
+            TerrainIdentity(0x2d76),
+            TerrainSeed(0),
+            SurfaceAlgorithm::RockyV5,
+        );
+        SurfaceGenerator::new(&definition, 80_000.0).unwrap()
+    }
+
+    fn test_terrain(roots: Vec<CubePatchAddress>) -> RegionalTerrain {
+        RegionalTerrain::new(
+            test_generator(),
+            TileBuildIdentity {
+                body_identity: 1,
+                surface_revision: 1,
+                material_revision: 1,
+            },
+            RegionalConfig {
+                roots,
+                cells: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn starved_candidate_selection_uses_synthetic_age_and_stable_ties() {
+        let terrain = test_terrain(vec![CubePatchAddress::root(CubeFace::PositiveX)]);
+        let addresses = CubePatchAddress::root(CubeFace::PositiveX)
+            .children()
+            .unwrap();
+        let keys: Vec<_> = addresses
+            .iter()
+            .map(|&address| terrain.key_for(address).unwrap())
+            .collect();
+        let now = Instant::now();
+        let mut waits = HashMap::new();
+        waits.insert(
+            keys[0].clone(),
+            BuildCandidateWait {
+                first_eligible: now - Duration::from_secs(3),
+                last_seen_epoch: 1,
+            },
+        );
+        waits.insert(
+            keys[1].clone(),
+            BuildCandidateWait {
+                first_eligible: now - Duration::from_secs(4),
+                last_seen_epoch: 1,
+            },
+        );
+        waits.insert(
+            keys[2].clone(),
+            BuildCandidateWait {
+                first_eligible: now - Duration::from_secs(4),
+                last_seen_epoch: 1,
+            },
+        );
+        waits.insert(
+            keys[3].clone(),
+            BuildCandidateWait {
+                first_eligible: now - Duration::from_millis(1_999),
+                last_seen_epoch: 1,
+            },
+        );
+
+        // The oldest timestamp wins, with the score/address order deciding an
+        // exact age tie; a candidate just below the threshold is not promoted.
+        assert_eq!(oldest_starved_candidate_index(&keys, &waits, now), Some(1));
+        assert_eq!(
+            oldest_starved_candidate_index(&keys[..1], &waits, now),
+            Some(0)
+        );
+        assert_eq!(
+            oldest_starved_candidate_index(&keys[3..], &waits, now),
+            None
+        );
+    }
+
+    #[test]
+    fn admission_wait_age_tracks_only_currently_eligible_missing_candidates() {
+        let root = CubePatchAddress::root(CubeFace::PositiveX);
+        let mut terrain = test_terrain(vec![root]);
+        terrain.drawable = vec![root];
+        terrain.resident.insert(root);
+        terrain.config.admission_cap_per_tick = 1;
+        let children = root.children().unwrap();
+        for (index, address) in children.iter().copied().enumerate() {
+            let priority = (children.len() - index) as f64;
+            terrain.desired.insert(
+                address,
+                RegionalPatchSnapshot {
+                    address: format!("{address:?}"),
+                    level: address.level(),
+                    projected_error_px: priority,
+                    priority,
+                    state: "desired",
+                },
+            );
         }
-        ancestor.neighbor(edge).address == neighbor
+
+        let now = Instant::now();
+        let starved_address = children[3];
+        let starved_key = terrain.key_for(starved_address).unwrap();
+        terrain.build_candidate_waits.insert(
+            starved_key.clone(),
+            BuildCandidateWait {
+                first_eligible: now - Duration::from_secs(3),
+                last_seen_epoch: terrain.build_candidate_wait_epoch,
+            },
+        );
+        terrain.admit_builds();
+
+        assert!(terrain.in_flight.contains_key(&starved_key));
+        assert!(!terrain.build_candidate_waits.contains_key(&starved_key));
+        let retired_address = children[2];
+        let retired_key = terrain.key_for(retired_address).unwrap();
+        assert!(terrain.build_candidate_waits.contains_key(&retired_key));
+
+        // Removing a candidate from the desired frontier retires its age on the
+        // next eligibility rebuild, even when admission itself is paused.
+        terrain.desired.remove(&retired_address);
+        terrain.config.admission_cap_per_tick = 0;
+        terrain.admit_builds();
+        assert!(!terrain.build_candidate_waits.contains_key(&retired_key));
+        assert!(
+            terrain
+                .build_candidate_waits
+                .keys()
+                .all(|key| terrain.desired.contains_key(&key.address))
+        );
+    }
+
+    fn original_merge_parent_dependencies(terrain: &RegionalTerrain) -> BTreeSet<CubePatchAddress> {
+        let drawable: HashSet<_> = terrain.drawable.iter().copied().collect();
+        let desired: HashSet<_> = terrain.desired.keys().copied().collect();
+        terrain
+            .drawable
+            .iter()
+            .filter_map(|child| child.parent())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|parent| {
+                let mut ancestor = Some(*parent);
+                while let Some(address) = ancestor {
+                    if desired.contains(&address) {
+                        return true;
+                    }
+                    ancestor = address.parent();
+                }
+                false
+            })
+            .filter(|parent| {
+                parent
+                    .children()
+                    .is_ok_and(|children| children.iter().all(|child| drawable.contains(child)))
+            })
+            .collect()
+    }
+
+    fn original_dependency_addresses(terrain: &RegionalTerrain) -> BTreeSet<CubePatchAddress> {
+        let mut dependencies = BTreeSet::new();
+        for &desired in terrain.desired.keys() {
+            let mut cursor = desired;
+            loop {
+                if !terrain
+                    .config
+                    .roots
+                    .iter()
+                    .any(|root| root.contains(cursor))
+                    || !dependencies.insert(cursor)
+                {
+                    break;
+                }
+                if terrain.config.roots.contains(&cursor) {
+                    break;
+                }
+                let Some(parent) = cursor.parent() else {
+                    break;
+                };
+                cursor = parent;
+            }
+        }
+        dependencies.extend(original_merge_parent_dependencies(terrain));
+        dependencies
+    }
+
+    fn original_scheduled_dependencies(terrain: &RegionalTerrain) -> BTreeSet<CubePatchAddress> {
+        let mut dependencies = original_dependency_addresses(terrain);
+        let Some(parent) = terrain.reserved_split_parent else {
+            return dependencies;
+        };
+        let mut retained: BTreeSet<_> = terrain
+            .config
+            .roots
+            .iter()
+            .chain(terrain.drawable.iter())
+            .chain(terrain.external_pins.iter())
+            .copied()
+            .collect();
+        retained.extend(original_merge_parent_dependencies(terrain));
+        if let Ok(children) = parent.children() {
+            retained.extend(children);
+        }
+        dependencies.retain(|address| retained.contains(address));
+        dependencies.extend(retained);
+        dependencies
+    }
+
+    fn original_upload_candidate_oracle(terrain: &RegionalTerrain) -> Vec<(f64, CubePatchAddress)> {
+        let drawable: HashSet<_> = terrain.drawable.iter().copied().collect();
+        let merge_frontier = original_merge_parent_dependencies(terrain);
+        let queued_addresses: HashSet<_> = terrain
+            .uploads
+            .iter()
+            .map(|upload| upload.address)
+            .collect();
+        let mut wanted: BTreeSet<_> = terrain.desired.keys().copied().collect();
+        wanted.extend(terrain.config.roots.iter().copied());
+        wanted.extend(original_scheduled_dependencies(terrain));
+        let priorities: BTreeMap<_, _> = terrain
+            .desired
+            .iter()
+            .map(|(address, patch)| (*address, patch.priority))
+            .collect();
+        let mut candidates: Vec<_> = wanted
+            .into_iter()
+            .filter(|address| {
+                !terrain.resident.contains(address) && !queued_addresses.contains(address)
+            })
+            .filter(|address| {
+                if terrain.drawable.is_empty() {
+                    terrain.config.roots.contains(address)
+                } else {
+                    drawable.contains(address)
+                        || merge_frontier.contains(address)
+                        || address
+                            .parent()
+                            .is_some_and(|parent| drawable.contains(&parent))
+                }
+            })
+            .filter(|address| {
+                terrain.reserved_split_parent.is_none_or(|parent| {
+                    drawable.contains(address)
+                        || merge_frontier.contains(address)
+                        || parent
+                            .children()
+                            .is_ok_and(|children| children.contains(address))
+                })
+            })
+            .filter(|address| {
+                terrain
+                    .upload_allowlist
+                    .as_ref()
+                    .is_none_or(|allowed| allowed.contains(address))
+            })
+            .filter_map(|address| {
+                terrain.cached_tiles_by_address.get(&address)?;
+                let priority = priorities
+                    .get(&address)
+                    .copied()
+                    .unwrap_or_else(|| terrain.score(address).1);
+                Some((priority, address))
+            })
+            .collect();
+        candidates.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        candidates
+    }
+
+    fn cache_test_tiles(terrain: &mut RegionalTerrain, addresses: &[CubePatchAddress]) {
+        for &address in addresses {
+            let (tile, _) = ResidentTileBuilder::build(
+                &terrain.generator,
+                terrain.identity,
+                address,
+                terrain.config.cells,
+            )
+            .unwrap();
+            assert!(matches!(
+                terrain.cache_insert(Arc::new(tile), false, None),
+                CacheInsertResult::Inserted | CacheInsertResult::AlreadyCached
+            ));
+        }
+    }
+
+    #[test]
+    fn cached_upload_frontier_matches_original_admission_oracle() {
+        let all_roots: Vec<_> = CubeFace::ALL
+            .into_iter()
+            .map(CubePatchAddress::root)
+            .collect();
+        for scenario in 0..4 {
+            let finite_root = all_roots[4].children().unwrap()[scenario % 4];
+            let roots = if scenario >= 2 {
+                vec![finite_root]
+            } else {
+                all_roots.clone()
+            };
+            let mut terrain = test_terrain(roots.clone());
+            let drawable = if scenario >= 2 {
+                vec![finite_root]
+            } else {
+                let split_root = all_roots[scenario];
+                all_roots
+                    .iter()
+                    .copied()
+                    .filter(|root| *root != split_root)
+                    .chain(split_root.children().unwrap())
+                    .collect()
+            };
+            terrain.drawable = drawable.clone();
+            for (parent_index, parent) in drawable.iter().copied().enumerate().take(5) {
+                let Ok(children) = parent.children() else {
+                    continue;
+                };
+                for (child_index, child) in children.into_iter().enumerate() {
+                    let priority = (parent_index * 4 + child_index) as f64 + 0.25;
+                    terrain.desired.insert(
+                        child,
+                        RegionalPatchSnapshot {
+                            address: format!("{child:?}"),
+                            level: child.level(),
+                            projected_error_px: priority,
+                            priority,
+                            state: "desired",
+                        },
+                    );
+                }
+            }
+
+            let mut possible = BTreeSet::new();
+            possible.extend(roots.iter().copied());
+            possible.extend(drawable.iter().copied());
+            possible.extend(terrain.desired.keys().copied());
+            for &address in terrain.desired.keys() {
+                let mut ancestor = address.parent();
+                while let Some(current) = ancestor {
+                    possible.insert(current);
+                    ancestor = current.parent();
+                }
+            }
+            // Include an ancestor outside a finite root to verify root clipping,
+            // plus unrelated cached leaves which should not become candidates.
+            possible.extend(all_roots.iter().copied());
+            possible.extend(all_roots[5].children().unwrap());
+            let possible: Vec<_> = possible.into_iter().collect();
+            let cached: Vec<_> = possible
+                .iter()
+                .enumerate()
+                .filter_map(|(index, address)| ((index + scenario) % 3 != 1).then_some(*address))
+                .collect();
+            cache_test_tiles(&mut terrain, &cached);
+
+            terrain.resident.extend(
+                cached
+                    .iter()
+                    .copied()
+                    .filter(|address| address.level() % 3 == 0)
+                    .take(2),
+            );
+            terrain.external_pins.extend(cached.iter().copied().take(1));
+            if scenario % 2 == 1 {
+                terrain.reserved_split_parent = Some(roots[0]);
+                terrain.upload_allowlist = Some(
+                    cached
+                        .iter()
+                        .copied()
+                        .filter(|address| address.coordinates()[0] % 2 == 0)
+                        .collect(),
+                );
+            }
+
+            let before_queue = original_upload_candidate_oracle(&terrain);
+            if scenario % 2 == 1
+                && let Some((_, address)) = before_queue.first().copied()
+                && let Some(tile) = terrain.cached_tiles_by_address.get(&address).cloned()
+            {
+                let bytes = tile_bytes(&tile);
+                terrain.uploads.push(RegionalUpload {
+                    address,
+                    tile,
+                    bytes,
+                });
+                terrain.upload_bytes = bytes;
+            }
+
+            let expected = original_upload_candidate_oracle(&terrain);
+            let actual = terrain
+                .upload_candidates()
+                .into_iter()
+                .map(|(priority, address, _)| (priority, address))
+                .collect::<Vec<_>>();
+            assert_eq!(actual.len(), expected.len(), "scenario {scenario}");
+            for ((actual_priority, actual_address), (expected_priority, expected_address)) in
+                actual.iter().zip(&expected)
+            {
+                assert_eq!(actual_address, expected_address, "scenario {scenario}");
+                assert_eq!(
+                    actual_priority.to_bits(),
+                    expected_priority.to_bits(),
+                    "scenario {scenario}, address {actual_address:?}"
+                );
+            }
+
+            // Admission order and queue-cap pressure must remain equivalent too.
+            let initial_uploads = terrain.uploads.len();
+            let initial_addresses: Vec<_> = terrain
+                .uploads
+                .iter()
+                .map(|upload| upload.address)
+                .collect();
+            if let Some((_, address)) = expected.first().copied() {
+                let first_tile_bytes = tile_bytes(&terrain.cached_tiles_by_address[&address]);
+                terrain.config.upload_tile_cap = initial_uploads + expected.len() + 1;
+                terrain.config.upload_byte_cap = terrain
+                    .upload_bytes
+                    .saturating_add(first_tile_bytes.saturating_sub(1));
+                terrain.admit_uploads();
+                assert_eq!(
+                    terrain
+                        .uploads
+                        .iter()
+                        .map(|upload| upload.address)
+                        .collect::<Vec<_>>(),
+                    initial_addresses,
+                    "byte pressure scenario {scenario}"
+                );
+                assert!(terrain.pressure.upload, "byte pressure scenario {scenario}");
+                terrain.pressure.upload = false;
+            }
+            let remaining = usize::from(!expected.is_empty());
+            terrain.config.upload_tile_cap = initial_uploads + remaining;
+            terrain.config.upload_byte_cap = usize::MAX;
+            terrain.admit_uploads();
+            let actual_addresses: Vec<_> = terrain
+                .uploads
+                .iter()
+                .map(|upload| upload.address)
+                .collect();
+            let mut expected_addresses = initial_addresses;
+            expected_addresses.extend(expected.iter().take(remaining).map(|(_, address)| *address));
+            assert_eq!(actual_addresses, expected_addresses, "scenario {scenario}");
+            assert_eq!(
+                terrain.pressure.upload,
+                expected.len() > remaining,
+                "scenario {scenario}"
+            );
+        }
+    }
+
+    #[test]
+    fn drawable_proxy_hotspots_are_bounded_stable_and_carry_exact_tile_identity() {
+        let roots: Vec<_> = CubeFace::ALL
+            .into_iter()
+            .map(CubePatchAddress::root)
+            .collect();
+        let mut terrain = test_terrain(roots.clone());
+        let drawable: Vec<_> = roots
+            .iter()
+            .flat_map(|root| root.children().unwrap())
+            .collect();
+        terrain.drawable = drawable.clone();
+
+        let mut scores = HashMap::new();
+        let mut expected: Vec<_> = drawable
+            .iter()
+            .copied()
+            .map(|address| (address, terrain.selection_score(address, &mut scores).0))
+            .collect();
+        expected.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let top = expected
+            .iter()
+            .take(8)
+            .map(|(address, _)| *address)
+            .collect::<Vec<_>>();
+        let desired_address = top[0];
+        let resident_address = top[1];
+        let desired_priority = 4.0;
+        terrain.desired.insert(
+            desired_address,
+            RegionalPatchSnapshot {
+                address: format!("{desired_address:?}"),
+                level: desired_address.level(),
+                projected_error_px: desired_priority,
+                priority: desired_priority,
+                state: "desired",
+            },
+        );
+        terrain.resident.insert(resident_address);
+        let blocked_parent = desired_address.parent().unwrap();
+        terrain.blocked_publication_parents.insert(blocked_parent);
+        terrain.upload_allowlist = Some(BTreeSet::from([desired_address, resident_address]));
+
+        let snapshot = terrain.snapshot();
+        let repeated = terrain.snapshot();
+        assert_eq!(snapshot.visible_drawable_proxy_hotspots.len(), 8);
+        assert_eq!(
+            snapshot
+                .visible_drawable_proxy_hotspots
+                .iter()
+                .map(|hotspot| hotspot.address.as_str())
+                .collect::<Vec<_>>(),
+            repeated
+                .visible_drawable_proxy_hotspots
+                .iter()
+                .map(|hotspot| hotspot.address.as_str())
+                .collect::<Vec<_>>()
+        );
+        for ((expected_address, expected_error), hotspot) in expected
+            .iter()
+            .take(8)
+            .zip(&snapshot.visible_drawable_proxy_hotspots)
+        {
+            assert_eq!(hotspot.address, format!("{expected_address:?}"));
+            assert_eq!(hotspot.error_px.to_bits(), expected_error.to_bits());
+            let key = terrain.key_for(*expected_address).unwrap();
+            let actual_key = hotspot.key.as_ref().unwrap();
+            assert_eq!(actual_key.body_identity, key.body_identity);
+            assert_eq!(actual_key.definition_words, key.definition_words);
+            assert_eq!(actual_key.radius_bits, key.radius_bits);
+            assert_eq!(actual_key.surface_revision, key.surface_revision);
+            assert_eq!(actual_key.material_revision, key.material_revision);
+            assert_eq!(actual_key.format_version, key.format_version);
+            assert_eq!(actual_key.filter_version, key.filter_version);
+            assert_eq!(actual_key.cells, key.cells);
+            assert_eq!(
+                hotspot.parent,
+                expected_address.parent().map(|p| format!("{p:?}"))
+            );
+        }
+
+        let desired_hotspot = snapshot
+            .visible_drawable_proxy_hotspots
+            .iter()
+            .find(|hotspot| hotspot.address == format!("{desired_address:?}"))
+            .unwrap();
+        assert!(desired_hotspot.desired);
+        assert!(desired_hotspot.publication_parent_blocked);
+        assert_eq!(desired_hotspot.upload_allowlisted, Some(true));
+        assert_eq!(desired_hotspot.blocker_status, "publication_parent_blocked");
+        let resident_hotspot = snapshot
+            .visible_drawable_proxy_hotspots
+            .iter()
+            .find(|hotspot| hotspot.address == format!("{resident_address:?}"))
+            .unwrap();
+        assert!(resident_hotspot.resident);
+        assert_eq!(resident_hotspot.upload_allowlisted, Some(true));
+
+        if let Some(worst) = &snapshot.worst_proxy {
+            assert_eq!(
+                worst.address,
+                snapshot.visible_drawable_proxy_hotspots[0].address
+            );
+            assert_eq!(
+                worst.error_px.to_bits(),
+                snapshot.visible_drawable_proxy_hotspots[0]
+                    .error_px
+                    .to_bits()
+            );
+            assert_eq!(
+                worst.projected_footprint_weight.to_bits(),
+                snapshot.visible_drawable_proxy_hotspots[0]
+                    .projected_footprint_weight
+                    .to_bits()
+            );
+        }
+        if let Some(worst) = &snapshot.worst_visible_unresolved {
+            assert!(worst.error_px > snapshot.convergence_target_error_px);
+            assert!(
+                snapshot
+                    .visible_drawable_proxy_hotspots
+                    .iter()
+                    .any(|hotspot| hotspot.address == worst.address)
+            );
+        }
+    }
+
+    fn indexed_split_frontier_groups(terrain: &RegionalTerrain) -> Vec<RegionalSplitFrontier> {
+        let desired_addresses: Vec<_> = terrain.desired.keys().copied().collect();
+        let (_, desired_descendants) = cover_address_index(&desired_addresses);
+        let (drawable_set, drawable_descendants) = cover_address_index(&terrain.drawable);
+        let mut groups = Vec::new();
+        for &parent in &terrain.drawable {
+            let Ok(children) = parent.children() else {
+                continue;
+            };
+            let child_priorities: Vec<_> = children
+                .iter()
+                .map(|child| {
+                    desired_descendants
+                        .get(child)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|address| terrain.desired.get(address))
+                        .map(|patch| patch.priority)
+                        .max_by(f64::total_cmp)
+                })
+                .collect();
+            if child_priorities.iter().any(Option::is_none)
+                || !replacement_is_balanced(parent, true, &drawable_set, &drawable_descendants)
+            {
+                continue;
+            }
+            let ready_children = children
+                .iter()
+                .filter(|child| {
+                    terrain.resident.contains(child)
+                        || terrain
+                            .key_for(**child)
+                            .is_ok_and(|key| terrain.cache.contains_key(&key))
+                        || terrain
+                            .uploads
+                            .iter()
+                            .any(|upload| upload.address == **child)
+                        || terrain
+                            .key_for(**child)
+                            .is_ok_and(|key| terrain.in_flight.contains_key(&key))
+                })
+                .count();
+            groups.push(RegionalSplitFrontier {
+                parent,
+                children,
+                parent_resident: terrain.resident.contains(&parent),
+                ready_children,
+                aggregate_priority: child_priorities.iter().flatten().copied().sum(),
+            });
+        }
+        groups.sort_by(|a, b| {
+            b.aggregate_priority
+                .total_cmp(&a.aggregate_priority)
+                .then_with(|| a.parent.cmp(&b.parent))
+        });
+        groups
+    }
+
+    fn indexed_merge_frontiers(terrain: &RegionalTerrain) -> Vec<CubePatchAddress> {
+        let (cover, descendants) = cover_address_index(&terrain.drawable);
+        let desired: HashSet<_> = terrain.desired.keys().copied().collect();
+        terrain
+            .drawable
+            .iter()
+            .filter_map(|child| child.parent())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|parent| {
+                let mut ancestor = Some(*parent);
+                while let Some(address) = ancestor {
+                    if desired.contains(&address) {
+                        return replacement_is_balanced(*parent, false, &cover, &descendants);
+                    }
+                    ancestor = address.parent();
+                }
+                false
+            })
+            .collect()
+    }
+
+    #[test]
+    fn allocation_light_frontiers_match_indexed_oracle_on_balanced_cube_covers() {
+        let roots: Vec<_> = CubeFace::ALL
+            .into_iter()
+            .map(CubePatchAddress::root)
+            .collect();
+        let mut cover = roots.clone();
+        let priorities = [
+            -1.0e20,
+            1.0e20,
+            -3.25,
+            -0.0,
+            0.0,
+            f64::from_bits(0x3fd5_5555_5555_5555),
+            1.0e-100,
+        ];
+
+        for sample in 0..16 {
+            if sample > 0 {
+                let splittable: Vec<_> = cover
+                    .iter()
+                    .copied()
+                    .filter(|address| address.level() < 7)
+                    .collect();
+                let parent = splittable[(sample * 13) % splittable.len()];
+                let mut proposed: Vec<_> = cover
+                    .iter()
+                    .copied()
+                    .filter(|address| *address != parent)
+                    .collect();
+                proposed.extend(parent.children().unwrap());
+                cover = balance_cover(&roots, proposed, 8, 2_048, None).unwrap();
+            }
+
+            let mut terrain = test_terrain(roots.clone());
+            terrain.drawable = cover.clone();
+            terrain.resident.extend(
+                cover
+                    .iter()
+                    .copied()
+                    .filter(|address| (usize::from(address.level()) + sample) % 3 == 0),
+            );
+            terrain.desired.clear();
+            for (parent_index, parent) in cover.iter().copied().enumerate() {
+                let Ok(children) = parent.children() else {
+                    continue;
+                };
+                for (child_index, child) in children.into_iter().enumerate() {
+                    if (parent_index + child_index + sample) % 5 == 0 {
+                        continue;
+                    }
+                    let priority =
+                        priorities[(parent_index + child_index + sample) % priorities.len()];
+                    terrain.desired.insert(
+                        child,
+                        RegionalPatchSnapshot {
+                            address: format!("{child:?}"),
+                            level: child.level(),
+                            projected_error_px: priority,
+                            priority,
+                            state: "desired",
+                        },
+                    );
+                    if let Ok(grandchildren) = child.children()
+                        && (parent_index + child_index + sample) % 2 == 0
+                    {
+                        let grandchild = grandchildren[(sample + child_index) % 4];
+                        let nested_priority = priorities
+                            [(parent_index + child_index + sample + 3) % priorities.len()];
+                        terrain.desired.insert(
+                            grandchild,
+                            RegionalPatchSnapshot {
+                                address: format!("{grandchild:?}"),
+                                level: grandchild.level(),
+                                projected_error_px: nested_priority,
+                                priority: nested_priority,
+                                state: "desired",
+                            },
+                        );
+                    }
+                    if (parent_index + child_index + sample) % 4 == 0 {
+                        terrain.resident.insert(child);
+                    }
+                }
+            }
+
+            let actual = terrain.split_frontier_groups();
+            let oracle = indexed_split_frontier_groups(&terrain);
+            assert_eq!(actual.len(), oracle.len(), "sample {sample}");
+            for (actual, oracle) in actual.iter().zip(&oracle) {
+                assert_eq!(actual.parent, oracle.parent, "sample {sample}");
+                assert_eq!(actual.children, oracle.children, "sample {sample}");
+                assert_eq!(actual.parent_resident, oracle.parent_resident);
+                assert_eq!(actual.ready_children, oracle.ready_children);
+                assert_eq!(
+                    actual.aggregate_priority.to_bits(),
+                    oracle.aggregate_priority.to_bits(),
+                    "sample {sample}, parent {:?}",
+                    actual.parent
+                );
+            }
+            assert_eq!(terrain.merge_frontiers(), indexed_merge_frontiers(&terrain));
+        }
+    }
+
+    #[test]
+    fn desired_priority_index_invalidates_on_exact_priority_and_address_changes() {
+        let roots: Vec<_> = CubeFace::ALL
+            .into_iter()
+            .map(CubePatchAddress::root)
+            .collect();
+        let mut terrain = test_terrain(roots.clone());
+        terrain.drawable = roots.clone();
+        let parent = roots[0];
+        let children = parent.children().unwrap();
+        for (index, child) in children.iter().copied().enumerate() {
+            let priority = (index + 1) as f64;
+            terrain.desired.insert(
+                child,
+                RegionalPatchSnapshot {
+                    address: format!("{child:?}"),
+                    level: child.level(),
+                    projected_error_px: priority,
+                    priority,
+                    state: "desired",
+                },
+            );
+        }
+
+        let initial = terrain.split_frontier_groups();
+        assert_eq!(initial, indexed_split_frontier_groups(&terrain));
+        let first_revision = terrain.desired_priority_revision();
+        let initial_priority = initial
+            .iter()
+            .find(|group| group.parent == parent)
+            .unwrap()
+            .aggregate_priority;
+
+        // The address set is unchanged; the exact priority bits must invalidate
+        // the cached ancestor maxima and preserve the indexed oracle's result.
+        let changed_child = children[0];
+        let changed_patch = terrain.desired.get_mut(&changed_child).unwrap();
+        changed_patch.priority = 12.125;
+        let changed_priority = terrain.split_frontier_groups();
+        assert_eq!(changed_priority, indexed_split_frontier_groups(&terrain));
+        assert!(terrain.desired_priority_revision() > first_revision);
+        let changed_aggregate = changed_priority
+            .iter()
+            .find(|group| group.parent == parent)
+            .unwrap()
+            .aggregate_priority;
+        assert_ne!(changed_aggregate.to_bits(), initial_priority.to_bits());
+
+        // Replacing one desired address with descendant addresses changes the
+        // exact signature and must roll the same ancestor index forward.
+        terrain.desired.remove(&changed_child);
+        for (index, descendant) in changed_child.children().unwrap().into_iter().enumerate() {
+            let priority = 8.0 + index as f64;
+            terrain.desired.insert(
+                descendant,
+                RegionalPatchSnapshot {
+                    address: format!("{descendant:?}"),
+                    level: descendant.level(),
+                    projected_error_px: priority,
+                    priority,
+                    state: "desired",
+                },
+            );
+        }
+        let changed_address = terrain.split_frontier_groups();
+        assert_eq!(changed_address, indexed_split_frontier_groups(&terrain));
+        assert!(terrain.desired_priority_revision() > first_revision + 1);
+    }
+
+    #[test]
+    fn local_publication_descriptor_acks_one_sorted_delta_and_public_api_keeps_full_cover() {
+        let roots: Vec<_> = CubeFace::ALL
+            .into_iter()
+            .map(CubePatchAddress::root)
+            .collect();
+        let mut terrain = test_terrain(roots.clone());
+        let parent = roots[0];
+        let children = parent.children().unwrap();
+        let independent_parent = roots[1];
+        let independent_children = independent_parent.children().unwrap();
+        terrain.drawable = roots.clone();
+        terrain.drawable.sort_unstable();
+        terrain.resident.extend(roots.iter().copied());
+        terrain.resident.extend(children);
+        terrain.resident.extend(independent_children);
+        for child in children.into_iter().chain(independent_children) {
+            terrain.desired.insert(
+                child,
+                RegionalPatchSnapshot {
+                    address: format!("{child:?}"),
+                    level: child.level(),
+                    projected_error_px: 2.0,
+                    priority: 2.0,
+                    state: "resident",
+                },
+            );
+        }
+        terrain.refresh_publications();
+        let local = terrain.publication_local_candidates();
+        assert_eq!(local.len(), 2);
+        let first = local
+            .iter()
+            .find(|candidate| publication_parent(candidate) == parent)
+            .unwrap();
+        let second = local
+            .iter()
+            .find(|candidate| publication_parent(candidate) == independent_parent)
+            .unwrap();
+        assert!(first.cover().is_empty());
+        assert!(terrain.publication_locally_current(first));
+        let full = terrain.publication_candidates();
+        assert_eq!(full.len(), 2);
+        assert!(
+            full.iter()
+                .all(|candidate| terrain.cover_is_valid(candidate.cover()))
+        );
+
+        terrain.resident.remove(&children[0]);
+        assert!(terrain.publication_locally_current(first));
+        assert_eq!(
+            terrain.ack_local_publication(first),
+            Err(RegionalError::NotResident)
+        );
+        terrain.resident.insert(children[0]);
+        terrain.ack_local_publication(first).unwrap();
+        assert!(terrain.publication_locally_current(second));
+        terrain.ack_local_publication(second).unwrap();
+        assert!(terrain.drawable.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(!terrain.drawable.contains(&parent));
+        assert!(!terrain.drawable.contains(&independent_parent));
+        assert!(
+            children
+                .iter()
+                .all(|child| terrain.drawable.contains(child))
+        );
+        assert!(
+            independent_children
+                .iter()
+                .all(|child| terrain.drawable.contains(child))
+        );
+        assert!(terrain.cover_is_valid(&terrain.drawable));
+    }
+
+    #[test]
+    fn prepared_merge_can_finish_after_demand_reverses() {
+        let roots: Vec<_> = CubeFace::ALL
+            .into_iter()
+            .map(CubePatchAddress::root)
+            .collect();
+        let mut terrain = test_terrain(roots.clone());
+        let parent = roots[0];
+        let children = parent.children().unwrap();
+        terrain.drawable = roots
+            .iter()
+            .copied()
+            .filter(|root| *root != parent)
+            .chain(children)
+            .collect();
+        terrain.drawable.sort_unstable();
+        terrain.resident.extend(terrain.drawable.iter().copied());
+        terrain.resident.insert(parent);
+        // A reversed selector target no longer contains the merge parent.
+        terrain.desired.extend(children.into_iter().map(|child| {
+            (
+                child,
+                RegionalPatchSnapshot {
+                    address: format!("{child:?}"),
+                    level: child.level(),
+                    projected_error_px: 0.0,
+                    priority: 0.0,
+                    state: "resident",
+                },
+            )
+        }));
+        terrain.ack_prepared_merge(parent, children).unwrap();
+        assert_eq!(terrain.drawable, roots);
+        assert!(terrain.cover_is_valid(&terrain.drawable));
+    }
+
+    #[test]
+    fn compact_snapshots_preserve_scalars_and_stationary_scheduling_reacts_to_changes() {
+        use crate::resident_terrain::ResidentTileBuilder;
+        use mundaris_world::terrain::{
+            SurfaceAlgorithm, SurfaceDefinition, TerrainIdentity, TerrainSeed,
+        };
+        let definition = SurfaceDefinition::generated(
+            TerrainIdentity(0x2d75),
+            TerrainSeed(0),
+            SurfaceAlgorithm::RockyV5,
+        );
+        let generator = SurfaceGenerator::new(&definition, 80_000.0).unwrap();
+        let identity = TileBuildIdentity {
+            body_identity: 1,
+            surface_revision: 1,
+            material_revision: 1,
+        };
+        let roots: Vec<_> = CubeFace::ALL
+            .into_iter()
+            .map(CubePatchAddress::root)
+            .collect();
+        let mut terrain = RegionalTerrain::new(
+            generator.clone(),
+            identity,
+            RegionalConfig {
+                roots: roots.clone(),
+                cells: 2,
+                worker_delay: Duration::from_secs(30),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for address in &roots {
+            let tile = ResidentTileBuilder::build(&generator, identity, *address, 2)
+                .unwrap()
+                .0;
+            terrain.seed_tile(Arc::new(tile)).unwrap();
+            terrain.ack_resident(*address);
+        }
+        let projection =
+            CelestialProjection::try_new(800, 600, 70.0_f64.to_radians(), 0.1).unwrap();
+        terrain
+            .set_planetary_view(DMat3::IDENTITY, projection)
+            .unwrap();
+        let far = RegionalView {
+            body_position_m: DVec3::Z * 80_000_000_000.0,
+            body_velocity_mps: DVec3::ZERO,
+            projection_scale_px: projection.focal_pixels(),
+        };
+        for _ in 0..20 {
+            terrain.tick(far, Duration::from_millis(16)).unwrap();
+        }
+        assert!(terrain.scheduler_fixed_point_reused);
+        assert!(terrain.is_idle());
+        let mut detailed = serde_json::to_value(terrain.snapshot()).unwrap();
+        let mut compact = serde_json::to_value(terrain.snapshot_summary()).unwrap();
+        assert_eq!(detailed["desired"].as_array().unwrap().len(), 6);
+        for field in ["desired", "resident", "drawable"] {
+            assert!(compact[field].as_array().unwrap().is_empty());
+            detailed.as_object_mut().unwrap().remove(field);
+            compact.as_object_mut().unwrap().remove(field);
+        }
+        assert_eq!(compact, detailed);
+        terrain.set_external_pins(&[roots[0].children().unwrap()[0]]);
+        terrain.tick(far, Duration::from_millis(16)).unwrap();
+        assert!(!terrain.scheduler_fixed_point_reused);
+        terrain.set_external_pins(&[]);
+        terrain.mark_not_resident(roots[0]);
+        terrain.tick(far, Duration::from_millis(16)).unwrap();
+        assert!(!terrain.scheduler_fixed_point_reused);
+        assert!(
+            terrain
+                .queued_uploads()
+                .iter()
+                .any(|upload| upload.address == roots[0])
+        );
+        terrain.ack_resident(roots[0]);
+        for _ in 0..3 {
+            terrain.tick(far, Duration::from_millis(16)).unwrap();
+        }
+        assert!(terrain.scheduler_fixed_point_reused);
+        terrain
+            .tick(
+                RegionalView {
+                    body_position_m: DVec3::Z * 80_250.0,
+                    ..far
+                },
+                Duration::from_millis(16),
+            )
+            .unwrap();
+        assert!(!terrain.scheduler_fixed_point_reused);
+        assert!(terrain.desired().len() > roots.len());
+    }
+
+    #[test]
+    fn local_merge_acknowledgement_rejects_wrong_cover_and_missing_residency() {
+        use mundaris_world::terrain::{
+            SurfaceAlgorithm, SurfaceDefinition, TerrainIdentity, TerrainSeed,
+        };
+        let mut roots: Vec<_> = CubeFace::ALL
+            .into_iter()
+            .map(CubePatchAddress::root)
+            .collect();
+        roots.sort();
+        let definition = SurfaceDefinition::generated(
+            TerrainIdentity(0x2d72),
+            TerrainSeed(0),
+            SurfaceAlgorithm::RockyV5,
+        );
+        let generator = SurfaceGenerator::new(&definition, 80_000.0).unwrap();
+        let mut terrain = RegionalTerrain::new(
+            generator,
+            TileBuildIdentity {
+                body_identity: 1,
+                surface_revision: 1,
+                material_revision: 1,
+            },
+            RegionalConfig {
+                roots: roots.clone(),
+                cells: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let parent = roots[0];
+        let children = parent.children().unwrap();
+        terrain.drawable = roots
+            .iter()
+            .copied()
+            .filter(|p| *p != parent)
+            .chain(children)
+            .collect();
+        terrain.drawable.sort();
+        terrain.resident.extend(terrain.drawable.iter().copied());
+        let original = terrain.drawable.clone();
+        assert_eq!(
+            terrain.ack_local_merge(parent, children, &roots[..5]),
+            Err(RegionalError::InvalidCover)
+        );
+        assert_eq!(
+            terrain.ack_local_merge(parent, children, &roots),
+            Err(RegionalError::NotResident)
+        );
+        assert_eq!(terrain.drawable, original);
+        terrain.resident.insert(parent);
+        terrain.ack_local_merge(parent, children, &roots).unwrap();
+        assert_eq!(terrain.drawable, roots);
+        assert!(terrain.cover_is_valid(&terrain.drawable));
+    }
+
+    #[test]
+    fn publication_limit_counts_valid_proposals_instead_of_blocking_behind_invalid_first() {
+        use mundaris_world::terrain::{
+            SurfaceAlgorithm, SurfaceDefinition, TerrainIdentity, TerrainSeed,
+        };
+        let roots: Vec<_> = CubeFace::ALL
+            .into_iter()
+            .map(CubePatchAddress::root)
+            .collect();
+        let mut cover = roots.clone();
+        for step in 0..48 {
+            let (set, descendants) = cover_address_index(&cover);
+            if !replacement_is_balanced(cover[0], true, &set, &descendants)
+                && let Some(expected) = cover
+                    .iter()
+                    .copied()
+                    .find(|parent| replacement_is_balanced(*parent, true, &set, &descendants))
+            {
+                let definition = SurfaceDefinition::generated(
+                    TerrainIdentity(0x2d71),
+                    TerrainSeed(0),
+                    SurfaceAlgorithm::RockyV5,
+                );
+                let generator = SurfaceGenerator::new(&definition, 80_000.0).unwrap();
+                let mut terrain = RegionalTerrain::new(
+                    generator,
+                    TileBuildIdentity {
+                        body_identity: 1,
+                        surface_revision: 1,
+                        material_revision: 1,
+                    },
+                    RegionalConfig {
+                        roots: roots.clone(),
+                        cells: 4,
+                        max_level: 24,
+                        max_desired_patches: 2048,
+                        publication_cap_per_tick: 1,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                terrain.drawable = cover.clone();
+                terrain.desired.clear();
+                for parent in &cover {
+                    terrain.resident.insert(*parent);
+                    for child in parent.children().unwrap() {
+                        terrain.resident.insert(child);
+                        terrain.desired.insert(
+                            child,
+                            RegionalPatchSnapshot {
+                                address: format!("{child:?}"),
+                                level: child.level(),
+                                projected_error_px: 0.0,
+                                priority: 1.0,
+                                state: "resident",
+                            },
+                        );
+                    }
+                }
+                terrain.refresh_publications();
+                let proposals = terrain.publication_candidates();
+                assert_eq!(proposals.len(), 1);
+                assert!(
+                    matches!(proposals[0], RegionalPublication::Split { parent, .. } if parent == expected)
+                );
+                assert!(terrain.cover_is_valid(proposals[0].cover()));
+                terrain.set_publication_blocked_parents(&[expected]);
+                terrain.refresh_publications();
+                let proposals = terrain.publication_candidates();
+                assert_eq!(proposals.len(), 1);
+                assert!(
+                    matches!(proposals[0], RegionalPublication::Split { parent, .. } if parent != expected)
+                );
+                assert!(terrain.cover_is_valid(proposals[0].cover()));
+                terrain.set_publication_blocked_parents(&[]);
+                terrain.refresh_publications();
+                let proposals = terrain.publication_candidates();
+                assert!(
+                    matches!(proposals[0], RegionalPublication::Split { parent, .. } if parent == expected)
+                );
+                return;
+            }
+            let parent = cover[(step * 17) % cover.len()];
+            let mut next: Vec<_> = cover.iter().copied().filter(|p| *p != parent).collect();
+            next.extend(parent.children().unwrap());
+            cover = balance_cover(&roots, next, 24, 1024, None).unwrap();
+        }
+        panic!("fixture did not exercise an invalid first proposal");
+    }
+
+    #[test]
+    fn indexed_local_replacements_match_full_cross_face_cover_validation() {
+        let roots: Vec<_> = CubeFace::ALL
+            .into_iter()
+            .map(CubePatchAddress::root)
+            .collect();
+        let mut cover = roots.clone();
+        let mut rejected_splits = 0;
+        let mut rejected_merges = 0;
+        for step in 0..48 {
+            let (set, descendants) = cover_address_index(&cover);
+            for &parent in &cover {
+                let mut trial: Vec<_> = cover.iter().copied().filter(|p| *p != parent).collect();
+                trial.extend(parent.children().unwrap());
+                let full = valid_cover(&roots, &trial, 24);
+                let globally_balanced =
+                    balance_cover(&roots, trial.clone(), 24, 1024, None).unwrap();
+                let locally_balanced = balance_planetary_split(
+                    &cover,
+                    parent,
+                    24,
+                    1024,
+                    1024,
+                    std::time::Instant::now(),
+                    Duration::from_secs(1),
+                )
+                .unwrap();
+                assert_eq!(locally_balanced, globally_balanced);
+                assert_eq!(
+                    replacement_is_balanced(parent, true, &set, &descendants),
+                    full
+                );
+                assert_eq!(local_replacement_is_balanced(parent, true, &cover), full);
+                rejected_splits += usize::from(!full);
+            }
+            for parent in cover
+                .iter()
+                .filter_map(|p| p.parent())
+                .collect::<BTreeSet<_>>()
+            {
+                let children = parent.children().unwrap();
+                if children.iter().all(|p| set.contains(p)) {
+                    let mut trial: Vec<_> = cover
+                        .iter()
+                        .copied()
+                        .filter(|p| !children.contains(p))
+                        .collect();
+                    trial.push(parent);
+                    let full = valid_cover(&roots, &trial, 24);
+                    assert_eq!(planetary_merge_is_balanced(parent, &set), full);
+                    assert_eq!(
+                        replacement_is_balanced(parent, false, &set, &descendants),
+                        full
+                    );
+                    assert_eq!(local_replacement_is_balanced(parent, false, &cover), full);
+                    rejected_merges += usize::from(!full);
+                }
+            }
+            let parent = cover[(step * 17) % cover.len()];
+            let mut next: Vec<_> = cover.iter().copied().filter(|p| *p != parent).collect();
+            next.extend(parent.children().unwrap());
+            cover = balance_cover(&roots, next, 24, 1024, None).unwrap();
+        }
+        assert!(rejected_splits > 0 && rejected_merges > 0);
     }
 }

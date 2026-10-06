@@ -686,6 +686,7 @@ fn rocky_world_mixed_lod_regional_gpu_matches_f64_oracle_and_shared_edges() -> R
             &target_boundaries,
         )?;
         let mut draw = RegionalResidentDraw {
+            planetary: false,
             capacity: all_tiles.len(),
             cells: CELLS,
             uploads,

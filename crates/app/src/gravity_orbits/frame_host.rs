@@ -9,6 +9,12 @@ pub(super) enum FrameHost<'a> {
     ),
 }
 impl FrameHost<'_> {
+    pub fn request_profile_timing(&mut self) {
+        #[cfg(feature = "developer-tools")]
+        if let Self::Native(renderer) = self {
+            renderer.request_developer_gpu_timing();
+        }
+    }
     pub fn pixels_per_point(&self) -> f32 {
         match self {
             Self::Native(r) => r.pixels_per_point(),
@@ -28,6 +34,13 @@ impl FrameHost<'_> {
             Self::Native(r) => r.latest_gpu_profile(),
             #[cfg(feature = "developer-tools")]
             Self::Offscreen(r, _) => r.last_gpu_profile(),
+        }
+    }
+    pub fn timestamp_availability(&self) -> mundaris_renderer::TimestampAvailability {
+        match self {
+            Self::Native(r) => r.timestamp_availability(),
+            #[cfg(feature = "developer-tools")]
+            Self::Offscreen(r, _) => r.timestamp_availability(),
         }
     }
     #[cfg(feature = "developer-tools")]
@@ -54,10 +67,10 @@ impl FrameHost<'_> {
             Self::Offscreen(r, _) => Ok(r.validate_resident_tile(draw)?),
         }
     }
-    #[cfg(feature = "developer-tools")]
     pub fn last_resident_regional_report(&self) -> mundaris_renderer::RegionalResidentReport {
         match self {
             Self::Native(r) => r.last_resident_regional_report(),
+            #[cfg(feature = "developer-tools")]
             Self::Offscreen(r, _) => r.last_resident_regional_report(),
         }
     }

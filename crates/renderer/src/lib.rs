@@ -434,6 +434,9 @@ impl Renderer {
 
         let size_changed =
             self.surface_config.width != width || self.surface_config.height != height;
+        if !size_changed && !self.suspended {
+            return;
+        }
         if size_changed {
             #[cfg(feature = "developer-tools")]
             self.native_capture.resized();
@@ -570,6 +573,11 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Mundaris frame encoder"),
             });
+        let frame_timing = timestamp_active
+            && self
+                .timestamp_slot
+                .as_ref()
+                .is_some_and(|slot| slot.queries.inside_encoders());
         let extra_command_buffers = self.egui_renderer.update_buffers(
             &self.device,
             &self.queue,
@@ -577,6 +585,22 @@ impl Renderer {
             &paint_jobs,
             &screen_descriptor,
         );
+        let frame_start = if frame_timing {
+            let mut timing_encoder =
+                self.device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("Mundaris frame timing start"),
+                    });
+            if let Some(slot) = &self.timestamp_slot {
+                timing_encoder.write_timestamp(
+                    &slot.queries.set,
+                    (gpu_profile::FRAME_QUERY_PAIR * 2) as u32,
+                );
+            }
+            Some(timing_encoder.finish())
+        } else {
+            None
+        };
 
         if let Some(frame) = debug_frame {
             let debug = self.debug.get_or_insert_with(|| {
@@ -626,7 +650,7 @@ impl Renderer {
 
         {
             let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Mundaris clear and UI pass"),
+                label: Some("Mundaris frame clear and editor UI"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     depth_slice: None,
@@ -666,11 +690,23 @@ impl Renderer {
             self.surface_config.height,
         );
 
+        if frame_timing && let Some(slot) = &self.timestamp_slot {
+            encoder.write_timestamp(
+                &slot.queries.set,
+                (gpu_profile::FRAME_QUERY_PAIR * 2 + 1) as u32,
+            );
+            scope_mask |= gpu_profile::FRAME_SCOPE_BIT;
+        }
+
         if timestamp_active && let Some(slot) = &self.timestamp_slot {
             slot.resolve(&mut encoder);
         }
-        self.queue
-            .submit(extra_command_buffers.into_iter().chain([encoder.finish()]));
+        self.queue.submit(
+            frame_start
+                .into_iter()
+                .chain(extra_command_buffers)
+                .chain([encoder.finish()]),
+        );
         if let Some(celestial) = &mut self.celestial {
             celestial.resident_on_submitted(&self.queue);
         }

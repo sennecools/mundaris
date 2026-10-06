@@ -265,6 +265,33 @@ pub struct TileDraw {
 }
 
 impl TileDraw {
+    /// Orbital tiles are large derived representations. Permit their actual
+    /// observer-relative narrowing within 1/262144 of the chart footprint.
+    /// Fine charts inside the original 10 km envelope retain its 1 mm gate.
+    /// Beyond that envelope, one f32 relative ulp bounds anchor presentation;
+    /// tile-local reconstruction and finite-fixture precision are unchanged.
+    /// This does not certify terrain approximation or alter reconstruction.
+    pub fn planetary_precision_budget(&self) -> crate::RenderPrecisionBudget {
+        let radius = f64::from_bits(self.tile.key.radius_bits);
+        let footprint = 2.0 * radius / (1u64 << self.tile.key.address.level()) as f64;
+        let distance = self.anchor_view_m.length();
+        let distant_anchor_error = if distance > 10_000.0 {
+            distance / 8_388_608.0
+        } else {
+            0.0
+        };
+        crate::RenderPrecisionBudget::try_new(
+            self.anchor_view_m
+                .length()
+                .max(footprint * 2.0)
+                .max(10_000.0)
+                * 1.01,
+            (footprint / 262_144.0)
+                .max(1.0e-3)
+                .max(distant_anchor_error),
+        )
+        .unwrap_or_else(|_| crate::RenderPrecisionBudget::near_debug())
+    }
     /// Check the f64-to-f32 view boundary before this draw enters staging.
     pub fn validate_view_transform(
         &self,

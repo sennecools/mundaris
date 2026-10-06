@@ -6,7 +6,9 @@ use super::{
     MoonTerrainGenerator, MoonTerrainVersion, SurfaceAlgorithm, SurfaceQueryWork, TerrainError,
     TerrainIdentity, TerrainSeed,
     director::{DirectedSample, DirectorField},
-    mix, unit,
+    mix,
+    query_context::{CachedFeature, PROVINCE_FEATURE_FAMILY, SurfaceQueryContext},
+    unit,
 };
 use glam::{DMat3, DVec3};
 use mundaris_math::{Direction3, noise::gradient_noise, surface::SurfaceLocation};
@@ -160,6 +162,25 @@ struct Feature {
     key: u64,
     edge_m: f64,
     level: usize,
+}
+
+fn cache_feature(feature: Feature) -> CachedFeature {
+    CachedFeature {
+        center: feature.center,
+        key: feature.key,
+        lineage_key: 0,
+        edge_m: feature.edge_m,
+        level: feature.level,
+    }
+}
+
+fn uncache_feature(feature: CachedFeature) -> Feature {
+    Feature {
+        center: feature.center,
+        key: feature.key,
+        edge_m: feature.edge_m,
+        level: feature.level,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -335,6 +356,22 @@ impl ProvinceField {
         &self,
         direction: DVec3,
     ) -> Result<(ProvinceSample, ProvinceParentContext), TerrainError> {
+        self.evaluate_with_query_context_inner(direction, None)
+    }
+
+    pub(super) fn evaluate_with_query_context(
+        &self,
+        direction: DVec3,
+        context: &mut SurfaceQueryContext<'_>,
+    ) -> Result<(ProvinceSample, ProvinceParentContext), TerrainError> {
+        self.evaluate_with_query_context_inner(direction, Some(context))
+    }
+
+    fn evaluate_with_query_context_inner(
+        &self,
+        direction: DVec3,
+        mut context: Option<&mut SurfaceQueryContext<'_>>,
+    ) -> Result<(ProvinceSample, ProvinceParentContext), TerrainError> {
         if !direction.is_finite() || direction.length_squared() <= f64::MIN_POSITIVE {
             return Err(TerrainError::InvalidConfig);
         }
@@ -386,7 +423,8 @@ impl ProvinceField {
         // query-side burial modifies old impacts before construction is applied.
         let mut parent_morphology = Differential::constant(0.0);
         for (level, allocation) in LOCAL_RELIEF_ALLOCATIONS.into_iter().enumerate() {
-            let contribution = self.local_level(n, level, w, c, &mut work)?;
+            let contribution =
+                self.local_level(n, level, w, c, &mut work, context.as_deref_mut())?;
             height = height + contribution;
             if level < 3 {
                 let budget = (self.edges_m[level] * 0.055)
@@ -525,6 +563,7 @@ impl ProvinceField {
         w: [Differential; 4],
         c: [Differential; 5],
         work: &mut SurfaceQueryWork,
+        mut context: Option<&mut SurfaceQueryContext<'_>>,
     ) -> Result<Differential, TerrainError> {
         let point = n * self.radius_m;
         let edge = self.edges_m[level];
@@ -542,7 +581,16 @@ impl ProvinceField {
                 for y in by - 1..=by + 1 {
                     for z in bz - 1..=bz + 1 {
                         work.cells_visited += 1;
-                        let Some(feature) = self.feature(x, y, z, level, layout) else {
+                        let feature = if let Some(context) = context.as_deref_mut() {
+                            context
+                                .feature(PROVINCE_FEATURE_FAMILY, level, layout, x, y, z, || {
+                                    self.feature(x, y, z, level, layout).map(cache_feature)
+                                })
+                                .map(uncache_feature)
+                        } else {
+                            self.feature(x, y, z, level, layout)
+                        };
+                        let Some(feature) = feature else {
                             continue;
                         };
                         work.candidate_features += 1;
@@ -558,7 +606,19 @@ impl ProvinceField {
                             *count += 1;
                         }
                         let window = (Differential::constant(1.0) - q2).cube();
-                        let centre_controls = self.controls(feature.center)?;
+                        let centre_controls = if let Some(context) = context.as_deref_mut() {
+                            context.controls(
+                                PROVINCE_FEATURE_FAMILY,
+                                level,
+                                layout,
+                                x,
+                                y,
+                                z,
+                                || self.controls(feature.center),
+                            )?
+                        } else {
+                            self.controls(feature.center)?
+                        };
                         let profile = self.profile(n, feature, centre_controls, w, c)?;
                         let budget = (edge * 0.055).min(
                             self.radius_m

@@ -7,7 +7,7 @@ use mundaris_renderer::{
     CelestialPreparationReport, CelestialProjection, GpuProfile, planet_surface::TerrainRenderMode,
 };
 use mundaris_world::{BodyId, CoherentCelestialView};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeMap};
 use serde_json::Value;
 
 use crate::{
@@ -16,8 +16,121 @@ use crate::{
     terrain_population::TerrainPopulation,
 };
 
+use std::{ops::Deref, sync::Arc};
+
+/// Planetary resident telemetry with immutable trace and history shared by
+/// published snapshots. Summary lookups stay allocation-free through `Deref`;
+/// trace and history are merged only when serialized for export/capture.
+#[derive(Debug, Clone)]
+pub struct ResidentDiagnosticSnapshot {
+    summary: Arc<Value>,
+    history: Option<Arc<crate::gravity_orbits::RegionalFrameHistory>>,
+    terrain_trace: Option<Arc<Value>>,
+}
+
+impl ResidentDiagnosticSnapshot {
+    pub(crate) fn new(
+        summary: Value,
+        history: Option<Arc<crate::gravity_orbits::RegionalFrameHistory>>,
+        terrain_trace: Option<Arc<Value>>,
+    ) -> Self {
+        Self {
+            summary: Arc::new(summary),
+            history,
+            terrain_trace,
+        }
+    }
+
+    /// Latest sampled terrain trace, shared without copying its JSON tree.
+    pub fn terrain_trace(&self) -> Option<&Value> {
+        self.terrain_trace.as_deref()
+    }
+}
+
+impl Deref for ResidentDiagnosticSnapshot {
+    type Target = Value;
+
+    fn deref(&self) -> &Self::Target {
+        &self.summary
+    }
+}
+
+impl Serialize for ResidentDiagnosticSnapshot {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let Value::Object(summary) = self.summary.as_ref() else {
+            return self.summary.serialize(serializer);
+        };
+        let mut map = serializer.serialize_map(Some(
+            summary.len()
+                + if self.history.is_some() { 3 } else { 0 }
+                + usize::from(self.terrain_trace.is_some()),
+        ))?;
+        for (key, value) in summary {
+            if self.history.is_some()
+                && matches!(
+                    key.as_str(),
+                    "native_frame_samples" | "frame_intervals_ms" | "events"
+                )
+            {
+                continue;
+            }
+            if self.terrain_trace.is_some() && key == "terrain_trace" {
+                continue;
+            }
+            map.serialize_entry(key, value)?;
+        }
+        if let Some(history) = &self.history {
+            map.serialize_entry("native_frame_samples", &history.native_frame_samples)?;
+            map.serialize_entry("frame_intervals_ms", &history.frame_intervals_ms)?;
+            map.serialize_entry("events", history.events.as_ref())?;
+        }
+        if let Some(trace) = &self.terrain_trace {
+            map.serialize_entry("terrain_trace", trace.as_ref())?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ResidentDiagnosticSnapshot {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut summary = Value::deserialize(deserializer)?;
+        let terrain_trace = summary
+            .as_object_mut()
+            .and_then(|object| object.remove("terrain_trace"))
+            .map(Arc::new);
+        Ok(Self {
+            summary: Arc::new(summary),
+            history: None,
+            terrain_trace,
+        })
+    }
+}
+
+impl PartialEq for ResidentDiagnosticSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        if Arc::ptr_eq(&self.summary, &other.summary)
+            && match (&self.history, &other.history) {
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                (None, None) => true,
+                _ => false,
+            }
+            && match (&self.terrain_trace, &other.terrain_trace) {
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                (None, None) => true,
+                _ => false,
+            }
+        {
+            return true;
+        }
+        match (serde_json::to_value(self), serde_json::to_value(other)) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
 /// Version of the JSON contract, independent of engine/world persistence formats.
-pub const SNAPSHOT_SCHEMA_VERSION: u32 = 5;
+pub const SNAPSHOT_SCHEMA_VERSION: u32 = 6;
 /// UI-only advisory ratio. This does not alter admission or the terrain cap.
 pub const MEMORY_NEAR_CAP_RATIO: f64 = 0.95;
 
@@ -108,6 +221,9 @@ pub struct CameraSnapshot {
 /// Radial levels describe the camera's radial chain, not whole-view visual quality.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TerrainSnapshot {
+    /// Active geometry backend, independent of requested detail.
+    #[serde(default)]
+    pub backend: String,
     pub active_body: Option<BodySnapshot>,
     /// Selected world authority, independent of currently ready mesh quality.
     #[serde(default)]
@@ -203,14 +319,44 @@ impl RenderingSnapshot {
 /// CPU stages are host elapsed times. GPU regular terrain and fallback are separate.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PerformanceSnapshot {
+    /// Host cost of bounded profiler publication/capture bookkeeping.
+    #[serde(default)]
+    pub profiler_publication_ms: Option<f64>,
     pub frame_cpu_ms: Option<f64>,
+    /// Entire host frame, including UI, driver/acquire/present and diagnostics.
+    /// This is elapsed host time, not a GPU execution duration or CPU-only time.
+    #[serde(default)]
+    pub host_frame_ms: Option<f64>,
+    /// Elapsed render submission, UI, acquire and present; includes resident preparation.
+    #[serde(default)]
+    pub render_present_ms: Option<f64>,
+    /// Publication of the compact diagnostic snapshot, including previous snapshot retirement.
+    #[serde(default)]
+    pub diagnostics_ms: Option<f64>,
+    #[serde(default)]
+    pub ui_build_cpu_ms: Option<f64>,
     pub update_ms: Option<f64>,
     pub terrain_update_ms: Option<f64>,
     pub preparation_ms: Option<f64>,
     pub terrain_preparation_ms: Option<f64>,
+    /// Host validation/upload/draw preparation for resident GPU terrain.
+    #[serde(default)]
+    pub gpu_preparation_cpu_ms: Option<f64>,
     pub gpu_terrain_ms: Option<f64>,
+    #[serde(default)]
+    pub gpu_frame_ms: Option<f64>,
+    #[serde(default)]
+    pub gpu_clouds_ms: Option<f64>,
+    #[serde(default)]
+    pub gpu_atmosphere_ms: Option<f64>,
+    #[serde(default)]
+    pub gpu_main_pass_ms: Option<f64>,
+    #[serde(default)]
+    pub gpu_overlay_ms: Option<f64>,
     pub gpu_transition_fallback_ms: Option<f64>,
     pub gpu_timing_scope: String,
+    #[serde(default)]
+    pub gpu_timestamp_capability: String,
     #[serde(default)]
     pub gpu_source_frame: Option<u64>,
     pub upload_bytes: Option<u64>,
@@ -218,6 +364,11 @@ pub struct PerformanceSnapshot {
 impl PerformanceSnapshot {
     /// Native uses `latest_completed`; blocking offscreen readback uses `same_frame`.
     pub fn with_gpu(mut self, profile: GpuProfile, scope: &str) -> Self {
+        self.gpu_frame_ms = profile.frame.map(|d| d.as_secs_f64() * 1000.0);
+        self.gpu_clouds_ms = profile.clouds.map(|d| d.as_secs_f64() * 1000.0);
+        self.gpu_atmosphere_ms = profile.atmosphere.map(|d| d.as_secs_f64() * 1000.0);
+        self.gpu_main_pass_ms = profile.celestial_pass.map(|d| d.as_secs_f64() * 1000.0);
+        self.gpu_overlay_ms = profile.overlay_pass.map(|d| d.as_secs_f64() * 1000.0);
         self.gpu_terrain_ms = profile.terrain.map(|d| d.as_secs_f64() * 1000.0);
         self.gpu_transition_fallback_ms = profile
             .transition_fallback
@@ -373,6 +524,35 @@ pub struct DeveloperSnapshot {
     /// Opt-in Slice 2C regional adaptive residency and refinement telemetry.
     #[serde(default)]
     pub resident_regional: Option<Value>,
+    /// Ordinary planetary resident runtime; distinct from finite fixtures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resident_planetary: Option<ResidentDiagnosticSnapshot>,
+    /// Bounded sampled CPU timeline; timestamps use its own monotonic epoch.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "shared_profile"
+    )]
+    pub engine_profile: Option<std::sync::Arc<Value>>,
+}
+
+mod shared_profile {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde_json::Value;
+    use std::sync::Arc;
+
+    pub fn serialize<S: Serializer>(
+        value: &Option<Arc<Value>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        value.as_deref().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Arc<Value>>, D::Error> {
+        Option::<Value>::deserialize(deserializer).map(|value| value.map(Arc::new))
+    }
 }
 
 /// Session and frame provenance. A presentation request is not monitor evidence.
@@ -539,6 +719,7 @@ impl DeveloperSnapshot {
                 navigation: input.navigation,
             },
             terrain: TerrainSnapshot {
+                backend: "LEGACY CPU MESH".into(),
                 active_body: active.map(body).transpose()?,
                 generator_algorithm,
                 certificate_kind,
@@ -586,6 +767,8 @@ impl DeveloperSnapshot {
             resident_tile: None,
             resident_hierarchy: None,
             resident_regional: None,
+            resident_planetary: None,
+            engine_profile: None,
         };
         snapshot.refresh_warnings();
         Ok(snapshot)
@@ -659,4 +842,54 @@ pub fn format_milliseconds(value: Option<f64>) -> String {
 
 pub fn format_bytes(bytes: u64) -> String {
     format!("{:.1} MiB", bytes as f64 / 1_048_576.0)
+}
+
+#[cfg(test)]
+mod resident_diagnostic_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn trace_sidecar_preserves_exported_json_and_roundtrips_without_summary_copy() {
+        let trace = Arc::new(serde_json::json!({
+            "events": [{"sequence": 7, "stage": "generation"}],
+            "jobs": [{"id": 3}],
+        }));
+        let snapshot = ResidentDiagnosticSnapshot::new(
+            serde_json::json!({"frame_id": 19}),
+            None,
+            Some(Arc::clone(&trace)),
+        );
+
+        assert!(snapshot.get("terrain_trace").is_none());
+        assert!(std::ptr::eq(
+            snapshot.terrain_trace().unwrap(),
+            trace.as_ref()
+        ));
+        let expected = serde_json::json!({
+            "frame_id": 19,
+            "terrain_trace": {
+                "events": [{"sequence": 7, "stage": "generation"}],
+                "jobs": [{"id": 3}],
+            },
+        });
+        assert_eq!(serde_json::to_value(&snapshot).unwrap(), expected);
+
+        let decoded: ResidentDiagnosticSnapshot = serde_json::from_value(expected.clone()).unwrap();
+        assert!(decoded.get("terrain_trace").is_none());
+        assert_eq!(decoded.terrain_trace(), Some(&expected["terrain_trace"]));
+        assert_eq!(serde_json::to_value(decoded).unwrap(), expected);
+    }
+
+    #[test]
+    fn snapshot_without_profile_trace_keeps_trace_absent() {
+        // The fixture only attaches this sidecar while profiling is enabled.
+        // Keep the default/profile-disabled shape free of a placeholder trace.
+        let snapshot =
+            ResidentDiagnosticSnapshot::new(serde_json::json!({"frame_id": 19}), None, None);
+        assert!(snapshot.terrain_trace().is_none());
+        assert_eq!(
+            serde_json::to_value(snapshot).unwrap(),
+            serde_json::json!({"frame_id": 19})
+        );
+    }
 }

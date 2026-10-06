@@ -149,7 +149,7 @@ fn moon_snapshot_identifies_the_native_compositional_authority() {
 fn developer_snapshot_serializes_stable_names_units_and_null_measurements() {
     let snapshot = Fixture::new(DeveloperScene::EarthClose).snapshot();
     let json = serde_json::to_value(&snapshot).unwrap();
-    assert_eq!(json["schema_version"], 5);
+    assert_eq!(json["schema_version"], 6);
     assert_eq!(json["general"]["camera_mode"], "surface_inspection");
     assert_eq!(json["camera"]["reference_frame"], "body_fixed");
     assert!(json["performance"]["gpu_terrain_ms"].is_null());
@@ -185,6 +185,7 @@ fn developer_snapshot_serializes_stable_names_units_and_null_measurements() {
     );
     let performance = PerformanceSnapshot::default().with_gpu(
         GpuProfile {
+            frame: Some(Duration::from_micros(850)),
             terrain: Some(Duration::from_micros(125)),
             transition_fallback: Some(Duration::from_micros(50)),
             ..Default::default()
@@ -192,6 +193,7 @@ fn developer_snapshot_serializes_stable_names_units_and_null_measurements() {
         "latest_completed",
     );
     assert_eq!(performance.gpu_terrain_ms, Some(0.125));
+    assert_eq!(performance.gpu_frame_ms, Some(0.85));
     assert_eq!(performance.gpu_transition_fallback_ms, Some(0.05));
     assert_eq!(performance.gpu_timing_scope, "latest_completed");
 }

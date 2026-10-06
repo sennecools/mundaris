@@ -64,6 +64,14 @@ not authorization to begin another phase:
     statement withholding Slice 2C authorization. Whole-planet streaming still
     requires a new user decision; existing art, camera UX and Acceptance A
     limitations are not waived by regional numerical success.
+11. The user authorized Slice 2D planetary-runtime integration on 2026-10-06.
+    Current dirty source connects the six-face regional resident runtime to the
+    ordinary `--solar-system` and `--real-solar-system` presets, with
+    `--legacy-terrain` retained for comparison. This is IMPLEMENTED architecture;
+    native acceptance is PENDING the [dated Slice 2D report](PLANET_TERRAIN_SLICE_2D_REPORT.md)
+    and reviewer assessment. The uncertified projected-relief/sagitta proxy can
+    remain `quality_pending`; implementation does not establish visual quality,
+    native UX, or performance acceptance. Slice 3A is not authorized.
 
 ## Current unresolved blockers
 

@@ -89,6 +89,57 @@ impl TerrainPopulation {
     pub fn active_body(&self) -> Option<BodyId> {
         self.active_body
     }
+    /// Reuse observer-local admission without updating legacy geometry.
+    pub fn resident_candidate(
+        &mut self,
+        pair: &CoherentCelestialView<'_>,
+        view: &PreparedView<'_>,
+        projection: CelestialProjection,
+        requests: &[CelestialRenderBody],
+        sessions: &mut [PlanetSurfaceSession],
+    ) -> Result<Option<BodyId>> {
+        let mut candidate = None;
+        let mut greatest_error = 0.0;
+        for session in sessions {
+            let index = pair
+                .system()
+                .bodies()
+                .position(|(id, _)| id == session.body())
+                .ok_or_else(|| anyhow::anyhow!("unknown surface capability body"))?;
+            let body = pair.system().body(session.body())?;
+            // The resident backend consumes compositional world authority.
+            if body.surface_definition().is_none() {
+                continue;
+            }
+            let binding =
+                self.surface_binding(session.body(), body, requests[index].reference_radius_m)?;
+            let input = SurfaceViewInput {
+                view,
+                body_fixed_frame: requests[index].body_fixed_frame,
+                reference_radius_m: requests[index].reference_radius_m,
+                projection,
+            };
+            if session.terrain_required(&input, binding.height_bound_m)?
+                && session.far_error_pixels > greatest_error
+            {
+                greatest_error = session.far_error_pixels;
+                candidate = Some(session.body());
+            }
+        }
+        Ok(candidate)
+    }
+    /// An opaque far representation must exist before resident coverage yields.
+    pub fn resident_far_ready(
+        &mut self,
+        view: &PreparedView<'_>,
+        projection: CelestialProjection,
+        request: CelestialRenderBody,
+        sphere: &Icosphere,
+    ) -> Result<bool> {
+        let mut frame = CelestialFrame::new(view, &mut self.far_probe, projection, sphere);
+        frame.append_bodies(&[request])?;
+        Ok(far_ready(frame.markers()[0].representation))
+    }
     /// One observer-local cover shares the inherited aggregate budget. The highest
     /// projected far error admits terrain; all other rocky bodies remain far-only.
     /// This is content streaming admission, not a physical size/range alteration.

@@ -12,6 +12,10 @@ fn row(ui: &mut egui::Ui, label: &str, value: impl Into<egui::RichText>) {
 
 pub(super) fn left(ui: &mut egui::Ui, controls: &mut Controls, info: &UiInfo<'_>) {
     ui.heading("Scene");
+    if ui.button("Performance Lab").clicked() {
+        controls.performance_lab.open = true;
+        controls.performance_lab.enabled = true;
+    }
     #[cfg(feature = "developer-tools")]
     if let Some(owner) = &controls.automation_owner {
         ui.colored_label(egui::Color32::YELLOW, format!("Automation active: {owner}"));
@@ -519,6 +523,83 @@ pub(super) fn right(ui: &mut egui::Ui, controls: &mut Controls, info: &UiInfo<'_
     let mut enabled = controls.terrain_preview;
     if ui.checkbox(&mut enabled, "Procedural terrain").on_hover_text("Use existing observer-local terrain admission; disabling requests the smooth/far path.").changed() { controls.pending.push_back(Command::TerrainPreview(enabled)); }
     if let Some(s) = info.snapshot {
+        ui.strong(&s.terrain.backend);
+        if let Some(r) = &s.resident_planetary {
+            for (label, field) in [
+                ("Desired tiles", "desired_count"),
+                ("CPU tiles", "cpu_cached_tiles"),
+                ("GPU tiles", "gpu_resident_tiles"),
+                ("Drawable tiles", "drawable_count"),
+                ("Fallback tiles", "gpu_fallback_count"),
+                ("Transitions", "active_transitions"),
+                ("Queued jobs", "worker_queued"),
+                ("Generating", "worker_running"),
+                ("Awaiting publication", "completion_backlog"),
+            ] {
+                row(ui, label, r[field].to_string());
+            }
+            row(
+                ui,
+                "Refinement debt",
+                format!("{:.3} px", r["refinement_debt"].as_f64().unwrap_or(0.0)),
+            );
+            row(
+                ui,
+                "Selection CPU",
+                format!(
+                    "{:.3} ms",
+                    r["selection_time_micros"].as_f64().unwrap_or(0.0) / 1000.0
+                ),
+            );
+            row(
+                ui,
+                "Publication CPU",
+                format!("{:.3} ms", r["publication_ms"].as_f64().unwrap_or(0.0)),
+            );
+            row(
+                ui,
+                "GPU prepare CPU",
+                format!("{:.3} ms", r["gpu_preparation_ms"].as_f64().unwrap_or(0.0)),
+            );
+            row(
+                ui,
+                "Content upload",
+                format!(
+                    "{} B",
+                    r["gpu_upload_bytes_per_frame"].as_u64().unwrap_or(0)
+                        + r["boundary_upload_bytes_per_frame"].as_u64().unwrap_or(0)
+                ),
+            );
+            row(
+                ui,
+                "Generation",
+                format!(
+                    "{:.2} tiles/s",
+                    r["generation_throughput_tiles_per_second"]
+                        .as_f64()
+                        .unwrap_or(0.0)
+                ),
+            );
+            row(
+                ui,
+                "CPU geometry",
+                format_bytes(
+                    r["resources"]["total_accounted_cpu_geometry_bytes"]
+                        .as_u64()
+                        .unwrap_or(0),
+                ),
+            );
+            row(
+                ui,
+                "GPU buffers",
+                format_bytes(
+                    r["resources"]["gpu_total_capacity_bytes"]
+                        .as_u64()
+                        .unwrap_or(0),
+                ),
+            );
+            ui.small("Requested buffers and retained payload; excludes driver overhead and worker stacks.");
+        }
         row(ui, "Source leaves", s.terrain.source_leaf_count.to_string());
         row(
             ui,
@@ -535,7 +616,13 @@ pub(super) fn right(ui: &mut egui::Ui, controls: &mut Controls, info: &UiInfo<'_
             "Frame CPU",
             format_milliseconds(s.performance.frame_cpu_ms),
         );
-        ui.small("Update + preparation; excludes UI and presentation.");
+        ui.small("Measured CPU stages; excludes driver and presentation waits.");
+        row(
+            ui,
+            "Host frame",
+            format_milliseconds(s.performance.host_frame_ms),
+        );
+        ui.small("Whole host elapsed time, including UI and presentation.");
         row(
             ui,
             "Terrain update",

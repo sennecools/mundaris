@@ -403,6 +403,64 @@ publication. This prototype has no whole-body streaming, pressure eviction, or
 global mixed-level topology. See [ADR 0012](adr/0012-resident-terrain-tile-prototype.md)
 and [ADR 0013](adr/0013-fixed-resident-terrain-hierarchy.md).
 
+### Ordinary planetary resident terrain (Slice 2D)
+
+The ordinary `--solar-system` and `--real-solar-system` presets use an app-owned
+`PlanetaryTerrain` runtime over the six-face resident regional scheduler. The
+explicit `--legacy-terrain` switch retains the earlier adaptive terrain path for
+comparison. This integrates resident terrain into the ordinary solar presets; it
+does not replace world-owned surface definitions or change terrain generation
+authority. Exact tile identity and source revisions gate rebinding and drawing, so
+a stale resident result cannot be presented after the selected body's definition,
+radius, or terrain revision changes.
+
+Planetary construction uses a bounded four-worker generation pool and a separate
+publication coordinator with at most two parallel background calculation tasks.
+The runtime bounds the desired set to 16,384 patches,
+CPU residency to 49,152 tiles, and GPU residency to 32,768 logical slots; each frame admits
+at most four uploads / 8 MiB and eight local publication adoptions, with sixteen
+active morph groups. These are current runtime
+configuration values, not measured performance targets or physical VRAM use. The
+selector checks a 2 ms work budget and reports overruns. Publication uses one
+in-flight bounded batch and eight retained prepared products; locally blocked
+work waits without rebuilding while independent products can proceed. Exact
+keys, current local sources/demand/balance and affected boundary expectations
+validate each adoption. Frame-thread admission defers against a cumulative 2 ms
+budget with 1.5 ms dispatch/adoption headroom and reports overruns. These are runtime limits with
+observable overruns, not guaranteed frame-time ceilings. The observer-relative
+anchor narrowing uses the original one-millimetre gate through 10 km. Beyond that
+envelope, its presentation allowance is the maximum of
+distance / 2^23, chart footprint / 262,144, and one millimetre; finite fixtures
+keep their original precision policy. This bounds f64-to-f32 anchor presentation,
+not terrain approximation or local tile reconstruction. Projected relief and
+sagitta drive an explicitly uncertified quality proxy, so
+capacity pressure or incomplete convergence remains `quality_pending`; matching
+the proxy does not certify terrain quality. Frustum and horizon culling affect
+visibility while the resident topology remains a complete balanced cover.
+
+The publication worker retains canonical sample owners and boundary dependencies
+for its current immutable tile cover. A local replacement invalidates affected
+sample owners, edge neighbors and interpolation dependents; full cover validation
+and the original boundary reconstruction arithmetic remain in force. Failure
+clears this derived cache, and stale work can be reversed to the acknowledged
+cover. Renderer validation may reuse exact immutable endpoint objects while
+validating presentation transforms and transaction state on every draw. Memory
+diagnostics distinguish owned cache/index/boundary storage from aliased tile
+references and conservative workspace limits; these are not RSS or physical VRAM.
+
+Stationary scheduling reuses a selector fixed point only with complete resident
+coverage and no pending work; completion draining and LRU touches continue, and
+view/residency/dependency changes restore admission. Planetary frame diagnostics
+retain scalar coverage, debt, jobs, timings and resources, explicitly omit
+per-tile arrays and export bounded recent history. Finite fixtures retain their
+detailed arrays. Snapshot retirement is included in diagnostic elapsed time.
+
+Slices 2A, 2B, and 2C remain separately available as finite resident, fixed
+hierarchy, and regional scheduling fixtures with their existing numerical and
+representation contracts. Slice 2D wires the regional runtime into ordinary
+planetary presentation; it does not supersede those fixtures or authorize Slice
+3A. Native acceptance is pending the [dated Slice 2D report](PLANET_TERRAIN_SLICE_2D_REPORT.md).
+
 ### Session interface
 
 The opt-in `developer-tools` application feature and `--dev-interface` flag expose

@@ -141,10 +141,17 @@ struct WorkerResult {
 pub(super) struct TerrainWorkers {
     slots: Vec<Slot>,
     next_id: u64,
+    #[cfg(test)]
+    cover_jobs_paused: Arc<AtomicBool>,
     #[cfg(feature = "surface-profile")]
     abandoned_metrics: [Option<WorkerMetrics>; 4],
 }
 impl TerrainWorkers {
+    #[cfg(test)]
+    pub fn set_cover_jobs_paused(&self, paused: bool) {
+        self.cover_jobs_paused.store(paused, Ordering::Release);
+    }
+
     pub fn required_bytes(count: usize) -> usize {
         size_of::<Self>() + count * (size_of::<Slot>() + WORKER_FIXED_BYTES)
     }
@@ -156,18 +163,29 @@ impl TerrainWorkers {
         let mut pool = Self {
             slots: Vec::with_capacity(count),
             next_id: 0,
+            #[cfg(test)]
+            cover_jobs_paused: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "surface-profile")]
             abandoned_metrics: [None; 4],
         };
         for index in 0..count {
             let (sender, jobs) = mpsc::sync_channel::<Job>(1);
             let (results, receiver) = mpsc::sync_channel(1);
+            #[cfg(test)]
+            let cover_jobs_paused = Arc::clone(&pool.cover_jobs_paused);
             let thread = thread::Builder::new()
                 .name(format!("terrain-{index}"))
                 .stack_size(WORKER_STACK_BYTES)
                 .spawn(move || {
                     let topology = SurfaceTopology::new();
                     while let Ok(job) = jobs.recv() {
+                        #[cfg(test)]
+                        while matches!(&job.calculation, Calculation::Cover(_))
+                            && cover_jobs_paused.load(Ordering::Acquire)
+                            && !job.cancelled.load(Ordering::Acquire)
+                        {
+                            thread::sleep(Duration::from_millis(1));
+                        }
                         #[cfg(feature = "surface-profile")]
                         let submitted = job.submitted;
                         let started = Instant::now();
@@ -641,6 +659,7 @@ mod tests {
         let mut pool = TerrainWorkers {
             slots: Vec::new(),
             next_id: 3,
+            cover_jobs_paused: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "surface-profile")]
             abandoned_metrics: [None; 4],
         };

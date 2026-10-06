@@ -2158,6 +2158,9 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(1));
             }
             let source_bytes = shared_surface_bytes(cover.stitched.as_ref().unwrap());
+            // Keep the transaction in flight through the center-view and source
+            // accounting assertions regardless of worker scheduling speed.
+            cache.workers.as_ref().unwrap().set_cover_jobs_paused(true);
             let refined = LodSettings::default().with_limits(128, 128, 1).unwrap();
             while !cover.construction_pending() {
                 cover
@@ -2199,6 +2202,7 @@ mod tests {
             assert_eq!(cover.resident_bytes(), charged_cover_bytes + source_bytes);
             cover.construction = Some(job);
             cache.cancel_body_work(body);
+            cache.workers.as_ref().unwrap().set_cover_jobs_paused(false);
             // Publication into the completion queue must not release the source
             // charge before the coordinator consumes its cancellation ack.
             while !cache.completed_covers.iter().any(|c| c.id == job) {

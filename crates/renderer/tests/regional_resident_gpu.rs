@@ -96,6 +96,7 @@ fn regional_shader_matches_cpu_and_keeps_adjacent_edges_watertight() {
         .collect();
 
     let mut regional = RegionalResidentDraw {
+        planetary: false,
         capacity: 4,
         cells: CELLS,
         uploads: draws
@@ -407,7 +408,7 @@ fn regional_shader_matches_cpu_and_keeps_adjacent_edges_watertight() {
         }
     }
 
-    // Stable resident draws upload only compact parameters after warm-up.
+    // Stable resident draws reuse both content and identical presentation bytes.
     {
         let mut frame = CelestialFrame::new(&view, &mut staging, projection, &sphere);
         frame.set_resident_regional(regional.clone()).unwrap();
@@ -416,7 +417,7 @@ fn regional_shader_matches_cpu_and_keeps_adjacent_edges_watertight() {
     let warm = capture.last_resident_regional_report();
     assert_eq!(warm.tile_upload_bytes, 0);
     assert_eq!(warm.boundary_upload_bytes, 0);
-    assert_eq!(warm.metadata_upload_bytes, 4 * 384);
+    assert_eq!(warm.metadata_upload_bytes, 0);
 
     // Two local morph groups may advance their own endpoint versions while
     // unaffected patches keep their existing versions. Child dependencies

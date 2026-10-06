@@ -24,15 +24,23 @@ pub struct CpuUploadProfile {
 /// `None` means the scope is unavailable or has not completed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GpuProfile {
+    /// Complete encoded native GPU frame body, including debug, celestial,
+    /// and editor-UI rendering. Surface acquisition, CPU work, present, and
+    /// timestamp readback are outside this interval.
+    pub frame: Option<std::time::Duration>,
     /// Complete main celestial render pass.
     pub celestial_pass: Option<std::time::Duration>,
     /// Complete atmosphere render pass.
     pub atmosphere_pass: Option<std::time::Duration>,
     /// Complete guides/overlay render pass.
     pub overlay_pass: Option<std::time::Duration>,
+    /// Mesh and resident surface draws, including the regional Moon terrain path.
     pub terrain: Option<std::time::Duration>,
+    /// Transition fallback surface draws inside the celestial scene pass.
     pub transition_fallback: Option<std::time::Duration>,
+    /// Planetary ocean shell draws inside the celestial scene pass.
     pub ocean: Option<std::time::Duration>,
+    /// Planetary cloud shell draws inside the celestial scene pass.
     pub clouds: Option<std::time::Duration>,
     /// Same measurement as `atmosphere_pass`, also available under the layer name.
     pub atmosphere: Option<std::time::Duration>,
@@ -55,6 +63,7 @@ pub(crate) fn decode(ticks: &[u64], period_nanoseconds: f32, scope_mask: u16) ->
             .flatten()
     };
     GpuProfile {
+        frame: scoped(9, 9),
         celestial_pass: scoped(0, 0),
         atmosphere_pass: scoped(1, 1),
         overlay_pass: scoped(2, 2),
@@ -76,6 +85,9 @@ pub(crate) fn available_features(adapter: &wgpu::Adapter) -> wgpu::Features {
     let mut requested = wgpu::Features::empty();
     if supported.contains(wgpu::Features::TIMESTAMP_QUERY) {
         requested |= wgpu::Features::TIMESTAMP_QUERY;
+        if supported.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS) {
+            requested |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        }
         if supported.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES) {
             requested |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
         }
@@ -93,10 +105,12 @@ pub(crate) fn availability(features: wgpu::Features) -> TimestampAvailability {
     }
 }
 
-/// Queries for three pass totals and six scopes inside the main pass.
+/// Queries for three pass totals, six scopes inside the main pass, and the
+/// complete encoded native frame.
 pub(crate) struct CelestialQueries {
     pub set: wgpu::QuerySet,
     inside_passes: bool,
+    inside_encoders: bool,
 }
 
 impl CelestialQueries {
@@ -106,13 +120,16 @@ impl CelestialQueries {
             .contains(wgpu::Features::TIMESTAMP_QUERY)
             .then(|| Self {
                 set: device.create_query_set(&wgpu::QuerySetDescriptor {
-                    label: Some("Mundaris celestial timestamps"),
+                    label: Some("Mundaris native frame and celestial timestamps"),
                     ty: wgpu::QueryType::Timestamp,
                     count: QUERY_COUNT,
                 }),
                 inside_passes: device
                     .features()
                     .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES),
+                inside_encoders: device
+                    .features()
+                    .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
             })
     }
 
@@ -128,6 +145,10 @@ impl CelestialQueries {
         self.inside_passes
     }
 
+    pub fn inside_encoders(&self) -> bool {
+        self.inside_encoders
+    }
+
     pub fn write_scope(&self, pass: &mut wgpu::RenderPass<'_>, pair: usize) {
         if self.inside_passes {
             pass.write_timestamp(&self.set, (pair * 2) as u32);
@@ -141,7 +162,9 @@ impl CelestialQueries {
     }
 }
 
-pub(crate) const QUERY_COUNT: u32 = 18;
+pub(crate) const FRAME_QUERY_PAIR: usize = 9;
+pub(crate) const FRAME_SCOPE_BIT: u16 = 1 << FRAME_QUERY_PAIR;
+pub(crate) const QUERY_COUNT: u32 = 20;
 
 /// Controls automatic timestamp sampling while developer observation is active.
 /// Ordinary renderer use remains continuously sampled as before.
@@ -284,8 +307,9 @@ mod tests {
 
     #[test]
     fn profile_exposes_available_pass_and_inside_pass_scopes() {
-        let profile = decode(&(0..18).collect::<Vec<u64>>(), 2.0, 0b1_1111_1111);
+        let profile = decode(&(0..20).collect::<Vec<u64>>(), 2.0, 0b11_1111_1111);
         let two_ns = Some(std::time::Duration::from_nanos(2));
+        assert_eq!(profile.frame, two_ns);
         assert_eq!(profile.celestial_pass, two_ns);
         assert_eq!(profile.atmosphere_pass, two_ns);
         assert_eq!(profile.terrain, two_ns);
@@ -296,7 +320,7 @@ mod tests {
 
     #[test]
     fn absent_scope_mask_ignores_stale_query_values() {
-        let profile = decode(&(0..16).collect::<Vec<u64>>(), 1.0, 1);
+        let profile = decode(&(0..20).collect::<Vec<u64>>(), 1.0, 1);
         assert_eq!(
             profile.celestial_pass,
             Some(std::time::Duration::from_nanos(1))
@@ -305,12 +329,36 @@ mod tests {
         assert_eq!(profile.terrain, None);
         assert_eq!(profile.transition_fallback, None);
         assert_eq!(profile.sky, None);
+        assert_eq!(profile.frame, None);
     }
 
     #[test]
     fn reversed_or_missing_timestamp_pair_is_unavailable() {
         assert_eq!(decode(&[20, 10], 1.0, 1).celestial_pass, None);
         assert_eq!(decode(&[], 1.0, 1).celestial_pass, None);
+    }
+
+    #[test]
+    fn frame_requires_its_mask_bit_and_a_valid_complete_pair() {
+        let mut ticks = (0..20).collect::<Vec<u64>>();
+        assert_eq!(decode(&ticks, 1.0, 0).frame, None);
+        assert_eq!(
+            decode(&ticks, 2.0, FRAME_SCOPE_BIT).frame,
+            Some(std::time::Duration::from_nanos(2))
+        );
+
+        ticks[FRAME_QUERY_PAIR * 2 + 1] = ticks[FRAME_QUERY_PAIR * 2];
+        assert_eq!(
+            decode(&ticks, 1.0, FRAME_SCOPE_BIT).frame,
+            Some(std::time::Duration::ZERO)
+        );
+
+        ticks[FRAME_QUERY_PAIR * 2 + 1] = ticks[FRAME_QUERY_PAIR * 2] - 1;
+        assert_eq!(decode(&ticks, 1.0, FRAME_SCOPE_BIT).frame, None);
+        assert_eq!(
+            decode(&ticks[..ticks.len() - 1], 1.0, FRAME_SCOPE_BIT).frame,
+            None
+        );
     }
 
     #[cfg(feature = "developer-tools")]

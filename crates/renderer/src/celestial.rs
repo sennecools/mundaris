@@ -463,11 +463,11 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
         for patch in &draw.patches {
             if patch
                 .own
-                .validate_view_transform(self.view.budget())
+                .validate_view_transform(draw.precision_budget(&patch.own))
                 .is_err()
                 || patch
                     .parent
-                    .validate_view_transform(self.view.budget())
+                    .validate_view_transform(draw.precision_budget(&patch.parent))
                     .is_err()
             {
                 self.failed = true;
@@ -1382,7 +1382,7 @@ impl CelestialRenderer {
             }
         }
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Debug celestial shading / actual history"),
+            label: Some("Celestial scene: terrain, bodies, and sky"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view,
                 depth_slice: None,
@@ -1475,7 +1475,7 @@ impl CelestialRenderer {
             .any(|draw| draw.config.atmosphere_enabled)
         {
             let mut atmosphere = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Planetary atmosphere single scattering"),
+                label: Some("Planetary atmosphere scattering"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view,
                     depth_slice: None,
@@ -1501,7 +1501,7 @@ impl CelestialRenderer {
         }
         if !storage.lines.is_empty() || !storage.polylines.is_empty() {
             let mut overlays = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Celestial guides above planetary atmosphere"),
+                label: Some("Celestial guides and overlays"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view,
                     depth_slice: None,

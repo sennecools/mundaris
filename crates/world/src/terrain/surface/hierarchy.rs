@@ -10,6 +10,7 @@ use super::{
     director::DirectedSample,
     mix,
     provinces::{ProvinceField, ProvinceSample},
+    query_context::{CachedFeature, HIERARCHICAL_FEATURE_FAMILY, SurfaceQueryContext},
     unit,
 };
 use glam::{DMat3, DVec3};
@@ -149,6 +150,24 @@ struct CellFeature {
     lineage_key: u64,
 }
 
+fn cache_feature(feature: CellFeature) -> CachedFeature {
+    CachedFeature {
+        center: feature.center,
+        key: feature.key,
+        lineage_key: feature.lineage_key,
+        edge_m: 0.0,
+        level: 0,
+    }
+}
+
+fn uncache_feature(feature: CachedFeature) -> CellFeature {
+    CellFeature {
+        center: feature.center,
+        key: feature.key,
+        lineage_key: feature.lineage_key,
+    }
+}
+
 /// Per-band work and hierarchical height decomposition from one authoritative
 /// evaluation. Gradients are tangent derivatives in metres per unit direction.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -256,6 +275,16 @@ impl HierarchicalField {
         Ok(self.evaluate_components(direction)?.sample)
     }
 
+    pub(super) fn evaluate_with_query_context(
+        &self,
+        direction: DVec3,
+        context: &mut SurfaceQueryContext<'_>,
+    ) -> Result<ProvinceSample, TerrainError> {
+        Ok(self
+            .evaluate_components_with_query_context(direction, Some(context))?
+            .sample)
+    }
+
     pub(super) fn diagnostics(
         &self,
         direction: DVec3,
@@ -264,11 +293,24 @@ impl HierarchicalField {
     }
 
     fn evaluate_components(&self, direction: DVec3) -> Result<Evaluation, TerrainError> {
+        self.evaluate_components_with_query_context(direction, None)
+    }
+
+    fn evaluate_components_with_query_context(
+        &self,
+        direction: DVec3,
+        mut context: Option<&mut SurfaceQueryContext<'_>>,
+    ) -> Result<Evaluation, TerrainError> {
         if !direction.is_finite() || direction.length_squared() <= f64::MIN_POSITIVE {
             return Err(TerrainError::InvalidConfig);
         }
         let n = direction.normalize();
-        let (inherited, parent_context) = self.parent.evaluate_with_context(direction)?;
+        let (inherited, parent_context) = if let Some(context) = context.as_deref_mut() {
+            self.parent
+                .evaluate_with_query_context(direction, context)?
+        } else {
+            self.parent.evaluate_with_context(direction)?
+        };
         let directed = parent_context.directed;
         let parent_controls = directed.controls;
         let point = n * self.radius_m;
@@ -276,16 +318,34 @@ impl HierarchicalField {
             Differential::new(parent_context.morphology, parent_context.gradient);
         let mut contributions = [Differential::constant(0.0); 3];
         let mut band_work = [SurfaceQueryWork::default(); 3];
-        contributions[0] =
-            self.evaluate_band(point, 0, parent_morphology, &directed, &mut band_work[0])?;
+        contributions[0] = self.evaluate_band(
+            point,
+            0,
+            parent_morphology,
+            &directed,
+            &mut band_work[0],
+            context.as_deref_mut(),
+        )?;
         let regional_context =
             parent_morphology + normalize_contribution(n, contributions[0], self.band_budget(0));
-        contributions[1] =
-            self.evaluate_band(point, 1, regional_context, &directed, &mut band_work[1])?;
+        contributions[1] = self.evaluate_band(
+            point,
+            1,
+            regional_context,
+            &directed,
+            &mut band_work[1],
+            context.as_deref_mut(),
+        )?;
         let local_context =
             regional_context + normalize_contribution(n, contributions[1], self.band_budget(1));
-        contributions[2] =
-            self.evaluate_band(point, 2, local_context, &directed, &mut band_work[2])?;
+        contributions[2] = self.evaluate_band(
+            point,
+            2,
+            local_context,
+            &directed,
+            &mut band_work[2],
+            context.as_deref_mut(),
+        )?;
         let total = Differential::new(inherited.height_m, inherited.gradient_m)
             + contributions[0]
             + contributions[1]
@@ -338,6 +398,7 @@ impl HierarchicalField {
         parent_context: Differential,
         directed: &DirectedSample,
         work: &mut SurfaceQueryWork,
+        mut context: Option<&mut SurfaceQueryContext<'_>>,
     ) -> Result<Differential, TerrainError> {
         let edge = BAND_EDGES_M[band].max(8.0);
         let support_radius = edge * SUPPORT;
@@ -358,7 +419,16 @@ impl HierarchicalField {
                 for y in base[1] - 1..=base[1] + 1 {
                     for z in base[2] - 1..=base[2] + 1 {
                         work.cells_visited += 1;
-                        let Some(feature) = self.feature(x, y, z, band, layout, edge) else {
+                        let feature = if let Some(context) = context.as_deref_mut() {
+                            context
+                                .feature(HIERARCHICAL_FEATURE_FAMILY, band, layout, x, y, z, || {
+                                    self.feature(x, y, z, band, layout, edge).map(cache_feature)
+                                })
+                                .map(uncache_feature)
+                        } else {
+                            self.feature(x, y, z, band, layout, edge)
+                        };
+                        let Some(feature) = feature else {
                             continue;
                         };
                         work.candidate_features += 1;
@@ -373,7 +443,19 @@ impl HierarchicalField {
                         let accepted = work.accepted_features.get_or_insert(0);
                         *accepted = accepted.saturating_add(1);
                         let window = (Differential::constant(1.0) - q2).cube();
-                        let controls = self.parent.controls(feature.center.normalize())?;
+                        let controls = if let Some(context) = context.as_deref_mut() {
+                            context.controls(
+                                HIERARCHICAL_FEATURE_FAMILY,
+                                band,
+                                layout,
+                                x,
+                                y,
+                                z,
+                                || self.parent.controls(feature.center.normalize()),
+                            )?
+                        } else {
+                            self.parent.controls(feature.center.normalize())?
+                        };
                         let profile =
                             self.profile(point, feature, edge, q2, controls, parent_context)?;
                         let amplitude = self.band_budget(band);
@@ -920,6 +1002,7 @@ mod tests {
                         Differential::constant(0.0),
                         &context.directed,
                         &mut work,
+                        None,
                     )
                     .unwrap();
                 if work.accepted_features.unwrap_or_default() > 0 {

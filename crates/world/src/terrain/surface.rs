@@ -12,7 +12,9 @@ mod director;
 mod geology;
 mod hierarchy;
 mod provinces;
+mod query_context;
 pub use hierarchy::SurfaceDetailDiagnostics;
+pub use query_context::{SurfaceQueryCacheStats, SurfaceQueryContext};
 
 /// Independent geological algorithm namespaces; parameters remain explicit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -909,7 +911,28 @@ impl SurfaceGenerator {
         Ok(output)
     }
 
+    /// Create a bounded, generator-bound cache for a worker or tile build.
+    pub fn query_context(&self) -> SurfaceQueryContext<'_> {
+        SurfaceQueryContext::new(self)
+    }
+
     pub fn evaluate_point(&self, location: SurfaceLocation) -> Result<SurfaceSample, TerrainError> {
+        self.evaluate_point_inner(location, None)
+    }
+
+    fn evaluate_point_with_context(
+        &self,
+        location: SurfaceLocation,
+        context: &mut SurfaceQueryContext<'_>,
+    ) -> Result<SurfaceSample, TerrainError> {
+        self.evaluate_point_inner(location, Some(context))
+    }
+
+    fn evaluate_point_inner(
+        &self,
+        location: SurfaceLocation,
+        mut context: Option<&mut SurfaceQueryContext<'_>>,
+    ) -> Result<SurfaceSample, TerrainError> {
         let n = location.direction().unit();
         let shape = self
             .definition
@@ -964,11 +987,19 @@ impl SurfaceGenerator {
                 (s.height_m, s.gradient_m, s.weights, s.work)
             }
             GeologicalField::Province(g) => {
-                let s = g.evaluate(n)?;
+                let s = if let Some(context) = context.as_deref_mut() {
+                    g.evaluate_with_query_context(n, context)?.0
+                } else {
+                    g.evaluate(n)?
+                };
                 (s.height_m, s.gradient_m, s.weights, s.work)
             }
             GeologicalField::Hierarchical(g) => {
-                let s = g.evaluate(n)?;
+                let s = if let Some(context) = context.as_deref_mut() {
+                    g.evaluate_with_query_context(n, context)?
+                } else {
+                    g.evaluate(n)?
+                };
                 (s.height_m, s.gradient_m, s.weights, s.work)
             }
         };

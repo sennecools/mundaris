@@ -1,11 +1,14 @@
 use super::{
     ReconstructedTileVertex, ResidentTileReport, TileData, TileDraw, TileKey, TileSlotState,
 };
-use crate::regional_resident::{RegionalResidentDraw, RegionalResidentReport, RegionalSlotReport};
+use crate::regional_resident::{
+    RegionalBoundaryEndpoints, RegionalEndpointValidationCache, RegionalResidentDraw,
+    RegionalResidentReport, RegionalSlotReport,
+};
 use crate::{RenderPreparationError, ResidentHierarchyDraw, ResidentHierarchyReport};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
-    Arc,
+    Arc, Weak,
     atomic::{AtomicU64, Ordering},
 };
 use wgpu::util::DeviceExt;
@@ -30,6 +33,7 @@ pub(crate) struct ResidentTileRenderer {
     tile_groups: BTreeMap<(usize, usize), wgpu::BindGroup>,
     params_layout: wgpu::BindGroupLayout,
     params_buffer: wgpu::Buffer,
+    params_cache: Vec<Option<[u8; PARAM_BYTES as usize]>>,
     validation_buffer: wgpu::Buffer,
     params_group: wgpu::BindGroup,
     grid_vertices: Option<wgpu::Buffer>,
@@ -40,6 +44,7 @@ pub(crate) struct ResidentTileRenderer {
     report: ResidentTileReport,
     hierarchy_report: ResidentHierarchyReport,
     regional_report: RegionalResidentReport,
+    regional_endpoint_validation: RegionalEndpointValidationCache,
     regional_draw: Option<RegionalResidentDraw>,
     completed_submission: Arc<AtomicU64>,
     submission_serial: u64,
@@ -59,7 +64,46 @@ struct ResidentTileGpuSlot {
     edge_capacity: u64,
     own_edge_version: Option<u64>,
     parent_boundary: Option<crate::regional_edges::TileBoundary>,
+    parent_boundary_identity: Weak<RegionalBoundaryEndpoints>,
     last_use_submission: u64,
+}
+
+#[derive(Default)]
+struct RegionalPreparationTimings {
+    validation_dependency_micros: Option<u64>,
+    resource_allocation_nanos: Option<u128>,
+    gpu_upload_preparation_nanos: Option<u128>,
+    cached_endpoint_validation_micros: Option<u64>,
+    proposed_slot_state_micros: Option<u64>,
+    slot_dependency_check_micros: Option<u64>,
+    metadata_pack_queue_write_nanos: Option<u128>,
+    draw_retention_micros: Option<u64>,
+    report_assembly_micros: Option<u64>,
+    endpoint_validation_cache_hits: u64,
+    endpoint_validation_cache_misses: u64,
+    prepare_patch_count: usize,
+    prepare_upload_count: usize,
+    prepare_distinct_slot_count: usize,
+}
+
+fn elapsed_micros(started: std::time::Instant) -> u64 {
+    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn elapsed_nanos(started: std::time::Instant) -> u128 {
+    started.elapsed().as_nanos()
+}
+
+fn nanos_to_micros(nanos: Option<u128>) -> Option<u64> {
+    nanos.map(|nanos| (nanos / 1_000).min(u128::from(u64::MAX)) as u64)
+}
+
+fn add_nanos(total: &mut Option<u128>, elapsed: u128) {
+    *total = Some((*total).unwrap_or(0).saturating_add(elapsed));
+}
+
+fn add_elapsed_nanos(total: &mut Option<u128>, started: std::time::Instant) {
+    add_nanos(total, elapsed_nanos(started));
 }
 
 struct SlotPreflight {
@@ -89,6 +133,7 @@ impl ResidentTileGpuSlot {
             edge_capacity: 48,
             own_edge_version: None,
             parent_boundary: None,
+            parent_boundary_identity: Weak::new(),
             last_use_submission: 0,
         }
     }
@@ -255,6 +300,7 @@ impl ResidentTileRenderer {
             tile_groups,
             params_layout,
             params_buffer,
+            params_cache: Vec::new(),
             validation_buffer,
             params_group,
             grid_vertices: None,
@@ -265,6 +311,7 @@ impl ResidentTileRenderer {
             report: ResidentTileReport::default(),
             hierarchy_report: ResidentHierarchyReport::default(),
             regional_report: RegionalResidentReport::default(),
+            regional_endpoint_validation: RegionalEndpointValidationCache::default(),
             regional_draw: None,
             completed_submission: Arc::new(AtomicU64::new(0)),
             submission_serial: 0,
@@ -426,8 +473,61 @@ impl ResidentTileRenderer {
         queue: &wgpu::Queue,
         draw: &RegionalResidentDraw,
     ) -> Result<(), RenderPreparationError> {
-        draw.validate()
-            .map_err(|_| RenderPreparationError::InvalidResidentTile)?;
+        let prepare_started = std::time::Instant::now();
+        let mut timings = RegionalPreparationTimings {
+            prepare_patch_count: draw.patches.len(),
+            prepare_upload_count: draw.uploads.len(),
+            ..RegionalPreparationTimings::default()
+        };
+        let result = self.prepare_regional_inner(device, queue, draw, &mut timings);
+        let total_micros = elapsed_micros(prepare_started);
+        let measured_micros = timings
+            .validation_dependency_micros
+            .unwrap_or(0)
+            .saturating_add(nanos_to_micros(timings.resource_allocation_nanos).unwrap_or(0))
+            .saturating_add(nanos_to_micros(timings.gpu_upload_preparation_nanos).unwrap_or(0));
+        self.regional_report.preparation_micros = total_micros;
+        self.regional_report.validation_dependency_micros = timings.validation_dependency_micros;
+        self.regional_report.resource_allocation_micros =
+            nanos_to_micros(timings.resource_allocation_nanos);
+        self.regional_report.gpu_upload_preparation_micros =
+            nanos_to_micros(timings.gpu_upload_preparation_nanos);
+        self.regional_report.cached_endpoint_validation_micros =
+            timings.cached_endpoint_validation_micros;
+        self.regional_report.proposed_slot_state_micros = timings.proposed_slot_state_micros;
+        self.regional_report.slot_dependency_check_micros = timings.slot_dependency_check_micros;
+        self.regional_report.metadata_pack_queue_write_micros =
+            nanos_to_micros(timings.metadata_pack_queue_write_nanos);
+        self.regional_report.draw_retention_micros = timings.draw_retention_micros;
+        self.regional_report.report_assembly_micros = timings.report_assembly_micros;
+        self.regional_report.endpoint_validation_cache_hits =
+            timings.endpoint_validation_cache_hits;
+        self.regional_report.endpoint_validation_cache_misses =
+            timings.endpoint_validation_cache_misses;
+        self.regional_report.prepare_patch_count = timings.prepare_patch_count;
+        self.regional_report.prepare_upload_count = timings.prepare_upload_count;
+        self.regional_report.prepare_distinct_slot_count = timings.prepare_distinct_slot_count;
+        self.regional_report.drawable_metadata_micros = result
+            .is_ok()
+            .then_some(total_micros.saturating_sub(measured_micros));
+        result
+    }
+
+    fn prepare_regional_inner(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        draw: &RegionalResidentDraw,
+        timings: &mut RegionalPreparationTimings,
+    ) -> Result<(), RenderPreparationError> {
+        let validation_started = std::time::Instant::now();
+        let cached_validation_started = std::time::Instant::now();
+        let (validation, cache_counts) =
+            draw.validate_cached_profiled(&mut self.regional_endpoint_validation);
+        timings.cached_endpoint_validation_micros = Some(elapsed_micros(cached_validation_started));
+        timings.endpoint_validation_cache_hits = cache_counts.hits;
+        timings.endpoint_validation_cache_misses = cache_counts.misses;
+        validation.map_err(|_| RenderPreparationError::InvalidResidentTile)?;
         self.preflight_grid(device, draw.cells)?;
         let params_bytes = PARAM_STRIDE
             .checked_mul(draw.capacity as u64)
@@ -440,6 +540,7 @@ impl ResidentTileRenderer {
             return Err(RenderPreparationError::InvalidResidentTile);
         }
 
+        let proposal_started = std::time::Instant::now();
         let mut proposed_states = BTreeMap::<usize, TileSlotState>::new();
         let mut upload_bytes = BTreeMap::<usize, Option<u64>>::new();
         for upload in &draw.uploads {
@@ -507,7 +608,10 @@ impl ResidentTileRenderer {
                 proposed_states.insert(slot_index, state);
             }
         }
+        timings.proposed_slot_state_micros = Some(elapsed_micros(proposal_started));
+        timings.prepare_distinct_slot_count = proposed_states.len();
 
+        let dependency_started = std::time::Instant::now();
         let completed = self.completed_submission.load(Ordering::Acquire);
         let upload_by_slot: BTreeMap<_, _> = draw
             .uploads
@@ -546,7 +650,9 @@ impl ResidentTileRenderer {
                 }
             }
         }
+        timings.slot_dependency_check_micros = Some(elapsed_micros(dependency_started));
         if blocked_dependencies {
+            timings.validation_dependency_micros = Some(elapsed_micros(validation_started));
             let mut report = self.regional_report.clone();
             report.capacity = draw.capacity;
             report.tile_upload_bytes = 0;
@@ -561,6 +667,7 @@ impl ResidentTileRenderer {
                 .iter()
                 .map(|patch| patch.own.mode)
                 .find(|mode| (6..=10).contains(mode));
+            let retention_started = std::time::Instant::now();
             if let (Some(previous), Some(reference)) = (
                 self.regional_draw.as_mut(),
                 draw.patches.first().map(|patch| &patch.own),
@@ -586,6 +693,8 @@ impl ResidentTileRenderer {
             }
             if let Some(previous) = self.regional_draw.clone() {
                 let active_patch_indices = self.regional_active_patches.clone();
+                timings.draw_retention_micros = Some(elapsed_micros(retention_started));
+                let metadata_started = std::time::Instant::now();
                 for patch_index in active_patch_indices {
                     if let Some(patch) = previous.patches.get(patch_index) {
                         let parent_delta = if patch.quadrant.is_some() {
@@ -616,11 +725,19 @@ impl ResidentTileRenderer {
                             patch.parent_slot,
                             2.0,
                         );
-                        self.write_params(queue, patch_index, &params, PrepareKind::Render);
-                        report.metadata_upload_bytes += PARAM_BYTES;
+                        if self.write_params(queue, patch_index, &params, PrepareKind::Render) {
+                            report.metadata_upload_bytes += PARAM_BYTES;
+                        }
                     }
                 }
+                add_elapsed_nanos(
+                    &mut timings.metadata_pack_queue_write_nanos,
+                    metadata_started,
+                );
+            } else {
+                timings.draw_retention_micros = Some(elapsed_micros(retention_started));
             }
+            let report_started = std::time::Instant::now();
             report.slots = (0..draw.capacity)
                 .map(|index| {
                     let old = self.tile_slots.get(REGIONAL_SLOT_BASE + index);
@@ -646,7 +763,11 @@ impl ResidentTileRenderer {
                 .iter()
                 .filter(|slot| slot.key.is_some())
                 .count();
-            report.evictable_count = report.resident_count.saturating_sub(report.pinned_count);
+            report.evictable_count = report
+                .slots
+                .iter()
+                .filter(|slot| slot.key.is_some() && slot.reuse_safe)
+                .count();
             let regional_slots = self.tile_slots.iter().skip(REGIONAL_SLOT_BASE);
             report.allocated_slot_count = self.tile_slots.len().saturating_sub(REGIONAL_SLOT_BASE);
             report.tile_capacity_bytes = regional_slots.clone().map(|slot| slot.capacity).sum();
@@ -667,25 +788,80 @@ impl ResidentTileRenderer {
                 .map(|slot| slot.edge_capacity)
                 .sum();
             report.metadata_capacity_bytes = self.params_buffer.size();
+            report.metadata_cpu_capacity_bytes = self.params_cache.capacity() as u64
+                * std::mem::size_of::<Option<[u8; PARAM_BYTES as usize]>>() as u64;
+            report.metadata_cpu_capacity_bytes +=
+                self.regional_endpoint_validation.capacity_bytes();
+            report.boundary_cpu_capacity_bytes = self
+                .tile_slots
+                .iter()
+                .filter_map(|slot| slot.parent_boundary.as_ref())
+                .map(|boundary| {
+                    boundary
+                        .edges
+                        .iter()
+                        .map(|edge| {
+                            edge.capacity() as u64
+                                * std::mem::size_of::<crate::regional_edges::BoundaryVertex>()
+                                    as u64
+                        })
+                        .sum::<u64>()
+                })
+                .sum();
             report.grid_capacity_bytes = self.grid_capacity_bytes;
             report.validation_capacity_bytes = self.validation_buffer.size();
             report.fallback_active = true;
+            report.resident_tile_capacity_bytes = 0;
+            report.pinned_tile_capacity_bytes = 0;
+            report.in_flight_tile_capacity_bytes = 0;
+            report.evictable_tile_capacity_bytes = 0;
+            for (index, slot) in self.tile_slots.iter().skip(REGIONAL_SLOT_BASE).enumerate() {
+                let pinned = report.slots.get(index).is_some_and(|state| state.pinned);
+                let in_flight = slot.last_use_submission > completed;
+                if slot.resident_key.is_some() {
+                    report.resident_tile_capacity_bytes += slot.capacity;
+                }
+                if pinned {
+                    report.pinned_tile_capacity_bytes += slot.capacity;
+                }
+                if in_flight {
+                    report.in_flight_tile_capacity_bytes += slot.capacity;
+                }
+                if slot.resident_key.is_some() && !pinned && !in_flight {
+                    report.evictable_tile_capacity_bytes += slot.capacity;
+                }
+            }
+            timings.report_assembly_micros = Some(elapsed_micros(report_started));
             self.regional_report = report;
             return Ok(());
         }
         if self.regional_cells != 0 && self.regional_cells != draw.cells {
             return Err(RenderPreparationError::InvalidResidentTile);
         }
+        timings.validation_dependency_micros = Some(elapsed_micros(validation_started));
 
         // All structural and payload checks have passed. Allocate the bounded
         // regional buffers only after the transaction is known to be valid.
-        self.ensure_regional_resources(
+        let allocation_started = std::time::Instant::now();
+        let resources_result = self.ensure_regional_resources(
             device,
-            draw.capacity,
+            draw.uploads
+                .iter()
+                .map(|u| u.slot + 1)
+                .chain(
+                    draw.patches
+                        .iter()
+                        .flat_map(|p| [p.own_slot + 1, p.parent_slot + 1]),
+                )
+                .max()
+                .unwrap_or(0),
             draw.cells,
             params_bytes,
             edge_bytes,
-        )?;
+        );
+        timings.resource_allocation_nanos = Some(elapsed_nanos(allocation_started));
+        resources_result?;
+        timings.gpu_upload_preparation_nanos = Some(0);
         self.clear_for_kind(PrepareKind::Render);
         let mut next_active = Vec::new();
         let mut report = RegionalResidentReport {
@@ -708,9 +884,14 @@ impl ResidentTileRenderer {
                 continue;
             }
             if let Some(required) = upload_bytes[&upload.slot] {
-                self.ensure_tile_capacity(device, physical_slot, required)?;
+                let allocation_started = std::time::Instant::now();
+                let allocation_result = self.ensure_tile_capacity(device, physical_slot, required);
+                add_elapsed_nanos(&mut timings.resource_allocation_nanos, allocation_started);
+                allocation_result?;
+                let upload_started = std::time::Instant::now();
                 let bytes = pack_tile(&upload.tile.tile);
                 queue.write_buffer(&self.tile_slots[physical_slot].buffer, 0, &bytes);
+                add_elapsed_nanos(&mut timings.gpu_upload_preparation_nanos, upload_started);
                 let slot = &mut self.tile_slots[physical_slot];
                 slot.publication_state = proposed_states
                     .remove(&upload.slot)
@@ -719,6 +900,7 @@ impl ResidentTileRenderer {
                 slot.resident_tile = Some(Arc::clone(&upload.tile.tile));
                 slot.own_edge_version = None;
                 slot.parent_boundary = None;
+                slot.parent_boundary_identity = Weak::new();
                 report.tile_upload_bytes += bytes.len() as u64;
                 report.tile_upload_count += 1;
                 report.cumulative_tile_upload_bytes = report
@@ -764,14 +946,16 @@ impl ResidentTileRenderer {
                         .map(|parent_anchor| own_anchor - parent_anchor)
                 })
                 .map_err(|_| RenderPreparationError::InvalidResidentTile)?;
-            crate::RenderPrecisionBudget::near_debug()
+            draw.precision_budget(&patch.parent)
                 .try_view_relative_position(delta)
                 .map_err(|_| RenderPreparationError::InvalidResidentTile)?;
             if self.tile_slots[own_physical_slot].own_edge_version
                 != Some(patch.boundary_endpoints.version)
             {
+                let upload_started = std::time::Instant::now();
                 let packed = pack_own_boundaries(&patch.boundary_endpoints, draw.cells);
                 queue.write_buffer(&self.tile_slots[own_physical_slot].edge_buffer, 0, &packed);
+                add_elapsed_nanos(&mut timings.gpu_upload_preparation_nanos, upload_started);
                 self.tile_slots[own_physical_slot].own_edge_version =
                     Some(patch.boundary_endpoints.version);
                 report.boundary_upload_bytes += packed.len() as u64;
@@ -782,17 +966,23 @@ impl ResidentTileRenderer {
                 report.cumulative_boundary_upload_count =
                     report.cumulative_boundary_upload_count.saturating_add(1);
             }
-            if self.tile_slots[parent_physical_slot]
-                .parent_boundary
-                .as_ref()
-                != Some(&patch.boundary_endpoints.parent)
-            {
+            let parent_matches = self.tile_slots[parent_physical_slot]
+                .parent_boundary_identity
+                .upgrade()
+                .is_some_and(|previous| Arc::ptr_eq(&previous, &patch.boundary_endpoints))
+                || self.tile_slots[parent_physical_slot]
+                    .parent_boundary
+                    .as_ref()
+                    == Some(&patch.boundary_endpoints.parent);
+            if !parent_matches {
+                let upload_started = std::time::Instant::now();
                 let packed = pack_parent_boundary(&patch.boundary_endpoints, draw.cells);
                 queue.write_buffer(
                     &self.tile_slots[parent_physical_slot].edge_buffer,
                     edge_layer_offset(draw.cells, 2)?,
                     &packed,
                 );
+                add_elapsed_nanos(&mut timings.gpu_upload_preparation_nanos, upload_started);
                 self.tile_slots[parent_physical_slot].parent_boundary =
                     Some(patch.boundary_endpoints.parent.clone());
                 report.boundary_upload_bytes += packed.len() as u64;
@@ -803,6 +993,8 @@ impl ResidentTileRenderer {
                 report.cumulative_boundary_upload_count =
                     report.cumulative_boundary_upload_count.saturating_add(1);
             }
+            self.tile_slots[parent_physical_slot].parent_boundary_identity =
+                Arc::downgrade(&patch.boundary_endpoints);
             let parent_delta = if let Some(quadrant) = patch.quadrant {
                 let parent_st = [f64::from(quadrant[0]) * 0.5, f64::from(quadrant[1]) * 0.5];
                 let _ = parent_st;
@@ -826,6 +1018,7 @@ impl ResidentTileRenderer {
                     .insert((own_physical_slot, parent_physical_slot), group);
             }
             active_pairs.insert((own_physical_slot, parent_physical_slot));
+            let metadata_started = std::time::Instant::now();
             let params = pack_params(
                 &patch.own,
                 &patch.parent,
@@ -838,21 +1031,29 @@ impl ResidentTileRenderer {
                 patch.parent_slot,
                 if patch.quality_fallback { 1.0 } else { 0.0 },
             );
-            self.write_params(queue, patch_index, &params, PrepareKind::Render);
-            report.metadata_upload_bytes += PARAM_BYTES;
+            if self.write_params(queue, patch_index, &params, PrepareKind::Render) {
+                report.metadata_upload_bytes += PARAM_BYTES;
+            }
+            add_elapsed_nanos(
+                &mut timings.metadata_pack_queue_write_nanos,
+                metadata_started,
+            );
             used_slots.insert(own_physical_slot);
             used_slots.insert(parent_physical_slot);
             next_active.push(patch_index);
         }
+        let retention_started = std::time::Instant::now();
         self.prepared_draw_slots = used_slots.clone();
         self.regional_active_patches = next_active;
         self.regional_draw = Some(draw.clone());
         self.tile_groups.retain(|(own, parent), _| {
             (*own < SLOT_COUNT && *parent < SLOT_COUNT) || active_pairs.contains(&(*own, *parent))
         });
+        timings.draw_retention_micros = Some(elapsed_micros(retention_started));
+        let report_started = std::time::Instant::now();
         let pinned: BTreeSet<_> = used_slots;
-        let regional_slots =
-            &self.tile_slots[REGIONAL_SLOT_BASE..REGIONAL_SLOT_BASE + draw.capacity];
+        let regional_slots = &self.tile_slots
+            [REGIONAL_SLOT_BASE..(REGIONAL_SLOT_BASE + draw.capacity).min(self.tile_slots.len())];
         report.resident_count = regional_slots
             .iter()
             .filter(|slot| slot.resident_key.is_some())
@@ -872,6 +1073,24 @@ impl ResidentTileRenderer {
         report.active_boundary_capacity_bytes =
             regional_slots.iter().map(|slot| slot.edge_capacity).sum();
         report.metadata_capacity_bytes = self.params_buffer.size();
+        report.metadata_cpu_capacity_bytes = self.params_cache.capacity() as u64
+            * std::mem::size_of::<Option<[u8; PARAM_BYTES as usize]>>() as u64;
+        report.metadata_cpu_capacity_bytes += self.regional_endpoint_validation.capacity_bytes();
+        report.boundary_cpu_capacity_bytes = self
+            .tile_slots
+            .iter()
+            .filter_map(|slot| slot.parent_boundary.as_ref())
+            .map(|boundary| {
+                boundary
+                    .edges
+                    .iter()
+                    .map(|edge| {
+                        edge.capacity() as u64
+                            * std::mem::size_of::<crate::regional_edges::BoundaryVertex>() as u64
+                    })
+                    .sum::<u64>()
+            })
+            .sum();
         report.grid_capacity_bytes = self.grid_capacity_bytes;
         report.validation_capacity_bytes = self.validation_buffer.size();
         report.slots = regional_slots
@@ -889,19 +1108,38 @@ impl ResidentTileRenderer {
                 }
             })
             .collect();
+        report.evictable_count = report
+            .slots
+            .iter()
+            .filter(|slot| slot.key.is_some() && slot.reuse_safe)
+            .count();
         report.in_flight_count = report.slots.iter().filter(|slot| slot.in_flight).count();
         report.transfer_staging_bytes = report
             .tile_upload_bytes
             .saturating_add(report.boundary_upload_bytes);
-        report.active_morph_count = draw
-            .patches
+        report.active_morph_count = self
+            .regional_active_patches
             .iter()
-            .enumerate()
-            .filter(|(index, patch)| {
-                self.regional_active_patches.contains(index)
-                    && (patch.morph_fraction < 1.0 || patch.boundary_fraction < 1.0)
-            })
+            .filter_map(|index| draw.patches.get(*index))
+            .filter(|patch| patch.morph_fraction < 1.0 || patch.boundary_fraction < 1.0)
             .count();
+        for (index, slot) in self.tile_slots.iter().skip(REGIONAL_SLOT_BASE).enumerate() {
+            let pinned = report.slots.get(index).is_some_and(|state| state.pinned);
+            let in_flight = slot.last_use_submission > completed;
+            if slot.resident_key.is_some() {
+                report.resident_tile_capacity_bytes += slot.capacity;
+            }
+            if pinned {
+                report.pinned_tile_capacity_bytes += slot.capacity;
+            }
+            if in_flight {
+                report.in_flight_tile_capacity_bytes += slot.capacity;
+            }
+            if slot.resident_key.is_some() && !pinned && !in_flight {
+                report.evictable_tile_capacity_bytes += slot.capacity;
+            }
+        }
+        timings.report_assembly_micros = Some(elapsed_micros(report_started));
         self.regional_report = report;
         self.regional_cells = draw.cells;
         self.finish_report();
@@ -985,6 +1223,7 @@ impl ResidentTileRenderer {
                 .saturating_add((required_slot_count - old_len) as u32);
         }
         if self.params_buffer.size() < params_bytes {
+            self.params_cache.clear();
             self.params_buffer = create_buffer(
                 device,
                 params_bytes,
@@ -1011,6 +1250,7 @@ impl ResidentTileRenderer {
                 slot.edge_capacity = edge_bytes;
                 slot.own_edge_version = None;
                 slot.parent_boundary = None;
+                slot.parent_boundary_identity = Weak::new();
                 edge_changed = true;
                 self.allocation_count = self.allocation_count.saturating_add(1);
             }
@@ -1109,6 +1349,7 @@ impl ResidentTileRenderer {
             slot.resident_tile = Some(Arc::clone(&draw.tile));
             slot.own_edge_version = None;
             slot.parent_boundary = None;
+            slot.parent_boundary_identity = Weak::new();
         }
         match kind {
             PrepareKind::Render => {
@@ -1230,8 +1471,15 @@ impl ResidentTileRenderer {
         slot: usize,
         params: &[u8; PARAM_BYTES as usize],
         kind: PrepareKind,
-    ) {
+    ) -> bool {
+        if self.params_cache.get(slot).and_then(Option::as_ref) == Some(params) {
+            return false;
+        }
+        if self.params_cache.len() <= slot {
+            self.params_cache.resize(slot + 1, None);
+        }
         queue.write_buffer(&self.params_buffer, slot as u64 * PARAM_STRIDE, params);
+        self.params_cache[slot] = Some(*params);
         match kind {
             PrepareKind::Render => {
                 self.report.metadata_upload_bytes = self
@@ -1246,6 +1494,7 @@ impl ResidentTileRenderer {
                     .saturating_add(params.len() as u64)
             }
         }
+        true
     }
 
     pub(crate) fn draw(&self, pass: &mut wgpu::RenderPass<'_>, projection: &wgpu::BindGroup) {
@@ -1942,6 +2191,7 @@ mod regional_pressure_tests {
         version: u64,
     ) -> RegionalResidentDraw {
         RegionalResidentDraw {
+            planetary: false,
             capacity: 1,
             cells: 2,
             uploads: vec![RegionalTileUpload {
@@ -2071,5 +2321,20 @@ mod regional_pressure_tests {
             assert_eq!(retained.own.mode, 10);
             assert_eq!(renderer.regional_report.metadata_upload_bytes, PARAM_BYTES);
         });
+    }
+}
+
+#[cfg(test)]
+mod preparation_timing_tests {
+    use super::{add_nanos, nanos_to_micros};
+
+    #[test]
+    fn repeated_submicrosecond_spans_are_converted_after_accumulation() {
+        let mut total_nanos = None;
+        for _ in 0..10 {
+            add_nanos(&mut total_nanos, 100);
+        }
+        assert_eq!(nanos_to_micros(total_nanos), Some(1));
+        assert_eq!(nanos_to_micros(Some(999)), Some(0));
     }
 }

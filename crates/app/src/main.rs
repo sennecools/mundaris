@@ -179,11 +179,22 @@ impl ApplicationHandler<AppEvent> for MundarisApp {
         #[cfg(feature = "developer-tools")]
         if matches!(
             &event,
-            WindowEvent::KeyboardInput { .. }
-                | WindowEvent::MouseInput { .. }
+            // Winit synthesizes keyboard state on Windows focus changes.
+            // Those events do not represent a human taking automation control.
+            WindowEvent::KeyboardInput {
+                is_synthetic: false,
+                ..
+            } | WindowEvent::MouseInput { .. }
                 | WindowEvent::MouseWheel { .. }
         ) && let (Some(service), Some(demo)) = (&mut self.developer, &mut self.gravity_demo)
         {
+            let input_kind = match &event {
+                WindowEvent::KeyboardInput { .. } => "keyboard",
+                WindowEvent::MouseInput { .. } => "mouse_button",
+                WindowEvent::MouseWheel { .. } => "mouse_wheel",
+                _ => unreachable!(),
+            };
+            info!(input_kind, "developer session received human input");
             service.interrupt(demo, renderer, "human_input");
         }
 
@@ -205,6 +216,10 @@ impl ApplicationHandler<AppEvent> for MundarisApp {
                     return;
                 }
                 let size = window.inner_size();
+                // Windows can expose the new client extent before delivering
+                // Resized. Projection and the acquired target must agree even
+                // when RedrawRequested arrives first.
+                renderer.resize(size.width, size.height);
                 let result = if let Some(demo) = &mut self.demo {
                     demo.render(renderer, size.width, size.height)
                 } else if let Some(demo) = &mut self.celestial_demo {
@@ -304,7 +319,10 @@ fn main() -> Result<()> {
         .build()
         .context("creating the native event loop")?;
     let mut arguments: Vec<_> = std::env::args().skip(1).collect();
-    let dev_interface = arguments.iter().any(|a| a == "--dev-interface");
+    let dev_interface = arguments.iter().any(|a| a == "--dev-interface")
+        || cfg!(feature = "developer-tools")
+            && (std::env::var("MUNDARIS_PERFORMANCE_LAB").is_ok_and(|value| value == "1")
+                || std::env::var_os("MUNDARIS_CAPTURE_DIR").is_some());
     anyhow::ensure!(
         arguments
             .iter()
@@ -319,7 +337,9 @@ fn main() -> Result<()> {
         !dev_interface,
         "--dev-interface requires the developer-tools build feature"
     );
-    let usage = "usage: mundaris_app [--solar-system | --real-solar-system | --reference-frames | --celestial-model | --gravity-orbits]";
+    let legacy_terrain = arguments.iter().any(|a| a == "--legacy-terrain");
+    arguments.retain(|a| a != "--legacy-terrain");
+    let usage = "usage: mundaris_app [--solar-system | --real-solar-system | --reference-frames | --celestial-model | --gravity-orbits] [--legacy-terrain]";
     anyhow::ensure!(
         arguments.len() <= 1,
         "conflicting or duplicate arguments; {usage}"
@@ -339,6 +359,9 @@ fn main() -> Result<()> {
         gravity_orbits,
         solar_scale,
     )?;
+    if legacy_terrain && let Some(demo) = &mut app.gravity_demo {
+        demo.use_legacy_terrain();
+    }
     #[cfg(feature = "developer-tools")]
     if dev_interface {
         anyhow::ensure!(

@@ -50,6 +50,9 @@ pub struct RegionalPatchDraw {
 /// One bounded upload/draw transaction for a regional adaptive cover.
 #[derive(Debug, Clone)]
 pub struct RegionalResidentDraw {
+    /// Planetary presentation uses a footprint-scaled narrowing budget. Finite
+    /// precision fixtures retain the original 10 km / 1 mm boundary.
+    pub planetary: bool,
     pub capacity: usize,
     pub cells: u32,
     pub uploads: Vec<RegionalTileUpload>,
@@ -59,6 +62,33 @@ pub struct RegionalResidentDraw {
 /// GPU residency and upload accounting for the latest regional transaction.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RegionalResidentReport {
+    /// Host time spent validating, admitting uploads and preparing GPU draws.
+    pub preparation_micros: u64,
+    /// Completed host time for transaction validation and slot dependency checks.
+    /// `None` means the stage did not complete (for example, validation returned an error).
+    pub validation_dependency_micros: Option<u64>,
+    /// Host time in buffer/grid/slot allocation calls. This does not include GPU execution.
+    pub resource_allocation_micros: Option<u64>,
+    /// Host time packing tile/boundary payloads and issuing their queue writes.
+    /// Queue writes are asynchronous; this is not GPU execution time.
+    pub gpu_upload_preparation_micros: Option<u64>,
+    /// Residual host time for drawable state/metadata work and report assembly after
+    /// subtracting the separately measured stages from the total preparation time.
+    pub drawable_metadata_micros: Option<u64>,
+    /// Narrow timing details; these can overlap the retained aggregate buckets.
+    pub cached_endpoint_validation_micros: Option<u64>,
+    pub proposed_slot_state_micros: Option<u64>,
+    pub slot_dependency_check_micros: Option<u64>,
+    pub metadata_pack_queue_write_micros: Option<u64>,
+    pub draw_retention_micros: Option<u64>,
+    pub report_assembly_micros: Option<u64>,
+    /// Input transaction work counts for the latest regional preparation.
+    pub prepare_patch_count: usize,
+    pub prepare_upload_count: usize,
+    pub prepare_distinct_slot_count: usize,
+    /// Endpoint references reused from or newly validated in the exact cache.
+    pub endpoint_validation_cache_hits: u64,
+    pub endpoint_validation_cache_misses: u64,
     pub capacity: usize,
     pub resident_count: usize,
     pub pinned_count: usize,
@@ -73,7 +103,16 @@ pub struct RegionalResidentReport {
     /// Capacity belonging to the currently configured logical slot pool.
     pub active_tile_capacity_bytes: u64,
     pub active_boundary_capacity_bytes: u64,
+    /// Actual retained buffer capacities in each (overlapping) slot state.
+    pub resident_tile_capacity_bytes: u64,
+    pub pinned_tile_capacity_bytes: u64,
+    pub in_flight_tile_capacity_bytes: u64,
+    pub evictable_tile_capacity_bytes: u64,
     pub metadata_capacity_bytes: u64,
+    /// Host cache of exact presentation bytes used to skip unchanged uploads.
+    pub metadata_cpu_capacity_bytes: u64,
+    /// Cached parent boundary buffers; endpoint references alias the draw cover.
+    pub boundary_cpu_capacity_bytes: u64,
     pub grid_capacity_bytes: u64,
     pub validation_capacity_bytes: u64,
     pub tile_upload_bytes: u64,
@@ -102,15 +141,36 @@ pub struct RegionalSlotReport {
 }
 
 impl RegionalResidentDraw {
+    pub fn precision_budget(&self, tile: &crate::TileDraw) -> crate::RenderPrecisionBudget {
+        if self.planetary {
+            tile.planetary_precision_budget()
+        } else {
+            crate::RenderPrecisionBudget::near_debug()
+        }
+    }
     /// Validate the whole transaction before the renderer mutates any slot.
     pub fn validate(&self) -> Result<(), crate::resident_tile::TileGeometryError> {
+        self.validate_inner(&mut |endpoints, cells| {
+            validate_boundary(&endpoints.own_coarse, cells)?;
+            validate_boundary(&endpoints.own_fine, cells)?;
+            validate_boundary(&endpoints.parent, cells)
+        })
+    }
+
+    fn validate_inner(
+        &self,
+        validate_endpoints: &mut impl FnMut(
+            &Arc<RegionalBoundaryEndpoints>,
+            u32,
+        )
+            -> Result<(), crate::resident_tile::TileGeometryError>,
+    ) -> Result<(), crate::resident_tile::TileGeometryError> {
         use crate::resident_tile::TileGeometryError;
 
         if self.capacity == 0
             || self.cells == 0
             || self.cells > TileData::MAX_CELLS
             || !self.cells.is_power_of_two()
-            || self.patches.is_empty()
             || self.patches.len() > self.capacity
             || self.uploads.len() > self.capacity
         {
@@ -160,15 +220,15 @@ impl RegionalResidentDraw {
             patch.parent.tile.validate_layout()?;
             patch
                 .own
-                .validate_view_transform(crate::RenderPrecisionBudget::near_debug())
+                .validate_view_transform(self.precision_budget(&patch.own))
                 .map_err(|_| TileGeometryError::InvalidTile)?;
             patch
                 .parent
-                .validate_view_transform(crate::RenderPrecisionBudget::near_debug())
+                .validate_view_transform(self.precision_budget(&patch.parent))
                 .map_err(|_| TileGeometryError::InvalidTile)?;
             let anchor_delta = patch.own.tile.anchor_position_body()?
                 - patch.parent.tile.anchor_position_body()?;
-            crate::RenderPrecisionBudget::near_debug()
+            self.precision_budget(&patch.parent)
                 .try_view_relative_position(anchor_delta)
                 .map_err(|_| TileGeometryError::InvalidTile)?;
             let expected_anchor =
@@ -177,9 +237,7 @@ impl RegionalResidentDraw {
                 return Err(TileGeometryError::InvalidTile);
             }
             let endpoints = &patch.boundary_endpoints;
-            validate_boundary(&endpoints.own_coarse, self.cells)?;
-            validate_boundary(&endpoints.own_fine, self.cells)?;
-            validate_boundary(&endpoints.parent, self.cells)?;
+            validate_endpoints(endpoints, self.cells)?;
 
             if let Some((parent_key, parent_boundary)) = parent_boundaries.get(&patch.parent_slot) {
                 if *parent_key != &patch.parent.tile.key || *parent_boundary != &endpoints.parent {
@@ -352,4 +410,189 @@ fn same_authority(a: &TileKey, b: &TileKey) -> bool {
         && a.format_version == b.format_version
         && a.filter_version == b.filter_version
         && a.cells == b.cells
+}
+
+/// Exact immutable endpoint validation retained only for the latest draw cover.
+/// Strong references prevent in-place mutation while their result is cached.
+#[derive(Default)]
+pub(crate) struct RegionalEndpointValidationCache {
+    cells: u32,
+    endpoints: std::collections::HashMap<usize, Arc<RegionalBoundaryEndpoints>>,
+}
+
+impl RegionalEndpointValidationCache {
+    pub(crate) fn capacity_bytes(&self) -> u64 {
+        (self.endpoints.capacity()
+            * (std::mem::size_of::<usize>()
+                + std::mem::size_of::<Arc<RegionalBoundaryEndpoints>>()
+                + 1)) as u64
+    }
+}
+
+impl RegionalResidentDraw {
+    #[cfg(test)]
+    pub(crate) fn validate_cached(
+        &self,
+        cache: &mut RegionalEndpointValidationCache,
+    ) -> Result<(), crate::resident_tile::TileGeometryError> {
+        self.validate_cached_profiled(cache).0
+    }
+
+    pub(crate) fn validate_cached_profiled(
+        &self,
+        cache: &mut RegionalEndpointValidationCache,
+    ) -> (
+        Result<(), crate::resident_tile::TileGeometryError>,
+        EndpointValidationCacheCounts,
+    ) {
+        let mut counts = EndpointValidationCacheCounts::default();
+        if cache.cells != self.cells {
+            cache.endpoints.clear();
+            cache.cells = self.cells;
+        }
+        let mut used = std::collections::HashSet::with_capacity(self.patches.len());
+        let result = self.validate_inner(&mut |endpoints, cells| {
+            let identity = Arc::as_ptr(endpoints) as usize;
+            match cache.endpoints.entry(identity) {
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    counts.hits = counts.hits.saturating_add(1);
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    counts.misses = counts.misses.saturating_add(1);
+                    validate_boundary(&endpoints.own_coarse, cells)?;
+                    validate_boundary(&endpoints.own_fine, cells)?;
+                    validate_boundary(&endpoints.parent, cells)?;
+                    entry.insert(Arc::clone(endpoints));
+                }
+            }
+            used.insert(identity);
+            Ok(())
+        });
+        if result.is_ok() {
+            cache
+                .endpoints
+                .retain(|identity, _| used.contains(identity));
+        } else {
+            cache.endpoints.clear();
+        }
+        (result, counts)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct EndpointValidationCacheCounts {
+    pub hits: u64,
+    pub misses: u64,
+}
+
+#[cfg(test)]
+mod endpoint_cache_tests {
+    use super::*;
+    use crate::{TILE_FILTER_VERSION, TILE_FORMAT_VERSION, TileSlotState, TileTexel};
+    use glam::{DMat3, DVec3};
+    use mundaris_math::surface::{CubeFace, CubePatchAddress};
+
+    fn draw() -> RegionalResidentDraw {
+        let address = CubePatchAddress::root(CubeFace::PositiveZ);
+        let tile = Arc::new(TileData {
+            key: TileKey {
+                body_identity: 1,
+                definition_words: vec![1],
+                radius_bits: 100_000.0f64.to_bits(),
+                surface_revision: 1,
+                material_revision: 1,
+                format_version: TILE_FORMAT_VERSION,
+                filter_version: TILE_FILTER_VERSION,
+                address,
+                cells: 2,
+            },
+            anchor_radius_m: 100_000.0,
+            min_max_radial_offset_m: [0.0, 0.0],
+            texels: vec![
+                TileTexel {
+                    radial_offset_m: 0.0,
+                    material: [1.0, 0.0, 0.0, 0.0]
+                };
+                25
+            ],
+        });
+        let publication = TileSlotState::default().request(&tile.key).unwrap();
+        let boundary = crate::regional_edges::build_boundaries(&BTreeMap::from([(
+            address,
+            Arc::clone(&tile),
+        )]))
+        .unwrap()
+        .remove(&address)
+        .unwrap();
+        let tile_draw = TileDraw {
+            tile,
+            publication,
+            anchor_view_m: DVec3::new(0.0, 0.0, -1000.0),
+            body_to_view: DMat3::IDENTITY,
+            mode: 0,
+            sun_body: DVec3::Z,
+        };
+        RegionalResidentDraw {
+            planetary: true,
+            capacity: 1,
+            cells: 2,
+            uploads: vec![],
+            patches: vec![RegionalPatchDraw {
+                own_slot: 0,
+                parent_slot: 0,
+                own: tile_draw.clone(),
+                parent: tile_draw,
+                morph_fraction: 1.0,
+                boundary_fraction: 1.0,
+                quadrant: None,
+                quality_fallback: false,
+                boundary_endpoints: Arc::new(RegionalBoundaryEndpoints {
+                    version: 1,
+                    own_coarse: boundary.clone(),
+                    own_fine: boundary.clone(),
+                    parent: boundary,
+                }),
+            }],
+        }
+    }
+
+    #[test]
+    fn exact_endpoint_cache_preserves_dynamic_checks_and_rejects_replacement_payloads() {
+        let original = draw();
+        let mut cache = RegionalEndpointValidationCache::default();
+        let (first, first_counts) = original.validate_cached_profiled(&mut cache);
+        first.unwrap();
+        assert_eq!(
+            first_counts,
+            EndpointValidationCacheCounts { hits: 0, misses: 1 }
+        );
+        let (second, second_counts) = original.validate_cached_profiled(&mut cache);
+        second.unwrap();
+        assert_eq!(
+            second_counts,
+            EndpointValidationCacheCounts { hits: 1, misses: 0 }
+        );
+        assert_eq!(cache.endpoints.len(), 1);
+        let mut invalid = original.clone();
+        invalid.patches[0].morph_fraction = f32::NAN;
+        assert_eq!(invalid.validate_cached(&mut cache), invalid.validate());
+        assert!(cache.endpoints.is_empty());
+        original.validate_cached(&mut cache).unwrap();
+        let mut endpoints = (*original.patches[0].boundary_endpoints).clone();
+        endpoints.parent.edges[0][0].material[0] = f64::NAN;
+        invalid = original.clone();
+        invalid.patches[0].boundary_endpoints = Arc::new(endpoints);
+        assert!(invalid.validate_cached(&mut cache).is_err());
+        assert!(cache.endpoints.is_empty());
+        original.validate_cached(&mut cache).unwrap();
+        invalid = original.clone();
+        invalid.cells = 4;
+        assert!(invalid.validate_cached(&mut cache).is_err());
+        assert!(cache.endpoints.is_empty());
+        original.validate_cached(&mut cache).unwrap();
+        let mut empty = original;
+        empty.patches.clear();
+        empty.validate_cached(&mut cache).unwrap();
+        assert!(cache.endpoints.is_empty());
+    }
 }

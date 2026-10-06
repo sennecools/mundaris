@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 use glam::DVec3;
 use mundaris_math::surface::SurfaceLocation;
 use mundaris_math::{Direction3, surface::CubePatchAddress};
-use mundaris_world::terrain::{SurfaceAtmosphere, SurfaceGenerator, TerrainError};
+use mundaris_world::terrain::{
+    SurfaceAtmosphere, SurfaceGenerator, SurfaceQueryContext, TerrainError,
+};
 
 pub use mundaris_renderer::resident_tile::{TileData, TileKey, TileTexel};
 
@@ -18,6 +20,7 @@ pub const DEFAULT_TILE_CELLS: u32 = 64;
 pub const TILE_FILTER_VERSION: u32 = mundaris_renderer::resident_tile::TILE_FILTER_VERSION;
 /// Version of the radial displacement/material texel layout.
 pub const TILE_FORMAT_VERSION: u32 = mundaris_renderer::resident_tile::TILE_FORMAT_VERSION;
+const QUERY_CACHE_FILTER_STEP_LIMIT_M: f64 = 8.0;
 
 /// Inputs that change authoritative or derived tile content.
 #[derive(Debug, Clone, Copy)]
@@ -39,6 +42,13 @@ pub struct TileBuildDiagnostics {
     pub builder_stack_scratch_bytes_estimate: usize,
     /// Heap scratch requested by the authority's scalar query path.
     pub surface_query_heap_scratch_bytes: usize,
+    /// Per-build bounded cache lookups, kept separate from authoritative queries.
+    pub query_cache_hits: u64,
+    pub query_cache_misses: u64,
+    pub query_feature_cache_hits: u64,
+    pub query_feature_cache_misses: u64,
+    pub query_controls_cache_hits: u64,
+    pub query_controls_cache_misses: u64,
     pub surface_generator_retained_heap_bytes: usize,
     pub surface_generator_heap_bound_bytes: usize,
     /// Nominal cube-chart spacing at the anchor, before local chart compression.
@@ -100,6 +110,11 @@ impl From<TerrainError> for TileBuildError {
 pub struct ResidentTileBuilder;
 
 impl ResidentTileBuilder {
+    /// Fixed query-cache payload allocated by one cached tile build.
+    pub const fn query_cache_workspace_bound_bytes() -> usize {
+        SurfaceQueryContext::workspace_bound_bytes()
+    }
+
     /// Construct the complete cache identity without evaluating the surface.
     /// This lets callers decide whether a resident payload is stale first.
     pub fn tile_key(
@@ -133,19 +148,59 @@ impl ResidentTileBuilder {
         address: CubePatchAddress,
         cells: u32,
     ) -> Result<(TileData, TileBuildDiagnostics), TileBuildError> {
+        Self::build_inner(generator, identity, address, cells, None)
+    }
+
+    /// Build a tile with a bounded query context borrowed from this generator.
+    /// The context lives only for this build and does not alter query results.
+    pub fn build_cached(
+        generator: &SurfaceGenerator,
+        identity: TileBuildIdentity,
+        address: CubePatchAddress,
+        cells: u32,
+    ) -> Result<(TileData, TileBuildDiagnostics), TileBuildError> {
+        // At broad physical sample spacing, adjacent stencil queries rarely
+        // reuse cells. The threshold is expressed in metres so the policy is
+        // independent of body radius and tile level.
+        if query_filter_step_m(generator.radius_m(), address, cells)?
+            > QUERY_CACHE_FILTER_STEP_LIMIT_M
+        {
+            return Self::build_inner(generator, identity, address, cells, None);
+        }
+        let mut context = generator.query_context();
+        Self::build_inner(generator, identity, address, cells, Some(&mut context))
+    }
+
+    /// Explicit name for the uncached reference path used in matched comparisons.
+    pub fn build_uncached(
+        generator: &SurfaceGenerator,
+        identity: TileBuildIdentity,
+        address: CubePatchAddress,
+        cells: u32,
+    ) -> Result<(TileData, TileBuildDiagnostics), TileBuildError> {
+        Self::build_inner(generator, identity, address, cells, None)
+    }
+
+    fn build_inner(
+        generator: &SurfaceGenerator,
+        identity: TileBuildIdentity,
+        address: CubePatchAddress,
+        cells: u32,
+        mut context: Option<&mut SurfaceQueryContext<'_>>,
+    ) -> Result<(TileData, TileBuildDiagnostics), TileBuildError> {
         if !cells.is_power_of_two() || !(1..=TileData::MAX_CELLS).contains(&cells) {
             return Err(TileBuildError::InvalidCells);
         }
         let started = Instant::now();
         let anchor_direction =
             canonical_direction_with_cells(address, i64::from(cells), i64::from(cells), cells * 2)?;
-        let anchor_sample = evaluate(generator, anchor_direction)?;
+        let anchor_sample = evaluate(generator, anchor_direction, context.as_deref_mut())?;
         let anchor_radius_m = anchor_sample.radius_m();
         let anchor_filter_directions = filter_directions(anchor_direction, address, cells)?;
         let anchor_position = anchor_sample.position(SurfaceLocation::new(anchor_direction));
         let mut filter_actual_surface_offsets_m = [0.0; 6];
         for (index, direction) in anchor_filter_directions.into_iter().skip(1).enumerate() {
-            let sample = evaluate(generator, direction)?;
+            let sample = evaluate(generator, direction, context.as_deref_mut())?;
             filter_actual_surface_offsets_m[index] =
                 (sample.position(SurfaceLocation::new(direction)) - anchor_position).length();
         }
@@ -169,7 +224,7 @@ impl ResidentTileBuilder {
                         .into_iter()
                         .enumerate()
                 {
-                    let sample = evaluate(generator, sample_direction)?;
+                    let sample = evaluate(generator, sample_direction, context.as_deref_mut())?;
                     let weight = if sample_index == 0 { 0.25 } else { 0.125 };
                     radial_sum += sample.radius_m() * weight;
                     for (sum, value) in material_sum.iter_mut().zip(sample.material_weights()) {
@@ -235,7 +290,11 @@ impl ResidentTileBuilder {
         let builder_stack_scratch_bytes_estimate = std::mem::size_of::<[Direction3; 7]>()
             + std::mem::size_of::<[f64; 4]>()
             + std::mem::size_of::<mundaris_world::terrain::SurfaceSample>();
-        let surface_query_heap_scratch_bytes = generator.query_workspace_bytes();
+        let query_cache_stats = context
+            .as_deref()
+            .map(SurfaceQueryContext::stats)
+            .unwrap_or_default();
+        let surface_query_heap_scratch_bytes = query_cache_stats.workspace_bytes;
         let surface_generator_retained_heap_bytes = generator.resident_heap_bytes();
         let surface_generator_heap_bound_bytes = SurfaceGenerator::working_heap_bound_bytes();
         Ok((
@@ -248,6 +307,16 @@ impl ResidentTileBuilder {
                 payload_bytes,
                 builder_stack_scratch_bytes_estimate,
                 surface_query_heap_scratch_bytes,
+                query_cache_hits: query_cache_stats
+                    .feature_hits
+                    .saturating_add(query_cache_stats.controls_hits),
+                query_cache_misses: query_cache_stats
+                    .feature_misses
+                    .saturating_add(query_cache_stats.controls_misses),
+                query_feature_cache_hits: query_cache_stats.feature_hits,
+                query_feature_cache_misses: query_cache_stats.feature_misses,
+                query_controls_cache_hits: query_cache_stats.controls_hits,
+                query_controls_cache_misses: query_cache_stats.controls_misses,
                 surface_generator_retained_heap_bytes,
                 surface_generator_heap_bound_bytes,
                 nominal_grid_spacing_radians,
@@ -278,7 +347,7 @@ impl ResidentTileBuilder {
             for x in 0..=cells {
                 let grid_direction =
                     canonical_direction_with_cells(tile.key.address, x as i64, y as i64, cells)?;
-                let complete = evaluate(generator, grid_direction)?.radius_m();
+                let complete = evaluate(generator, grid_direction, None)?.radius_m();
                 let index = ((y + 1) * side + x + 1) as usize;
                 let represented =
                     tile.anchor_radius_m + f64::from(tile.texels[index].radial_offset_m);
@@ -319,8 +388,8 @@ impl ResidentTileBuilder {
                         + represented_centroid;
                     let direction = Direction3::try_new(body_centroid)
                         .map_err(|_| TileBuildError::InvalidSample)?;
-                    let complete =
-                        evaluate(generator, direction)?.position(SurfaceLocation::new(direction));
+                    let complete = evaluate(generator, direction, None)?
+                        .position(SurfaceLocation::new(direction));
                     let error = (complete - body_centroid).length();
                     if !error.is_finite() {
                         return Err(TileBuildError::InvalidSample);
@@ -335,7 +404,7 @@ impl ResidentTileBuilder {
             for x in 0..=cells {
                 let direction =
                     canonical_direction_with_cells(tile.key.address, x as i64, y as i64, cells)?;
-                let complete_normal = evaluate(generator, direction)?.normal();
+                let complete_normal = evaluate(generator, direction, None)?.normal();
                 let represented_normal = tile
                     .normal_local([x, y])
                     .map_err(|_| TileBuildError::InvalidSample)?;
@@ -369,10 +438,14 @@ impl ResidentTileBuilder {
 fn evaluate(
     generator: &SurfaceGenerator,
     direction: Direction3,
+    context: Option<&mut SurfaceQueryContext<'_>>,
 ) -> Result<mundaris_world::terrain::SurfaceSample, TileBuildError> {
-    generator
-        .evaluate_point(SurfaceLocation::new(direction))
-        .map_err(Into::into)
+    let location = SurfaceLocation::new(direction);
+    match context {
+        Some(context) => context.evaluate_point(location),
+        None => generator.evaluate_point(location),
+    }
+    .map_err(Into::into)
 }
 
 fn filter_directions(
@@ -405,6 +478,18 @@ fn filter_directions(
     } else {
         Ok(directions)
     }
+}
+
+fn query_filter_step_m(
+    radius_m: f64,
+    address: CubePatchAddress,
+    cells: u32,
+) -> Result<f64, TileBuildError> {
+    let chart_divisions = 1u64
+        .checked_shl(u32::from(address.level()))
+        .and_then(|divisions| divisions.checked_mul(u64::from(cells)))
+        .ok_or(TileBuildError::InvalidAddress)?;
+    Ok(radius_m * 0.5 / chart_divisions as f64)
 }
 
 fn normalize_material(values: [f64; 4]) -> Result<[f32; 4], TileBuildError> {
@@ -507,4 +592,410 @@ fn canonical_direction_with_cells(
     }
     let raw = DVec3::new(xyz[0] as f64, xyz[1] as f64, xyz[2] as f64);
     Direction3::try_new(raw).map_err(|_| TileBuildError::InvalidAddress)
+}
+
+#[cfg(test)]
+mod query_context_tests {
+    use super::*;
+    use glam::DVec3;
+    use mundaris_math::surface::{CubeFace, CubePatchAddress};
+    use mundaris_world::terrain::{
+        SurfaceAlgorithm, SurfaceDefinition, TerrainIdentity, TerrainSeed,
+    };
+
+    fn generator() -> SurfaceGenerator {
+        generator_at_radius(1_737_400.0)
+    }
+
+    fn gameplay_generator() -> SurfaceGenerator {
+        let production_moon_seed = 0x4d4f_4f4e;
+        let definition = SurfaceDefinition::generated(
+            TerrainIdentity(production_moon_seed),
+            TerrainSeed(production_moon_seed),
+            SurfaceAlgorithm::RockyV5,
+        );
+        let gameplay_radius_m = 1_737_400.0 * (400_000.0 / 6_371_000.0);
+        SurfaceGenerator::new(&definition, gameplay_radius_m).unwrap()
+    }
+
+    fn generator_at_radius(radius_m: f64) -> SurfaceGenerator {
+        let definition = SurfaceDefinition::generated(
+            TerrainIdentity(0x2e_cafe_0001),
+            TerrainSeed(0x005e_ed2a),
+            SurfaceAlgorithm::RockyV5,
+        );
+        SurfaceGenerator::new(&definition, radius_m).unwrap()
+    }
+
+    fn assert_sample_bits_equal(
+        left: mundaris_world::terrain::SurfaceSample,
+        right: mundaris_world::terrain::SurfaceSample,
+    ) {
+        assert_eq!(
+            left.shape().direction().to_array().map(f64::to_bits),
+            right.shape().direction().to_array().map(f64::to_bits)
+        );
+        assert_eq!(
+            left.shape().radius_m().to_bits(),
+            right.shape().radius_m().to_bits()
+        );
+        assert_eq!(
+            left.shape().gradient_m().to_array().map(f64::to_bits),
+            right.shape().gradient_m().to_array().map(f64::to_bits)
+        );
+        assert_eq!(
+            left.shape().normal().to_array().map(f64::to_bits),
+            right.shape().normal().to_array().map(f64::to_bits)
+        );
+        assert_eq!(
+            left.terrain().height_m().to_bits(),
+            right.terrain().height_m().to_bits()
+        );
+        assert_eq!(
+            left.terrain()
+                .tangent_gradient_m_per_unit_direction()
+                .to_array()
+                .map(f64::to_bits),
+            right
+                .terrain()
+                .tangent_gradient_m_per_unit_direction()
+                .to_array()
+                .map(f64::to_bits)
+        );
+        assert_eq!(
+            left.material_weights().map(f64::to_bits),
+            right.material_weights().map(f64::to_bits)
+        );
+        assert_eq!(left.radius_m().to_bits(), right.radius_m().to_bits());
+        assert_eq!(
+            left.normal().to_array().map(f64::to_bits),
+            right.normal().to_array().map(f64::to_bits)
+        );
+        assert_eq!(left.work(), right.work());
+    }
+
+    #[test]
+    fn cached_query_and_adjacent_tile_payloads_match_the_uncached_oracle_bitwise() {
+        let generator = generator();
+        let identity = TileBuildIdentity {
+            body_identity: 0xface_1234,
+            surface_revision: 9,
+            material_revision: 4,
+        };
+        for level in [4u8, 8, 12, 16] {
+            let tile_count = 1u32 << level;
+            let x = tile_count / 3;
+            let y = tile_count / 2;
+            for address in [
+                CubePatchAddress::try_new(CubeFace::PositiveZ, level, x, y).unwrap(),
+                CubePatchAddress::try_new(CubeFace::PositiveZ, level, x + 1, y).unwrap(),
+            ] {
+                let (oracle, _) =
+                    ResidentTileBuilder::build_uncached(&generator, identity, address, 32).unwrap();
+                let (cached, diagnostics) =
+                    ResidentTileBuilder::build_cached(&generator, identity, address, 32).unwrap();
+                assert_eq!(oracle.key, cached.key);
+                assert_eq!(
+                    oracle.anchor_radius_m.to_bits(),
+                    cached.anchor_radius_m.to_bits()
+                );
+                assert_eq!(
+                    oracle.min_max_radial_offset_m.map(f64::to_bits),
+                    cached.min_max_radial_offset_m.map(f64::to_bits)
+                );
+                assert_eq!(oracle.texels.len(), cached.texels.len());
+                for (left, right) in oracle.texels.iter().zip(&cached.texels) {
+                    assert_eq!(
+                        left.radial_offset_m.to_bits(),
+                        right.radial_offset_m.to_bits()
+                    );
+                    assert_eq!(
+                        left.material.map(f32::to_bits),
+                        right.material.map(f32::to_bits)
+                    );
+                }
+                if query_filter_step_m(generator.radius_m(), address, 32).unwrap()
+                    <= QUERY_CACHE_FILTER_STEP_LIMIT_M
+                {
+                    assert!(diagnostics.surface_query_heap_scratch_bytes > 0);
+                    assert!(diagnostics.query_cache_hits > 0);
+                } else {
+                    assert_eq!(diagnostics.surface_query_heap_scratch_bytes, 0);
+                    assert_eq!(diagnostics.query_cache_hits, 0);
+                }
+            }
+        }
+
+        let mut locations = vec![
+            DVec3::X,
+            -DVec3::X,
+            DVec3::Y,
+            -DVec3::Y,
+            DVec3::Z,
+            -DVec3::Z,
+            DVec3::new(1.0, 1.0, 1.0),
+        ];
+        let near = SurfaceLocation::new(Direction3::try_new(DVec3::Z).unwrap());
+        locations.extend(
+            generator
+                .diagnostic_boundary_probes(near)
+                .unwrap()
+                .into_iter()
+                .map(|probe| probe.location.direction().unit()),
+        );
+        let mut random = 0x91e1_0da5_c79e_7b1d_u64;
+        for _ in 0..96 {
+            let mut next = || {
+                random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((random >> 11) as f64 / ((1u64 << 53) as f64)) * 2.0 - 1.0
+            };
+            locations.push(DVec3::new(next(), next(), next()));
+        }
+        let mut context = generator.query_context();
+        for direction in locations {
+            let direction = Direction3::try_new(direction).unwrap();
+            let location = SurfaceLocation::new(direction);
+            let oracle = generator.evaluate_point(location).unwrap();
+            let cached = context.evaluate_point(location).unwrap();
+            assert_sample_bits_equal(oracle, cached);
+        }
+    }
+
+    #[test]
+    fn gameplay_radius_high_lod_tiles_and_queries_match_bitwise() {
+        let generator = gameplay_generator();
+        assert_eq!(generator.radius_m().to_bits(), 4_682_232_455_833_781_654);
+        assert_eq!(generator.definition().identity().0, 0x4d4f_4f4e);
+        assert_eq!(generator.definition().seed().0, 0x4d4f_4f4e);
+        let identity = TileBuildIdentity {
+            body_identity: 0xface_1234,
+            surface_revision: 9,
+            material_revision: 4,
+        };
+        for level in [8u8, 10, 12, 16] {
+            let tile_count = 1u32 << level;
+            let x = tile_count / 3;
+            let y = tile_count / 2;
+            for address in [
+                CubePatchAddress::try_new(CubeFace::PositiveZ, level, x, y).unwrap(),
+                CubePatchAddress::try_new(CubeFace::PositiveZ, level, x + 1, y).unwrap(),
+            ] {
+                let (oracle, _) =
+                    ResidentTileBuilder::build_uncached(&generator, identity, address, 32).unwrap();
+                let (cached, diagnostics) =
+                    ResidentTileBuilder::build_cached(&generator, identity, address, 32).unwrap();
+                assert_eq!(oracle.key, cached.key);
+                assert_eq!(
+                    oracle.anchor_radius_m.to_bits(),
+                    cached.anchor_radius_m.to_bits()
+                );
+                assert_eq!(
+                    oracle.min_max_radial_offset_m.map(f64::to_bits),
+                    cached.min_max_radial_offset_m.map(f64::to_bits)
+                );
+                for (left, right) in oracle.texels.iter().zip(&cached.texels) {
+                    assert_eq!(
+                        left.radial_offset_m.to_bits(),
+                        right.radial_offset_m.to_bits()
+                    );
+                    assert_eq!(
+                        left.material.map(f32::to_bits),
+                        right.material.map(f32::to_bits)
+                    );
+                }
+                assert!(diagnostics.surface_query_heap_scratch_bytes > 0);
+                assert!(diagnostics.query_cache_hits > 0);
+            }
+        }
+
+        let near = SurfaceLocation::new(Direction3::try_new(DVec3::Z).unwrap());
+        let mut directions = vec![
+            DVec3::X,
+            -DVec3::X,
+            DVec3::Y,
+            -DVec3::Y,
+            DVec3::Z,
+            -DVec3::Z,
+        ];
+        directions.extend(
+            generator
+                .diagnostic_boundary_probes(near)
+                .unwrap()
+                .into_iter()
+                .map(|probe| probe.location.direction().unit()),
+        );
+        let mut random = 0xd8b4_61c3_5a27_0091_u64;
+        for _ in 0..48 {
+            let mut next = || {
+                random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((random >> 11) as f64 / ((1u64 << 53) as f64)) * 2.0 - 1.0
+            };
+            directions.push(DVec3::new(next(), next(), next()));
+        }
+        let mut context = generator.query_context();
+        for direction in directions {
+            let location = SurfaceLocation::new(Direction3::try_new(direction).unwrap());
+            assert_sample_bits_equal(
+                generator.evaluate_point(location).unwrap(),
+                context.evaluate_point(location).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "release-mode same-process comparison; run explicitly for Phase 2E evidence"]
+    fn release_cached_vs_uncached_tile_benchmark() {
+        benchmark_fixture(
+            "generic_real_scale",
+            &generator(),
+            TileBuildIdentity {
+                body_identity: 0xface_1234,
+                surface_revision: 9,
+                material_revision: 4,
+            },
+        );
+        benchmark_fixture(
+            "native_gameplay_moon",
+            &gameplay_generator(),
+            TileBuildIdentity {
+                body_identity: 5,
+                surface_revision: 0,
+                material_revision: 0,
+            },
+        );
+    }
+
+    fn benchmark_fixture(fixture: &str, generator: &SurfaceGenerator, identity: TileBuildIdentity) {
+        let definition_words = exact_definition_words(generator);
+        let definition = generator.definition();
+        let radius_m = generator.radius_m();
+        let radius_bits = radius_m.to_bits();
+        let terrain_identity = definition.identity().0;
+        let terrain_seed = definition.seed().0;
+        let mut corpus = Vec::new();
+        for level in [4u8, 8, 12, 16] {
+            let tile_count = 1u32 << level;
+            let x = tile_count / 3;
+            let y = tile_count / 2;
+            corpus.push(CubePatchAddress::try_new(CubeFace::PositiveZ, level, x, y).unwrap());
+            corpus.push(CubePatchAddress::try_new(CubeFace::PositiveZ, level, x + 1, y).unwrap());
+        }
+        let mut uncached_nanos = Vec::new();
+        let mut cached_nanos = Vec::new();
+        let mut uncached_by_level: [Vec<u64>; 4] = std::array::from_fn(|_| Vec::new());
+        let mut cached_by_level: [Vec<u64>; 4] = std::array::from_fn(|_| Vec::new());
+        let mut feature_hits = 0u64;
+        let mut feature_misses = 0u64;
+        let mut controls_hits = 0u64;
+        let mut controls_misses = 0u64;
+        let mut feature_hits_by_level = [0u64; 4];
+        let mut feature_misses_by_level = [0u64; 4];
+        let mut controls_hits_by_level = [0u64; 4];
+        let mut controls_misses_by_level = [0u64; 4];
+        let mut workspace_bytes = 0usize;
+        for repetition in 0..3 {
+            for (index, address) in corpus.iter().copied().enumerate() {
+                for cached_first in [(index + repetition) % 2 == 0] {
+                    let mut run_cached = || {
+                        let started = Instant::now();
+                        let (_, diagnostics) =
+                            ResidentTileBuilder::build_cached(&generator, identity, address, 32)
+                                .unwrap();
+                        let elapsed_ns = started.elapsed().as_nanos() as u64;
+                        cached_nanos.push(elapsed_ns);
+                        cached_by_level[index / 2].push(elapsed_ns);
+                        feature_hits =
+                            feature_hits.saturating_add(diagnostics.query_feature_cache_hits);
+                        feature_misses =
+                            feature_misses.saturating_add(diagnostics.query_feature_cache_misses);
+                        controls_hits =
+                            controls_hits.saturating_add(diagnostics.query_controls_cache_hits);
+                        controls_misses =
+                            controls_misses.saturating_add(diagnostics.query_controls_cache_misses);
+                        feature_hits_by_level[index / 2] = feature_hits_by_level[index / 2]
+                            .saturating_add(diagnostics.query_feature_cache_hits);
+                        feature_misses_by_level[index / 2] = feature_misses_by_level[index / 2]
+                            .saturating_add(diagnostics.query_feature_cache_misses);
+                        controls_hits_by_level[index / 2] = controls_hits_by_level[index / 2]
+                            .saturating_add(diagnostics.query_controls_cache_hits);
+                        controls_misses_by_level[index / 2] = controls_misses_by_level[index / 2]
+                            .saturating_add(diagnostics.query_controls_cache_misses);
+                        workspace_bytes = diagnostics.surface_query_heap_scratch_bytes;
+                    };
+                    let mut run_uncached = || {
+                        let started = Instant::now();
+                        ResidentTileBuilder::build_uncached(&generator, identity, address, 32)
+                            .unwrap();
+                        let elapsed_ns = started.elapsed().as_nanos() as u64;
+                        uncached_nanos.push(elapsed_ns);
+                        uncached_by_level[index / 2].push(elapsed_ns);
+                    };
+                    if cached_first {
+                        run_cached();
+                        run_uncached();
+                    } else {
+                        run_uncached();
+                        run_cached();
+                    }
+                }
+            }
+        }
+        let uncached_median_ns = median(&mut uncached_nanos);
+        let cached_median_ns = median(&mut cached_nanos);
+        let uncached_mean_ns = mean(&uncached_nanos);
+        let cached_mean_ns = mean(&cached_nanos);
+        let speedup = uncached_median_ns as f64 / cached_median_ns as f64;
+        println!(
+            "PHASE_2E_QUERY_CACHE_JSON {{\"fixture\":\"{}\",\"scope\":\"aggregate\",\"build\":\"release\",\"algorithm\":\"RockyV5\",\"terrain_identity\":{},\"terrain_seed\":{},\"radius_m\":{:.14},\"radius_bits\":{},\"definition_words\":{:?},\"cells\":32,\"unique_tiles\":{},\"paired_builds_per_path\":{},\"uncached_median_ns\":{},\"cached_median_ns\":{},\"uncached_mean_ns\":{},\"cached_mean_ns\":{},\"median_speedup\":{:.6},\"workspace_bytes\":{},\"feature_hits\":{},\"feature_misses\":{},\"controls_hits\":{},\"controls_misses\":{}}}",
+            fixture,
+            terrain_identity,
+            terrain_seed,
+            radius_m,
+            radius_bits,
+            definition_words,
+            corpus.len(),
+            uncached_nanos.len(),
+            uncached_median_ns,
+            cached_median_ns,
+            uncached_mean_ns,
+            cached_mean_ns,
+            speedup,
+            workspace_bytes,
+            feature_hits,
+            feature_misses,
+            controls_hits,
+            controls_misses,
+        );
+        for (index, level) in [4, 8, 12, 16].into_iter().enumerate() {
+            let uncached_median_ns = median(&mut uncached_by_level[index]);
+            let cached_median_ns = median(&mut cached_by_level[index]);
+            println!(
+                "PHASE_2E_QUERY_CACHE_JSON {{\"fixture\":\"{}\",\"scope\":\"lod\",\"algorithm\":\"RockyV5\",\"terrain_identity\":{},\"terrain_seed\":{},\"radius_m\":{:.14},\"radius_bits\":{},\"definition_words\":{:?},\"level\":{},\"paired_builds\":{},\"uncached_median_ns\":{},\"cached_median_ns\":{},\"median_speedup\":{:.6},\"feature_hits\":{},\"feature_misses\":{},\"controls_hits\":{},\"controls_misses\":{}}}",
+                fixture,
+                terrain_identity,
+                terrain_seed,
+                radius_m,
+                radius_bits,
+                definition_words,
+                level,
+                uncached_by_level[index].len(),
+                uncached_median_ns,
+                cached_median_ns,
+                uncached_median_ns as f64 / cached_median_ns as f64,
+                feature_hits_by_level[index],
+                feature_misses_by_level[index],
+                controls_hits_by_level[index],
+                controls_misses_by_level[index],
+            );
+        }
+    }
+
+    fn median(samples: &mut [u64]) -> u64 {
+        samples.sort_unstable();
+        samples[samples.len() / 2]
+    }
+
+    fn mean(samples: &[u64]) -> u64 {
+        samples.iter().copied().sum::<u64>() / samples.len() as u64
+    }
 }
