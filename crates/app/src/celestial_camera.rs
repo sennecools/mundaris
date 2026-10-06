@@ -82,6 +82,20 @@ struct Transition {
     target_anchor: LocalPosition,
 }
 
+#[derive(Clone, PartialEq)]
+enum TerrainAuthority {
+    Legacy(mundaris_world::terrain::TerrainDefinition),
+    Compositional(mundaris_world::terrain::SurfaceDefinition),
+}
+impl TerrainAuthority {
+    fn for_body(body: &CelestialBody) -> Option<Self> {
+        body.surface_definition()
+            .cloned()
+            .map(Self::Compositional)
+            .or_else(|| body.terrain().cloned().map(Self::Legacy))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CameraAttachment {
     System,
@@ -131,12 +145,15 @@ pub struct CelestialCamera {
     response_clearance_m: f64,
     base_source: &'static str,
     clearance_sample: Option<crate::terrain_inspection::TerrainClearance>,
-    sampled_definition: Option<mundaris_world::terrain::TerrainDefinition>,
+    sampled_definition: Option<TerrainAuthority>,
+    sampled_radius_m: Option<f64>,
     terrain_query_count: u64,
     terrain_query_us: f64,
     surface_heading: DVec3,
     surface_pitch: f64,
     last_wheel_notches: Option<f64>,
+    #[cfg(feature = "developer-tools")]
+    developer_fixture_pose: Option<FramePose>,
 }
 impl CelestialCamera {
     pub fn overview(
@@ -184,11 +201,14 @@ impl CelestialCamera {
             base_source: "overview_distance",
             clearance_sample: None,
             sampled_definition: None,
+            sampled_radius_m: None,
             terrain_query_count: 0,
             terrain_query_us: 0.0,
             surface_heading: -DVec3::Z,
             surface_pitch: 0.0,
             last_wheel_notches: None,
+            #[cfg(feature = "developer-tools")]
+            developer_fixture_pose: None,
         };
         camera.update_pose(root)?;
         Ok(camera)
@@ -330,16 +350,17 @@ impl CelestialCamera {
             .metres();
         let distance = p.length();
         let direction = Direction3::try_new(p)?.unit();
-        let Some(definition) = celestial.terrain() else {
+        let Some(definition) = TerrainAuthority::for_body(celestial) else {
             self.clearance_sample = None;
             self.sampled_definition = None;
+            self.sampled_radius_m = None;
             self.base_source = "reference_sphere_fallback";
             return Ok(distance - radius);
         };
         let reused = self.clearance_sample.filter(|s| {
             s.body == body
-                && self.sampled_definition.as_ref() == Some(definition)
-                && (s.surface_radius_m - s.terrain_elevation_m - radius).abs() < 1e-8
+                && self.sampled_definition.as_ref() == Some(&definition)
+                && self.sampled_radius_m == Some(radius)
                 && (s.location.direction().unit() - direction).length() <= 1e-14
         });
         let sample = if let Some(mut s) = reused {
@@ -349,10 +370,12 @@ impl CelestialCamera {
             s
         } else {
             let start = std::time::Instant::now();
-            let s = crate::terrain_inspection::clearance_at_position(definition, radius, p, body)?;
+            let s = crate::terrain_inspection::clearance_at_body_position(celestial, p, body)?
+                .ok_or_else(|| anyhow::anyhow!("body surface authority is unavailable"))?;
             self.terrain_query_us += start.elapsed().as_secs_f64() * 1e6;
             self.terrain_query_count += 1;
-            self.sampled_definition = Some(definition.clone());
+            self.sampled_definition = Some(definition);
+            self.sampled_radius_m = Some(radius);
             s
         };
         self.clearance_sample = Some(sample);
@@ -389,6 +412,64 @@ impl CelestialCamera {
         self.wheel_pending = DVec3::ZERO;
         self.flight_log_scale = None;
         self.response_clearance_m = self.sample_clearance(pair, body, self.pose)?;
+        Ok(())
+    }
+    /// Set a fixture-controlled observer while retaining the normal surface
+    /// inspection controller and the same published body-fixed frame.
+    #[cfg(feature = "developer-tools")]
+    pub(crate) fn developer_set_surface_pose(
+        &mut self,
+        pair: &CoherentCelestialView<'_>,
+        body: BodyId,
+        pose: FramePose,
+    ) -> Result<()> {
+        let fixed = pair.projection().frames_for(body)?.body_fixed;
+        let mut pose = pair.evaluation().reexpress_pose(pose, fixed)?;
+        let mut position = pose.position().local().metres();
+        let radius = pair.system().body(body)?.properties().reference_radius_m();
+        ensure!(
+            position.is_finite() && position.length_squared() > 0.0,
+            "fixture observer position must be finite and nonzero"
+        );
+        let mut clearance = self.sample_clearance(pair, body, pose)?;
+        ensure!(
+            clearance.is_finite(),
+            "fixture observer clearance is nonfinite"
+        );
+        if clearance < 10.0 {
+            position = position.normalize() * (position.length() + 10.0 - clearance);
+            pose = FramePose::new(
+                FramePosition::new(fixed, LocalPosition::try_metres(position)?),
+                pose.orientation(),
+            );
+            clearance = self.sample_clearance(pair, body, pose)?;
+        }
+        ensure!(
+            clearance > 0.0,
+            "fixture observer must clear the published complete surface; clearance {clearance} m"
+        );
+        let anchor = crate::planet_surface::SurfaceInspectionAnchor::new(
+            body,
+            position,
+            radius,
+            self.inspection.map(|previous| previous.tangent),
+        )?;
+        self.pose = pose;
+        self.velocity = FrameVelocity::new(fixed, LinearVelocity3::zero());
+        self.attachment = CameraAttachment::BodyFixed(body);
+        self.mode = CameraMode::SurfaceInspection;
+        self.anchor = LocalPosition::origin();
+        self.radius_m = radius;
+        self.distance_m = position.length();
+        self.min_distance_m = radius + minimum_clearance(radius)?;
+        self.response_clearance_m = clearance;
+        self.zoom_target_log = self.response_clearance_m.max(1.0).ln();
+        self.inspection = Some(anchor);
+        self.transition = None;
+        self.wheel_pending = DVec3::ZERO;
+        self.terrain_approach = true;
+        self.initialize_surface_angles(anchor.tangent.up().unit());
+        self.developer_fixture_pose = Some(pose);
         Ok(())
     }
     pub fn look_surface_horizon(&mut self) -> Result<()> {
@@ -523,13 +604,13 @@ impl CelestialCamera {
                 Some(anchor.tangent),
             )?);
         } else if self.mode == CameraMode::BodyOrbit && self.focused_body() == Some(body) {
-            let terrain_height = self
-                .terrain_height_at_orbit_direction(pair, body)?
+            let surface_offset = self
+                .surface_offset_at_orbit_direction(pair, body)?
                 .unwrap_or(0.0);
-            let clearance = minimum_radius - self.radius_m - terrain_height;
+            let clearance = minimum_radius - self.radius_m - surface_offset;
             self.distance_m = minimum_radius;
             self.zoom_target_log = clearance.max(1.0).ln();
-            self.terrain_approach = pair.system().body(body)?.terrain().is_some();
+            self.terrain_approach = pair.system().body(body)?.has_surface();
         }
         Ok(true)
     }
@@ -574,13 +655,13 @@ impl CelestialCamera {
         );
         self.refresh_navigation_constraint(pair)?;
         let body = self.focused_body().expect("body orbit has focus");
-        let terrain_height = self.terrain_height_at_orbit_direction(pair, body)?;
-        self.terrain_approach = terrain_height.is_some();
-        let terrain_height = terrain_height.unwrap_or(0.0);
+        let surface_offset = self.surface_offset_at_orbit_direction(pair, body)?;
+        self.terrain_approach = surface_offset.is_some();
+        let surface_offset = surface_offset.unwrap_or(0.0);
         ensure!(
             clearance.is_finite()
                 && clearance >= 1.0
-                && clearance + self.radius_m + terrain_height <= 1e15,
+                && clearance + self.radius_m + surface_offset <= 1e15,
             "invalid navigation clearance"
         );
         self.zoom_target_log = clearance.ln();
@@ -901,7 +982,7 @@ impl CelestialCamera {
         self.distance_m = p.length();
         self.radius_m = pair.system().body(body)?.properties().reference_radius_m();
         self.response_clearance_m = self.sample_clearance(pair, body, pose)?;
-        self.terrain_approach = pair.system().body(body)?.terrain().is_some();
+        self.terrain_approach = pair.system().body(body)?.has_surface();
         self.zoom_target_log = self.response_clearance_m.max(1.0).ln();
         self.wheel_pending = DVec3::ZERO;
         self.velocity = FrameVelocity::new(frame, LinearVelocity3::zero());
@@ -923,6 +1004,17 @@ impl CelestialCamera {
                 && (1.0..=4.0).contains(&input.boost_multiplier),
             "invalid navigation input"
         );
+        #[cfg(feature = "developer-tools")]
+        if self.developer_fixture_pose.is_some() {
+            let active = input.drag != [0.0; 2]
+                || input.scroll_notches != 0.0
+                || input.translation != DVec3::ZERO;
+            if !active {
+                return Ok(());
+            }
+            // Explicit navigation returns control to the ordinary camera path.
+            self.developer_fixture_pose = None;
+        }
         let mut candidate = self.clone();
         if input.scroll_notches != 0.0 {
             candidate.last_wheel_notches = Some(input.scroll_notches);
@@ -939,6 +1031,7 @@ impl CelestialCamera {
         } else if candidate.mode == CameraMode::SystemOrbit {
             candidate.clearance_sample = None;
             candidate.sampled_definition = None;
+            candidate.sampled_radius_m = None;
             candidate.base_source = "overview_distance";
         }
         if matches!(
@@ -1151,7 +1244,7 @@ impl CelestialCamera {
         self.refresh_navigation_constraint(pair)?;
         if let Some(body) = self.focused_body() {
             self.response_clearance_m = self.sample_clearance(pair, body, self.pose)?;
-            if !self.terrain_approach && pair.system().body(body)?.terrain().is_some() {
+            if !self.terrain_approach && pair.system().body(body)?.has_surface() {
                 self.terrain_approach = true;
                 self.zoom_target_log = self.response_clearance_m.max(1.0).ln();
             }
@@ -1165,7 +1258,7 @@ impl CelestialCamera {
             let id = self.focused_body().expect("terrain approach has a body");
             let effective_radius = self.radius_m
                 + self
-                    .terrain_height_at_orbit_direction(pair, id)?
+                    .surface_offset_at_orbit_direction(pair, id)?
                     .unwrap_or(0.0);
             let target = self.zoom_target_log - input.scroll_notches * self.wheel_response();
             ensure!(
@@ -1263,6 +1356,7 @@ impl CelestialCamera {
             self.base_source = "overview_distance";
             self.clearance_sample = None;
             self.sampled_definition = None;
+            self.sampled_radius_m = None;
         }
         self.response_clearance_m = scale;
         let response = self.local_response();
@@ -1291,12 +1385,19 @@ impl CelestialCamera {
                 let local = pair.evaluation().reexpress_pose(self.pose, fixed)?;
                 let p = local.position().local().metres();
                 let radius = body.properties().reference_radius_m();
-                // Complete terrain's admitted envelope is within 10% of radius;
-                // far bodies need no procedural query for radial protection.
-                if p.length() > radius * 1.1 {
+                // Legacy terrain is constrained to a 10% radial envelope.
+                // Compositional shapes have their own validated bound.
+                let outside_surface = if let Some(definition) = body.surface_definition() {
+                    let outer = mundaris_world::terrain::SurfaceGenerator::new(definition, radius)?
+                        .conservative_radius_envelope_m()[1];
+                    p.length() > (outer + 1.0).next_up()
+                } else {
+                    p.length() > radius * 1.1
+                };
+                if outside_surface {
                     continue;
                 }
-                let minimum = if body.terrain().is_some() {
+                let minimum = if body.has_surface() {
                     let c = self.sample_clearance(pair, id, self.pose)?;
                     p.length() - c + 1.0
                 } else {
@@ -1538,7 +1639,7 @@ impl CelestialCamera {
         );
         self.min_distance_m = minimum;
         self.radius_m = radius;
-        if self.terrain_approach && pair.system().body(id)?.terrain().is_some() {
+        if self.terrain_approach && pair.system().body(id)?.has_surface() {
             return Ok(());
         }
         if self.distance_m < minimum {
@@ -1613,12 +1714,12 @@ impl CelestialCamera {
         self.zoom_target_log = (distance - self.radius_m).ln();
         self.update_pose(self.pose.position().frame())
     }
-    fn terrain_height_at_orbit_direction(
+    fn surface_offset_at_orbit_direction(
         &mut self,
         pair: &CoherentCelestialView<'_>,
         body: BodyId,
     ) -> Result<Option<f64>> {
-        if pair.system().body(body)?.terrain().is_none() {
+        if !pair.system().body(body)?.has_surface() {
             return Ok(None);
         }
         let rotation = self.orbit_basis.compose(UnitRotation::try_from_quaternion(
@@ -1640,7 +1741,7 @@ impl CelestialCamera {
             UnitRotation::identity(),
         );
         self.sample_clearance(pair, body, pose)?;
-        Ok(self.clearance_sample.map(|s| s.terrain_elevation_m))
+        Ok(self.clearance_sample.map(|s| s.surface_radius_m - radius))
     }
     /// Instantaneous pose/physical-velocity preservation between the focused body's
     /// translating/fixed debug roles. A new pivot uses Focus, not coordinate migration.

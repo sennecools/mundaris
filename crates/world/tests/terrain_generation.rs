@@ -94,7 +94,11 @@ fn complete_definition_equality_and_input_validation() {
         TerrainGeneratorVersion::from_code(2).unwrap(),
         TerrainGeneratorVersion::V2
     );
-    assert!(TerrainGeneratorVersion::from_code(3).is_err());
+    assert_eq!(
+        TerrainGeneratorVersion::from_code(3).unwrap(),
+        TerrainGeneratorVersion::CrateredV1
+    );
+    assert!(TerrainGeneratorVersion::from_code(4).is_err());
     for x in [f64::NAN, f64::INFINITY, -1.0] {
         assert!(TerrainFootprint::new(x).is_err());
     }

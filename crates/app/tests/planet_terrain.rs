@@ -431,6 +431,8 @@ fn erosion_version_and_configuration_separate_cached_geometry_and_regenerate() {
                 old.definition.seed(),
                 TerrainGeneratorVersion::V2,
                 old.definition
+                    .legacy()
+                    .unwrap()
                     .config()
                     .clone()
                     .with_erosion(ErosionConfig::new(octaves, 1.0).unwrap()),

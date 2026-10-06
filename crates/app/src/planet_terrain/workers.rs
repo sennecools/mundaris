@@ -13,6 +13,10 @@ const WORKER_FIXED_BYTES: usize = WORKER_STACK_BYTES + 128 * 1024;
 pub(super) const PATCH_RESERVATION: usize =
     GRID_SAMPLES * size_of::<SurfaceGeometrySample>() + size_of::<GeneratedSurfacePatch>() + 64;
 
+pub(super) fn patch_reservation(identity: &TerrainGeometryIdentity) -> usize {
+    PATCH_RESERVATION + identity.definition.working_heap_bound_bytes()
+}
+
 pub(super) struct CoverJob {
     pub old: Option<Arc<StitchedSurface>>,
     pub old_cover: Vec<ActiveSurfacePatch>,
@@ -310,7 +314,7 @@ impl TerrainWorkers {
             &request.identity,
             Some(request.address),
             request.pin_when_ready,
-            PATCH_RESERVATION,
+            patch_reservation(&request.identity),
             Calculation::Patch(request.address),
         )
     }
@@ -477,7 +481,8 @@ fn calculate(job: Job, topology: &SurfaceTopology) -> Result<Output> {
         Calculation::Patch(address) => {
             #[cfg(feature = "surface-profile")]
             let generation_start = Instant::now();
-            let generator = TerrainGenerator::new(&job.identity.definition, job.identity.radius_m)?;
+            let generator =
+                NativeTerrainGenerator::new(&job.identity.definition, job.identity.radius_m)?;
             let radius = job.identity.radius_m;
             let footprint =
                 TerrainFootprint::new(radius * 2.0 / (16.0 * (1u64 << address.level()) as f64))?;
@@ -489,7 +494,10 @@ fn calculate(job: Job, topology: &SurfaceTopology) -> Result<Output> {
                 let count = GENERATION_MICROBATCH.min(GRID_SAMPLES - samples.len());
                 let mut locations = [SurfaceLocation::new(Direction3::try_new(glam::DVec3::X)?);
                     GENERATION_MICROBATCH];
-                let mut output = [TerrainSample::default(); GENERATION_MICROBATCH];
+                let mut output = [SurfaceGeometrySample {
+                    position_body_m: glam::DVec3::ZERO,
+                    normal_body: glam::DVec3::X,
+                }; GENERATION_MICROBATCH];
                 for (offset, location) in locations[..count].iter_mut().enumerate() {
                     let index = samples.len() + offset;
                     *location = SurfaceLocation::new(
@@ -498,13 +506,12 @@ fn calculate(job: Job, topology: &SurfaceTopology) -> Result<Output> {
                             .direction(),
                     );
                 }
-                generator.evaluate_batch(&locations[..count], footprint, &mut output[..count])?;
-                for (location, sample) in locations[..count].iter().zip(&output[..count]) {
-                    samples.push(SurfaceGeometrySample {
-                        position_body_m: location.direction().unit() * (radius + sample.height_m()),
-                        normal_body: sample.normal_body(*location, radius)?.unit(),
-                    });
-                }
+                generator.evaluate_geometry_batch(
+                    &locations[..count],
+                    footprint,
+                    &mut output[..count],
+                )?;
+                samples.extend_from_slice(&output[..count]);
             }
             #[cfg(feature = "surface-profile")]
             let raw_generation_cpu = generation_start.elapsed();

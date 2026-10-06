@@ -2,7 +2,7 @@
 //! disposable raw cache entries, never queued generation or pinned draw ownership.
 use anyhow::Result;
 use mundaris_renderer::{planet_surface::*, *};
-use mundaris_world::{BodyId, CoherentCelestialView};
+use mundaris_world::{BodyId, CoherentCelestialView, terrain::SurfaceGenerator};
 use std::time::Duration;
 
 /// Population-level candidate admission and ownership handoff timing.
@@ -16,6 +16,33 @@ pub struct TerrainPopulationProfile {
 
 use crate::{planet_surface::*, planet_terrain::*};
 
+const MAX_CACHED_SURFACE_BINDINGS: usize = 8;
+
+#[derive(Clone)]
+struct CachedSurfaceBinding {
+    identity: TerrainGeometryIdentity,
+    height_bound_m: f64,
+}
+impl CachedSurfaceBinding {
+    fn matches(&self, body: BodyId, state: &mundaris_world::CelestialBody, radius_m: f64) -> bool {
+        if self.identity.body != body
+            || self.identity.revision != state.terrain_revision()
+            || self.identity.radius_m != radius_m
+        {
+            return false;
+        }
+        match (
+            &self.identity.definition,
+            state.surface_definition(),
+            state.terrain(),
+        ) {
+            (NativeTerrainDefinition::Surface(cached), Some(current), _) => cached == current,
+            (NativeTerrainDefinition::Legacy(cached), _, Some(current)) => cached == current,
+            _ => false,
+        }
+    }
+}
+
 pub struct TerrainPopulation {
     #[cfg(feature = "surface-profile")]
     pub profile: TerrainPopulationProfile,
@@ -24,6 +51,8 @@ pub struct TerrainPopulation {
     pub work: TerrainWorkReport,
     active_body: Option<BodyId>,
     far_probe: CelestialStaging,
+    surface_bindings: [Option<CachedSurfaceBinding>; MAX_CACHED_SURFACE_BINDINGS],
+    next_surface_binding: usize,
 }
 impl TerrainPopulation {
     pub fn new() -> Result<Self> {
@@ -53,6 +82,8 @@ impl TerrainPopulation {
             work: TerrainWorkReport::default(),
             active_body: None,
             far_probe: CelestialStaging::default(),
+            surface_bindings: std::array::from_fn(|_| None),
+            next_surface_binding: 0,
         })
     }
     pub fn active_body(&self) -> Option<BodyId> {
@@ -95,6 +126,27 @@ impl TerrainPopulation {
                 .position(|(body, _)| body == id)
                 .ok_or_else(|| anyhow::anyhow!("unknown surface capability body"))
         };
+        for entry in &mut self.surface_bindings {
+            let Some(cached) = entry else { continue };
+            let Some(session_index) = sessions
+                .iter()
+                .position(|session| session.body() == cached.identity.body)
+            else {
+                *entry = None;
+                continue;
+            };
+            let index = index_of(sessions[session_index].body())?;
+            let state = pair.system().body(cached.identity.body)?;
+            if !state.has_surface()
+                || !cached.matches(
+                    cached.identity.body,
+                    state,
+                    requests[index].reference_radius_m,
+                )
+            {
+                *entry = None;
+            }
+        }
         let mut candidate = None;
         let mut greatest_error = 0.0;
         #[cfg(feature = "surface-profile")]
@@ -102,15 +154,16 @@ impl TerrainPopulation {
         for session in sessions.iter_mut() {
             let index = index_of(session.body())?;
             let body = pair.system().body(session.body())?;
-            if terrain_enabled && let Some(definition) = body.terrain() {
+            if terrain_enabled && body.has_surface() {
+                let binding =
+                    self.surface_binding(session.body(), body, requests[index].reference_radius_m)?;
                 let input = SurfaceViewInput {
                     view,
                     body_fixed_frame: requests[index].body_fixed_frame,
                     reference_radius_m: requests[index].reference_radius_m,
                     projection,
                 };
-                if session
-                    .terrain_required(&input, definition.config().absolute_height_bound_m())?
+                if session.terrain_required(&input, binding.height_bound_m)?
                     && session.far_error_pixels > greatest_error
                 {
                     greatest_error = session.far_error_pixels;
@@ -170,7 +223,7 @@ impl TerrainPopulation {
             if retaining_source
                 && !terrain_enabled
                 && self.active_body == Some(session.body())
-                && world_body.terrain().is_some()
+                && world_body.has_surface()
                 && self.cover.ready()
             {
                 // A disabled terrain request is not permission to remove its
@@ -179,21 +232,17 @@ impl TerrainPopulation {
                 owners[index] = session.state() == SurfaceRepresentationState::Surface;
                 continue;
             }
-            if terrain_enabled && world_body.terrain().is_some() {
+            if terrain_enabled && world_body.has_surface() {
                 if self.active_body == Some(session.body()) {
-                    let definition = world_body
-                        .terrain()
-                        .ok_or_else(|| anyhow::anyhow!("terrain definition unavailable"))?;
-                    let identity = TerrainGeometryIdentity::new(
+                    let binding = self.surface_binding(
                         session.body(),
-                        definition.clone(),
-                        world_body.terrain_revision(),
+                        world_body,
                         request.reference_radius_m,
                     )?;
                     self.cover.set_morph_duration(morph_duration)?;
                     self.work = self.cover.update_with_elapsed(
                         &mut self.cache,
-                        &identity,
+                        &binding.identity,
                         &input,
                         &settings,
                         vertex_budget,
@@ -202,11 +251,11 @@ impl TerrainPopulation {
                     )?;
                     session.update_with_terrain_report(
                         &input,
-                        definition.config().absolute_height_bound_m(),
+                        binding.height_bound_m,
                         self.cover.report,
                     )?;
                     for patch in self.cover.visible() {
-                        self.cache.get(&identity, patch.address)?;
+                        self.cache.get(&binding.identity, patch.address)?;
                     }
                     owners[index] = session.state() == SurfaceRepresentationState::Surface
                         && self.cover.ready();
@@ -233,6 +282,73 @@ impl TerrainPopulation {
             self.profile.total = total_started.elapsed();
         }
         Ok(())
+    }
+
+    fn surface_binding(
+        &mut self,
+        body: BodyId,
+        state: &mundaris_world::CelestialBody,
+        radius_m: f64,
+    ) -> Result<CachedSurfaceBinding> {
+        if let Some(cached) = self
+            .surface_bindings
+            .iter()
+            .flatten()
+            .find(|cached| cached.matches(body, state, radius_m))
+        {
+            return Ok(cached.clone());
+        }
+
+        let revision = state.terrain_revision();
+        let binding = if let Some(definition) = state.surface_definition() {
+            let generator = SurfaceGenerator::new(definition, radius_m)?;
+            let envelope = generator.conservative_radius_envelope_m();
+            let height_bound_m = (envelope[0] - radius_m)
+                .abs()
+                .max((envelope[1] - radius_m).abs())
+                .next_up();
+            anyhow::ensure!(
+                height_bound_m < 0.1 * radius_m,
+                "native surface radial envelope exceeds the renderer's ten-percent limit"
+            );
+            CachedSurfaceBinding {
+                identity: TerrainGeometryIdentity {
+                    body,
+                    definition: NativeTerrainDefinition::Surface(definition.clone()),
+                    revision,
+                    radius_m,
+                },
+                height_bound_m,
+            }
+        } else {
+            let identity = TerrainGeometryIdentity::new(
+                body,
+                state
+                    .terrain()
+                    .ok_or_else(|| anyhow::anyhow!("body has no surface authority"))?
+                    .clone(),
+                revision,
+                radius_m,
+            )?;
+            let height_bound_m = identity.definition.absolute_height_bound_m(radius_m)?;
+            CachedSurfaceBinding {
+                identity,
+                height_bound_m,
+            }
+        };
+
+        if let Some(slot) = self.surface_bindings.iter_mut().find(|entry| {
+            entry
+                .as_ref()
+                .is_some_and(|cached| cached.identity.body == body)
+        }) {
+            *slot = Some(binding.clone());
+        } else {
+            self.surface_bindings[self.next_surface_binding] = Some(binding.clone());
+            self.next_surface_binding =
+                (self.next_surface_binding + 1) % MAX_CACHED_SURFACE_BINDINGS;
+        }
+        Ok(binding)
     }
 }
 fn far_ready(representation: SphereRepresentation) -> bool {

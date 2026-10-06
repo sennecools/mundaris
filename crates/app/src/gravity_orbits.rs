@@ -10,7 +10,7 @@ use crate::{
     celestial_labels::*, celestial_selection::*, interactive_clock::*, orbit_guides::*,
     playback_metrics::*, system_view::*,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use glam::DVec3;
 use mundaris_math::*;
 use mundaris_renderer::planet_surface::*;
@@ -24,6 +24,7 @@ use std::{
 };
 
 enum Command {
+    Visual(visual_controls::VisualCommand),
     ValidationRoute,
     LookBody(BodyId),
     SurfaceInspection,
@@ -64,9 +65,23 @@ enum Command {
     TrailReference(BodyId),
 }
 mod analytic_validation;
+#[cfg(feature = "developer-tools")]
+mod developer;
 mod developer_ui;
+mod frame_host;
+#[cfg(feature = "developer-tools")]
+mod hierarchy_fixture;
 mod navigation_input;
+#[cfg(feature = "developer-tools")]
+mod regional_fixture;
+#[cfg(feature = "developer-tools")]
+mod resident_fixture;
+mod visual_controls;
 struct Controls {
+    #[cfg(feature = "developer-tools")]
+    automation_owner: Option<String>,
+    #[cfg(feature = "developer-tools")]
+    automation_stop: bool,
     snapshot_export_status: Option<String>,
     terrain_preview: bool,
     sun_from_star: bool,
@@ -118,6 +133,10 @@ struct Controls {
 impl Controls {
     fn new(body: &CelestialBody) -> Self {
         Self {
+            #[cfg(feature = "developer-tools")]
+            automation_owner: None,
+            #[cfg(feature = "developer-tools")]
+            automation_stop: false,
             snapshot_export_status: None,
             terrain_preview: false,
             sun_from_star: false,
@@ -190,6 +209,20 @@ impl Controls {
 }
 
 pub struct GravityOrbitsDemo {
+    #[cfg(feature = "developer-tools")]
+    developer_session: Option<String>,
+    #[cfg(feature = "developer-tools")]
+    developer_snapshot: Option<DeveloperSnapshot>,
+    #[cfg(feature = "developer-tools")]
+    developer_offscreen: Option<mundaris_renderer::terrain_capture::TerrainCaptureRenderer>,
+    #[cfg(feature = "developer-tools")]
+    developer_navigation: Option<(Duration, NavigationInput)>,
+    #[cfg(feature = "developer-tools")]
+    resident_tile: resident_fixture::ResidentTileFixture,
+    #[cfg(feature = "developer-tools")]
+    resident_hierarchy: hierarchy_fixture::ResidentHierarchyFixture,
+    #[cfg(feature = "developer-tools")]
+    resident_regional: regional_fixture::RegionalFixture,
     sky_definition: std::sync::Arc<mundaris_renderer::sky::SkyDefinition>,
     navigation_snapshot_path: Option<std::path::PathBuf>,
     navigation_wall_at: Option<Instant>,
@@ -517,7 +550,7 @@ impl GravityOrbitsDemo {
             GravityFixture::Circular => vec![ids[1]],
             GravityFixture::GameplaySolarSystem | GravityFixture::RealSolarSystem => system
                 .bodies()
-                .filter_map(|(id, body)| body.terrain().map(|_| id))
+                .filter_map(|(id, body)| body.has_surface().then_some(id))
                 .collect(),
         };
         let surfaces = enabled
@@ -525,6 +558,20 @@ impl GravityOrbitsDemo {
             .map(|id| PlanetSurfaceSession::new(id, 2048))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
+            #[cfg(feature = "developer-tools")]
+            developer_session: None,
+            #[cfg(feature = "developer-tools")]
+            developer_snapshot: None,
+            #[cfg(feature = "developer-tools")]
+            developer_offscreen: None,
+            #[cfg(feature = "developer-tools")]
+            developer_navigation: None,
+            #[cfg(feature = "developer-tools")]
+            resident_tile: resident_fixture::ResidentTileFixture::default(),
+            #[cfg(feature = "developer-tools")]
+            resident_hierarchy: hierarchy_fixture::ResidentHierarchyFixture::default(),
+            #[cfg(feature = "developer-tools")]
+            resident_regional: regional_fixture::RegionalFixture::default(),
             sky_definition: crate::sky_definition::default_sky()?,
             navigation_snapshot_path: std::env::var_os("MUNDARIS_NAVIGATION_SNAPSHOT")
                 .map(std::path::PathBuf::from),
@@ -616,6 +663,16 @@ impl GravityOrbitsDemo {
             .retain(|c| !matches!(c, Command::Navigation(_) | Command::TimedNavigation(..)));
         self.navigation_wall_at = None;
         self.camera.cancel_transition();
+    }
+    fn automation_active(&self) -> bool {
+        #[cfg(feature = "developer-tools")]
+        {
+            self.controls.automation_owner.is_some()
+        }
+        #[cfg(not(feature = "developer-tools"))]
+        {
+            false
+        }
     }
     /// Native lifecycle hook; camera policy and cancellation remain app-owned.
     pub fn on_window_event(&mut self, event: &winit::event::WindowEvent) -> bool {
@@ -814,7 +871,9 @@ impl GravityOrbitsDemo {
             at.saturating_duration_since(previous)
         });
         self.navigation_wall_at = Some(at);
-        self.controls.navigation.speed_multiplier = self.controls.manual_speed;
+        if !self.automation_active() {
+            self.controls.navigation.speed_multiplier = self.controls.manual_speed;
+        }
         if elapsed > self.clock.threshold() {
             self.cancel_navigation_input();
             return Ok(());
@@ -1022,6 +1081,11 @@ impl GravityOrbitsDemo {
                     .checked_add(1)
                     .ok_or_else(|| anyhow::anyhow!("tree namespace overflow"))?;
                 let replacement = Self::create(scenario, system_namespace, tree_namespace)?;
+                #[cfg(feature = "developer-tools")]
+                let replacement = Self {
+                    developer_session: self.developer_session.clone(),
+                    ..replacement
+                };
                 *self = replacement;
             }
             Command::Select(body) => {
@@ -1205,7 +1269,7 @@ impl GravityOrbitsDemo {
                 {
                     let id = self.ids[1];
                     let body = self.system.body(id)?;
-                    if body.terrain().is_none() {
+                    if !body.has_surface() {
                         let version =
                             if std::env::var("MUNDARIS_PHASE55_AB").as_deref() == Ok("legacy") {
                                 mundaris_world::terrain::TerrainGeneratorVersion::V1
@@ -1220,9 +1284,11 @@ impl GravityOrbitsDemo {
                         self.system.edit_terrain(id, Some(definition))?;
                     }
                 }
-                self.controls.terrain_preview = enabled;
+                visual_controls::VisualCommand::Layer(visual_controls::Layer::Terrain, enabled)
+                    .apply(&mut self.controls)?;
                 self.controls.surface_style.elevation_colors = enabled;
             }
+            Command::Visual(command) => command.apply(&mut self.controls)?,
             Command::TrailMode(relative) => {
                 let mode = if relative {
                     TrailMode::SimultaneousBodyRelative(id)
@@ -1272,6 +1338,19 @@ impl GravityOrbitsDemo {
     }
     /// Host duration is explicit and captured once. Surface retries never reuse it.
     pub fn update(&mut self, elapsed: Duration) {
+        #[cfg(feature = "developer-tools")]
+        if let Some((remaining, input)) = self.developer_navigation.take() {
+            self.controls.navigation = if remaining.is_zero() {
+                NavigationInput::default()
+            } else {
+                input
+            };
+            if remaining > elapsed {
+                self.developer_navigation = Some((remaining - elapsed, input));
+            } else if !remaining.is_zero() {
+                self.developer_navigation = Some((Duration::ZERO, input));
+            }
+        }
         analytic_validation::advance(self, elapsed);
         self.advance_solar_validation(elapsed);
         self.advance_surface_validation(elapsed);
@@ -1749,6 +1828,24 @@ impl GravityOrbitsDemo {
         Ok(())
     }
     pub fn render(&mut self, renderer: &mut Renderer, width: u32, height: u32) -> Result<()> {
+        self.render_host(
+            &mut frame_host::FrameHost::Native(renderer),
+            width,
+            height,
+            None,
+        )
+    }
+    fn render_host(
+        &mut self,
+        renderer: &mut frame_host::FrameHost<'_>,
+        width: u32,
+        height: u32,
+        fixed_elapsed: Option<Duration>,
+    ) -> Result<()> {
+        #[cfg(feature = "developer-tools")]
+        if self.developer_session.is_some() {
+            self.developer_snapshot = None;
+        }
         if width == 0 || height == 0 {
             self.set_lifecycle_drawable(false);
             return Ok(());
@@ -1760,11 +1857,11 @@ impl GravityOrbitsDemo {
             .last_wall
             .map_or(Duration::ZERO, |previous| now.duration_since(previous));
         self.last_wall = Some(now);
-        let elapsed = match self.clock.classify(elapsed) {
+        let elapsed = fixed_elapsed.unwrap_or_else(|| match self.clock.classify(elapsed) {
             ClockInterval::Accepted(elapsed) => elapsed,
             ClockInterval::Hidden => Duration::ZERO,
             ClockInterval::Discontinuity(gap) => gap,
-        };
+        });
         #[cfg(feature = "surface-profile")]
         let update_started = Instant::now();
         self.update(elapsed);
@@ -1798,27 +1895,91 @@ impl GravityOrbitsDemo {
         if self.viewport != new_viewport {
             let first = self.viewport.is_none();
             self.viewport = new_viewport;
-            if (first || self.camera.mode() == CameraMode::SystemOrbit)
+            #[cfg(feature = "developer-tools")]
+            let fixture_camera = self.resident_tile.enabled;
+            #[cfg(not(feature = "developer-tools"))]
+            let fixture_camera = false;
+            if !fixture_camera
+                && (first || self.camera.mode() == CameraMode::SystemOrbit)
                 && let Err(error) = self.refit(!first)
             {
                 self.diagnostic = Some(error.to_string());
             }
         }
         let started = Instant::now();
-        self.prepare_visuals()?;
+        #[cfg(feature = "developer-tools")]
+        let visual_prep_context = if self.resident_tile.enabled {
+            "resident tile fixture failed during orbit visual preparation"
+        } else {
+            "orbit visual preparation failed"
+        };
+        #[cfg(not(feature = "developer-tools"))]
+        let visual_prep_context = "orbit visual preparation failed";
+        self.prepare_visuals().context(visual_prep_context)?;
+        #[cfg(feature = "developer-tools")]
+        if !self.resident_regional.enabled {
+            self.resident_regional.pump_shutdown();
+        }
         let selected_index = self.selected_index();
         let pair = self.projection.coherent_view(&self.system)?;
         self.camera
             .set_navigation_projection(self.content_projection(0.1)?, scale)?;
         self.controls.pixels_per_point = scale;
+        #[cfg(feature = "developer-tools")]
+        if self.resident_tile.enabled {
+            let was_stale = self.resident_tile.stale_reason.is_some();
+            let stale_reason = match (self.resident_tile.body, self.resident_tile.tile.as_ref()) {
+                (Some(body), Some(tile)) => match pair.system().body(body) {
+                    Ok(state)
+                        if state.surface_definition().is_some()
+                            && state.terrain_revision().value() == tile.key.surface_revision
+                            && state.properties().reference_radius_m().to_bits()
+                                == tile.key.radius_bits =>
+                    {
+                        None
+                    }
+                    Ok(_) => Some(
+                        "published_surface_or_radius_changed; issue_explicit_gpu_tile_rebuild"
+                            .into(),
+                    ),
+                    Err(error) => Some(format!("tile_body_unavailable:{error}")),
+                },
+                _ => Some("tile_publication_unavailable; issue_explicit_gpu_tile_rebuild".into()),
+            };
+            if stale_reason.is_some() {
+                self.resident_regional.disable();
+            }
+            if stale_reason.is_some() && !was_stale && self.resident_hierarchy.enabled {
+                self.resident_hierarchy.invalidate_parent_authority();
+            }
+            self.resident_tile.stale_reason = stale_reason;
+        }
+        #[cfg(feature = "developer-tools")]
+        if self.resident_hierarchy.enabled {
+            let previous_hierarchy_report = renderer.last_resident_hierarchy_report();
+            self.resident_hierarchy
+                .observe_uploads(Some(&previous_hierarchy_report));
+            self.resident_hierarchy.poll_and_advance(
+                elapsed,
+                Some(&previous_hierarchy_report),
+                renderer.deterministic(),
+            );
+        }
         self.terrain_clearance = self.camera.recorded_terrain_clearance();
         self.clearance_query_us = self.camera.navigation_diagnostics().terrain_query_us;
         self.ready_mesh_probe = None;
+        #[cfg(feature = "developer-tools")]
+        if self.resident_tile.enabled {
+            // The opt-in fixture owns one explicit prebuilt tile; ordinary
+            // fixture frames do not run the legacy adaptive terrain builder.
+            self.terrain_clearance = None;
+        }
         let view = PreparedView::new(
             &pair.evaluation(),
             self.camera.pose(),
             RenderPrecisionBudget::near_debug(),
-        )?;
+        )
+        .context("preparing source-centered render view after fixture camera placement")?;
         self.requests.clear();
         let mut clearance = f64::MAX;
         for (index, (id, body)) in pair.system().bodies().enumerate() {
@@ -1850,20 +2011,43 @@ impl GravityOrbitsDemo {
         let population_near = near;
         self.surface_owners.clear();
         self.surface_owners.resize(self.requests.len(), false);
-        self.terrain.update(
-            &pair,
-            &view,
-            projection,
-            &self.requests,
-            &mut self.surfaces,
-            &mut self.surface_owners,
-            &self.sphere,
-            self.controls.terrain_preview,
-            Duration::from_millis(self.controls.terrain_morph_ms),
-            64,
-            Some(Duration::from_millis(2)),
-            elapsed,
-        )?;
+        #[cfg(feature = "developer-tools")]
+        let resident_fixture_active = self.resident_tile.enabled;
+        #[cfg(not(feature = "developer-tools"))]
+        let resident_fixture_active = false;
+        if !resident_fixture_active {
+            self.terrain.update(
+                &pair,
+                &view,
+                projection,
+                &self.requests,
+                &mut self.surfaces,
+                &mut self.surface_owners,
+                &self.sphere,
+                self.controls.terrain_preview,
+                Duration::from_millis(self.controls.terrain_morph_ms),
+                64,
+                if renderer.deterministic() {
+                    None
+                } else {
+                    Some(Duration::from_millis(2))
+                },
+                elapsed,
+            )?;
+        } else {
+            #[cfg(feature = "surface-profile")]
+            {
+                // Avoid carrying the previous legacy update's duration into a
+                // frame which deliberately skipped legacy terrain population.
+                self.terrain.profile = Default::default();
+            }
+            #[cfg(feature = "developer-tools")]
+            if let Some(body) = self.resident_tile.body
+                && let Some(index) = self.ids.iter().position(|&id| id == body)
+            {
+                self.surface_owners[index] = true;
+            }
+        }
         if let Some(terrain) = self.terrain_clearance
             && self.terrain.active_body() == Some(terrain.body)
         {
@@ -1945,6 +2129,52 @@ impl GravityOrbitsDemo {
         }
         let mut frame = CelestialFrame::new(&view, &mut self.staging, projection, &self.sphere);
         frame.set_terrain_lighting(lighting);
+        #[cfg(feature = "developer-tools")]
+        let mut resident_validation_draw = None;
+        #[cfg(feature = "developer-tools")]
+        let mut resident_hierarchy_validation_draw = None;
+        #[cfg(feature = "developer-tools")]
+        if self.resident_tile.enabled
+            && self.resident_tile.stale_reason.is_none()
+            && !self.resident_tile.reference_cpu
+        {
+            let body = self
+                .resident_tile
+                .body
+                .ok_or_else(|| anyhow::anyhow!("resident tile has no body"))?;
+            let body_frame = pair.projection().frames_for(body)?.body_fixed;
+            let draw = self.resident_tile.draw(&view, body_frame)?;
+            if self.resident_regional.enabled {
+                let source = view.prepare_source(body_frame)?;
+                let position = source.observer_in_source().metres();
+                let projection_scale_px =
+                    f64::from(size[1]) / (2.0 * (projection.vertical_fov_rad() * 0.5).tan());
+                self.resident_regional
+                    .observe(renderer.last_resident_regional_report());
+                self.resident_regional.advance(
+                    position,
+                    projection_scale_px,
+                    elapsed,
+                    renderer.deterministic(),
+                )?;
+                let regional_draw = self.resident_regional.draw(&draw)?;
+                frame.set_resident_regional(regional_draw)?;
+            } else if self.resident_hierarchy.enabled {
+                let report = renderer.last_resident_hierarchy_report();
+                let hierarchy_draw = self.resident_hierarchy.draw(draw, Some(&report))?;
+                frame.set_resident_hierarchy(hierarchy_draw.clone())?;
+                if let Some(patch_index) = self.resident_hierarchy.validation_pending
+                    && hierarchy_draw.draw_children
+                {
+                    resident_hierarchy_validation_draw = Some((hierarchy_draw, patch_index));
+                }
+            } else {
+                frame.set_resident_tile(draw.clone())?;
+                if self.resident_tile.validation_pending {
+                    resident_validation_draw = Some((draw, body_frame));
+                }
+            }
+        }
         if let Some(active) = self.terrain.active_body()
             && let Some(index) = self.ids.iter().position(|&id| id == active)
             && matches!(
@@ -1982,7 +2212,28 @@ impl GravityOrbitsDemo {
                     .iter()
                     .position(|&id| id == session.body())
                     .expect("surface body");
-                if self.surface_owners[index] {
+                #[cfg(feature = "developer-tools")]
+                let resident_fixture_owns_body =
+                    self.resident_tile.enabled && self.resident_tile.body == Some(session.body());
+                #[cfg(not(feature = "developer-tools"))]
+                let resident_fixture_owns_body = false;
+                if self.surface_owners[index] && resident_fixture_owns_body {
+                    #[cfg(feature = "developer-tools")]
+                    if self.resident_tile.stale_reason.is_none() && self.resident_tile.reference_cpu
+                    {
+                        let reference =
+                            self.resident_tile.cpu_reference.as_ref().ok_or_else(|| {
+                                anyhow::anyhow!("resident CPU reference is missing")
+                            })?;
+                        frame.append_generated_surface(
+                            self.requests[index],
+                            &[reference.patch],
+                            &[&reference.mesh],
+                            &reference.topology,
+                            self.controls.surface_style,
+                        )?;
+                    }
+                } else if self.surface_owners[index] {
                     if self.terrain.active_body() == Some(session.body())
                         && self.terrain.cover.ready()
                     {
@@ -2165,6 +2416,7 @@ impl GravityOrbitsDemo {
         let report = frame.report();
         let performance = PerformanceSnapshot {
             preparation_ms: Some(preparation_ms),
+            gpu_source_frame: renderer.gpu_source_frame(),
             upload_bytes: Some(report.surface.uploaded_bytes as u64),
             ..Default::default()
         }
@@ -2300,6 +2552,251 @@ impl GravityOrbitsDemo {
         renderer.render_celestial(&frame, |context| {
             draw_ui(context, controls, &info, frame.markers())
         })?;
+        #[cfg(feature = "developer-tools")]
+        if let Some((draw, body_frame)) = resident_validation_draw {
+            // Validation follows the real frame submission so its setup cannot
+            // consume the cold publication before the captured production draw.
+            let vertices = renderer.validate_resident_tile(&draw)?;
+            let tile = self
+                .resident_tile
+                .tile
+                .as_ref()
+                .expect("prepared resident tile");
+            let anchor = tile.anchor_position_body()?;
+            let prepared_source = view.prepare_source(body_frame)?;
+            let root_frame = pair.projection().tree().root();
+            let body_origin_in_root_m = pair
+                .evaluation()
+                .convert_position(
+                    FramePosition::new(body_frame, LocalPosition::origin()),
+                    root_frame,
+                )?
+                .local()
+                .metres();
+            let observer_in_root_m = pair
+                .evaluation()
+                .convert_position(self.camera.pose().position(), root_frame)?
+                .local()
+                .metres();
+            let cells = tile.key.cells;
+            let mut max_local_error = 0.0f64;
+            let mut max_view_error = 0.0f64;
+            let mut max_normal_error = 0.0f64;
+            let mut max_material_error = 0.0f64;
+            let mut max_view_narrowing_error = 0.0f64;
+            let mut invalid_sample_count = 0usize;
+            for (index, gpu) in vertices.iter().enumerate() {
+                let x = index as u32 % (cells + 1);
+                let y = index as u32 / (cells + 1);
+                let st = [
+                    f64::from(x) / f64::from(cells),
+                    f64::from(y) / f64::from(cells),
+                ];
+                let local = tile.position_local(st)?;
+                let gpu_local = DVec3::from_array(gpu.position_local_m.map(f64::from));
+                max_local_error = max_local_error.max(local.distance(gpu_local));
+                let complete_body_point = anchor + local;
+                let expected_view_m = prepared_source
+                    .view_displacement(FramePosition::new(
+                        body_frame,
+                        LocalPosition::try_metres(complete_body_point)?,
+                    ))?
+                    .metres();
+                let gpu_view_m = DVec3::from_array(gpu.position_view_m.map(f64::from));
+                max_view_error = max_view_error.max(expected_view_m.distance(gpu_view_m));
+                let narrowed_anchor = draw.anchor_view_m.as_vec3().as_dvec3();
+                let rotated_local = (draw.body_to_view * local).as_vec3().as_dvec3();
+                max_view_narrowing_error = max_view_narrowing_error
+                    .max(expected_view_m.distance(narrowed_anchor + rotated_local));
+                let expected_normal = tile.normal_local([x, y])?;
+                let actual_normal = DVec3::from_array(gpu.normal_body.map(f64::from));
+                max_normal_error = max_normal_error.max(
+                    expected_normal
+                        .cross(actual_normal)
+                        .length()
+                        .atan2(expected_normal.dot(actual_normal)),
+                );
+                let expected_material = tile.material(st)?;
+                for (expected, actual) in expected_material.into_iter().zip(gpu.material) {
+                    max_material_error =
+                        max_material_error.max((f64::from(expected) - f64::from(actual)).abs());
+                }
+                let material_sum = gpu.material.iter().sum::<f32>();
+                let sample_valid = gpu.position_local_m.iter().all(|v| v.is_finite())
+                    && gpu.position_view_m.iter().all(|v| v.is_finite())
+                    && gpu.normal_body.iter().all(|v| v.is_finite())
+                    && gpu
+                        .material
+                        .iter()
+                        .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
+                    && (actual_normal.length() - 1.0).abs() <= 1.0e-4
+                    && (material_sum - 1.0).abs() <= 1.0e-4;
+                if !sample_valid {
+                    invalid_sample_count += 1;
+                }
+            }
+            let passed = vertices.len() == ((cells + 1) * (cells + 1)) as usize
+                && invalid_sample_count == 0
+                && max_local_error <= 0.001
+                && max_view_error <= 0.001
+                && max_normal_error <= 0.001
+                && max_material_error <= 1.0e-5;
+            self.resident_tile.gpu_validation = Some(serde_json::json!({
+                "sample_count": vertices.len(),
+                "max_local_position_error_m": max_local_error,
+                "max_view_position_error_m": max_view_error,
+                "max_prepared_view_to_narrowed_gpu_path_error_m": max_view_narrowing_error,
+                "anchor_view_m": draw.anchor_view_m.to_array(),
+                "body_to_view_columns": [
+                    draw.body_to_view.x_axis.to_array(),
+                    draw.body_to_view.y_axis.to_array(),
+                    draw.body_to_view.z_axis.to_array(),
+                ],
+                "body_origin_in_root_m": body_origin_in_root_m.to_array(),
+                "observer_in_root_m": observer_in_root_m.to_array(),
+                "common_parent_translation_m": body_origin_in_root_m.length(),
+                "validated_frame_number": self.developer_frame_number,
+                "view_mode": self.resident_tile.mode,
+                "sun_direction_body": self.resident_tile.sun_direction_body.to_array(),
+                "camera_offset_m": self.resident_tile.camera_offset_m,
+                "max_normal_error_radians": max_normal_error,
+                "max_material_component_error": max_material_error,
+                "invalid_sample_count": invalid_sample_count,
+                "all_positions_normals_materials_finite": invalid_sample_count == 0,
+                "normal_length_tolerance": 0.0001,
+                "material_weight_sum_tolerance": 0.0001,
+                "local_position_tolerance_m": 0.001,
+                "view_position_tolerance_m": 0.001,
+                "normal_tolerance_radians": 0.001,
+                "material_component_tolerance": 0.00001,
+                "passed": passed,
+                "readback_scope": "one_shot_fixture_validation_after_first_frame_submission",
+                "ordinary_frame_readbacks": 0,
+            }));
+            self.resident_tile.validation_pending = false;
+        }
+        #[cfg(feature = "developer-tools")]
+        if let Some((draw, patch_index)) = resident_hierarchy_validation_draw {
+            let vertices = renderer.validate_resident_hierarchy(&draw, patch_index)?;
+            let cells = draw.parent.tile.key.cells;
+            let mut max_local_error = 0.0f64;
+            let mut max_view_error = 0.0f64;
+            let mut max_normal_error = 0.0f64;
+            let mut max_material_error = 0.0f64;
+            let mut invalid_sample_count = 0usize;
+            for (index, gpu) in vertices.iter().enumerate() {
+                let grid = [index as u32 % (cells + 1), index as u32 / (cells + 1)];
+                let cpu = draw.reconstruct_patch(patch_index, grid)?;
+                let gpu_local = DVec3::from_array(gpu.position_local_m.map(f64::from));
+                let gpu_view = DVec3::from_array(gpu.position_view_m.map(f64::from));
+                max_local_error =
+                    max_local_error.max(cpu.position_parent_local_m.distance(gpu_local));
+                max_view_error = max_view_error.max(draw.position_view(&cpu).distance(gpu_view));
+                let gpu_normal = DVec3::from_array(gpu.normal_body.map(f64::from));
+                max_normal_error = max_normal_error.max(
+                    cpu.normal_body
+                        .cross(gpu_normal)
+                        .length()
+                        .atan2(cpu.normal_body.dot(gpu_normal)),
+                );
+                for (expected, actual) in cpu.material.into_iter().zip(gpu.material) {
+                    max_material_error =
+                        max_material_error.max((expected - f64::from(actual)).abs());
+                }
+                let normal_length = gpu_normal.length();
+                let material_sum = gpu.material.iter().sum::<f32>();
+                let valid = gpu.position_local_m.iter().all(|v| v.is_finite())
+                    && gpu.position_view_m.iter().all(|v| v.is_finite())
+                    && gpu.normal_body.iter().all(|v| v.is_finite())
+                    && (normal_length - 1.0).abs() <= 1.0e-4
+                    && gpu
+                        .material
+                        .iter()
+                        .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
+                    && (material_sum - 1.0).abs() <= 1.0e-4;
+                if !valid {
+                    invalid_sample_count += 1;
+                }
+            }
+            let passed = vertices.len() == ((cells + 1) * (cells + 1)) as usize
+                && invalid_sample_count == 0
+                && max_local_error <= 0.001
+                && max_view_error <= 0.001
+                && max_normal_error <= 0.001
+                && max_material_error <= 1.0e-5;
+            let validation = serde_json::json!({
+                "patch_index": patch_index,
+                "sample_count": vertices.len(),
+                "max_parent_anchor_local_error_m": max_local_error,
+                "max_view_position_error_m": max_view_error,
+                "max_normal_error_radians": max_normal_error,
+                "max_material_component_error": max_material_error,
+                "invalid_sample_count": invalid_sample_count,
+                "material_weight_sum_tolerance": 0.0001,
+                "normal_length_tolerance": 0.0001,
+                "position_tolerance_m": 0.001,
+                "normal_tolerance_radians": 0.001,
+                "material_component_tolerance": 0.00001,
+                "passed": passed,
+                "readback_scope": "explicit_hierarchy_diagnostic_validation_after_frame_submission",
+                "ordinary_frame_readbacks": 0,
+            });
+            self.resident_hierarchy.validation = Some(validation.clone());
+            self.resident_hierarchy.validation_history.push(validation);
+            self.resident_hierarchy.validation_pending =
+                (patch_index < 4).then_some(patch_index + 1);
+        }
+        #[cfg(feature = "developer-tools")]
+        let resident_report = self
+            .resident_tile
+            .enabled
+            .then(|| renderer.last_resident_tile_report());
+        #[cfg(feature = "developer-tools")]
+        let hierarchy_report = self
+            .resident_hierarchy
+            .enabled
+            .then(|| renderer.last_resident_hierarchy_report());
+        #[cfg(feature = "developer-tools")]
+        if let Some(report) = hierarchy_report.as_ref() {
+            self.resident_hierarchy.observe_uploads(Some(report));
+        }
+        #[cfg(feature = "developer-tools")]
+        {
+            snapshot.resident_tile = self
+                .resident_tile
+                .snapshot(resident_report.as_ref(), self.developer_frame_number);
+            snapshot.resident_hierarchy = self
+                .resident_hierarchy
+                .snapshot(hierarchy_report.as_ref(), self.developer_frame_number);
+            if self.resident_regional.enabled {
+                self.resident_regional
+                    .observe(renderer.last_resident_regional_report());
+                if !renderer.deterministic() {
+                    self.resident_regional
+                        .record_native_frame(&snapshot.performance);
+                }
+                snapshot.resident_regional = self.resident_regional.snapshot();
+            }
+            if let (Some(reason), Some(serde_json::Value::Object(hierarchy))) = (
+                self.resident_tile.stale_reason.as_ref(),
+                snapshot.resident_hierarchy.as_mut(),
+            ) {
+                hierarchy.insert("stale_reason".into(), serde_json::json!(reason));
+                hierarchy.insert("parent_drawable".into(), serde_json::json!(false));
+                hierarchy.insert("draw_children_gpu_ready".into(), serde_json::json!(false));
+            }
+        }
+        #[cfg(feature = "developer-tools")]
+        if renderer.deterministic() {
+            snapshot.performance = snapshot
+                .performance
+                .with_gpu(renderer.latest_gpu_profile(), "same_frame_offscreen");
+            snapshot.performance.gpu_source_frame = Some(self.developer_frame_number);
+        }
+        #[cfg(feature = "developer-tools")]
+        if self.developer_session.is_some() || renderer.deterministic() {
+            self.developer_snapshot = Some(snapshot);
+        }
         #[cfg(feature = "surface-profile")]
         tracing::debug!(
             interval_ms = elapsed.as_secs_f64() * 1000.0,
@@ -2626,7 +3123,7 @@ fn draw_engineering_ui(
         ui.small("Orbit: left drag / wheel. Flight: WASD, Q/E, right drag, Shift boost.");
         ui.add(egui::Slider::new(&mut controls.manual_speed,1e-3..=1e3).logarithmic(true).text("User speed multiplier (×)"));
         ui.small(format!("Navigation speed {} / wall s",compact_distance(info.camera.flight_speed_m_s())));
-        ui.checkbox(&mut controls.markers,"Navigation markers");ui.checkbox(&mut controls.labels,"Labels");ui.checkbox(&mut controls.guide_visible,"Instantaneous orbit guides");ui.checkbox(&mut controls.trails,"Committed historical trails");
+        visual_controls::checkbox(ui,controls,visual_controls::Layer::Markers,"Navigation markers");visual_controls::checkbox(ui,controls,visual_controls::Layer::Labels,"Labels");visual_controls::checkbox(ui,controls,visual_controls::Layer::Guides,"Instantaneous orbit guides");visual_controls::checkbox(ui,controls,visual_controls::Layer::Trails,"Committed historical trails");
         let guide_count=if controls.guide_visible{info.guides.iter().filter(|g|(g.authored_orbit.is_some() || g.elements.is_some_and(|e|e.class()==ConicClass::Elliptic))&&g.reference.is_some()).count()}else{0};
         ui.small(format!("{guide_count} available guides · sampled {:.3} simulation s",info.system.sample_time().seconds_since_epoch()));
         ui.small("Coincident markers: repeat click to cycle every candidate.");
@@ -2731,7 +3228,7 @@ fn draw_engineering_ui(
             }
             });
         });
-        ui.checkbox(&mut controls.markers,"Navigation markers (no physical size change)");ui.checkbox(&mut controls.labels,"Labels");ui.checkbox(&mut controls.trails,"Actual committed-history trails");
+        visual_controls::checkbox(ui,controls,visual_controls::Layer::Markers,"Navigation markers (no physical size change)");visual_controls::checkbox(ui,controls,visual_controls::Layer::Labels,"Labels");visual_controls::checkbox(ui,controls,visual_controls::Layer::Trails,"Actual committed-history trails");
         let mut relative=controls.relative_trails;if ui.checkbox(&mut relative,"Simultaneous history relative to selected body").changed() {controls.pending.push_back(Command::TrailMode(relative));}
         let mode_label=match info.trail_mode {TrailMode::Inertial=>"Inertial system-space history".to_string(),TrailMode::SimultaneousBodyRelative(id)=>format!("History relative to {} at each sample",info.system.body(id).expect("trail reference").name())};
         ui.label(mode_label);ui.label(format!("Trail stride {} ticks / {}/{} complete samples / {} bytes / times {:?} s",info.trail_stride,info.trail_count,info.trail_capacity,info.trail_bytes,info.trail_times));
@@ -2795,7 +3292,7 @@ fn draw_ui(
                     }
                 });
                 ui.small("Guard protects sampled complete-terrain radial clearance (reference-sphere fallback when unavailable), not collision. Pending drawn mesh may intersect the observer; it does not clamp navigation.");
-            } else if info.system.body(id).is_ok_and(|body|body.terrain().is_none()) {
+            } else if info.system.body(id).is_ok_and(|body|!body.has_surface()) {
                 ui.label("Non-terrain / far-only body: no rocky terrain query");
                 if let Ok(clearance)=info.camera.measured_clearance(&pair,id) {ui.label(format!("Reference-sphere altitude {}",compact_distance(clearance)));}
             } else {ui.label("Terrain clearance unavailable");}
@@ -2816,26 +3313,26 @@ fn draw_ui(
             }
             });
             ui.collapsing("Debug rendering / lighting", |ui| {
-            ui.checkbox(&mut controls.surface_style.borders,"Patch borders");ui.checkbox(&mut controls.surface_style.lod_colors,"LOD colours");ui.checkbox(&mut controls.surface_style.face_colors,"Face IDs / colours");ui.checkbox(&mut controls.surface_style.underside,"No-cull underside diagnostic");
+            visual_controls::checkbox(ui,controls,visual_controls::Layer::Borders,"Patch borders");visual_controls::checkbox(ui,controls,visual_controls::Layer::LodColors,"LOD colours");ui.checkbox(&mut controls.surface_style.face_colors,"Face IDs / colours");ui.checkbox(&mut controls.surface_style.underside,"No-cull underside diagnostic");
             ui.checkbox(&mut controls.surface_bounds,"Bounds / normal envelope axes (bounded)");
             let mut preview=controls.terrain_preview;
             if ui.checkbox(&mut preview,"Adaptive terrain with stitched transitions").changed() {controls.pending.push_back(Command::TerrainPreview(preview));}
             if controls.terrain_preview {
                 ui.label("Natural planetary presentation (render-only layers)");
-                ui.checkbox(&mut controls.planetary_ocean,"Ocean layer (where defined)");
-                ui.checkbox(&mut controls.planetary_clouds,"Cloud layer (where defined)");
-                ui.checkbox(&mut controls.planetary_atmosphere,"Atmosphere layer (where defined)");
+                visual_controls::checkbox(ui,controls,visual_controls::Layer::Ocean,"Ocean layer (where defined)");
+                visual_controls::checkbox(ui,controls,visual_controls::Layer::Clouds,"Cloud layer (where defined)");
+                visual_controls::checkbox(ui,controls,visual_controls::Layer::Atmosphere,"Atmosphere layer (where defined)");
                 ui.checkbox(&mut controls.sun_from_star,"Use central star direction (disable for lighting presets)");
                 ui.add(egui::Slider::new(&mut controls.terrain_morph_ms,0..=1000).text("Morph ms (0: static)").clamping(egui::SliderClamping::Always));
                 ui.checkbox(&mut controls.surface_style.elevation_colors,"Derived terrain elevation colours");
                 let mut enabled = matches!(controls.terrain_lighting.mode(),TerrainRenderMode::Lit|TerrainRenderMode::Readability|TerrainRenderMode::Natural);
                 if ui.checkbox(&mut enabled, "Terrain lighting enabled").changed() {
-                    controls.terrain_lighting = controls.terrain_lighting.with_mode(if enabled { TerrainRenderMode::Lit } else { TerrainRenderMode::Elevation });
+                    controls.pending.push_back(Command::Visual(visual_controls::VisualCommand::RenderMode(if enabled { TerrainRenderMode::Lit } else { TerrainRenderMode::Elevation })));
                 }
                 egui::ComboBox::from_label("Terrain shading mode").selected_text(format!("{:?}", controls.terrain_lighting.mode())).show_ui(ui, |ui| {
                     for mode in TerrainRenderMode::ALL {
                         if ui.selectable_label(controls.terrain_lighting.mode() == mode, format!("{mode:?}")).clicked() {
-                            controls.terrain_lighting = controls.terrain_lighting.with_mode(mode);
+                            controls.pending.push_back(Command::Visual(visual_controls::VisualCommand::RenderMode(mode)));
                         }
                     }
                 });
@@ -3059,7 +3556,13 @@ fn draw_ui(
         let local_look=matches!(info.camera.mode(),CameraMode::FreeFlight|CameraMode::SurfaceInspection);
         let keyboard_blocked=context.wants_keyboard_input() || context.memory(|m|m.focused().is_some());
         controls.keyboard_blocked=keyboard_blocked;
-        if !input.focused || !controls.input_focused {
+        let automation_active={
+            #[cfg(feature="developer-tools")]
+            { controls.automation_owner.is_some() }
+            #[cfg(not(feature="developer-tools"))]
+            { false }
+        };
+        if (!input.focused || !controls.input_focused) && !automation_active {
             controls.pending.push_back(Command::CancelNavigation);
         } else if !controls.native_events {
             let deltas=controls.viewport_input.events(&input.events,rect,local_look,keyboard_blocked,

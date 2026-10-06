@@ -18,8 +18,8 @@ fn terrain_clearance_is_complete_read_only_and_absent_for_gas_giants() {
     let revision = world.revision();
     for body_kind in [SolarBody::Earth, SolarBody::Moon, SolarBody::Mars] {
         let (id, body) = world.bodies().nth(body_kind as usize).unwrap();
-        let terrain = body.terrain().unwrap();
         let radius = body.properties().reference_radius_m();
+        let fixed = projection.frames_for(id).unwrap().body_fixed;
         for direction in [
             DVec3::X,
             DVec3::Y,
@@ -28,13 +28,32 @@ fn terrain_clearance_is_complete_read_only_and_absent_for_gas_giants() {
             -DVec3::Y,
             -DVec3::Z,
         ] {
-            let measured =
-                clearance_at_position(terrain, radius, direction * (radius + 100.0), id).unwrap();
+            let position = direction * (radius + 100.0);
+            let pose = FramePose::new(
+                FramePosition::new(fixed, LocalPosition::try_metres(position).unwrap()),
+                UnitRotation::identity(),
+            );
+            let measured = terrain_clearance(&pair, pose, id).unwrap().unwrap();
+            if let Some(terrain) = body.terrain() {
+                let direct = clearance_at_position(terrain, radius, position, id).unwrap();
+                assert_eq!(measured.clearance_m, direct.clearance_m);
+            } else {
+                let generator = mundaris_world::terrain::SurfaceGenerator::new(
+                    body.surface_definition().unwrap(),
+                    radius,
+                )
+                .unwrap();
+                let location = mundaris_math::surface::SurfaceLocation::new(
+                    Direction3::try_new(direction).unwrap(),
+                );
+                let oracle = generator.evaluate_point(location).unwrap();
+                assert_eq!(measured.terrain_elevation_m, oracle.terrain().height_m());
+                assert_eq!(measured.clearance_m, position.length() - oracle.radius_m());
+            }
             assert!((measured.clearance_m - (100.0 - measured.terrain_elevation_m)).abs() < 1e-7);
             assert_eq!(measured.sphere_altitude_m, 100.0);
             assert!(measured.slope_angle_rad.is_finite());
         }
-        let fixed = projection.frames_for(id).unwrap().body_fixed;
         let pose = FramePose::new(
             FramePosition::new(
                 fixed,

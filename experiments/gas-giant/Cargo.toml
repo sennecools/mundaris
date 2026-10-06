@@ -1,0 +1,22 @@
+[package]
+name = "mundaris_gas_giant_lab"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Deliberately isolated: no production crate depends on this research executable.
+[workspace]
+
+[dependencies]
+png = "0.18"
+rustfft = "6.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+thiserror = "2"
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[profile.release]
+debug = 1

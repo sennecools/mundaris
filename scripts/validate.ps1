@@ -10,11 +10,11 @@ remain separate. Historical acceptance/evidence scripts are preserved unchanged.
 param(
     [string] $OutputDirectory,
     [switch] $IncludeGpu,
-    [ValidateSet('format','workspace-check','clippy-all-features','clippy-default','tests-debug','tests-release','rustdoc','long-orbits','native_close_surface','native_full_frame','developer_interface')]
+    [ValidateSet('format','workspace-check','clippy-all-features','clippy-default','tests-debug','tests-release','rustdoc','long-orbits','native_close_surface','native_full_frame','developer_interface','developer_bridge','developer_scenarios')]
     [string[]] $Only = @()
 )
 $ErrorActionPreference = 'Stop'
-if (!$IncludeGpu -and @($Only | Where-Object { $_ -in @('native_close_surface','native_full_frame','developer_interface') }).Count -gt 0) {
+if (!$IncludeGpu -and @($Only | Where-Object { $_ -in @('native_close_surface','native_full_frame','developer_interface','developer_scenarios') }).Count -gt 0) {
     throw 'Selected GPU checks require -IncludeGpu; refusing an empty/unexecuted selection.'
 }
 $repo = Split-Path -Parent $PSScriptRoot
@@ -62,8 +62,9 @@ try {
     try { $env:RUSTDOCFLAGS='-D warnings'; Run-Check 'rustdoc' @('doc','--locked','--workspace','--all-features','--no-deps') }
     finally { $env:RUSTDOCFLAGS=$oldFlags }
     Run-Check 'long-orbits' @('test','--locked','--release','-p','mundaris_simulation','--test','orbits','--','--ignored','--nocapture')
+    Run-Check 'developer_bridge' @('test','--locked','--release','-p','mundaris_app','--features','developer-tools','--test','developer_bridge','--','--nocapture')
     if ($IncludeGpu) {
-        foreach ($test in @('native_close_surface','native_full_frame','developer_interface')) {
+        foreach ($test in @('native_close_surface','native_full_frame','developer_interface','developer_scenarios')) {
             Run-Check $test @('test','--locked','--release','-p','mundaris_app','--all-features','--test',$test,'--','--ignored','--nocapture')
         }
     }

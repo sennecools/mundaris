@@ -90,11 +90,14 @@ fn surface_certificate(
 /// covers complete truth as well as the filtered field; numeric margins cover
 /// radial reconstruction and the centre direction. Interpolation is unchanged.
 pub(super) fn certificate_for_samples(
-    generator: &TerrainGenerator,
+    generator: &NativeTerrainGenerator,
     address: CubePatchAddress,
     metadata: PatchMetadata,
     samples: &[SurfaceGeometrySample],
 ) -> Result<(SurfaceExtent, SurfaceErrorContributions)> {
+    let NativeTerrainGenerator::Legacy(generator) = generator else {
+        return generator.surface_certificate(address, metadata);
+    };
     let centre = samples
         .get(8 * 17 + 8)
         .ok_or_else(|| anyhow::anyhow!("missing terrain centre sample"))?;

@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "preset": "solar-system",
+  "deterministic": true,
+  "initial_settings": [{ "action": "reset" }, { "action": "pause", "paused": true }],
+  "steps": [
+    { "action": { "action": "overview" } },
+    { "checkpoint": { "name": "system-overview-start", "predicate": { "path": "general.camera_mode", "equals": "system_orbit" }, "timeout_s": 20 } },
+    { "capture": { "name": "overview-start" } },
+    { "action": { "action": "select", "body": "solar:earth" } },
+    { "action": { "action": "focus", "body": "solar:earth" } },
+    { "checkpoint": { "name": "earth-focused", "predicate": { "path": "general.focused_body.name", "equals": "Earth" }, "timeout_s": 20 } },
+    { "capture": { "name": "earth-orbit" } },
+    { "action": { "action": "navigation_mode", "mode": "surface_inspection" } },
+    { "checkpoint": { "name": "earth-surface-ready", "predicate": { "path": "general.camera_mode", "equals": "surface_inspection" }, "timeout_s": 20 } },
+    { "capture": { "name": "earth-surface" } },
+    { "action": { "action": "select", "body": "solar:moon" } },
+    { "action": { "action": "focus", "body": "solar:moon" } },
+    { "checkpoint": { "name": "moon-focused", "predicate": { "path": "general.focused_body.name", "equals": "Moon" }, "timeout_s": 20 } },
+    { "capture": { "name": "moon-orbit" } },
+    { "action": { "action": "navigation_mode", "mode": "surface_inspection" } },
+    { "checkpoint": { "name": "moon-surface-ready", "predicate": { "path": "general.camera_mode", "equals": "surface_inspection" }, "timeout_s": 20 } },
+    { "capture": { "name": "moon-surface" } },
+    { "action": { "action": "overview" } },
+    { "checkpoint": { "name": "system-overview-recovered", "predicate": { "path": "general.camera_mode", "equals": "system_orbit" }, "timeout_s": 20 } },
+    { "capture": { "name": "overview-recovered" } }
+  ]
+}

@@ -225,6 +225,7 @@ impl TerrainCaptureRenderer {
         // device completion and readback. This is never GPU elapsed time.
         self.last_cpu_encode = start.elapsed();
         let submission = self.queue.submit([commands]);
+        self.renderer.resident_on_submitted(&self.queue);
         let (sender, receiver) = std::sync::mpsc::channel();
         self.readback
             .map_async(wgpu::MapMode::Read, .., move |result| {
@@ -313,6 +314,48 @@ impl TerrainCaptureRenderer {
     /// Same-submission sky residency and upload accounting, excluding readback.
     pub fn last_sky_resource_report(&self) -> crate::sky::SkyResourceReport {
         self.renderer.last_sky_resource_report()
+    }
+    /// Last resident tile content upload and allocation accounting.
+    pub fn last_resident_tile_report(&self) -> crate::ResidentTileReport {
+        self.renderer.last_resident_tile_report()
+    }
+
+    /// Last five-slot resident hierarchy payload and readiness accounting.
+    pub fn last_resident_hierarchy_report(&self) -> crate::ResidentHierarchyReport {
+        self.renderer.last_resident_hierarchy_report()
+    }
+    /// Latest regional residency accounting from the submitted capture.
+    pub fn last_resident_regional_report(&self) -> crate::RegionalResidentReport {
+        self.renderer.last_resident_regional_report()
+    }
+    /// Explicit regional GPU reconstruction readback; excluded from ordinary frames.
+    pub fn validate_resident_regional(
+        &mut self,
+        draw: &crate::RegionalResidentDraw,
+        index: usize,
+    ) -> Result<Vec<crate::ReconstructedTileVertex>, RenderPreparationError> {
+        self.renderer
+            .validate_resident_regional(&self.device, &self.queue, draw, index)
+    }
+
+    /// Reconstruct every regular-grid vertex using the production WGSL helper.
+    /// This explicit diagnostic waits for a one-shot readback; render() does not.
+    pub fn validate_resident_tile(
+        &mut self,
+        draw: &crate::TileDraw,
+    ) -> Result<Vec<crate::ReconstructedTileVertex>, RenderPreparationError> {
+        self.renderer
+            .validate_resident_tile(&self.device, &self.queue, draw)
+    }
+
+    /// Reconstruct one parent/child regular grid through the production WGSL helper.
+    pub fn validate_resident_hierarchy(
+        &mut self,
+        draw: &crate::ResidentHierarchyDraw,
+        patch_index: usize,
+    ) -> Result<Vec<crate::ReconstructedTileVertex>, RenderPreparationError> {
+        self.renderer
+            .validate_resident_hierarchy(&self.device, &self.queue, draw, patch_index)
     }
 
     pub fn width(&self) -> u32 {

@@ -233,6 +233,11 @@ struct ErosionContext {
     features: usize,
     feedback: bool,
 }
+struct EvaluationWeights {
+    noise: [[f64; 4]; 5],
+    erosion: [f64; 5],
+    craters: Vec<f64>,
+}
 impl ErosionContext {
     fn new(feedback: bool) -> Self {
         Self {
@@ -253,6 +258,7 @@ pub struct TerrainGenerator {
     global_height_m: f64,
     erosion: [Option<ErosionOctave>; 5],
     orientation_weights: [[f64; 4]; 5],
+    craters: Option<crater::CompiledCraterField>,
 }
 impl TerrainGenerator {
     pub fn new(definition: &TerrainDefinition, radius_m: f64) -> Result<Self, TerrainError> {
@@ -266,6 +272,15 @@ impl TerrainGenerator {
         Self::compile(definition, radius_m).map(|_| ())
     }
     fn compile(d: &TerrainDefinition, radius_m: f64) -> Result<Self, TerrainError> {
+        let craters = match (d.version(), d.config().crater_field()) {
+            (TerrainGeneratorVersion::CrateredV1, Some(config)) => Some(
+                crater::CompiledCraterField::new(config, salt(d, 0x435241544552, 0), radius_m)?,
+            ),
+            (TerrainGeneratorVersion::CrateredV1, None) | (_, Some(_)) => {
+                return Err(TerrainError::InvalidConfig);
+            }
+            (_, None) => None,
+        };
         let c = d.config().controls();
         let frequency = |b: TerrainBandConfig| match b.scale() {
             TerrainScale::Metres {
@@ -449,9 +464,25 @@ impl TerrainGenerator {
             octaves,
             continent,
             mountains,
-            global_height_m: d.config().absolute_height_bound_m(),
+            global_height_m: d.config().noise_height_bound_m(),
             erosion,
             orientation_weights,
+            craters,
+        })
+    }
+    fn evaluation_weights(
+        &self,
+        footprint: TerrainFootprint,
+    ) -> Result<EvaluationWeights, TerrainError> {
+        Ok(EvaluationWeights {
+            noise: self.weights(footprint)?,
+            erosion: self.erosion_weights(footprint)?,
+            craters: self
+                .craters
+                .as_ref()
+                .map(|field| field.weights(footprint))
+                .transpose()?
+                .unwrap_or_default(),
         })
     }
     fn weights(&self, footprint: TerrainFootprint) -> Result<[[f64; 4]; 5], TerrainError> {
@@ -640,23 +671,22 @@ impl TerrainGenerator {
     fn evaluate(
         &self,
         location: SurfaceLocation,
-        weights: &[[f64; 4]; 5],
-        erosion_weights: &[f64; 5],
+        weights: &EvaluationWeights,
         calls: &mut usize,
         features: &mut usize,
         context: &mut ErosionContext,
     ) -> Result<TerrainSample, TerrainError> {
         let n = location.direction().unit();
-        let (mut sum, base_mask) = self.base(n, weights, calls)?;
-        if erosion_weights.iter().any(|w| *w != 0.0) {
-            let mask = if weights[1..].iter().flatten().any(|w| *w != 0.0) {
+        let (mut sum, base_mask) = self.base(n, &weights.noise, calls)?;
+        if weights.erosion.iter().any(|w| *w != 0.0) {
+            let mask = if weights.noise[1..].iter().flatten().any(|w| *w != 0.0) {
                 base_mask
             } else {
                 self.base(n, &self.orientation_weights, calls)?.1
             };
             context.noise_calls = 0;
             context.features = 0;
-            for (level, w) in erosion_weights.iter().copied().enumerate() {
+            for (level, w) in weights.erosion.iter().copied().enumerate() {
                 if w == 0.0 {
                     continue;
                 }
@@ -664,6 +694,13 @@ impl TerrainGenerator {
             }
             *calls += context.noise_calls;
             *features += context.features;
+        }
+        if let Some(field) = &self.craters {
+            let (height, gradient) = field.sample(n, &weights.craters);
+            sum = sum.add(Value {
+                v: height,
+                g: gradient,
+            });
         }
         let tangent = sum.g - n * sum.g.dot(n);
         if !sum.v.is_finite() || !tangent.is_finite() {
@@ -674,8 +711,7 @@ impl TerrainGenerator {
     pub fn evaluate_point(&self, query: TerrainQuery) -> Result<TerrainSample, TerrainError> {
         self.evaluate(
             query.location,
-            &self.weights(query.footprint)?,
-            &self.erosion_weights(query.footprint)?,
+            &self.evaluation_weights(query.footprint)?,
             &mut 0,
             &mut 0,
             &mut ErosionContext::new(true),
@@ -689,8 +725,7 @@ impl TerrainGenerator {
     ) -> Result<TerrainSample, TerrainError> {
         self.evaluate(
             query.location,
-            &self.weights(query.footprint)?,
-            &self.erosion_weights(query.footprint)?,
+            &self.evaluation_weights(query.footprint)?,
             &mut 0,
             &mut 0,
             &mut ErosionContext::new(false),
@@ -706,7 +741,16 @@ impl TerrainGenerator {
         let (_, mask) = self.base(n, &self.orientation_weights, &mut 0)?;
         let mut output = [TerrainSample::default(); 1];
         let report = self.evaluate_batch(&[query.location], query.footprint, &mut output)?;
-        let contribution_m = output[0].height_m() - base.v;
+        let crater_height = self.craters.as_ref().map_or(Ok(0.0), |field| {
+            field
+                .weights(query.footprint)
+                .map(|weights| field.sample(n, &weights).0)
+        })?;
+        let contribution_m = if self.erosion.iter().flatten().any(|x| x.amplitude_m != 0.0) {
+            output[0].height_m() - base.v - crater_height
+        } else {
+            0.0
+        };
         let budget: f64 = self.erosion.iter().flatten().map(|x| x.amplitude_m).sum();
         Ok(ErosionDiagnostics {
             contribution_m,
@@ -729,8 +773,7 @@ impl TerrainGenerator {
         if locations.len() != output.len() {
             return Err(TerrainError::LengthMismatch);
         }
-        let weights = self.weights(footprint)?;
-        let erosion_weights = self.erosion_weights(footprint)?;
+        let weights = self.evaluation_weights(footprint)?;
         let mut primitive_calls = 0;
         let mut erosion_features = 0;
         // Fixed-anchor coefficients may be reused within one caller-owned batch.
@@ -741,7 +784,6 @@ impl TerrainGenerator {
             *sample = self.evaluate(
                 *location,
                 &weights,
-                &erosion_weights,
                 &mut primitive_calls,
                 &mut erosion_features,
                 &mut context,
@@ -750,29 +792,55 @@ impl TerrainGenerator {
         let cap = DirectionalCap::new(
             mundaris_math::Direction3::try_new(DVec3::X)
                 .map_err(|_| TerrainError::InvalidConfig)?,
-            0.0,
+            if self.craters.is_some() {
+                std::f64::consts::PI
+            } else {
+                0.0
+            },
         )
         .map_err(|_| TerrainError::InvalidConfig)?;
         Ok(TerrainEvaluationReport {
             sample_count: locations.len(),
             primitive_calls,
             erosion_features,
-            active_erosion_octaves: erosion_weights.iter().filter(|w| **w == 1.0).count(),
-            faded_erosion_octaves: erosion_weights
+            active_erosion_octaves: weights.erosion.iter().filter(|w| **w == 1.0).count(),
+            faded_erosion_octaves: weights
+                .erosion
                 .iter()
                 .filter(|w| **w > 0.0 && **w < 1.0)
                 .count(),
             skipped_erosion_octaves: self.erosion.iter().flatten().count()
-                - erosion_weights.iter().filter(|w| **w != 0.0).count(),
+                - weights.erosion.iter().filter(|w| **w != 0.0).count(),
             cartesian_height_gradient_bound_m: self.bounds_for_region(cap, footprint)?.gradient,
         })
     }
     pub fn radius_m(&self) -> f64 {
         self.radius_m
     }
+    /// Immutable generated landmarks, independent of observer, frames and render LOD.
+    pub fn crater_features(&self) -> &[CraterFeature] {
+        self.craters.as_ref().map_or(&[], |field| field.features())
+    }
+    /// Retained catalogue capacity; the generator itself is inline in its owner.
+    pub fn resident_heap_bytes(&self) -> usize {
+        self.craters
+            .as_ref()
+            .map_or(0, |field| field.resident_heap_bytes())
+    }
+    /// Two simultaneous footprint-weight vectors can be live during a batch report.
+    pub fn query_workspace_bytes(&self) -> usize {
+        self.crater_features().len() * 2 * std::mem::size_of::<f64>()
+    }
+    /// Preflight for a catalogue and its bounded query workspace before compilation.
+    pub fn working_heap_bound_bytes(config: &TerrainConfig) -> usize {
+        config.crater_field().map_or(0, |field| {
+            usize::from(field.count())
+                * (std::mem::size_of::<CraterFeature>() + 2 * std::mem::size_of::<f64>())
+        })
+    }
     pub fn bounds_for_region(
         &self,
-        _cap: DirectionalCap,
+        cap: DirectionalCap,
         footprint: TerrainFootprint,
     ) -> Result<TerrainRegionCertificate, TerrainError> {
         let weights = self.weights(footprint)?;
@@ -834,8 +902,33 @@ impl TerrainGenerator {
         {
             return Err(TerrainError::InvalidConfig);
         }
+        let mut interval = [-self.global_height_m, self.global_height_m];
+        if let Some(field) = &self.craters {
+            let bounds = field.bounds(cap, &field.weights(footprint)?);
+            interval = [
+                (interval[0] + bounds.interval[0]).next_down(),
+                (interval[1] + bounds.interval[1]).next_up(),
+            ];
+            represented = widen(represented + bounds.represented);
+            unresolved = widen(unresolved + bounds.unresolved);
+            gradient = widen(gradient + bounds.gradient);
+            hessian = widen(hessian + bounds.hessian);
+        }
+        if ![
+            interval[0],
+            interval[1],
+            represented,
+            unresolved,
+            gradient,
+            hessian,
+        ]
+        .iter()
+        .all(|x| x.is_finite())
+        {
+            return Err(TerrainError::InvalidConfig);
+        }
         Ok(TerrainRegionCertificate {
-            interval: [-self.global_height_m, self.global_height_m],
+            interval,
             represented,
             unresolved,
             gradient,
@@ -847,6 +940,27 @@ impl TerrainGenerator {
     /// profiles at the same direction.
     pub fn profile_difference_bound_m(
         &self,
+        a: TerrainFootprint,
+        b: TerrainFootprint,
+    ) -> Result<f64, TerrainError> {
+        self.profile_difference_bound_in_cap_m(None, a, b)
+    }
+
+    /// Bounds the difference of two filtered profiles at any shared direction
+    /// in the cap. Analytic crater landmarks contribute zero at every footprint;
+    /// background noise and erosion retain their global certificates.
+    pub fn profile_difference_bound_for_region_m(
+        &self,
+        cap: DirectionalCap,
+        a: TerrainFootprint,
+        b: TerrainFootprint,
+    ) -> Result<f64, TerrainError> {
+        self.profile_difference_bound_in_cap_m(Some(cap), a, b)
+    }
+
+    fn profile_difference_bound_in_cap_m(
+        &self,
+        _cap: Option<DirectionalCap>,
         a: TerrainFootprint,
         b: TerrainFootprint,
     ) -> Result<f64, TerrainError> {
@@ -885,6 +999,8 @@ impl TerrainGenerator {
                 total = widen(total + product(x.amplitude_m, delta));
             }
         }
+        // Compact analytic landmarks have identical values at all footprints.
+        // Their curvature is charged to interpolation, never to profile delta.
         if total.is_finite() {
             Ok(total)
         } else {

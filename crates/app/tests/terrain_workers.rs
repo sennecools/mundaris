@@ -16,13 +16,17 @@ fn fixture() -> (CelestialSystem, Vec<TerrainGeometryIdentity>) {
         .into_iter()
         .map(|target| {
             let (body, state) = world.bodies().nth(target as usize).unwrap();
-            TerrainGeometryIdentity::new(
-                body,
-                state.terrain().unwrap().clone(),
-                state.terrain_revision(),
-                state.properties().reference_radius_m(),
-            )
-            .unwrap()
+            if state.surface_definition().is_some() {
+                TerrainGeometryIdentity::from_body(body, state).unwrap()
+            } else {
+                TerrainGeometryIdentity::new(
+                    body,
+                    state.terrain().unwrap().clone(),
+                    state.terrain_revision(),
+                    state.properties().reference_radius_m(),
+                )
+                .unwrap()
+            }
         })
         .collect();
     (world, identities)
@@ -133,7 +137,7 @@ fn worker_cancellation_revision_switch_and_aggregate_reservations_stay_bounded()
     cache.generate(1, GENERATION_MICROBATCH, None).unwrap();
     thread::sleep(Duration::from_millis(1));
     world
-        .edit_terrain(old.body, Some(old.definition.clone()))
+        .edit_terrain(old.body, Some(old.definition.legacy().unwrap().clone()))
         .unwrap();
     let revised = TerrainGeometryIdentity::new(
         old.body,

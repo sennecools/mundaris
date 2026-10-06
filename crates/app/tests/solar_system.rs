@@ -308,13 +308,22 @@ fn both_presets_advance_with_the_unchanged_resolved_newtonian_integrator() {
 }
 
 #[test]
-fn terrain_definitions_are_distinct_rocky_v2_and_attached() {
+fn rocky_terrain_definitions_are_distinct_and_attached() {
     let system = SolarSystemPreset::gameplay().create(ns(30)).unwrap();
     let world_bodies = bodies(&system);
     let mut definitions = Vec::new();
     for (index, body) in world_bodies.iter().enumerate() {
         match SOLAR_SYSTEM_CONTENT[index].rocky_terrain_seed {
             Some(seed) => {
+                if SOLAR_SYSTEM_CONTENT[index].identity == SolarBody::Moon {
+                    assert!(body.terrain().is_none());
+                    assert_eq!(body.surface_definition().unwrap().seed(), TerrainSeed(seed));
+                    assert_eq!(
+                        body.surface_definition().unwrap().terrain().algorithm(),
+                        SurfaceAlgorithm::RockyV5
+                    );
+                    continue;
+                }
                 let definition = body.terrain().expect("rocky bodies receive terrain");
                 assert_eq!(definition.seed(), TerrainSeed(seed));
                 assert_eq!(definition.version(), TerrainGeneratorVersion::V2);
@@ -327,7 +336,7 @@ fn terrain_definitions_are_distinct_rocky_v2_and_attached() {
             None => assert!(body.terrain().is_none(), "Sun/gas giants have no terrain"),
         }
     }
-    assert_eq!(definitions.len(), 5);
+    assert_eq!(definitions.len(), 4);
     assert!(definitions.windows(2).all(|pair| pair[0] != pair[1]));
 
     let small = terrain_definition(SolarBody::Earth, 50_000.0)
@@ -382,5 +391,160 @@ fn terrain_definitions_are_distinct_rocky_v2_and_attached() {
                 .dot(location.direction().unit())
                 > 0.0
         );
+    }
+}
+
+#[test]
+fn moon_surface_is_native_rocky_v5_and_clearance_queries_the_same_field() {
+    for (namespace, preset) in [
+        (ns(31), SolarSystemPreset::gameplay()),
+        (ns(32), SolarSystemPreset::real_scale()),
+    ] {
+        let mut system = preset.create(namespace).unwrap();
+        let (moon_id, moon) = system
+            .bodies()
+            .find(|(_, body)| body.name() == "Moon")
+            .expect("Moon body exists");
+        let definition = moon.surface_definition().expect("native Moon surface");
+        let original_surface = definition.clone();
+        assert!(moon.terrain().is_none());
+        assert_eq!(definition.terrain().algorithm(), SurfaceAlgorithm::RockyV5);
+
+        let radius_m = moon.properties().reference_radius_m();
+        let location = mundaris_math::surface::SurfaceLocation::new(
+            Direction3::try_new(glam::DVec3::new(1.0, 2.0, 3.0)).unwrap(),
+        );
+        let sample = SurfaceGenerator::new(definition, radius_m)
+            .unwrap()
+            .evaluate_point(location)
+            .unwrap();
+        let body_position = location.direction().unit() * (radius_m + 500.0);
+        let clearance = mundaris_app::terrain_inspection::clearance_at_body_position(
+            moon,
+            body_position,
+            moon_id,
+        )
+        .unwrap()
+        .expect("surface clearance");
+        assert!(
+            (clearance.location.direction().unit() - location.direction().unit()).length() < 1e-14
+        );
+        assert!(
+            (clearance.terrain_elevation_m - sample.terrain().height_m()).abs() < 1e-10 * radius_m
+        );
+        assert!((clearance.surface_radius_m - sample.radius_m()).abs() < 1e-10 * radius_m);
+
+        // Keep the historical CrateredV1 recipe independently constructible and
+        // replayable even though the native preset now selects RockyV5.
+        let seed = definition.seed();
+        let historical =
+            cratered_terrain_definition(definition.identity(), seed, radius_m).unwrap();
+        assert_eq!(historical.version(), TerrainGeneratorVersion::CrateredV1);
+        let first = TerrainGenerator::new(&historical, radius_m).unwrap();
+        let replay = cratered_terrain_definition(definition.identity(), seed, radius_m).unwrap();
+        assert_eq!(
+            first.crater_features(),
+            TerrainGenerator::new(&replay, radius_m)
+                .unwrap()
+                .crater_features()
+        );
+        assert_eq!(first.crater_features().len(), 128);
+
+        // The UI radius command publishes body properties through this world
+        // edit path. It must retain the selected authority and refresh its radius.
+        let mass_kg = moon.properties().mass_kg();
+        let edited_radius_m = radius_m * 1.01;
+        system
+            .edit_properties(
+                moon_id,
+                mundaris_world::BodyProperties::new(mass_kg, edited_radius_m).unwrap(),
+            )
+            .unwrap();
+        let edited_moon = system.body(moon_id).unwrap();
+        assert_eq!(edited_moon.surface_definition(), Some(&original_surface));
+        assert_eq!(
+            mundaris_app::planet_terrain::TerrainGeometryIdentity::from_body(moon_id, edited_moon)
+                .unwrap()
+                .radius_m,
+            edited_radius_m
+        );
+    }
+}
+
+#[test]
+fn cratered_recipe_is_seeded_reusable_and_bounded_for_arbitrary_bodies() {
+    let fixtures = [
+        (TerrainIdentity(0xdecafbad), TerrainSeed(71), 80_000.0),
+        (TerrainIdentity(0x1234_5678), TerrainSeed(92), 1_200_000.0),
+    ];
+
+    for (identity, seed, radius_m) in fixtures {
+        let definition = cratered_terrain_definition(identity, seed, radius_m).unwrap();
+        assert_eq!(definition.identity(), identity);
+        assert_eq!(definition.seed(), seed);
+        assert_eq!(definition.version(), TerrainGeneratorVersion::CrateredV1);
+        assert_eq!(
+            TerrainGeneratorVersion::from_code(3).unwrap(),
+            definition.version()
+        );
+        definition.validate_radius(radius_m).unwrap();
+
+        let generator = TerrainGenerator::new(&definition, radius_m).unwrap();
+        let repeated = cratered_terrain_definition(identity, seed, radius_m).unwrap();
+        let repeated_generator = TerrainGenerator::new(&repeated, radius_m).unwrap();
+        assert_eq!(
+            generator.crater_features(),
+            repeated_generator.crater_features()
+        );
+        let features = generator.crater_features();
+        assert_eq!(features.len(), 128);
+        let minimum_radius_m = 64.0;
+        let maximum_radius_m = (0.13 * radius_m).min(24_000.0);
+        for feature in features {
+            let center = feature.center().unit();
+            assert!(center.is_finite());
+            assert!((center.length() - 1.0).abs() < 1e-12);
+            assert!((minimum_radius_m..=maximum_radius_m).contains(&feature.radius_m()));
+            assert!(feature.depth_m().is_finite() && feature.depth_m() > 0.0);
+            assert!(feature.rim_height_m().is_finite() && feature.rim_height_m() >= 0.0);
+        }
+
+        let changed_seed =
+            cratered_terrain_definition(identity, TerrainSeed(seed.0 + 1), radius_m).unwrap();
+        let changed_generator = TerrainGenerator::new(&changed_seed, radius_m).unwrap();
+        assert_ne!(features, changed_generator.crater_features());
+
+        let locations: Vec<_> = [
+            glam::DVec3::X,
+            glam::DVec3::Y,
+            glam::DVec3::Z,
+            -glam::DVec3::X,
+            -glam::DVec3::Y,
+            -glam::DVec3::Z,
+            glam::DVec3::new(1.0, 2.0, 3.0),
+            glam::DVec3::new(-4.0, 1.0, 2.0),
+            glam::DVec3::new(2.0, -3.0, 1.0),
+        ]
+        .into_iter()
+        .map(|direction| {
+            mundaris_math::surface::SurfaceLocation::new(Direction3::try_new(direction).unwrap())
+        })
+        .collect();
+        let mut samples = vec![TerrainSample::default(); locations.len()];
+        generator
+            .evaluate_batch(&locations, TerrainFootprint::COMPLETE, &mut samples)
+            .unwrap();
+        let height_bound_m = definition.config().absolute_height_bound_m();
+        for (location, sample) in locations.iter().zip(samples) {
+            assert!(sample.height_m().is_finite());
+            assert!(sample.height_m().abs() <= height_bound_m);
+            assert!(
+                sample
+                    .normal_body(*location, radius_m)
+                    .unwrap()
+                    .unit()
+                    .is_finite()
+            );
+        }
     }
 }

@@ -2,6 +2,7 @@ use glam::{DQuat, DVec3};
 use mundaris_app::{planet_surface::*, solar_system::*, terrain_population::TerrainPopulation};
 use mundaris_math::*;
 use mundaris_renderer::*;
+use mundaris_world::terrain::*;
 use mundaris_world::*;
 use std::{num::NonZeroU64, time::Duration};
 
@@ -36,7 +37,7 @@ fn system() -> (
             unlit: false,
             selected: false,
         });
-        if body.terrain().is_some() {
+        if body.has_surface() {
             sessions.push(PlanetSurfaceSession::new(id, 4096).unwrap());
         }
     }
@@ -213,6 +214,75 @@ fn near_earth_roots_exclusively_own_surface_and_teleports_reuse_unpinned_cache()
     assert_eq!(population.cache.report().pinned_patches, 0);
     assert_eq!(population.work.vertices_generated, 0);
     assert!(!population.cover.ready());
+}
+
+#[test]
+fn surface_binding_refreshes_after_definition_and_radius_changes() {
+    let (mut world, mut frames, mut sessions, mut requests) = system();
+    let mut population = TerrainPopulation::new().unwrap();
+    let index = SolarBody::Moon as usize;
+    let moon = world.bodies().nth(index).unwrap().0;
+    let mut radius = requests[index].reference_radius_m;
+
+    let (owners, active) = population_update(
+        &mut population,
+        &world,
+        &frames,
+        &mut sessions,
+        &requests,
+        SolarBody::Moon,
+        DVec3::Z * (radius + 600_000.0),
+        1734,
+    );
+    assert_eq!(active, moon);
+    assert!(owners[index]);
+    assert!(population.work.vertices_generated > 0);
+
+    let definition = SurfaceDefinition::generated(
+        TerrainIdentity(0x4d4f4f4e),
+        TerrainSeed(0x4d4f4f4e),
+        SurfaceAlgorithm::RockyV5,
+    );
+    world
+        .edit_surface_definition(moon, Some(definition))
+        .unwrap();
+    let (owners, active) = population_update(
+        &mut population,
+        &world,
+        &frames,
+        &mut sessions,
+        &requests,
+        SolarBody::Moon,
+        DVec3::Z * (radius + 600_000.0),
+        1734,
+    );
+    assert_eq!(active, moon);
+    assert!(owners[index]);
+    assert!(population.work.vertices_generated > 0);
+
+    radius += 10_000.0;
+    let body = world.body(moon).unwrap();
+    world
+        .edit_properties(
+            moon,
+            BodyProperties::new(body.properties().mass_kg(), radius).unwrap(),
+        )
+        .unwrap();
+    frames.publish(&world).unwrap();
+    requests[index].reference_radius_m = radius;
+    let (owners, active) = population_update(
+        &mut population,
+        &world,
+        &frames,
+        &mut sessions,
+        &requests,
+        SolarBody::Moon,
+        DVec3::Z * (radius + 600_000.0),
+        1734,
+    );
+    assert_eq!(active, moon);
+    assert!(owners[index]);
+    assert_eq!(population.work.vertices_generated, 1734);
 }
 
 #[test]

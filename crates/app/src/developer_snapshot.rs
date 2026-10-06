@@ -8,6 +8,7 @@ use mundaris_renderer::{
 };
 use mundaris_world::{BodyId, CoherentCelestialView};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{
     celestial_camera::{CameraMode, NavigationDiagnostics},
@@ -16,7 +17,7 @@ use crate::{
 };
 
 /// Version of the JSON contract, independent of engine/world persistence formats.
-pub const SNAPSHOT_SCHEMA_VERSION: u32 = 4;
+pub const SNAPSHOT_SCHEMA_VERSION: u32 = 5;
 /// UI-only advisory ratio. This does not alter admission or the terrain cap.
 pub const MEMORY_NEAR_CAP_RATIO: f64 = 0.95;
 
@@ -108,6 +109,17 @@ pub struct CameraSnapshot {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TerrainSnapshot {
     pub active_body: Option<BodySnapshot>,
+    /// Selected world authority, independent of currently ready mesh quality.
+    #[serde(default)]
+    pub generator_algorithm: Option<String>,
+    /// The proof used for mesh quality, rather than a sampled quality estimate.
+    #[serde(default)]
+    pub certificate_kind: Option<String>,
+    /// Mesh demand can be a resolution guide while complete quality is unproven.
+    #[serde(default)]
+    pub refinement_demand_kind: Option<String>,
+    #[serde(default)]
+    pub target_certifiable: Option<bool>,
     pub source_radial_lod: Option<u8>,
     pub ready_radial_lod: Option<u8>,
     pub desired_radial_lod: Option<u8>,
@@ -199,6 +211,8 @@ pub struct PerformanceSnapshot {
     pub gpu_terrain_ms: Option<f64>,
     pub gpu_transition_fallback_ms: Option<f64>,
     pub gpu_timing_scope: String,
+    #[serde(default)]
+    pub gpu_source_frame: Option<u64>,
     pub upload_bytes: Option<u64>,
 }
 impl PerformanceSnapshot {
@@ -348,6 +362,34 @@ pub struct DeveloperSnapshot {
     pub motion: Option<MotionSnapshot>,
     #[serde(default)]
     pub sky: Option<SkySnapshot>,
+    #[serde(default)]
+    pub development: Option<DevelopmentSnapshot>,
+    /// Opt-in Slice 2A fixture telemetry from the same resident-tile submission.
+    #[serde(default)]
+    pub resident_tile: Option<Value>,
+    /// Opt-in Slice 2B parent/four-child readiness and transition telemetry.
+    #[serde(default)]
+    pub resident_hierarchy: Option<Value>,
+    /// Opt-in Slice 2C regional adaptive residency and refinement telemetry.
+    #[serde(default)]
+    pub resident_regional: Option<Value>,
+}
+
+/// Session and frame provenance. A presentation request is not monitor evidence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DevelopmentSnapshot {
+    pub session_id: String,
+    pub observation_age_ms: f64,
+    pub stale: bool,
+    pub drawable: bool,
+    pub command_sequence: u64,
+    pub prepared_frame: u64,
+    pub submitted_frame: Option<u64>,
+    pub presentation_requested: bool,
+    pub capture_id: Option<String>,
+    pub current_errors: Vec<String>,
+    pub asynchronous_measurement_source: String,
+    pub gpu_measurement_source_frame: Option<u64>,
 }
 
 /// Already-measured frame inputs. Collection performs no terrain query/generation.
@@ -439,6 +481,28 @@ impl DeveloperSnapshot {
             altitude = Some(p.length() - world.body(id)?.properties().reference_radius_m());
         }
         let active = input.terrain.active_body();
+        let active_authority = active.map(|id| world.body(id)).transpose()?;
+        let generator_algorithm = active_authority.and_then(|body| {
+            body.surface_definition()
+                .map(|definition| definition.terrain().algorithm().name().to_owned())
+                .or_else(|| {
+                    body.terrain().map(|definition| match definition.version() {
+                        mundaris_world::terrain::TerrainGeneratorVersion::V1 => "V1".to_owned(),
+                        mundaris_world::terrain::TerrainGeneratorVersion::V2 => "V2".to_owned(),
+                        mundaris_world::terrain::TerrainGeneratorVersion::CrateredV1 => {
+                            "CrateredV1".to_owned()
+                        }
+                    })
+                })
+        });
+        let certificate_kind = active_authority.map(|body| {
+            if body.surface_definition().is_some() {
+                "complete_amplitude_bound"
+            } else {
+                "filtered_derivative_bounds"
+            }
+            .to_owned()
+        });
         let cover = &input.terrain.cover;
         let diagnostic = cover.convergence;
         let cache = input.terrain.cache.report();
@@ -476,6 +540,17 @@ impl DeveloperSnapshot {
             },
             terrain: TerrainSnapshot {
                 active_body: active.map(body).transpose()?,
+                generator_algorithm,
+                certificate_kind,
+                refinement_demand_kind: active_authority.map(|body| {
+                    if body.surface_definition().is_some() {
+                        "projected_sample_spacing"
+                    } else {
+                        "certified_error"
+                    }
+                    .to_owned()
+                }),
+                target_certifiable: active.map(|_| diagnostic.target_certifiable),
                 source_radial_lod: active.and(diagnostic.rendered_local_lod),
                 ready_radial_lod: active.and(diagnostic.ready_local_lod),
                 desired_radial_lod: active.and(diagnostic.desired_local_lod),
@@ -507,6 +582,10 @@ impl DeveloperSnapshot {
             capture: None,
             motion: input.motion,
             sky: None,
+            development: None,
+            resident_tile: None,
+            resident_hierarchy: None,
+            resident_regional: None,
         };
         snapshot.refresh_warnings();
         Ok(snapshot)

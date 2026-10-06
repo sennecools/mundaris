@@ -432,8 +432,19 @@ impl SolarSystemPreset {
                     AngularVelocity3::try_radians_per_second(omega)?,
                 ),
             )?;
-            if body.rocky_terrain_seed.is_some() {
-                system.edit_terrain(id, terrain_definition(body.identity, radii[i])?)?;
+            if let Some(seed) = body.rocky_terrain_seed {
+                if body.identity == SolarBody::Moon {
+                    system.edit_surface_definition(
+                        id,
+                        Some(SurfaceDefinition::generated(
+                            TerrainIdentity(seed),
+                            TerrainSeed(seed),
+                            SurfaceAlgorithm::RockyV5,
+                        )),
+                    )?;
+                } else {
+                    system.edit_terrain(id, terrain_definition(body.identity, radii[i])?)?;
+                }
             }
         }
         Ok(system)
@@ -582,6 +593,10 @@ pub fn terrain_definition(
     let Some(seed) = content(body).rocky_terrain_seed else {
         return Ok(None);
     };
+    if body == SolarBody::Moon {
+        return cratered_terrain_definition(TerrainIdentity(seed), TerrainSeed(seed), radius_m)
+            .map(Some);
+    }
     anyhow::ensure!(
         radius_m.is_finite() && radius_m > 0.0,
         "terrain radius must be finite and positive"
@@ -641,4 +656,73 @@ pub fn terrain_definition(
         TerrainGeneratorVersion::V2,
         config,
     )))
+}
+
+/// Build reusable quiet-plains terrain with seeded impact craters. Noise and crater
+/// dimensions are in meters except for the broad angular octave; dimensions scale
+/// with the supplied body radius so unrelated moon-like bodies can share this recipe.
+pub fn cratered_terrain_definition(
+    identity: TerrainIdentity,
+    seed: TerrainSeed,
+    radius_m: f64,
+) -> anyhow::Result<TerrainDefinition> {
+    anyhow::ensure!(
+        radius_m.is_finite() && radius_m > 0.0,
+        "terrain radius must be finite and positive"
+    );
+
+    let maximum_crater_radius_m = (0.13 * radius_m).min(24_000.0);
+    let minimum_crater_radius_m = 64.0;
+    let crater_field = CraterFieldConfig::new(
+        // Descending size ceilings bound complete overlap while preserving
+        // major basins and a larger population of smaller impact features.
+        128,
+        minimum_crater_radius_m,
+        maximum_crater_radius_m,
+        0.085,
+        0.040,
+    )?;
+    let bands = [
+        TerrainBandConfig::new(
+            (0.0008 * radius_m).min(120.0),
+            TerrainScale::Angular {
+                lowest_cycles_per_body: 2.0,
+            },
+            2,
+        )?,
+        TerrainBandConfig::new(
+            0.0,
+            TerrainScale::Metres {
+                longest_wavelength_m: 64.0,
+            },
+            2,
+        )?,
+        TerrainBandConfig::new(
+            0.0,
+            TerrainScale::Metres {
+                longest_wavelength_m: 64.0,
+            },
+            2,
+        )?,
+        TerrainBandConfig::new(
+            (0.00002 * radius_m).min(4.0),
+            TerrainScale::Metres {
+                longest_wavelength_m: 2_000.0,
+            },
+            2,
+        )?,
+        TerrainBandConfig::new(
+            (0.000005 * radius_m).min(0.7),
+            TerrainScale::Metres {
+                longest_wavelength_m: 160.0,
+            },
+            2,
+        )?,
+    ];
+    let controls = TerrainControls::new(0.0, 1.0, 0.0, 0.0, 0.0, 0.4)?;
+    let config = TerrainConfig::new(bands, controls)?.with_crater_field(crater_field)?;
+    let definition =
+        TerrainDefinition::new(identity, seed, TerrainGeneratorVersion::CrateredV1, config);
+    definition.validate_radius(radius_m)?;
+    Ok(definition)
 }

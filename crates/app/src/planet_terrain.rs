@@ -10,13 +10,19 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod native_surface;
+pub use native_surface::NativeTerrainDefinition;
+use native_surface::NativeTerrainGenerator;
+
 mod certificate;
 pub use certificate::terrain_surface_certificate;
 mod adaptive;
 pub use adaptive::{AdaptiveTerrainCover, TerrainConvergenceDiagnostic, TerrainSelectionPolicy};
 mod workers;
 
-pub const TERRAIN_CPU_CAP_BYTES: usize = 128 * 1024 * 1024;
+/// Aggregate ceiling for derived CPU terrain, including renderer staging and
+/// transitions. Allocations remain demand driven; this is not an eager arena.
+pub const TERRAIN_CPU_CAP_BYTES: usize = 512 * 1024 * 1024;
 pub const MAX_TERRAIN_PATCHES: usize = 4096;
 pub const MAX_PENDING_PATCHES: usize = 256;
 pub const GENERATION_MICROBATCH: usize = 8;
@@ -166,7 +172,7 @@ pub fn checkpoint_terrain_definition_version(
 #[derive(Debug, Clone, PartialEq)]
 pub struct TerrainGeometryIdentity {
     pub body: BodyId,
-    pub definition: TerrainDefinition,
+    pub definition: NativeTerrainDefinition,
     pub revision: TerrainRevision,
     pub radius_m: f64,
 }
@@ -332,17 +338,56 @@ impl TerrainReadyCover {
 impl TerrainGeometryIdentity {
     pub fn new(
         body: BodyId,
-        definition: TerrainDefinition,
+        definition: impl Into<NativeTerrainDefinition>,
         revision: TerrainRevision,
         radius_m: f64,
     ) -> Result<Self> {
-        definition.validate_radius(radius_m)?;
+        let definition = definition.into();
+        match &definition {
+            NativeTerrainDefinition::Legacy(definition) => definition.validate_radius(radius_m)?,
+            NativeTerrainDefinition::Surface(_) => {
+                NativeTerrainGenerator::new(&definition, radius_m)?;
+            }
+        }
         Ok(Self {
             body,
             definition,
             revision,
             radius_m,
         })
+    }
+
+    pub fn new_surface(
+        body: BodyId,
+        definition: SurfaceDefinition,
+        revision: TerrainRevision,
+        radius_m: f64,
+    ) -> Result<Self> {
+        let definition = NativeTerrainDefinition::Surface(definition);
+        NativeTerrainGenerator::new(&definition, radius_m)?;
+        Ok(Self {
+            body,
+            definition,
+            revision,
+            radius_m,
+        })
+    }
+
+    pub fn from_body(body: BodyId, state: &mundaris_world::CelestialBody) -> Result<Self> {
+        let radius_m = state.properties().reference_radius_m();
+        if let Some(definition) = state.surface_definition() {
+            Self::new_surface(body, definition.clone(), state.terrain_revision(), radius_m)
+        } else {
+            Self::new(
+                body,
+                state
+                    .terrain()
+                    .ok_or_else(|| anyhow::anyhow!("body has no surface authority"))?
+                    .clone(),
+                state.terrain_revision(),
+                radius_m,
+            )
+        }
     }
 }
 
@@ -455,7 +500,7 @@ struct Request {
 }
 struct Builder {
     request: Request,
-    generator: TerrainGenerator,
+    generator: NativeTerrainGenerator,
     samples: Vec<SurfaceGeometrySample>,
 }
 
@@ -487,7 +532,7 @@ impl TerrainPatchCache {
             bail!("invalid terrain cache quota");
         }
         // Fixed bookkeeping capacity makes allocation preflight exact. Geometry
-        // buffers are allocated only on demand, never a 128 MiB eager arena.
+        // buffers are allocated only on demand, never an eager arena matching the quota.
         let cache = Self {
             entries: Vec::with_capacity(max_entries),
             requests: Vec::with_capacity(MAX_PENDING_PATCHES),
@@ -585,6 +630,8 @@ impl TerrainPatchCache {
                 .sum::<usize>()
             + self.building.as_ref().map_or(0, |b| {
                 b.samples.capacity() * size_of::<SurfaceGeometrySample>()
+                    + b.generator.resident_heap_bytes()
+                    + b.generator.query_workspace_bytes()
                     + size_of::<GeneratedSurfacePatch>()
                     + 4 * size_of::<usize>() // outer patch Arc and final sample Arc
             })
@@ -953,7 +1000,11 @@ impl TerrainPatchCache {
                 }
                 let bytes = GRID_SAMPLES * size_of::<SurfaceGeometrySample>()
                     + size_of::<GeneratedSurfacePatch>()
-                    + 4 * size_of::<usize>();
+                    + 4 * size_of::<usize>()
+                    + self.requests[0]
+                        .identity
+                        .definition
+                        .working_heap_bound_bytes();
                 let admission_cap = self.soft_admission_cap();
                 while self.entries.len() >= self.max_entries
                     || self.resident_bytes() + self.external_bytes + bytes > admission_cap
@@ -975,8 +1026,10 @@ impl TerrainPatchCache {
                     }
                 }
                 let request = self.requests.remove(0);
-                let generator =
-                    TerrainGenerator::new(&request.identity.definition, request.identity.radius_m)?;
+                let generator = NativeTerrainGenerator::new(
+                    &request.identity.definition,
+                    request.identity.radius_m,
+                )?;
                 self.building = Some(Builder {
                     request,
                     generator,
@@ -999,7 +1052,10 @@ impl TerrainPatchCache {
             let generator = &builder.generator;
             let mut locations =
                 [SurfaceLocation::new(Direction3::try_new(glam::DVec3::X)?); MAX_GENERATION_BATCH];
-            let mut output = [TerrainSample::default(); MAX_GENERATION_BATCH];
+            let mut output = [SurfaceGeometrySample {
+                position_body_m: glam::DVec3::ZERO,
+                normal_body: glam::DVec3::X,
+            }; MAX_GENERATION_BATCH];
             for (offset, location) in locations[..count].iter_mut().enumerate() {
                 let index = first + offset;
                 *location = SurfaceLocation::new(
@@ -1008,13 +1064,12 @@ impl TerrainPatchCache {
                         .direction(),
                 );
             }
-            generator.evaluate_batch(&locations[..count], footprint, &mut output[..count])?;
-            for (location, sample) in locations[..count].iter().zip(&output[..count]) {
-                builder.samples.push(SurfaceGeometrySample {
-                    position_body_m: location.direction().unit() * (radius + sample.height_m()),
-                    normal_body: sample.normal_body(*location, radius)?.unit(),
-                });
-            }
+            generator.evaluate_geometry_batch(
+                &locations[..count],
+                footprint,
+                &mut output[..count],
+            )?;
+            builder.samples.extend_from_slice(&output[..count]);
             work.vertices_generated += count;
             if builder.samples.len() == GRID_SAMPLES {
                 let metadata = PatchMetadata::build(address, &self.topology)?;
@@ -1142,9 +1197,9 @@ impl TerrainPatchCache {
                 .as_ref()
                 .map_or(0, workers::TerrainWorkers::in_flight);
             let admission_cap = self.soft_admission_cap();
+            let patch_reservation = workers::patch_reservation(&self.requests[0].identity);
             while self.entries.len() + in_flight >= self.max_entries
-                || self.resident_bytes() + self.external_bytes + workers::PATCH_RESERVATION
-                    > admission_cap
+                || self.resident_bytes() + self.external_bytes + patch_reservation > admission_cap
             {
                 #[cfg(feature = "surface-profile")]
                 {
@@ -1156,9 +1211,7 @@ impl TerrainPatchCache {
             }
             let critical = self.requests.first().is_some_and(|r| r.pin_when_ready);
             let admission_cap = if critical {
-                if self.resident_bytes() + self.external_bytes + workers::PATCH_RESERVATION
-                    > admission_cap
-                {
+                if self.resident_bytes() + self.external_bytes + patch_reservation > admission_cap {
                     self.report.soft_waterline_misses += 1;
                 }
                 self.cap_bytes
@@ -1166,8 +1219,7 @@ impl TerrainPatchCache {
                 admission_cap
             };
             if self.entries.len() + in_flight >= self.max_entries
-                || self.resident_bytes() + self.external_bytes + workers::PATCH_RESERVATION
-                    > admission_cap
+                || self.resident_bytes() + self.external_bytes + patch_reservation > admission_cap
             {
                 self.report.reservation_rejected += 1;
                 #[cfg(feature = "surface-profile")]

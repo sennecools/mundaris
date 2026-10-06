@@ -26,7 +26,7 @@ pub use lighting::{
 pub use lod::LodProfile;
 pub use lod::{
     ActiveSurfacePatch, LodReport, LodSettings, SurfaceGeometryPolicy, SurfaceLodSession,
-    SurfaceViewInput,
+    SurfaceRefinementInput, SurfaceViewInput,
 };
 #[cfg(feature = "surface-profile")]
 pub use prepare::SurfacePreparationProfile;

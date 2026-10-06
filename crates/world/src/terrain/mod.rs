@@ -4,7 +4,13 @@ mod query;
 pub use query::*;
 mod generator;
 pub use generator::*;
+mod crater;
 mod erosion;
+mod moon;
+pub use crater::{CraterFeature, CraterFieldConfig};
+pub use moon::*;
+mod surface;
+pub use surface::*;
 
 /// Explicit authoring salt, not a runtime body handle or display name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -18,12 +24,15 @@ pub enum TerrainGeneratorVersion {
     V1,
     /// Body-fixed, feature-anchored gradient-feedback erosion.
     V2,
+    /// Seeded compact impact craters over independently filtered background bands.
+    CrateredV1,
 }
 impl TerrainGeneratorVersion {
     pub fn from_code(code: u32) -> Result<Self, TerrainError> {
         match code {
             1 => Ok(Self::V1),
             2 => Ok(Self::V2),
+            3 => Ok(Self::CrateredV1),
             _ => Err(TerrainError::UnsupportedVersion(code)),
         }
     }
@@ -31,6 +40,7 @@ impl TerrainGeneratorVersion {
         match self {
             Self::V1 => 1,
             Self::V2 => 2,
+            Self::CrateredV1 => 3,
         }
     }
 }
@@ -204,6 +214,7 @@ pub struct TerrainConfig {
     controls: TerrainControls,
     absolute_height_bound_m: f64,
     erosion: ErosionConfig,
+    crater_field: Option<CraterFieldConfig>,
 }
 
 /// Stateless mountain erosion hierarchy. The regional band's displacement budget
@@ -273,6 +284,7 @@ impl TerrainConfig {
             controls,
             absolute_height_bound_m: bound,
             erosion: ErosionConfig::default(),
+            crater_field: None,
         })
     }
     pub fn band(&self, band: TerrainBand) -> TerrainBandConfig {
@@ -289,8 +301,27 @@ impl TerrainConfig {
     pub fn erosion(&self) -> ErosionConfig {
         self.erosion
     }
-    pub fn absolute_height_bound_m(&self) -> f64 {
+    /// Optional impact-field authoring; requires the explicit cratered algorithm.
+    pub fn with_crater_field(mut self, config: CraterFieldConfig) -> Result<Self, TerrainError> {
+        self.crater_field = Some(config);
+        if !self.absolute_height_bound_m().is_finite() {
+            return Err(TerrainError::InvalidConfig);
+        }
+        Ok(self)
+    }
+    pub fn crater_field(&self) -> Option<CraterFieldConfig> {
+        self.crater_field
+    }
+    pub(super) fn noise_height_bound_m(&self) -> f64 {
         self.absolute_height_bound_m
+    }
+    pub fn absolute_height_bound_m(&self) -> f64 {
+        match self.crater_field {
+            None => self.absolute_height_bound_m,
+            Some(config) => {
+                (self.absolute_height_bound_m + config.absolute_height_bound_m()).next_up()
+            }
+        }
     }
 }
 

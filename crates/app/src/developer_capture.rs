@@ -27,11 +27,15 @@ mod capture {
     };
     use anyhow::Context;
     use anyhow::ensure;
+    use mundaris_math::surface::SurfaceLocation;
     use mundaris_renderer::{
         CelestialFrame, CelestialRenderBody, CelestialStaging, Icosphere, PreparedView,
         RenderPrecisionBudget,
         planet_surface::{SurfaceStyle, TerrainLighting, TerrainRenderMode},
         terrain_capture::TerrainCaptureRenderer,
+    };
+    use mundaris_world::terrain::{
+        TerrainFootprint, TerrainGenerator, TerrainIdentity, TerrainQuery, TerrainSeed,
     };
     use std::{
         fs,
@@ -41,9 +45,17 @@ mod capture {
     };
 
     const UPDATES: usize = 64;
+    const CRATER_DETAIL_UPDATES: usize = 4096;
     const VERTEX_BUDGET: usize = 64;
     const STEP: Duration = Duration::from_millis(16);
     const MORPH: Duration = Duration::from_millis(150);
+
+    #[derive(Debug, Clone, Copy)]
+    struct CaptureBudget {
+        updates: usize,
+        camera_mode: Option<CameraMode>,
+        vertices_per_update: usize,
+    }
 
     #[derive(Debug)]
     pub struct DeveloperCapture {
@@ -73,6 +85,218 @@ mod capture {
             None,
             Some(motion.snapshot(&world)),
         )
+    }
+
+    /// Captures deterministic diagnostic views of the gameplay Moon's seeded crater field.
+    /// The fixed-step update counts are work budgets, not elapsed simulation time.
+    pub fn capture_crater_reference(output: &Path, seed: u64) -> Result<()> {
+        let namespace = NonZeroU64::new(514).context("invalid crater fixture namespace")?;
+        let (mut world, definition) = SolarSystemPreset::gameplay().create_analytic(namespace)?;
+        let (moon_id, moon) = world
+            .bodies()
+            .nth(4)
+            .context("gameplay Moon fixture is missing")?;
+        let radius_m = moon.properties().reference_radius_m();
+        let terrain_definition = solar_system::cratered_terrain_definition(
+            TerrainIdentity(seed),
+            TerrainSeed(seed),
+            radius_m,
+        )?;
+        let generator = TerrainGenerator::new(&terrain_definition, radius_m)?;
+        ensure!(
+            !generator.crater_features().is_empty(),
+            "generated crater catalogue is empty"
+        );
+        world.edit_terrain(moon_id, Some(terrain_definition.clone()))?;
+        ensure!(
+            world.body(moon_id)?.terrain() == Some(&terrain_definition),
+            "Moon terrain does not match the requested crater fixture"
+        );
+
+        let mut motion = AnalyticSession::new(&mut world, definition)?;
+        motion.seek_seconds(0.0, &mut world)?;
+        let publication_started = Instant::now();
+        let frames = mundaris_world::CelestialFrameProjection::build(&world, namespace)?;
+        motion.frame_published(&world, publication_started.elapsed());
+        let pair = frames.coherent_view(&world)?;
+        let projection = CelestialProjection::try_new(WIDTH, HEIGHT, 60_f64.to_radians(), 0.1)?;
+        let body = pair.system().body(moon_id)?;
+        ensure!(
+            body.terrain() == Some(&terrain_definition),
+            "published Moon terrain does not match the crater generator"
+        );
+        let moon_frame = pair.projection().frames_for(moon_id)?.body_fixed;
+        let root = pair.projection().tree().root();
+        let sun = pair
+            .system()
+            .bodies()
+            .next()
+            .context("Sun fixture is missing")?
+            .1
+            .state()
+            .center_in_system()
+            .metres();
+        let to_sun = sun - body.state().center_in_system().metres();
+        let sun_direction = pair
+            .evaluation()
+            .convert_direction(
+                FrameDirection::new(root, Direction3::try_new(to_sun)?),
+                moon_frame,
+            )?
+            .local()
+            .unit();
+        let features = generator.crater_features();
+        let chosen = features
+            .iter()
+            .copied()
+            .filter(|feature| {
+                let dot = feature.center().unit().dot(sun_direction);
+                (0.25..=0.85).contains(&dot)
+            })
+            .max_by(|left, right| left.radius_m().total_cmp(&right.radius_m()))
+            .or_else(|| {
+                features.iter().copied().max_by(|left, right| {
+                    left.center()
+                        .unit()
+                        .dot(sun_direction)
+                        .total_cmp(&right.center().unit().dot(sun_direction))
+                })
+            })
+            .context("no generated crater feature is available")?;
+        let center = chosen.center().unit();
+        let radial_camera_pose = |direction: DVec3, clearance_m: f64| -> Result<FramePose> {
+            ensure!(
+                clearance_m.is_finite() && clearance_m > 0.0,
+                "crater capture clearance must be finite and positive"
+            );
+            let location = SurfaceLocation::new(Direction3::try_new(direction)?);
+            let sample = generator.evaluate_point(TerrainQuery {
+                location,
+                footprint: TerrainFootprint::COMPLETE,
+            })?;
+            let eye = direction * (radius_m + sample.height_m() + clearance_m);
+            Ok(FramePose::new(
+                FramePosition::new(moon_frame, LocalPosition::try_metres(eye)?),
+                look_rotation(-direction)?,
+            ))
+        };
+        let tangent_to_sun = (sun_direction - center * center.dot(sun_direction))
+            .try_normalize()
+            .or_else(|| (DVec3::X - center * center.x).try_normalize())
+            .or_else(|| (DVec3::Z - center * center.z).try_normalize())
+            .context("no tangent direction is available for crater rim pose")?;
+        let rim_angle = chosen.radius_m() / radius_m;
+        let rim_direction = (center * rim_angle.cos() + tangent_to_sun * rim_angle.sin())
+            .try_normalize()
+            .context("crater rim direction is degenerate")?;
+        let rim_pose = radial_camera_pose(rim_direction, 200.0)?;
+        let center_sample = generator.evaluate_point(TerrainQuery {
+            location: SurfaceLocation::new(chosen.center()),
+            footprint: TerrainFootprint::COMPLETE,
+        })?;
+        let floor = center * (radius_m + center_sample.height_m());
+        let rim_pose = FramePose::new(rim_pose.position(), {
+            let forward = (floor - rim_pose.position().local().metres()).normalize();
+            let right = forward.cross(rim_direction).normalize();
+            let up = right.cross(forward).normalize();
+            UnitRotation::try_from_quaternion(DQuat::from_mat3(&glam::DMat3::from_cols(
+                right, up, -forward,
+            )))?
+        });
+        let views = [
+            (
+                "crater-orbit",
+                radial_camera_pose(center, radius_m)?,
+                512,
+                CameraMode::BodyOrbit,
+            ),
+            (
+                "crater-regional",
+                radial_camera_pose(center, (2.0 * chosen.radius_m()).max(5_000.0))?,
+                CRATER_DETAIL_UPDATES,
+                CameraMode::SurfaceInspection,
+            ),
+            (
+                "crater-rim",
+                rim_pose,
+                CRATER_DETAIL_UPDATES,
+                CameraMode::SurfaceInspection,
+            ),
+        ];
+        fs::create_dir_all(output)?;
+        let manifest_path = output.join("crater-reference.json");
+        ensure!(
+            !manifest_path.exists(),
+            "refusing to replace existing crater reference manifest"
+        );
+        for (name, _, _, _) in views {
+            ensure!(
+                !output.join(format!("{name}.png")).exists()
+                    && !output.join(format!("{name}.json")).exists(),
+                "refusing to replace existing crater capture {name}"
+            );
+        }
+        for (name, pose, updates, camera_mode) in views {
+            let mut capture = capture_pose_with_updates(
+                DeveloperScene::MoonOrbit,
+                &pair,
+                projection,
+                pose,
+                None,
+                Some(motion.snapshot(&world)),
+                CaptureBudget {
+                    updates,
+                    camera_mode: Some(camera_mode),
+                    vertices_per_update: 1156,
+                },
+            )?;
+            ensure!(
+                pair.system().body(moon_id)?.terrain() == Some(&terrain_definition)
+                    && capture
+                        .snapshot
+                        .terrain
+                        .active_body
+                        .as_ref()
+                        .is_some_and(|active| active.index == 4),
+                "crater capture has inactive or mismatched Moon terrain"
+            );
+            let metadata = capture
+                .snapshot
+                .capture
+                .as_mut()
+                .context("capture metadata missing")?;
+            metadata.scene = name.into();
+            metadata.image = format!("{name}.png");
+            write_pair(output, &capture)?;
+        }
+
+        let manifest = serde_json::json!({
+            "fixture": "solar regression fixture using generic seeded crater terrain; not procedural-system generation",
+            "seed": seed,
+            "radius_m": radius_m,
+            "generator_code": terrain_definition.version().code(),
+            "generated_crater_count": features.len(),
+            "chosen_feature": {
+                "center_body_fixed": chosen.center().unit().to_array(),
+                "radius_m": chosen.radius_m(),
+                "depth_m": chosen.depth_m(),
+                "rim_height_m": chosen.rim_height_m(),
+                "sun_dot": chosen.center().unit().dot(sun_direction),
+            },
+            "captures": ["crater-orbit", "crater-regional", "crater-rim"],
+            "timing_limitation": "Serial diagnostic terrain updates at fixed 16 ms steps; update counts are work budgets, not admitted elapsed simulation time or native control evidence.",
+            "vertices_per_update": 1156,
+        });
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&manifest_path)
+            .context("publishing crater reference manifest without replacement")?;
+        file.write_all(&manifest_bytes)?;
+        file.write_all(b"\n")?;
+        Ok(())
     }
 
     /// Small same-session playback probe: epoch, forward, reverse, then epoch again.
@@ -122,6 +346,30 @@ mod capture {
         camera: Option<&crate::celestial_camera::CelestialCamera>,
         motion: Option<MotionSnapshot>,
     ) -> Result<DeveloperCapture> {
+        capture_pose_with_updates(
+            scene,
+            pair,
+            projection,
+            pose,
+            camera,
+            motion,
+            CaptureBudget {
+                updates: UPDATES,
+                camera_mode: None,
+                vertices_per_update: VERTEX_BUDGET,
+            },
+        )
+    }
+
+    fn capture_pose_with_updates(
+        scene: DeveloperScene,
+        pair: &CoherentCelestialView<'_>,
+        projection: CelestialProjection,
+        pose: FramePose,
+        camera: Option<&crate::celestial_camera::CelestialCamera>,
+        motion: Option<MotionSnapshot>,
+        budget: CaptureBudget,
+    ) -> Result<DeveloperCapture> {
         let evaluation = pair.evaluation();
         let requests: Vec<_> = pair
             .system()
@@ -157,14 +405,14 @@ mod capture {
         let view = PreparedView::new(&evaluation, pose, RenderPrecisionBudget::near_debug())?;
         let mut sessions = requests
             .iter()
-            .filter(|(id, _)| pair.system().body(*id).is_ok_and(|b| b.terrain().is_some()))
+            .filter(|(id, _)| pair.system().body(*id).is_ok_and(|b| b.has_surface()))
             .map(|(id, _)| PlanetSurfaceSession::new(*id, MAX_TERRAIN_PATCHES))
             .collect::<Result<Vec<_>>>()?;
         let mut population = TerrainPopulation::new()?;
         let mut owners = vec![false; render_bodies.len()];
         let sphere = Icosphere::new();
         let mut update_duration = Duration::ZERO;
-        for _ in 0..UPDATES {
+        for _ in 0..budget.updates {
             let update_started = Instant::now();
             population.update(
                 pair,
@@ -176,7 +424,7 @@ mod capture {
                 &sphere,
                 true,
                 MORPH,
-                VERTEX_BUDGET,
+                budget.vertices_per_update,
                 None,
                 STEP,
             )?;
@@ -278,6 +526,28 @@ mod capture {
             }
         }
         let report = frame.report();
+        if budget.camera_mode.is_some() {
+            println!(
+                "crater work: selector_level={} precision_floor={} splits={} merges={} deferred={} parent={:?} work={:?} cache={:?}",
+                population.cover.report.max_level,
+                population.cover.report.precision_floor,
+                population.cover.report.splits,
+                population.cover.report.merges,
+                population.cover.report.deferred_transactions,
+                population.cover.report.refinement_parent,
+                population.work,
+                population.cache.report(),
+            );
+            println!(
+                "crater preparation: patches={} triangles={} fallback_triangles={} draws={} max_error_pixels={} convergence={:?}",
+                report.surface.patches,
+                report.surface.triangles,
+                report.surface.fallback_triangles,
+                report.surface.draws,
+                population.cover.report.max_error_pixels,
+                population.cover.convergence,
+            );
+        }
         let preparation_duration = preparation_started.elapsed();
         let rgba = gpu.render(&frame)?;
         let profile = gpu.last_gpu_profile();
@@ -320,11 +590,13 @@ mod capture {
             motion,
             pair,
             pose,
-            camera_mode: camera.map_or(scene.camera_mode(), |c| c.mode()),
+            camera_mode: budget
+                .camera_mode
+                .unwrap_or_else(|| camera.map_or(scene.camera_mode(), |c| c.mode())),
             selected_body: selected,
             focused_body: target,
             reference_body: target,
-            frame_number: UPDATES as u64,
+            frame_number: budget.updates as u64,
             projection,
             terrain: &population,
             terrain_clearance_m: clearance.map(|c| c.clearance_m),
@@ -346,7 +618,7 @@ mod capture {
             image: format!("{}.png", scene.name()),
             width: WIDTH,
             height: HEIGHT,
-            terrain_updates: UPDATES,
+            terrain_updates: budget.updates,
             worker_count: 0,
             step_ms: STEP.as_millis() as u64,
             morph_duration_ms: MORPH.as_millis() as u64,
@@ -623,8 +895,9 @@ mod capture {
 
 #[cfg(feature = "terrain-capture")]
 pub use capture::{
-    DeveloperCapture, capture_analytic_playback, capture_navigation_route, capture_scene,
-    capture_scene_at, default_output_directory, write_pair,
+    DeveloperCapture, capture_analytic_playback, capture_crater_reference,
+    capture_navigation_route, capture_scene, capture_scene_at, default_output_directory,
+    write_pair,
 };
 
 #[cfg(feature = "terrain-capture")]

@@ -1,0 +1,190 @@
+{
+  "schema": 1,
+  "preset": "real-solar-system",
+  "deterministic": true,
+  "initial_settings": [
+    {
+      "action": "pause",
+      "paused": true
+    },
+    {
+      "action": "select",
+      "body": "Moon"
+    }
+  ],
+  "steps": [
+    {
+      "name": "enable-canonical-tile",
+      "action": {
+        "action": "gpu_tile",
+        "enabled": true
+      },
+      "duration_s": 0
+    },
+    {
+      "checkpoint": {
+        "name": "published",
+        "predicate": {
+          "path": "resident_tile.gpu_residency.cumulative_content_upload_count",
+          "equals": 1
+        },
+        "timeout_s": 30
+      }
+    },
+    {
+      "capture": {
+        "name": "resident-lit"
+      }
+    },
+    {
+      "action": {
+        "action": "gpu_tile_view",
+        "mode": 1
+      },
+      "duration_s": 0.25
+    },
+    {
+      "checkpoint": {
+        "name": "presentation-reuses-content",
+        "predicate": {
+          "path": "resident_tile.gpu_residency.tile_content_upload_bytes",
+          "equals": 0
+        },
+        "timeout_s": 30
+      }
+    },
+    {
+      "capture": {
+        "name": "resident-height"
+      }
+    },
+    {
+      "action": {
+        "action": "gpu_tile_view",
+        "mode": 2
+      },
+      "duration_s": 0.1
+    },
+    {
+      "capture": {
+        "name": "resident-normal"
+      }
+    },
+    {
+      "action": {
+        "action": "gpu_tile_view",
+        "mode": 3
+      },
+      "duration_s": 0.1
+    },
+    {
+      "capture": {
+        "name": "resident-material"
+      }
+    },
+    {
+      "action": {
+        "action": "gpu_tile_view",
+        "mode": 4
+      },
+      "duration_s": 0.1
+    },
+    {
+      "capture": {
+        "name": "resident-uv"
+      }
+    },
+    {
+      "action": {
+        "action": "gpu_tile_view",
+        "mode": 5,
+        "camera_offset_m": [
+          16,
+          0,
+          0
+        ]
+      },
+      "duration_s": 0.25
+    },
+    {
+      "capture": {
+        "name": "resident-grid-moved"
+      }
+    },
+    {
+      "action": {
+        "action": "gpu_tile_view",
+        "mode": 0,
+        "sun_direction_body": [
+          -0.4,
+          0.2,
+          0.9
+        ]
+      },
+      "duration_s": 0.25
+    },
+    {
+      "checkpoint": {
+        "name": "warm-after-camera-light",
+        "predicate": {
+          "path": "resident_tile.gpu_residency.cumulative_content_upload_count",
+          "equals": 1
+        },
+        "timeout_s": 30
+      }
+    },
+    {
+      "capture": {
+        "name": "resident-light-changed"
+      }
+    },
+    {
+      "action": {
+        "action": "gpu_tile",
+        "enabled": true,
+        "revision": 1
+      },
+      "duration_s": 0
+    },
+    {
+      "checkpoint": {
+        "name": "invalidated-once",
+        "predicate": {
+          "path": "resident_tile.gpu_residency.cumulative_content_upload_count",
+          "equals": 2
+        },
+        "timeout_s": 30
+      }
+    },
+    {
+      "capture": {
+        "name": "resident-invalidated"
+      }
+    },
+    {
+      "action": {
+        "action": "gpu_tile_view",
+        "mode": 0,
+        "reference_cpu": true
+      },
+      "duration_s": 0.25
+    },
+    {
+      "capture": {
+        "name": "cpu-reference"
+      }
+    },
+    {
+      "action": {
+        "action": "gpu_tile",
+        "enabled": false
+      },
+      "duration_s": 0.25
+    },
+    {
+      "capture": {
+        "name": "old-path-restored"
+      }
+    }
+  ]
+}

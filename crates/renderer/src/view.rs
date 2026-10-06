@@ -41,6 +41,15 @@ impl RenderPrecisionBudget {
     pub fn max_component_error_m(self) -> f64 {
         self.max_component_error_m
     }
+
+    /// Validate an already observer-relative coordinate before a renderer
+    /// stages its f64 value for f32 GPU parameters.
+    pub fn try_view_relative_position(
+        self,
+        view_metres: DVec3,
+    ) -> Result<RenderRelativePosition, RenderPreparationError> {
+        narrow(view_metres, self)
+    }
 }
 
 /// Disposable view-relative GPU value, only valid for the view that produced it.
@@ -89,6 +98,8 @@ pub enum RenderPreparationError {
     InvalidDebugGeometry,
     #[error("debug frame contains a failed batch and cannot be submitted")]
     FailedDebugFrame,
+    #[error("resident terrain tile data or draw parameters are invalid")]
+    InvalidResidentTile,
     #[error("GPU progress during bounded resource growth: {0}")]
     GpuProgress(String),
 }

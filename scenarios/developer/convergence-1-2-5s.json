@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "preset": "solar-system",
+  "deterministic": true,
+  "initial_settings": [{ "action": "reset" }, { "action": "pause", "paused": true }],
+  "steps": [
+    { "action": { "action": "select", "body": "solar:earth" } },
+    { "action": { "action": "focus", "body": "solar:earth" } },
+    { "action": { "action": "navigation_mode", "mode": "surface_inspection" } },
+    { "action": { "action": "layer", "layer": "terrain", "enabled": true } },
+    { "wait": { "predicate": { "path": "general.camera_mode", "equals": "surface_inspection" }, "timeout_s": 20 } },
+    { "action": { "action": "pause", "paused": false }, "duration_s": 1.0 },
+    { "checkpoint": { "name": "t-plus-1s", "predicate": { "path": "general.camera_mode", "equals": "surface_inspection" }, "timeout_s": 20 } },
+    { "capture": { "name": "convergence-1s" } },
+    { "action": { "action": "pause", "paused": false }, "duration_s": 1.0 },
+    { "checkpoint": { "name": "t-plus-2s", "predicate": { "path": "general.camera_mode", "equals": "surface_inspection" }, "timeout_s": 20 } },
+    { "capture": { "name": "convergence-2s" } },
+    { "action": { "action": "pause", "paused": false }, "duration_s": 3.0 },
+    { "checkpoint": { "name": "t-plus-5s", "predicate": { "path": "general.camera_mode", "equals": "surface_inspection" }, "timeout_s": 20 } },
+    { "capture": { "name": "convergence-5s" } }
+  ]
+}

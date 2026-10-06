@@ -4,7 +4,15 @@
 pub mod celestial_camera;
 pub mod celestial_labels;
 pub mod celestial_selection;
+#[cfg(feature = "developer-tools")]
+pub mod developer_bridge;
 pub mod developer_capture;
+#[cfg(feature = "developer-tools")]
+pub mod developer_protocol;
+#[cfg(feature = "developer-tools")]
+pub mod developer_scenarios;
+#[cfg(feature = "developer-tools")]
+pub mod developer_service;
 pub mod developer_snapshot;
 pub mod gravity_fixtures;
 mod gravity_orbits;
@@ -14,6 +22,8 @@ pub mod orbit_guides;
 pub mod planet_surface;
 pub mod planet_terrain;
 pub mod playback_metrics;
+pub mod regional_terrain;
+pub mod resident_terrain;
 #[cfg(feature = "terrain-capture")]
 pub mod sky_capture;
 pub mod sky_definition;

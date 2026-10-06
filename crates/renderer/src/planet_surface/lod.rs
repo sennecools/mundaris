@@ -20,6 +20,22 @@ pub struct SurfaceViewInput<'view, 'tree> {
     pub projection: CelestialProjection,
 }
 
+/// Inputs for a policy's representation-specific refinement heuristic.
+///
+/// `certified_error_pixels` remains the conservative quality measure. A policy
+/// may choose representation resolution using a different demand, but cannot
+/// change culling bounds or the reported quality certificate.
+#[derive(Debug, Clone, Copy)]
+pub struct SurfaceRefinementInput {
+    pub address: CubePatchAddress,
+    pub metadata: PatchMetadata,
+    pub reference_radius_m: f64,
+    pub center_view: glam::DVec3,
+    pub ball_radius_m: f64,
+    pub projection: CelestialProjection,
+    pub certified_error_pixels: f64,
+}
+
 /// App-supplied, domain-free terrain bounds, error certificates, and geometry readiness.
 pub trait SurfaceGeometryPolicy {
     fn certificate(
@@ -28,14 +44,40 @@ pub trait SurfaceGeometryPolicy {
         metadata: PatchMetadata,
         radius_m: f64,
     ) -> Result<(SurfaceExtent, SurfaceErrorContributions), RenderPreparationError>;
+    /// Heuristic pixel demand used only for topology selection.
+    ///
+    /// The default retains the conservative certificate as the refinement
+    /// demand for policies that do not opt into a separate heuristic.
+    fn refinement_demand_pixels(
+        &mut self,
+        input: SurfaceRefinementInput,
+    ) -> Result<f64, RenderPreparationError> {
+        Ok(input.certified_error_pixels)
+    }
+    /// Whether camera-radial refinement takes precedence over projected demand.
+    fn prioritize_observer_patch(&self) -> bool {
+        true
+    }
     /// Record/request geometry for `address`, returning whether it is ready.
     fn request_ready(&mut self, address: CubePatchAddress) -> bool;
     /// Freeze topology replacement while an external transition is in progress.
     fn allow_replacement(&self) -> bool {
         true
     }
+    /// Permit another complete sibling merge in the current covering update.
+    fn allow_coarsening_replacement(&self) -> bool {
+        self.allow_replacement()
+    }
     /// Called after one complete balanced replacement is published.
     fn replacement_committed(&mut self) {}
+    /// Record the requested root of a complete balanced refinement closure.
+    fn refinement_committed(&mut self, _parent: CubePatchAddress) {
+        self.replacement_committed();
+    }
+    /// Record a complete sibling merge for policies tracking an unpublished batch.
+    fn coarsening_committed(&mut self, _parent: CubePatchAddress) {
+        self.replacement_committed();
+    }
     /// Resource preflight for the complete proposed covering surface.
     fn admit_replacement(&mut self, _cover_patches: usize) -> bool {
         true
@@ -264,6 +306,17 @@ impl SurfaceLodSession {
     pub fn active_visible(&self) -> &[ActiveSurfacePatch] {
         &self.visible
     }
+    /// Highest-priority outstanding refinement in the current covering surface.
+    pub fn next_refinement_parent(&self) -> Option<CubePatchAddress> {
+        self.refinement_parents().next()
+    }
+    /// Outstanding current leaves in deterministic refinement-priority order.
+    pub fn refinement_parents(&self) -> impl Iterator<Item = CubePatchAddress> + '_ {
+        self.requests
+            .iter()
+            .filter(|request| self.cover.contains(&request.0))
+            .map(|request| request.0)
+    }
     pub fn covering_leaves(&self) -> impl Iterator<Item = CubePatchAddress> + '_ {
         self.cover.iter().copied()
     }
@@ -380,7 +433,7 @@ impl SurfaceLodSession {
             let relevant = self.cover.contains(&parent)
                 && self.cache.get(parent)?.is_some_and(|m| {
                     relevance(parent, m, input, &source, &mut policy)
-                        .is_ok_and(|(v, e, _)| v && e > settings.split_px)
+                        .is_ok_and(|(v, demand, _, _)| v && demand > settings.split_px)
                 });
             if !relevant {
                 self.pending.clear();
@@ -421,13 +474,13 @@ impl SurfaceLodSession {
                 continue;
             }
             let m = self.cache.get(parent)?.expect("active ancestors pinned");
-            let (visible, error, _) = relevance(parent, m, input, &source, &mut policy)?;
-            if visible && error >= settings.merge_px {
+            let (visible, demand, _, _) = relevance(parent, m, input, &source, &mut policy)?;
+            if visible && demand >= settings.merge_px {
                 continue;
             }
             if merge_neighbors_valid(parent, &self.cover)
                 && policy.as_deref_mut().is_none_or(|p| {
-                    p.allow_replacement()
+                    p.allow_coarsening_replacement()
                         && p.admit_replacement(self.cover.len() - 3)
                         && p.request_ready(parent)
                 })
@@ -446,7 +499,7 @@ impl SurfaceLodSession {
                     source.observer_in_source().metres(),
                 );
                 if let Some(p) = policy.as_deref_mut() {
-                    p.replacement_committed();
+                    p.coarsening_committed(parent);
                 }
             }
         }
@@ -478,8 +531,8 @@ impl SurfaceLodSession {
                 report.profile.cover_candidates += 1;
             }
             let m = self.cache.get(p)?.expect("active metadata pinned");
-            let (visible, error, _) = relevance(p, m, input, &source, &mut policy)?;
-            if visible && error > settings.split_px {
+            let (visible, demand, _, _) = relevance(p, m, input, &source, &mut policy)?;
+            if visible && demand > settings.split_px {
                 if p.level() < settings.max_level {
                     let observer = source.observer_in_source().metres();
                     let local = address_contains_observer_direction(p, observer);
@@ -499,7 +552,7 @@ impl SurfaceLodSession {
                         / (-center_view.z).max(input.projection.near_m());
                     self.requests.push((
                         p,
-                        error,
+                        demand,
                         local,
                         extent,
                         view_offset,
@@ -520,13 +573,23 @@ impl SurfaceLodSession {
         }
         #[cfg(feature = "surface-profile")]
         let request_sort_started = Instant::now();
-        self.requests.sort_by(compare_request_priority);
-        // Finish an admitted closure unless a newly relevant camera-local chain
-        // outranks it. Peripheral infinite certificates must not starve a local
-        // finite-error request; thresholds and balance rules are unchanged.
+        let local_priority = policy
+            .as_deref()
+            .is_none_or(|p| p.prioritize_observer_patch());
+        self.requests.sort_by(if local_priority {
+            compare_request_priority
+        } else {
+            compare_projected_priority
+        });
+        // Finish a still-relevant admitted closure to preserve cold-work progress.
+        // Policies with radial priority allow a new camera-local chain to outrank
+        // it; projected-demand policies use that priority only when choosing a
+        // new closure. Obsolete requests have already been removed above.
         if let Some(parent) = self.pending_parent
             && let Some(index) = self.requests.iter().position(|r| r.0 == parent)
-            && (self.requests[index].2 || self.requests.first().is_none_or(|r| !r.2))
+            && (!local_priority
+                || self.requests[index].2
+                || self.requests.first().is_none_or(|r| !r.2))
         {
             let request = self.requests.remove(index);
             self.requests.insert(0, request);
@@ -643,7 +706,7 @@ impl SurfaceLodSession {
                     report.splits += 1;
                     report.balance_splits += forced;
                     if let Some(p) = policy.as_deref_mut() {
-                        p.replacement_committed();
+                        p.refinement_committed(parent);
                     }
                     self.pending.clear();
                     self.pending_parent = None;
@@ -725,11 +788,11 @@ impl SurfaceLodSession {
                 .cache
                 .get(p)?
                 .expect("desired traversal enters ready children");
-            let (visible, error, _) = relevance(p, m, input, &source, &mut policy)?;
+            let (visible, demand, _, _) = relevance(p, m, input, &source, &mut policy)?;
             let split = if self.previous_splits.contains(&p) {
-                error >= settings.merge_px
+                demand >= settings.merge_px
             } else {
-                error > settings.split_px
+                demand > settings.split_px
             };
             if visible && split && p.level() < settings.max_level {
                 let children = p
@@ -777,7 +840,7 @@ impl SurfaceLodSession {
         let stage_started = Instant::now();
         for &p in &self.cover {
             let m = self.cache.get(p)?.expect("active metadata pinned");
-            let (visible, _, horizon) = relevance(p, m, input, &source, &mut policy)?;
+            let (visible, _, horizon, _) = relevance(p, m, input, &source, &mut policy)?;
             if !visible {
                 if horizon {
                     report.horizon_culled += 1;
@@ -858,7 +921,7 @@ fn visible_for(
     output.clear();
     for &p in cover {
         let metadata = cache.get(p)?.expect("ready covering leaf");
-        let (visible, error, _) = relevance(p, metadata, input, source, policy)?;
+        let (visible, _, _, certified_error) = relevance(p, metadata, input, source, policy)?;
         if visible {
             let mut mask = 0;
             for edge in PatchEdge::ALL {
@@ -878,7 +941,7 @@ fn visible_for(
                 address: p,
                 stitch_mask: mask,
                 metadata,
-                error_pixels: error,
+                error_pixels: certified_error,
             });
         }
     }
@@ -949,7 +1012,7 @@ fn relevance(
     input: &SurfaceViewInput<'_, '_>,
     source: &PreparedRenderFrame<'_>,
     policy: &mut Option<&mut dyn SurfaceGeometryPolicy>,
-) -> Result<(bool, f64, bool), RenderPreparationError> {
+) -> Result<(bool, f64, bool, f64), RenderPreparationError> {
     let radius = input.reference_radius_m;
     let (extent, error) = if let Some(policy) = policy.as_deref_mut() {
         policy.certificate(address, m, radius)?
@@ -963,7 +1026,7 @@ fn relevance(
     if (policy.is_none() || extent.guaranteed_opaque_radius_m > 0.0)
         && m.horizon_reject(source.observer_in_source().metres(), radius, extent)
     {
-        return Ok((false, 0.0, true));
+        return Ok((false, 0.0, true, 0.0));
     }
     let (center, r) = m.ball(radius, extent)?;
     let center = source
@@ -973,17 +1036,34 @@ fn relevance(
         ))?
         .metres();
     if input.projection.rejects_ball(center, r)? {
-        return Ok((false, 0.0, false));
+        return Ok((false, 0.0, false, 0.0));
     }
-    Ok((
-        true,
-        if policy.is_some() {
-            m.projected_total_error(error, center, r, input.projection)?
-        } else {
-            m.projected_error(center, r, radius, input.projection)
-        },
-        false,
-    ))
+    let certified_error = if policy.is_some() {
+        m.projected_total_error(error, center, r, input.projection)?
+    } else {
+        m.projected_error(center, r, radius, input.projection)
+    };
+    let demand = if let Some(policy) = policy.as_deref_mut() {
+        let demand = policy.refinement_demand_pixels(SurfaceRefinementInput {
+            address,
+            metadata: m,
+            reference_radius_m: radius,
+            center_view: center,
+            ball_radius_m: r,
+            projection: input.projection,
+            certified_error_pixels: certified_error,
+        })?;
+        // A perspective ball crossing the near plane has unbounded projected
+        // error. Preserve that valid default demand; only NaN/negative inputs
+        // are invalid, rather than rejecting close legacy terrain.
+        if demand.is_nan() || demand < 0.0 {
+            return Err(RenderPreparationError::InvalidDebugGeometry);
+        }
+        demand
+    } else {
+        certified_error
+    };
+    Ok((true, demand, false, certified_error))
 }
 
 fn address_contains_observer_direction(address: CubePatchAddress, observer: glam::DVec3) -> bool {
@@ -1027,9 +1107,33 @@ fn compare_request_priority(
             }
         })
 }
+
+fn compare_projected_priority(
+    a: &(CubePatchAddress, f64, bool, f64, f64, f64),
+    b: &(CubePatchAddress, f64, bool, f64, f64, f64),
+) -> std::cmp::Ordering {
+    b.1.total_cmp(&a.1)
+        .then_with(|| b.3.total_cmp(&a.3))
+        .then_with(|| a.4.total_cmp(&b.4))
+        .then_with(|| a.5.total_cmp(&b.5))
+        .then(a.0.cmp(&b.0))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn projected_priority_refines_coarse_edges_before_fine_observer_patch() {
+        let local = CubePatchAddress::try_new(CubeFace::PositiveX, 4, 7, 7).unwrap();
+        let edge = CubePatchAddress::try_new(CubeFace::PositiveX, 2, 3, 1).unwrap();
+        let mut requests = [
+            (local, 2.0, true, 30.0, 0.0, 10.0),
+            (edge, 8.0, false, 100.0, 400.0, 30.0),
+        ];
+        requests.sort_by(compare_projected_priority);
+        assert_eq!(requests[0].0, edge);
+        requests.sort_by(compare_request_priority);
+        assert_eq!(requests[0].0, local);
+    }
     #[test]
     fn infinite_error_priority_prefers_local_then_projected_extent_and_view_center() {
         let local = CubePatchAddress::try_new(CubeFace::PositiveX, 2, 1, 1).unwrap();

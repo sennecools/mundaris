@@ -256,7 +256,13 @@ fn main() -> Result<()> {
     let north = direction.cross(east).normalize();
     let width = radius * 2.0 / 8192.0;
     let footprint = TerrainFootprint::new(width / 16.0)?;
-    let generator = TerrainGenerator::new(&identity.definition, radius)?;
+    let generator = TerrainGenerator::new(
+        identity
+            .definition
+            .legacy()
+            .ok_or_else(|| anyhow::anyhow!("legacy transition fixture"))?,
+        radius,
+    )?;
     let location = SurfaceLocation::new(Direction3::try_new(direction)?);
     let center_sample = generator.evaluate_point(TerrainQuery {
         location,
@@ -474,7 +480,7 @@ fn main() -> Result<()> {
     )?;
     ensure!(
         estimated_peak <= TERRAIN_CPU_CAP_BYTES,
-        "estimated construction exceeds 128 MiB"
+        "estimated construction exceeds terrain CPU quota"
     );
     fs::write(
         Path::new(&output).join(format!("{scene}-manifest.txt")),

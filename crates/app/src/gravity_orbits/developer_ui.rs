@@ -12,6 +12,13 @@ fn row(ui: &mut egui::Ui, label: &str, value: impl Into<egui::RichText>) {
 
 pub(super) fn left(ui: &mut egui::Ui, controls: &mut Controls, info: &UiInfo<'_>) {
     ui.heading("Scene");
+    #[cfg(feature = "developer-tools")]
+    if let Some(owner) = &controls.automation_owner {
+        ui.colored_label(egui::Color32::YELLOW, format!("Automation active: {owner}"));
+        if ui.button("Stop automation").clicked() {
+            controls.automation_stop = true;
+        }
+    }
     if let Some(s) = info.snapshot {
         row(
             ui,
@@ -331,16 +338,26 @@ pub(super) fn left(ui: &mut egui::Ui, controls: &mut Controls, info: &UiInfo<'_>
         );
     }
     ui.collapsing("Scene overlays", |ui| {
-        ui.checkbox(&mut controls.markers, "Navigation markers");
-        ui.checkbox(&mut controls.labels, "Body labels");
-        ui.checkbox(&mut controls.guide_visible, "Orbit guides")
+        visual_controls::checkbox(
+            ui,
+            controls,
+            visual_controls::Layer::Markers,
+            "Navigation markers",
+        );
+        visual_controls::checkbox(ui, controls, visual_controls::Layer::Labels, "Body labels");
+        visual_controls::checkbox(ui, controls, visual_controls::Layer::Guides, "Orbit guides")
             .on_hover_text(if info.motion.is_analytic() {
                 "Authored ellipses about their reference's published center; not history."
             } else {
                 "Instantaneous two-body guides, not predictions or historical paths."
             });
-        ui.checkbox(&mut controls.trails, "Recorded history")
-            .on_hover_text("Actual committed simulation samples.");
+        visual_controls::checkbox(
+            ui,
+            controls,
+            visual_controls::Layer::Trails,
+            "Recorded history",
+        )
+        .on_hover_text("Actual committed simulation samples.");
     });
 }
 
@@ -388,15 +405,24 @@ pub(super) fn right(ui: &mut egui::Ui, controls: &mut Controls, info: &UiInfo<'_
         )
         .changed()
     {
-        controls.terrain_lighting = controls.terrain_lighting.with_mode(if natural {
-            TerrainRenderMode::Natural
-        } else {
-            TerrainRenderMode::Lit
-        });
+        controls
+            .pending
+            .push_back(Command::Visual(visual_controls::VisualCommand::RenderMode(
+                if natural {
+                    TerrainRenderMode::Natural
+                } else {
+                    TerrainRenderMode::Lit
+                },
+            )));
     }
-    ui.checkbox(&mut controls.planetary_ocean, "Ocean");
-    ui.checkbox(&mut controls.planetary_clouds, "Clouds");
-    ui.checkbox(&mut controls.planetary_atmosphere, "Atmosphere");
+    visual_controls::checkbox(ui, controls, visual_controls::Layer::Ocean, "Ocean");
+    visual_controls::checkbox(ui, controls, visual_controls::Layer::Clouds, "Clouds");
+    visual_controls::checkbox(
+        ui,
+        controls,
+        visual_controls::Layer::Atmosphere,
+        "Atmosphere",
+    );
     ui.small("Layers render only where defined, in Natural mode.");
     if let Some(s) = info.snapshot {
         ui.small(format!(
@@ -407,10 +433,20 @@ pub(super) fn right(ui: &mut egui::Ui, controls: &mut Controls, info: &UiInfo<'_
         ));
     }
     ui.collapsing("Diagnostic rendering", |ui| {
-        ui.checkbox(&mut controls.surface_style.borders, "Patch borders")
-            .on_hover_text("Draw chart patch boundaries, not additional geometry.");
-        ui.checkbox(&mut controls.surface_style.lod_colors, "LOD colors")
-            .on_hover_text("Cyclic diagnostic palette, not a whole-screen quality measure.");
+        visual_controls::checkbox(
+            ui,
+            controls,
+            visual_controls::Layer::Borders,
+            "Patch borders",
+        )
+        .on_hover_text("Draw chart patch boundaries, not additional geometry.");
+        visual_controls::checkbox(
+            ui,
+            controls,
+            visual_controls::Layer::LodColors,
+            "LOD colors",
+        )
+        .on_hover_text("Cyclic diagnostic palette, not a whole-screen quality measure.");
         ui.checkbox(&mut controls.surface_style.face_colors, "Face colors");
         egui::ComboBox::from_label("Shading")
             .selected_text(render_mode_name(controls.terrain_lighting.mode()))
@@ -423,36 +459,39 @@ pub(super) fn right(ui: &mut egui::Ui, controls: &mut Controls, info: &UiInfo<'_
                         )
                         .clicked()
                     {
-                        controls.terrain_lighting = controls.terrain_lighting.with_mode(mode);
+                        controls.pending.push_back(Command::Visual(
+                            visual_controls::VisualCommand::RenderMode(mode),
+                        ));
                     }
                 }
             });
     });
+    let mut sky_settings = controls.sky;
     ui.collapsing("Distant sky", |ui| {
         ui.small("Fictional decorative content · not travel destinations");
-        ui.checkbox(&mut controls.sky.enabled, "Enabled");
-        ui.add(egui::Slider::new(&mut controls.sky.intensity, 0.0..=3.0).text("Intensity"));
+        ui.checkbox(&mut sky_settings.enabled, "Enabled");
+        ui.add(egui::Slider::new(&mut sky_settings.intensity, 0.0..=3.0).text("Intensity"));
         ui.add(
             egui::Slider::new(
-                &mut controls.sky.galactic_yaw_rad,
+                &mut sky_settings.galactic_yaw_rad,
                 -std::f64::consts::PI..=std::f64::consts::PI,
             )
             .text("Galactic yaw"),
         );
         ui.add(
             egui::Slider::new(
-                &mut controls.sky.galactic_roll_rad,
+                &mut sky_settings.galactic_roll_rad,
                 -std::f64::consts::PI..=std::f64::consts::PI,
             )
             .text("Galactic roll"),
         );
-        ui.add(egui::Slider::new(&mut controls.sky.star_intensity, 0.0..=3.0).text("Stars"));
+        ui.add(egui::Slider::new(&mut sky_settings.star_intensity, 0.0..=3.0).text("Stars"));
         ui.add(
-            egui::Slider::new(&mut controls.sky.background_intensity, 0.0..=3.0)
+            egui::Slider::new(&mut sky_settings.background_intensity, 0.0..=3.0)
                 .text("Galactic band"),
         );
         ui.add(
-            egui::Slider::new(&mut controls.sky.halo_strength, 0.0..=0.5).text("Bright-star halos"),
+            egui::Slider::new(&mut sky_settings.halo_strength, 0.0..=0.5).text("Bright-star halos"),
         );
         if let Some(sky) = info.snapshot.and_then(|s| s.sky.as_ref()) {
             ui.small(format!(
@@ -467,6 +506,13 @@ pub(super) fn right(ui: &mut egui::Ui, controls: &mut Controls, info: &UiInfo<'_
             }
         }
     });
+    if sky_settings != controls.sky {
+        controls
+            .pending
+            .push_back(Command::Visual(visual_controls::VisualCommand::Sky(
+                sky_settings,
+            )));
+    }
     ui.add_space(8.0);
     ui.separator();
     ui.heading("Terrain");

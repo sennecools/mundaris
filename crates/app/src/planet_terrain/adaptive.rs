@@ -62,7 +62,7 @@ impl Default for CertificateCache {
 impl CertificateCache {
     fn get(
         &mut self,
-        generator: &TerrainGenerator,
+        generator: &NativeTerrainGenerator,
         address: CubePatchAddress,
         metadata: PatchMetadata,
     ) -> Result<(SurfaceExtent, SurfaceErrorContributions)> {
@@ -74,7 +74,7 @@ impl CertificateCache {
         {
             return Ok((*extent, *error));
         }
-        let (extent, error) = terrain_surface_certificate(generator, address, metadata)?;
+        let (extent, error) = generator.surface_certificate(address, metadata)?;
         self.entries[self.cursor] = Some((address, extent, error));
         self.cursor = (self.cursor + 1) % self.entries.len();
         Ok((extent, error))
@@ -89,21 +89,59 @@ fn physical_resolution(address: CubePatchAddress, radius_m: f64) -> Result<(f64,
     Ok((width, spacing))
 }
 
+fn boundary_profile_bound(
+    generator: &NativeTerrainGenerator,
+    address: CubePatchAddress,
+    metadata: PatchMetadata,
+    global_bounds: &[f64; 31],
+) -> Result<f64> {
+    if !generator.has_local_profile_bounds() {
+        return Ok(global_bounds[usize::from(address.level())]);
+    }
+    let footprint =
+        |level| TerrainFootprint::new(generator.radius_m() * 2.0 / (16.0 * (1u64 << level) as f64));
+    let (axis, alpha) = metadata.cap();
+    // Stitch owners share the same canonical direction, contained in this cap.
+    // First-two-row corrections are convex combinations of these edge deltas,
+    // so no neighboring chart's spatial support is needed for this bound.
+    generator.profile_difference_bound_for_region_m(
+        DirectionalCap::new(Direction3::try_new(axis)?, alpha)?,
+        footprint(address.level())?,
+        footprint(address.level().saturating_sub(2))?,
+    )
+}
+
 /// Temporary mutable bridge. Renderer receives only certificates/readiness, never
 /// a terrain definition, generator seed or procedural query interface.
 pub struct TerrainSelectionPolicy<'a> {
     cache: &'a mut TerrainPatchCache,
     identity: &'a TerrainGeometryIdentity,
-    generator: &'a TerrainGenerator,
+    generator: &'a NativeTerrainGenerator,
     boundary_bounds: &'a [f64; 31],
     morph_remaining_m: f64,
     required: Vec<CubePatchAddress>,
     replacements: usize,
+    changed_parents: [Option<(CubePatchAddress, bool)>; 32],
     frozen: bool,
     reservation_base: usize,
     certificates: &'a mut CertificateCache,
+    representation_clearance_m: Option<f64>,
+    split_pixels: f64,
 }
 impl SurfaceGeometryPolicy for TerrainSelectionPolicy<'_> {
+    fn prioritize_observer_patch(&self) -> bool {
+        self.representation_clearance_m.is_none()
+    }
+    fn refinement_demand_pixels(
+        &mut self,
+        input: SurfaceRefinementInput,
+    ) -> std::result::Result<f64, RenderPreparationError> {
+        Ok(self.generator.representation_demand_pixels(
+            input,
+            self.representation_clearance_m,
+            self.split_pixels,
+        ))
+    }
     fn certificate(
         &mut self,
         address: CubePatchAddress,
@@ -124,7 +162,9 @@ impl SurfaceGeometryPolicy for TerrainSelectionPolicy<'_> {
         // Edge balance also bounds a four-quadrant vertex's coarsest owner by
         // two levels (the edge-neighbor graph has diameter two). Cube corners
         // have three mutually adjacent faces. No global-height morph allowance.
-        let boundary = self.boundary_bounds[usize::from(address.level())];
+        let boundary =
+            boundary_profile_bound(self.generator, address, metadata, self.boundary_bounds)
+                .map_err(|_| RenderPreparationError::InvalidDebugGeometry)?;
         error.boundary_constraint_m = (boundary + error.numeric_m).next_up();
         error.morph_remaining_m = self.morph_remaining_m;
         let allowance = (error.boundary_constraint_m + error.morph_remaining_m).next_up();
@@ -140,9 +180,35 @@ impl SurfaceGeometryPolicy for TerrainSelectionPolicy<'_> {
         self.cache.pin(self.identity, address)
     }
     fn allow_replacement(&self) -> bool {
-        !self.frozen && self.replacements == 0
+        !self.frozen
+            && self.replacements
+                < if self.representation_clearance_m.is_some() {
+                    MAX_REFINEMENT_REPLACEMENTS
+                } else {
+                    1
+                }
+    }
+    fn allow_coarsening_replacement(&self) -> bool {
+        // Retire independent sibling groups together after a view change rather
+        // than constructing and morphing an entire cover for every single merge.
+        // Every merge still passes readiness, balance, and memory admission.
+        !self.frozen
+            && self.replacements
+                < if self.representation_clearance_m.is_some() {
+                    32
+                } else {
+                    1
+                }
     }
     fn replacement_committed(&mut self) {
+        self.replacements += 1;
+    }
+    fn refinement_committed(&mut self, parent: CubePatchAddress) {
+        self.changed_parents[self.replacements] = Some((parent, true));
+        self.replacements += 1;
+    }
+    fn coarsening_committed(&mut self, parent: CubePatchAddress) {
+        self.changed_parents[self.replacements] = Some((parent, false));
         self.replacements += 1;
     }
     fn admit_replacement(&mut self, patches: usize) -> bool {
@@ -161,7 +227,7 @@ pub struct AdaptiveTerrainCover {
     #[cfg(feature = "surface-profile")]
     pub profile: AdaptiveTerrainProfile,
     identity: Option<TerrainGeometryIdentity>,
-    generator: Option<TerrainGenerator>,
+    generator: Option<NativeTerrainGenerator>,
     boundary_bounds: [f64; 31],
     lod: Option<SurfaceLodSession>,
     active: Vec<ActiveSurfacePatch>,
@@ -181,6 +247,7 @@ pub struct AdaptiveTerrainCover {
     construction_obsolete: bool,
     construction_refining: bool,
     unpublished_parent: Option<(CubePatchAddress, bool)>,
+    unpublished_changes: [Option<(CubePatchAddress, bool)>; 32],
     morph_duration: Duration,
     /// Overlay rejection keeps the complete source and private target frozen.
     /// Bounded larger-budget retries never bypass aggregate admission.
@@ -201,13 +268,26 @@ pub struct AdaptiveTerrainCover {
     local_metadata: [Option<(CubePatchAddress, PatchMetadata)>; 31],
     local_certificates: [Option<CachedCertificate>; 31],
     certificates: CertificateCache,
-    prefetch_parent: Option<CubePatchAddress>,
+    prefetch_parents: [Option<CubePatchAddress>; MAX_REFINEMENT_REPLACEMENTS],
     prefetch_dependencies: Vec<CubePatchAddress>,
     pub peak_transition_bytes: usize,
     pub peak_cpu_bytes: usize,
 }
 const TRANSITION_RESERVATION: usize = 16 * 1024 * 1024;
 const MAX_TRANSITION_RESERVATION: usize = 32 * 1024 * 1024;
+const SELECTOR_SCRATCH_RESERVATION: usize = 8 * 1024 * 1024;
+const MAX_REFINEMENT_REPLACEMENTS: usize = 8;
+// `required` and its publication snapshot remain live through raw generation.
+// Bound their combined transient allocation before selection.
+const SELECTOR_TEMPORARY_RESERVATION: usize =
+    2 * MAX_TERRAIN_PATCHES * size_of::<CubePatchAddress>();
+fn mark_generation_reservation_rejection(report: &mut LodReport, before: u64, after: u64) {
+    if after > before {
+        report.budget_constrained = true;
+        report.quality_pending = true;
+        report.settled = false;
+    }
+}
 fn shared_surface_bytes(surface: &Arc<StitchedSurface>) -> usize {
     surface.resident_bytes() + 2 * size_of::<usize>()
 }
@@ -285,6 +365,7 @@ impl AdaptiveTerrainCover {
     /// charge separately; sum with cache residency for the aggregate accounting.
     pub fn resident_bytes(&self) -> usize {
         size_of::<Self>()
+            + self.generator.as_ref().map_or(0, |generator| generator.resident_heap_bytes() + generator.query_workspace_bytes())
             + self.prefetch_dependencies.capacity() * size_of::<CubePatchAddress>()
             + (self.active.capacity() + self.visible.capacity()) * size_of::<ActiveSurfacePatch>()
             // An admitted cover reservation owns this same shared allocation
@@ -323,6 +404,8 @@ impl AdaptiveTerrainCover {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("missing selector"))?
             .restore_published_cover(&cover)?;
+        self.prefetch_parents = [None; MAX_REFINEMENT_REPLACEMENTS];
+        self.prefetch_dependencies.clear();
         Ok(())
     }
     fn publish_output(&mut self, output: workers::CoverOutput, duration: Duration) {
@@ -440,14 +523,15 @@ impl AdaptiveTerrainCover {
             self.construction_parent = None;
             self.construction_obsolete = false;
             self.unpublished_parent = None;
+            self.unpublished_changes = [None; 32];
             self.local_metadata = [None; 31];
             self.local_certificates = [None; 31];
             self.certificates = CertificateCache::default();
-            self.prefetch_parent = None;
+            self.prefetch_parents = [None; MAX_REFINEMENT_REPLACEMENTS];
             self.prefetch_dependencies.clear();
             self.transition_deferred = false;
             self.transition_budget_step = 0;
-            self.generator = Some(TerrainGenerator::new(
+            self.generator = Some(NativeTerrainGenerator::new(
                 &identity.definition,
                 identity.radius_m,
             )?);
@@ -492,6 +576,17 @@ impl AdaptiveTerrainCover {
         }
         #[cfg(feature = "surface-profile")]
         let stage_started = Instant::now();
+        let representation_clearance_m = self
+            .generator
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("missing terrain generator"))?
+            .representation_clearance_m(
+                input
+                    .view
+                    .prepare_source(input.body_fixed_frame)?
+                    .observer_in_source()
+                    .metres(),
+            )?;
         if (self.construction.is_some() || self.queued.is_some())
             && !self.construction_obsolete
             && let Some((parent, refining)) = self
@@ -500,47 +595,70 @@ impl AdaptiveTerrainCover {
                 .or(self.queued_parent)
             && self.stitched.is_some()
         {
-            let topology = self
-                .lod
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("missing selector"))?
-                .topology();
-            let metadata = PatchMetadata::build(parent, topology)?;
-            let generator = self
-                .generator
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("missing generator"))?;
-            let (mut extent, mut error) = self.certificates.get(generator, parent, metadata)?;
-            error.boundary_constraint_m =
-                (self.boundary_bounds[usize::from(parent.level())] + error.numeric_m).next_up();
-            extent.min_height_m = (extent.min_height_m - error.boundary_constraint_m).next_down();
-            extent.max_height_m = (extent.max_height_m + error.boundary_constraint_m).next_up();
-            let (center, ball) = metadata.ball(identity.radius_m, extent)?;
-            let source = input.view.prepare_source(input.body_fixed_frame)?;
-            let center = source
-                .view_displacement(mundaris_math::FramePosition::new(
-                    input.body_fixed_frame,
-                    mundaris_math::LocalPosition::try_metres(center)?,
-                ))?
-                .metres();
-            let visible = !input.projection.rejects_ball(center, ball)?;
-            let projected =
-                metadata.projected_total_error(error, center, ball, input.projection)?;
-            let obsolete = if refining {
-                !visible || projected <= settings.split_pixels()
-            } else {
-                visible && projected >= settings.merge_pixels()
-            };
-            if obsolete {
-                // Keep construction ownership until the cancellation acknowledgement;
-                // the source Arc must not be double charged while the worker holds it.
-                if self.construction.is_some() {
-                    self.construction_obsolete = true;
-                    cache.cancel_workers(|i, address| i == identity && address.is_none());
+            let mut changes = self.unpublished_changes;
+            if changes[0].is_none() {
+                changes[0] = Some((parent, refining));
+            }
+            for (parent, refining) in changes.into_iter().flatten() {
+                let topology = self
+                    .lod
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("missing selector"))?
+                    .topology();
+                let metadata = PatchMetadata::build(parent, topology)?;
+                let generator = self
+                    .generator
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("missing generator"))?;
+                let (mut extent, mut error) = self.certificates.get(generator, parent, metadata)?;
+                error.boundary_constraint_m =
+                    (boundary_profile_bound(generator, parent, metadata, &self.boundary_bounds)?
+                        + error.numeric_m)
+                        .next_up();
+                extent.min_height_m =
+                    (extent.min_height_m - error.boundary_constraint_m).next_down();
+                extent.max_height_m = (extent.max_height_m + error.boundary_constraint_m).next_up();
+                let (center, ball) = metadata.ball(identity.radius_m, extent)?;
+                let source = input.view.prepare_source(input.body_fixed_frame)?;
+                let center = source
+                    .view_displacement(mundaris_math::FramePosition::new(
+                        input.body_fixed_frame,
+                        mundaris_math::LocalPosition::try_metres(center)?,
+                    ))?
+                    .metres();
+                let visible = !input.projection.rejects_ball(center, ball)?;
+                let projected =
+                    metadata.projected_total_error(error, center, ball, input.projection)?;
+                let demand = generator.representation_demand_pixels(
+                    SurfaceRefinementInput {
+                        address: parent,
+                        metadata,
+                        reference_radius_m: identity.radius_m,
+                        center_view: center,
+                        ball_radius_m: ball,
+                        projection: input.projection,
+                        certified_error_pixels: projected,
+                    },
+                    representation_clearance_m,
+                    settings.split_pixels(),
+                );
+                let obsolete = if refining {
+                    !visible || demand <= settings.split_pixels()
                 } else {
-                    self.queued = None;
-                    self.queued_parent = None;
-                    self.restore_endpoint()?;
+                    visible && demand >= settings.merge_pixels()
+                };
+                if obsolete {
+                    // Keep construction ownership until the cancellation acknowledgement;
+                    // the source Arc must not be double charged while the worker holds it.
+                    if self.construction.is_some() {
+                        self.construction_obsolete = true;
+                        cache.cancel_workers(|i, address| i == identity && address.is_none());
+                    } else {
+                        self.queued = None;
+                        self.queued_parent = None;
+                        self.restore_endpoint()?;
+                    }
+                    break;
                 }
             }
         }
@@ -596,14 +714,17 @@ impl AdaptiveTerrainCover {
             cache.request_pinned(identity, root);
         }
         // Reserve an explicit renderer-facing staging allowance in addition to
-        // actual derived geometry. Never raise the aggregate 128 MiB cap.
+        // actual derived geometry, within the configured aggregate CPU cap.
         // Renderer staging is shared with smooth bodies and retains capacities
         // across frames. Reserve its full outgoing (64 MiB) and boundary (8 MiB)
         // caps, not a typical-view payload, before admitting terrain allocations.
         const STAGING_ALLOWANCE: usize = 72 * 1024 * 1024 + 32 * 1024;
         let transition_budget = self.transition_budget();
-        // Selector scratch is separately bounded by 8 MiB; account for capacity
-        // growth before its metadata/balance traversal, not after allocation.
+        // `resident_bytes` already includes the previous selector's retained
+        // scratch. Reserve only the remaining growth to its hard bound, plus a
+        // bound for the short-lived address lists that survive into generation.
+        let selector_scratch_growth =
+            SELECTOR_SCRATCH_RESERVATION.saturating_sub(self.report.scratch_bytes);
         let transition_reserve = if self.morph_duration.is_zero()
             || self.queued.is_some()
             || self.construction.is_some()
@@ -612,8 +733,11 @@ impl AdaptiveTerrainCover {
         } else {
             transition_budget
         };
-        let reserve =
-            self.resident_bytes() + STAGING_ALLOWANCE + 8 * 1024 * 1024 + transition_reserve;
+        let mut reserve = self.resident_bytes()
+            + STAGING_ALLOWANCE
+            + selector_scratch_growth
+            + SELECTOR_TEMPORARY_RESERVATION
+            + transition_reserve;
         cache.operational_reserve_bytes = transition_reserve
             + self.morph.as_ref().map_or(0, |m| {
                 m.mesh.resident_bytes() + shared_surface_bytes(&m.destination)
@@ -643,6 +767,7 @@ impl AdaptiveTerrainCover {
             morph_remaining_m: 0.0,
             required: Vec::new(),
             replacements: 0,
+            changed_parents: [None; 32],
             frozen: !admitted
                 || self.stitched.is_none()
                 || self.queued.is_some()
@@ -651,6 +776,8 @@ impl AdaptiveTerrainCover {
                 || unpublished_target,
             reservation_base: reserve,
             certificates: &mut self.certificates,
+            representation_clearance_m,
+            split_pixels: settings.split_pixels(),
         };
         #[cfg(feature = "surface-profile")]
         {
@@ -659,10 +786,8 @@ impl AdaptiveTerrainCover {
         let selection_start = Instant::now();
         self.report = lod.update_with_policy(input, settings, &mut policy)?;
         if self.report.splits != 0 || self.report.merges != 0 {
-            self.unpublished_parent = self
-                .report
-                .refinement_parent
-                .map(|parent| (parent, self.report.splits != 0));
+            self.unpublished_changes = policy.changed_parents;
+            self.unpublished_parent = policy.changed_parents.into_iter().flatten().last();
         }
         self.selection_preparation = selection_start.elapsed();
         #[cfg(feature = "surface-profile")]
@@ -681,12 +806,17 @@ impl AdaptiveTerrainCover {
             required.extend(lod.covering_leaves());
         }
         let publishing_required = required.clone();
-        // While the current endpoint is being constructed/morphed, otherwise
-        // idle patch workers can prepare the *next* local balanced closure.
-        // This never advances topology beyond the endpoint or changes quality.
-        let mut next_parent = if self.construction.is_some() || self.morph.is_some() {
+        // Prepare a bounded priority-ordered group of independent closures so
+        // ready splits can share one complete cover construction and morph.
+        // Prefetch never advances topology or relaxes the quality certificate.
+        let mut next_parents = [None; MAX_REFINEMENT_REPLACEMENTS];
+        if representation_clearance_m.is_some() {
+            for (slot, parent) in next_parents.iter_mut().zip(lod.refinement_parents()) {
+                *slot = Some(parent);
+            }
+        } else if self.construction.is_some() || self.morph.is_some() {
             let source = input.view.prepare_source(input.body_fixed_frame)?;
-            Direction3::try_new(source.observer_in_source().metres())
+            next_parents[0] = Direction3::try_new(source.observer_in_source().metres())
                 .ok()
                 .and_then(|direction| {
                     let (face, uv) = SurfaceLocation::new(direction).face_uv();
@@ -700,11 +830,10 @@ impl AdaptiveTerrainCover {
                                 })
                         })
                         .map(|p| p.address)
-                })
-        } else {
-            None
-        };
-        if let Some(parent) = next_parent {
+                });
+        }
+        for slot in &mut next_parents {
+            let Some(parent) = *slot else { continue };
             let source = input.view.prepare_source(input.body_fixed_frame)?;
             let metadata = lod
                 .active_visible()
@@ -714,7 +843,9 @@ impl AdaptiveTerrainCover {
                 .metadata;
             let (mut extent, mut error) = self.certificates.get(generator, parent, metadata)?;
             error.boundary_constraint_m =
-                (self.boundary_bounds[usize::from(parent.level())] + error.numeric_m).next_up();
+                (boundary_profile_bound(generator, parent, metadata, &self.boundary_bounds)?
+                    + error.numeric_m)
+                    .next_up();
             extent.min_height_m = (extent.min_height_m - error.boundary_constraint_m).next_down();
             extent.max_height_m = (extent.max_height_m + error.boundary_constraint_m).next_up();
             let (center, ball) = metadata.ball(identity.radius_m, extent)?;
@@ -726,25 +857,53 @@ impl AdaptiveTerrainCover {
                 .metres();
             // An active transition's remaining displacement is not unresolved
             // endpoint terrain and must not manufacture speculative refinement.
-            if input.projection.rejects_ball(center, ball)?
-                || metadata.projected_total_error(error, center, ball, input.projection)?
-                    <= settings.split_pixels()
-            {
-                next_parent = None;
+            let demand = generator.representation_demand_pixels(
+                SurfaceRefinementInput {
+                    address: parent,
+                    metadata,
+                    reference_radius_m: identity.radius_m,
+                    center_view: center,
+                    ball_radius_m: ball,
+                    projection: input.projection,
+                    certified_error_pixels: metadata.projected_total_error(
+                        error,
+                        center,
+                        ball,
+                        input.projection,
+                    )?,
+                },
+                representation_clearance_m,
+                settings.split_pixels(),
+            );
+            if input.projection.rejects_ball(center, ball)? || demand <= settings.split_pixels() {
+                *slot = None;
             }
         }
-        if self.prefetch_parent != next_parent {
+        // Balance dependencies belong to this complete cover, not just to the
+        // requested roots. Even unchanged roots need new closures after a merge
+        // or an independent split changes their incident neighbors.
+        if self.prefetch_parents != next_parents
+            || self.report.splits != 0
+            || self.report.merges != 0
+        {
             self.prefetch_dependencies.clear();
-            if let Some(parent) = next_parent {
+            for parent in next_parents.into_iter().flatten() {
                 match lod.replacement_dependencies(parent, settings) {
-                    Ok(dependencies) if dependencies.len() <= MAX_PENDING_PATCHES => {
-                        self.prefetch_dependencies = dependencies
+                    Ok(dependencies) => {
+                        for address in dependencies {
+                            if !self.prefetch_dependencies.contains(&address) {
+                                if self.prefetch_dependencies.len() == MAX_PENDING_PATCHES {
+                                    break;
+                                }
+                                self.prefetch_dependencies.push(address);
+                            }
+                        }
                     }
-                    Ok(_) | Err(RenderPreparationError::InvalidBudget) => {}
+                    Err(RenderPreparationError::InvalidBudget) => {}
                     Err(error) => return Err(error.into()),
                 }
             }
-            self.prefetch_parent = next_parent;
+            self.prefetch_parents = next_parents;
         }
         for &address in &self.prefetch_dependencies {
             cache.request_pinned(identity, address);
@@ -759,11 +918,39 @@ impl AdaptiveTerrainCover {
         // Preserve the highest projected-error blocking closure. Everything else
         // is discardable, including an obsolete partially generated builder.
         cache.retain_required(identity, &required);
+        // Selection has finished. Its unused growth allowance is no longer
+        // needed; retain the actual new selector capacity and the address lists
+        // that remain live while raw patches are generated.
+        let selector_temporaries = required
+            .capacity()
+            .saturating_add(publishing_required.capacity())
+            .saturating_mul(size_of::<CubePatchAddress>());
+        reserve =
+            self.resident_bytes() + STAGING_ALLOWANCE + transition_reserve + selector_temporaries;
+        let generation_admitted = cache.reserve_external(reserve);
+        if !generation_admitted {
+            self.report.budget_constrained = true;
+            self.report.quality_pending = true;
+            self.report.settled = false;
+        }
         let ready_before = publishing_required
             .iter()
             .filter(|&&a| cache.peek(identity, a).is_some())
             .count();
-        let mut work = cache.generate(vertex_budget, GENERATION_MICROBATCH, wall_budget)?;
+        let rejected_before = cache.report().reservation_rejected;
+        let mut work = if generation_admitted {
+            cache.generate(vertex_budget, GENERATION_MICROBATCH, wall_budget)?
+        } else {
+            TerrainWorkReport {
+                pending_patches: cache.pending(),
+                ..TerrainWorkReport::default()
+            }
+        };
+        mark_generation_reservation_rejection(
+            &mut self.report,
+            rejected_before,
+            cache.report().reservation_rejected,
+        );
         #[cfg(feature = "surface-profile")]
         {
             self.profile.cache_generation = stage_started.elapsed();
@@ -1176,7 +1363,7 @@ impl AdaptiveTerrainCover {
         }
         #[cfg(feature = "surface-profile")]
         let stage_started = Instant::now();
-        self.update_convergence(cache, identity, input, settings)?;
+        self.update_convergence(cache, identity, input, settings, representation_clearance_m)?;
         #[cfg(feature = "surface-profile")]
         {
             self.profile.diagnostics = stage_started.elapsed();
@@ -1200,7 +1387,7 @@ impl AdaptiveTerrainCover {
         self.peak_cpu_bytes = cache.report().peak_aggregate_bytes;
         anyhow::ensure!(
             self.peak_cpu_bytes <= TERRAIN_CPU_CAP_BYTES,
-            "terrain aggregate peak exceeded 128 MiB"
+            "terrain aggregate peak exceeded the configured CPU cap"
         );
         #[cfg(feature = "surface-profile")]
         {
@@ -1215,6 +1402,7 @@ impl AdaptiveTerrainCover {
         identity: &TerrainGeometryIdentity,
         input: &SurfaceViewInput<'_, '_>,
         settings: &LodSettings,
+        representation_clearance_m: Option<f64>,
     ) -> Result<()> {
         let start = Instant::now();
         let source = input.view.prepare_source(input.body_fixed_frame)?;
@@ -1259,7 +1447,7 @@ impl AdaptiveTerrainCover {
             if geometry.is_some() {
                 diagnostic.ready_local_lod = Some(level);
             }
-            if diagnostic.target_certifiable {
+            if diagnostic.desired_local_lod.is_some() {
                 continue;
             }
             let slot = &mut self.local_metadata[usize::from(level)];
@@ -1282,7 +1470,9 @@ impl AdaptiveTerrainCover {
                 (extent, error)
             };
             error.boundary_constraint_m =
-                (self.boundary_bounds[usize::from(level)] + error.numeric_m).next_up();
+                (boundary_profile_bound(generator, address, metadata, &self.boundary_bounds)?
+                    + error.numeric_m)
+                    .next_up();
             extent.min_height_m = (extent.min_height_m - error.boundary_constraint_m).next_down();
             extent.max_height_m = (extent.max_height_m + error.boundary_constraint_m).next_up();
             let (center, radius) = metadata.ball(identity.radius_m, extent)?;
@@ -1293,27 +1483,38 @@ impl AdaptiveTerrainCover {
                 ))?
                 .metres();
             let pixels = metadata.projected_total_error(error, center, radius, input.projection)?;
-            if pixels <= settings.split_pixels() || level == 30 {
+            let demand = generator.representation_demand_pixels(
+                SurfaceRefinementInput {
+                    address,
+                    metadata,
+                    reference_radius_m: identity.radius_m,
+                    center_view: center,
+                    ball_radius_m: radius,
+                    projection: input.projection,
+                    certified_error_pixels: pixels,
+                },
+                representation_clearance_m,
+                settings.split_pixels(),
+            );
+            if demand <= settings.split_pixels() || level == 30 {
                 diagnostic.desired_local_lod = Some(level);
                 diagnostic.target_certifiable = pixels <= settings.split_pixels();
-                diagnostic.certificate_limited_target_lod = Some(level);
-                // This is the certified useful target, not a heuristic geometry
-                // spacing target. No second, unproved quality threshold is used.
-                diagnostic.useful_target_lod = diagnostic.target_certifiable.then_some(level);
+                diagnostic.certificate_limited_target_lod =
+                    diagnostic.target_certifiable.then_some(level);
+                // Compositional demand is a resolution guide. Keep proof of
+                // complete reconstruction separate from useful mesh readiness.
+                diagnostic.useful_target_lod = (representation_clearance_m.is_some()
+                    || diagnostic.target_certifiable)
+                    .then_some(level);
                 let (width, spacing) = physical_resolution(address, identity.radius_m)?;
                 diagnostic.desired_patch_width_m = width;
                 diagnostic.desired_sample_spacing_m = spacing;
                 diagnostic.terrain_footprint_m =
                     identity.radius_m * 2.0 / (16.0 * (1u64 << level) as f64);
-                diagnostic.represented_height_bound_m = generator
-                    .bounds_for_region(
-                        DirectionalCap::new(
-                            Direction3::try_new(metadata.cap().0)?,
-                            metadata.cap().1,
-                        )?,
-                        TerrainFootprint::new(diagnostic.terrain_footprint_m)?,
-                    )?
-                    .represented_height_bound_m();
+                diagnostic.represented_height_bound_m = generator.represented_height_bound_m(
+                    DirectionalCap::new(Direction3::try_new(metadata.cap().0)?, metadata.cap().1)?,
+                    TerrainFootprint::new(diagnostic.terrain_footprint_m)?,
+                )?;
                 diagnostic.projected_depth_floor_m =
                     (-center.z - radius).max(input.projection.near_m());
                 diagnostic.pixel_footprint_m =
@@ -1360,7 +1561,10 @@ impl AdaptiveTerrainCover {
             diagnostic.rendered_sample_spacing_m =
                 physical_resolution(address_at(level)?, identity.radius_m)?.1;
             diagnostic.local_error = geometry.error();
-            diagnostic.local_error.boundary_constraint_m = self.boundary_bounds[usize::from(level)];
+            let address = address_at(level)?;
+            let metadata = PatchMetadata::build(address, topology)?;
+            diagnostic.local_error.boundary_constraint_m =
+                boundary_profile_bound(generator, address, metadata, &self.boundary_bounds)?;
             diagnostic.local_error.morph_remaining_m = self
                 .morph
                 .as_ref()
@@ -1415,6 +1619,149 @@ mod tests {
     use mundaris_renderer::*;
     use mundaris_world::*;
     use std::num::NonZeroU64;
+
+    #[test]
+    fn stale_merge_batch_checks_non_final_parent() {
+        stale_batch_checks_non_final_parent(false);
+    }
+
+    #[test]
+    fn stale_refinement_batch_checks_non_final_parent() {
+        stale_batch_checks_non_final_parent(true);
+    }
+
+    fn stale_batch_checks_non_final_parent(refining: bool) {
+        use mundaris_world::terrain::{SurfaceAlgorithm, SurfaceDefinition, SurfaceGenerator};
+        let radius = 109_081.776_8;
+        let definition = SurfaceDefinition::generated(
+            TerrainIdentity(91_515),
+            TerrainSeed(71),
+            SurfaceAlgorithm::RockyV5,
+        );
+        let mut world =
+            CelestialSystem::new(NonZeroU64::new(91_515).unwrap(), SimulationInstant::ZERO);
+        let body = world
+            .insert_body(
+                "merge batch fixture",
+                BodyProperties::new(1.0, radius).unwrap(),
+                BodyState::new(
+                    LocalPosition::origin(),
+                    LinearVelocity3::zero(),
+                    UnitRotation::identity(),
+                    AngularVelocity3::zero(),
+                ),
+            )
+            .unwrap();
+        world
+            .edit_surface_definition(body, Some(definition.clone()))
+            .unwrap();
+        let identity = TerrainGeometryIdentity::from_body(body, world.body(body).unwrap()).unwrap();
+        let oracle = SurfaceGenerator::new(&definition, radius).unwrap();
+        let surface_radius = oracle
+            .evaluate_point(SurfaceLocation::new(Direction3::try_new(DVec3::Z).unwrap()))
+            .unwrap()
+            .radius_m();
+        let tree = FrameTree::new(NonZeroU64::new(91_515).unwrap());
+        let view = PreparedView::new(
+            &tree.evaluate(),
+            FramePose::new(
+                FramePosition::new(
+                    tree.root(),
+                    LocalPosition::try_metres(DVec3::Z * (surface_radius + 1.0)).unwrap(),
+                ),
+                UnitRotation::identity(),
+            ),
+            RenderPrecisionBudget::near_debug(),
+        )
+        .unwrap();
+        let input = SurfaceViewInput {
+            view: &view,
+            body_fixed_frame: tree.root(),
+            reference_radius_m: radius,
+            projection: CelestialProjection::try_new(128, 96, 60.0_f64.to_radians(), 0.1).unwrap(),
+        };
+        let settings = LodSettings::default().with_limits(128, 128, 0).unwrap();
+        let mut cache = TerrainPatchCache::new(TERRAIN_CPU_CAP_BYTES, 128).unwrap();
+        let mut cover = AdaptiveTerrainCover::default();
+        cover.set_morph_duration(Duration::ZERO).unwrap();
+        for _ in 0..40 {
+            cover
+                .update(&mut cache, &identity, &input, &settings, 4096, None)
+                .unwrap();
+            if cover.ready() {
+                break;
+            }
+        }
+        assert!(cover.ready());
+        let front = CubePatchAddress::try_new(CubeFace::PositiveZ, 8, 127, 127).unwrap();
+        let back = CubePatchAddress::try_new(CubeFace::NegativeZ, 8, 127, 127).unwrap();
+        let generator = cover.generator.as_ref().unwrap();
+        let metadata = PatchMetadata::build(back, cover.lod.as_ref().unwrap().topology()).unwrap();
+        let (extent, error) = generator.surface_certificate(back, metadata).unwrap();
+        let (center, ball) = metadata.ball(radius, extent).unwrap();
+        let center = input
+            .view
+            .prepare_source(tree.root())
+            .unwrap()
+            .view_displacement(FramePosition::new(
+                tree.root(),
+                LocalPosition::try_metres(center).unwrap(),
+            ))
+            .unwrap()
+            .metres();
+        assert!(
+            generator.representation_demand_pixels(
+                SurfaceRefinementInput {
+                    address: back,
+                    metadata,
+                    reference_radius_m: radius,
+                    center_view: center,
+                    ball_radius_m: ball,
+                    projection: input.projection,
+                    certified_error_pixels: metadata
+                        .projected_total_error(error, center, ball, input.projection)
+                        .unwrap(),
+                },
+                Some(1.0),
+                settings.split_pixels()
+            ) < settings.merge_pixels()
+        );
+        // A held construction isolates cancellation before worker completion.
+        cover.construction = Some(u64::MAX);
+        let (obsolete, relevant) = if refining {
+            (back, front)
+        } else {
+            (front, back)
+        };
+        cover.construction_parent = Some(relevant);
+        cover.construction_refining = refining;
+        cover.unpublished_changes[0] = Some((obsolete, refining));
+        cover.unpublished_changes[1] = Some((relevant, refining));
+        cover
+            .update(&mut cache, &identity, &input, &settings, 0, None)
+            .unwrap();
+        assert!(
+            cover.construction_obsolete,
+            "the earlier changed parent invalidates the whole batch"
+        );
+    }
+
+    #[test]
+    fn raw_generation_reservation_rejection_keeps_quality_pending_honest() {
+        let mut report = LodReport {
+            settled: true,
+            ..LodReport::default()
+        };
+        mark_generation_reservation_rejection(&mut report, 7, 7);
+        assert!(!report.budget_constrained);
+        assert!(!report.quality_pending);
+        assert!(report.settled);
+
+        mark_generation_reservation_rejection(&mut report, 7, 8);
+        assert!(report.budget_constrained);
+        assert!(report.quality_pending);
+        assert!(!report.settled);
+    }
 
     #[test]
     fn publication_view_selects_duration_but_never_instantly_switches_normals() {

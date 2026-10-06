@@ -5,6 +5,7 @@ edition.workspace = true
 publish = false
 
 [features]
+developer-tools = []
 # Explicit diagnostic timing; ordinary preparation has no clock reads.
 surface-profile = ["dep:cpu-time"]
 terrain-capture = []

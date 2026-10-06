@@ -2,7 +2,7 @@
 
 Read this first after `AGENTS.md`, then check Git status and drill into references
 only as needed. This is an orientation index, not a substitute for current source,
-runtime evidence, or the user's direction. **Last checked: 2026-10-05.**
+runtime evidence, or the user's direction. **Last checked: 2026-10-06.**
 
 ## Mundaris vision
 
@@ -23,8 +23,47 @@ not authorization to begin another phase:
    upload/reuse, and memory headroom evidence; compare architectures before editing.
 3. Assess visual quality, camera/navigation, and developer UI in narrow separate
    reviews, including human native interaction rather than only offscreen tests.
-4. Revisit morphology only after the existing responsiveness prerequisite is met or
-   the user explicitly approves a changed sequence.
+4. The user approved a procedural crater terrain foundation on 2026-10-05,
+   changing the morphology sequence. Review its shape and unresolved LOD evidence
+   separately; see the dated Phase 5.15 note below.
+5. The approved Slice 1B task now establishes compositional body surfaces and
+   three procedural families. Review its fixed-seed orbital and local diagnostics
+   with the user before any Slice 2 work; the dated checkpoint below supersedes
+   the preceding Slice 1 authority limitations only where explicitly described.
+6. The approved Slice 1B.1 successor adds geological directors and province/process
+   authority. Review its final grey geometry and retained unbiased near crops:
+   the inspected near portion of Gate E remains FAILED, and within-body volcanic
+   separation remains weak. See the dated handoff below; no Slice 2 is authorized.
+7. Slice 1B.2 adds hierarchical geometric successors down to metre-scale process
+   structure. Review its same-anchor approaches and unbiased grey views using
+   the [dated report](PLANET_TERRAIN_SLICE_1B_2_REPORT.md). Numerical success does
+   not accept its still-soft fine appearance; no Slice 2 implementation is authorized.
+8. The separately authorized native Moon integration now selects RockyV5 in both
+   Solar System presets. Review the current paired fixture and certificate limitations
+   in the [dated handoff](NATIVE_MOON_INTEGRATION_REPORT.md); this does not itself
+   accept visual quality or authorize another terrain phase.
+9. The user explicitly authorized Slice 2A and gated continuation into fixed Slice
+   2B on 2026-10-06. The [Slice 2A checkpoint](PLANET_TERRAIN_SLICE_2A_REPORT.md)
+   passes its resident-tile architecture gates with preserved source attribution,
+   native/offscreen captures, historical bitwise replay, and the repaired full
+   quality matrix. The [fixed parent/four-child checkpoint](PLANET_TERRAIN_SLICE_2B_REPORT.md)
+   now passes B1–B12 with actual GPU seam/endpoint measurements, independently
+   ready children, native delay/reversal/stale-result proof, preserved authority,
+   and all 13 final quality commands. Work stopped after Slice 2B. Earlier
+   statements withholding Slice 2 authorization are dated context; they do not
+   override this request. Whole-body LOD, streaming, and Slice 2C remain outside
+   the authorization. Existing visual/UX and global-quality blockers remain open.
+10. The user separately authorized Slice 2C on 2026-10-06. Its adaptive regional
+    desired/resident/drawable scheduler, bounded caches and local mixed-level
+    transitions are implemented in the dirty tree. The [dated Slice 2C report](PLANET_TERRAIN_SLICE_2C_REPORT.md)
+    records a PARTIAL result: numerical GPU checks and final cold/warm pressure
+    routes pass, while C15 fails on native CPU publication/advance hitches (maximum
+    measured wall interval 336.30 ms on the identified delay-route binary). C4 and
+    native original-Moon verification remain partial. The recommendation is to
+    hold in Slice 2C for contained publication/scheduling work. This later request supersedes the preceding
+    statement withholding Slice 2C authorization. Whole-planet streaming still
+    requires a new user decision; existing art, camera UX and Acceptance A
+    limitations are not waived by regional numerical success.
 
 ## Current unresolved blockers
 
@@ -42,7 +81,8 @@ entire working tree. Recheck source/fingerprints before claiming a current resul
 | Terrain headroom | Reported descents peak at the unchanged 128 MiB accounted cap with zero headroom. Allocation sharing does not prove unique-allocation accounting or operational margin; RSS/driver VRAM unmeasured. |
 | Visual quality | Whole-view quality and shell visual acceptance are not established. Before/after admitted covers differ; unsettled images are not settled terrain proof. |
 | Camera/navigation | Scripted native route passed its exercised paths on RX 9070 XT/Vulkan; human control feel and desired navigation UX remain unaccepted. |
-| Developer UI / AI observability | Dirty source includes `developer_snapshot.rs`, UI snapshot use in `gravity_orbits.rs`, developer capture modules/example, and `scripts/ai-check.ps1`. These are in-progress inputs, not a validated/accepted interface here; inspect current paths, rendered-state coupling, tests, and paired evidence. |
+| Developer UI / AI observability | Phase 5.14 adds a live loopback developer protocol, CLI/MCP bridge, native paired capture, bounded diagnostics, reusable scenarios, and owned rebuild/replay. The interface is IMPLEMENTED and has current-phase native/MCP/scenario evidence; Windows cancellation, capture, scenarios and fresh-Codex operation have been demonstrated. The final Windows matrix passes; Linux native and adapter-fault gates remain open. See the dated Phase 5.14 note and its report. |
+| Native Moon surface | Both presets select RockyV5 through the existing tile path. The latest demand selector prioritizes projected demand at the nearest point of each patch ball, and the same demand drives stale/coarsening checks and actual-selector prefetch. The user rejected the latest screenshots for center detail, coarse edges and slow retained cover; visual acceptance is FAILED for those images. The global certificate remains nonconvergent, and final performance/validation evidence is pending. See the [2026-10-06 report](NATIVE_MOON_INTEGRATION_REPORT.md). |
 | Morphology | 5.11E makes no generator/morphology change. Responsiveness-before-morphology sequencing remains in the Phase 5.10 acceptance record. |
 | Hitch / platform evidence | Historical 114.533 ms event lacks established reproduction/root cause. Non-reproduction is not a fix. No 5.11E Linux, remote-CI, or universal adapter acceptance is claimed. |
 
@@ -93,11 +133,13 @@ only relevant portions of [the checklist](REVIEW_CHECKLIST.md).
   [surface ownership ADR 0006](adr/0006-planet-surface-topology-and-lod.md).
   Some milestone inventories are historical; source wins over stale “not implemented” text.
 - AI/runtime inspection: [mechanics diagnostics](ENGINE_MECHANICS_REFERENCE.md#18-diagnostics-controls-and-what-they-actually-diagnose),
-  in-progress [snapshot source](../crates/app/src/developer_snapshot.rs),
-  [capture source](../crates/app/src/developer_capture.rs), and
-  [check script](../scripts/ai-check.ps1). No dedicated accepted AI-interface document
-  was located at this check; add its link when one exists. Do not run these checks
-  merely to answer a discussion question or assume unfinished tooling passes.
+  [developer interface guide](AI_DEVELOPMENT_INTERFACE.md),
+  [snapshot source](../crates/app/src/developer_snapshot.rs),
+  [native capture source](../crates/app/src/developer_capture.rs),
+  [developer service](../crates/app/src/developer_service.rs),
+  [scenario/process runner](../crates/app/src/developer_scenarios.rs), and
+  [fast check](../scripts/ai-check.ps1). The guide documents implementation and
+  commands; it does not establish user acceptance or close the terrain/camera gates.
 - [OpenCode role selection and permissions](opencode-workflow.md#reviewer--plan-mode).
 
 ## External rendering research
@@ -362,3 +404,348 @@ passes all 11 locked commands, and
 pass both commands. The first full attempt timed out at 120 s, not a failed test;
 the retained successful retry removes that limit (debug suite 432.89 s). Native
 interaction, warm profiles and Linux/remote CI are not established by these checks.
+
+## Phase 5.14 AI engine development interface — 2026-10-05
+
+The current dirty source implements an app-owned loopback interface for AI-assisted
+inspection and bounded control. IMPLEMENTED: session-bound opaque body handles,
+typed actions, exclusive expiring control leases, freshness-tagged snapshots,
+bounded terrain/performance/error/event diagnostics, a stdio MCP adapter and CLI,
+native paired evidence capture, parameterized scenario files, deterministic fixed-step
+offscreen execution, native wall-paced replay, and owned stop/build/copy/launch/replay
+with semantic checkpoint comparison. See the [interface guide](AI_DEVELOPMENT_INTERFACE.md)
+and current [protocol](../crates/app/src/developer_protocol.rs),
+[service](../crates/app/src/developer_service.rs),
+[CLI/MCP bridge](../crates/app/src/developer_bridge.rs), and
+[scenario/process runner](../crates/app/src/developer_scenarios.rs).
+
+VERIFIED: the complete 13-check Windows matrix passed in
+`target/phase514/final-validation/validation.json`, including debug/release workspace
+checks and four explicitly selected GPU test targets. A subsequent test-only
+ambiguity regression passed six bridge tests on Windows and Linux; the selected
+format/Clippy/release test rerun is `final-ambiguity-retry/validation.json`.
+`final-ai-check-retry` passed; its paired 960x640 Earth image was inspected with
+schema 5, `quality_pending=true`, `settled=false`. This is offscreen evidence.
+
+Actual Windows native evidence covers paired full-client/crop captures,
+resize/minimize/restore, stale queries, busy/cancel/retry, lease expiry, failure
+retention, disconnect and human wheel interruption. Actual stdio MCP exercises
+structured actions, matching PNG content, immediate argument rejection and
+cancellation. All four scenarios passed natively; final deterministic offscreen
+repeats compare checkpoint values and decoded pixels. Owned rebuild/replay produced
+a new session, equivalent semantic checkpoints and stale-handle rejection. The
+fresh Codex run in `fresh-codex-final.jsonl` completed discover/launch/inspect/focus/
+settings/capture/release/stop. A later retry using final binaries was interrupted
+by an external service capacity error after inspection; do not count that retry
+as a completed workflow. Its process absence and registry state were checked.
+
+Linux WSL headless workspace tests passed; final focused tests and warnings-denied
+all-target/all-feature Clippy also passed. Windows used Rust 1.98.1 and Linux 1.99.0;
+the repository selects `stable`, not a pinned compiler. Native Linux and real
+unsupported-adapter/forced surface-device-loss demonstrations remain UNTESTED.
+Measured native process costs and capture cost have small raw sample budgets and
+identified binaries; no universal overhead or speedup is asserted.
+
+Use the [Phase 5.14 implementation report](PHASE_5_14_AI_ENGINE_DEVELOPMENT_INTERFACE_REPORT.md)
+for exact commands, fingerprints, retained failures and final evidence paths.
+The interface is IMPLEMENTED with exercised acceptance paths and PARTIAL overall
+acceptance. It does not close historical 5.11E Acceptance A, terrain headroom,
+visual approval, camera/navigation UX or unrelated platform/performance gates.
+
+
+## 2026-10-05 terrain direction and redesign request
+
+The user rejected the crater experiment, including its higher-detail result, and
+requested a plan for a replacement LOD/rendering approach. The crater experiment
+remains paused. The user subsequently requested starting
+[the redesign](PLANET_TERRAIN_RENDERING_REDESIGN.md), authorizing the
+[Slice 1 contract](PLANET_TERRAIN_SLICE_1.md) on 2026-10-05: a reusable world-owned
+moon field and fixed-resolution visual references. Visual approval and later
+GPU/streaming slices remain gated; do not treat this request as acceptance of
+the rejected experiment or automatically advance to Slice 2.
+The user also retired the old 128 MiB constraint and authorized spending machine
+resources while pursuing excellent visuals and real-time performance.
+
+IMPLEMENTED in the dirty Phase 5.15 experiment: footprint-independent crater
+landmarks, sharper profiles, 128 seeded feature sizes and a demand-driven 512 MiB
+CPU terrain ceiling. This is not visually accepted or fully validated. The latest
+seed-2 regional pair reaches radial LOD 11 with about 4.84 m spacing, but remains
+unsettled and visibly artificial. Its 2,046-leaf cover approaches the separate
+2,048-leaf population limit despite RAM headroom. See the [report](PHASE_5_15_PROCEDURAL_CRATER_TERRAIN_FOUNDATION_REPORT.md)
+and `target/phase515/recovery-512/` for scope and limitations. Passing numerical
+checks and a larger memory budget did not close the visual gate.
+
+## 2026-10-05 terrain redesign Slice 1 prototype
+
+IMPLEMENTED: a separate world-owned `MoonTerrainDefinition` / `MoonLikeV1`
+complete height, tangent-gradient and material oracle, with seeded spatial cells,
+three impact epochs, bounded overlap composition, warped walls and broken rims.
+See [source](../crates/world/src/terrain/moon.rs), the
+[contract](PLANET_TERRAIN_SLICE_1.md) and [handoff](PLANET_TERRAIN_SLICE_1_REPORT.md).
+The native path and `Body::terrain()` have not migrated to this definition.
+
+The app's temporary f64 software reference renderer records orbit/regional/near
+views for seeds 2, 7 and 19, seven diagnostic PNGs per scene and 495 complete oracle
+queries for later reuse. Evidence is `target/terrain-redesign/slice1/reference-final/`.
+All 63 PNGs and the query corpus match the preceding equivalent capture by SHA-256.
+Focused world and example tests pass. All 13 documented Windows quality gates
+have passing final results, including the four explicit GPU targets. Initial lint
+and active-binary file-lock failures plus the successful focused/isolated retries
+are retained in the handoff evidence. The final production check is offscreen,
+ready but quality pending and
+unsettled, and samples the legacy definition.
+
+OBSERVED: the reference terrain remains soft and repetitive. Acceptance is PARTIAL;
+convincing morphology/materials and user visual review remain OPEN. Discuss those
+views before further Slice 1 refinement. Do not advance to Slice 2, claim native
+GPU/LOD/performance acceptance, or resume the rejected experiment automatically.
+
+## 2026-10-06 Slice 1 orbital target and moon variety
+
+The user supplied lunar images as an orbital morphology/readability target:
+dense multi-scale impacts, degraded overlap, rough highlands, smoother regions,
+structured inter-crater terrain and terminator relief. They are not crater-layout
+or composition templates. The user also clarified that other moons must support
+substantially different appearances, including Phobos/Deimos, Europa, Io and
+Titan-like families. See the [variety requirement](PLANET_TERRAIN_RENDERING_REDESIGN.md#variety-across-moons--user-clarification-2026-10-05).
+
+IMPLEMENTED: explicit `MoonLikeV2` selection alongside preserved V1, with ten
+impact epochs, two seeded rotated/translated layouts per epoch, bounded
+age-ordered composition, broad highland/plains context and analytic derivatives.
+The temporary reference adds fixed denser orbital geometry, represented-mesh CPU
+ray shadows and separate unshadowed/visibility diagnostics. Local morphology
+fixtures use higher sunlight, recorded independently from the orbital fixture.
+The [orbital handoff](PLANET_TERRAIN_SLICE_1_ORBITAL_REPORT.md) indexes current
+source, tests, captures and remaining gates; the preceding V1 section is historical.
+
+At that checkpoint, the new field was the cratered family only. Generic family dispatch, irregular
+shape support, ice/volcanic materials and atmospheric presentation are not
+implemented. The current radial limit and three material weights must not become
+universal moon assumptions. Body role, shape, structural family, materials and
+optional atmosphere remain distinct design choices for future scoped work.
+The native path and production clearance have not migrated. Slice 2 and visual
+acceptance remain gated by user review; numerical/quality results cannot replace it.
+
+## 2026-10-06 Slice 1B compositional surfaces
+
+IMPLEMENTED: world-owned `SurfaceDefinition` separates shape, geological history,
+material channel/composition and atmosphere descriptor. `RockyV3` wraps the
+preserved V2 field with phenotype/resurfacing composition; independent `IcyV1`
+and `VolcanicV1` fields use bounded local fracture/emplacement features. Sphere,
+triaxial and asymmetric irregular shapes share complete radial queries and
+analytic gradients. See [ADR 0009](adr/0009-compositional-body-surfaces.md),
+[source](../crates/world/src/terrain/surface.rs), the
+[contract](PLANET_TERRAIN_SLICE_1B.md) and
+[handoff](PLANET_TERRAIN_SLICE_1B_REPORT.md).
+
+IMPLEMENTED: actual celestial bodies can select the new authority transactionally,
+and production radial clearance/camera safeguards query its combined shape and
+relief. The native terrain renderer remains legacy-specific. There is no new
+GPU tile system, atmospheric rendering or general solid collision. The radial
+graph supports one positive radius per direction, with the explicit non-star-shaped
+topology boundary in the ADR.
+
+The evidence package is rooted at `target/terrain-redesign/slice1b/`: twelve fixed
+seed bodies, unbiased orbital/regional/near views, separate selected landmark
+views, grayscale height/shape/normal/material diagnostics, irregular-shape captures,
+full definitions and reusable query corpus. The intermediate probe exposed weak
+local geometry and regular icy bands, prompting the bounded morphology iteration.
+Use `frozen-source-final/` and `reference-final-fixed-384/` plus the handoff for
+current validation and visual observations; intermediate PNGs do not identify
+the final field. The final package contains 49 scenes/588 per-scene PNGs and a
+2,577-record corpus whose complete parsed replay matches exactly. V1/V2 historical
+replays also match exactly for 165 seed-2 cases each.
+
+VERIFIED: `full-validation-final/validation.json` records all 13 quality stages
+passing on the frozen final source, including the four ignored native/GPU
+regressions. The paired `ai-check-final-source/earth-orbit.json` on RX 9070 XT /
+Vulkan is still quality-pending/unsettled legacy Earth; it is not compositional
+rendering or settled terrain proof. See the report for scoped software timings
+and process peak working set; there is no native performance improvement claim.
+
+Acceptance is PARTIAL. The inspected near-view portion of Gate E is FAILED:
+icy/volcanic near views do not yet convey convincing family grammar, even though
+selected features exist numerically. User visual review remains OPEN; repetitive
+regional material patches and similar bodies within each row also need review.
+Stop in Slice 1B and discuss the captures; tests and generated contact sheets do
+not grant approval or authorize Slice 2.
+
+## 2026-10-06 Slice 1B.1 geological provinces
+
+IMPLEMENTED: explicit `RockyV4`, `IcyV2` and `VolcanicV2` definitions add correlated
+body histories, body-fixed geological directors, four normalized provinces per
+family and family-specific regional/local process composition. Control gradients,
+support windows, burial and bounded overlap participate in the complete world
+query. New scalar diagnostics expose the same authority. Historical algorithms
+remain separately selectable. See [ADR 0010](adr/0010-geological-province-directors.md),
+the [contract](PLANET_TERRAIN_SLICE_1B_1.md) and
+[handoff](PLANET_TERRAIN_SLICE_1B_1_REPORT.md).
+
+VERIFIED: `target/terrain-redesign/slice1b1/reference-review-384/` contains twelve
+fixed bodies plus an irregular stress fixture, 88 scenes / 2,288 paired scene
+PNGs, four provinces per family at 20 km, 2 km, 256 m and 32 m, individual
+director/process maps and 63 comparison sheets. Its 3,601-record complete corpus
+matches the repeated numerical replay exactly. The prior 2,577-record family
+corpus and both 165-case MoonLike replays are also exact; the twelve historical
+near PNGs per Moon version retain their SHA-256 hashes. Source inputs are frozen
+in `frozen-source-final/` with 234 fingerprints and no subsequent source drift;
+the baseline audit records no unrelated file changes. Ignore older/interrupted
+directories carrying `final` in their names when selecting this phase's evidence.
+
+VERIFIED with an intermittent failure retained: the final quality matrix has
+12/13 initial stage passes; the release workspace stage fails an unchanged worker
+test (`adaptive.rs:1939`, expected pending job `Some(12)`, observed `None`). A
+focused reproduction and exact full release-stage retry both pass, so all thirteen
+stages have passing runs. This is not proof the intermittent assertion is fixed.
+The report indexes both the failure and retry, 431-pass workspace suites,
+46 focused reference tests, seven province tests and native/GPU checks.
+The inspected RX 9070 XT / Vulkan Earth fast-check pair is still legacy,
+quality-pending and unsettled (source/ready LOD 1 versus desired 14).
+
+MEASURED: one contended optimized software reference process takes 1,142.489 s
+with a 397.4 MiB peak working set. Complete queries visit 810 cells for RockyV4
+(including retained Moon history) and 270 for ice/volcanic. These are bounded
+software-reference observations, not production FPS, GPU performance, a speedup
+or acceptance of continuous native approach. Generator heap/scratch and rocky
+accepted-history support counts remain unavailable.
+
+Acceptance is PARTIAL. OBSERVED: orbital impacts, icy lineaments and volcanic
+roughness differ, but grey geometry is muted and some bodies remain similar;
+Gate D is PARTIAL / OPEN for user review. Selected 256 m crops show real process
+forms, while several 32 m and unbiased standing-height crops are smooth. The
+near recognition portion of Gate E is FAILED; within-body volcanic province
+separation is weak. The scalar maps and passing tests do not accept the visuals.
+Stop within Slice 1B.1 for user discussion; do not begin Slice 2.
+
+## 2026-10-06 Slice 1B.2 hierarchical authority checkpoint
+
+IMPLEMENTED: `RockyV5`, `IcyV3` and `VolcanicV3` preserve their explicit province
+parent and add bounded 256 m / 32 m / 8 m residual regimes. Fine continuous
+processes contain 2 m joints, stress troughs/shoulders and stepped emplacement
+fronts. Signed parent morphology, normalized preceding residuals and regional
+lineage orientation correlate detail with larger geology. Analytic derivatives
+and derived decomposition come from the same authority. Fixed search work adds
+162 cell visits; no GPU tiles, streaming, LOD replacement or micro-detail renderer
+is introduced. See [ADR 0011](adr/0011-hierarchical-geological-residuals.md) and the
+[contract](PLANET_TERRAIN_SLICE_1B_2.md).
+
+VERIFIED: frozen v4 independent complete corpora match exactly (7,085 records),
+as do the historical 2,577-record family and 3,601-record province corpora and
+both 165-record MoonLike corpora/near PNG sets. All fifteen focused hierarchy
+tests pass. Keyed v3/v4 comparisons preserve all inherited/regional/local/context/
+work values exactly. All thirteen frozen-v4 quality stages pass, including both
+workspace suites, strict lint/rustdoc, long orbits and explicit GPU/developer
+regressions. The complete-package audit passes: twelve bodies, 106 scenes, twelve
+five-scale approaches, 36 nine-channel decomposition-map scenes, 3,080 scene PNGs
+and 63 comparison sheets. Full capture/replay also matches exact float bits;
+all 3,143 PNG encodings verify. The final sheet helper includes all five approach
+columns; its packaging-only hash change is recorded separately from the unchanged
+compiled v4 inputs.
+The final native Earth fast-check pair passes its commands
+but remains ready, quality-pending and unsettled; it is not new-family or native
+interaction acceptance. Evidence is under `target/terrain-redesign/slice1b2/`.
+
+OBSERVED: a first 8 m candidate was broadly featureless despite nonzero relief
+and less than 0.1 mm measured mesh error. Fine-process corrections now reveal
+icy troughs and unequal shoulders, volcanic steps/fronts, and rocky joints.
+Some selected views are dominated by steep parent slopes; the appearance remains
+soft and rounded, and rocky 8 m family recognition is weak. Unbiased 8 m crops
+have relief; the separate 128 m standing views show represented mesh/shadow
+facets in steep terrain. These observations do not establish polished visual
+acceptance. Final neutral review finds strong family identity at 256 m and
+generally at 32 m. At 8 m, rocky impact-derived recognition is FAILED; ice and
+volcanic recognition are PARTIAL, with weak/rounded forms. Unbiased crops are
+useful relief fixtures but do not accept their family recognition. The maximum
+sampled 8 m triangle-centroid error across selected crops is below 0.854 mm; this
+is an uncertified finite sample, not a global error bound.
+
+MEASURED: matched optimized complete-query medians are 20.841 microseconds for
+RockyV5, 12.038 for IcyV3 and 11.959 for VolcanicV3, with paired parent cost ratios
+1.260 / 1.572 / 1.587. Each successor adds 162 fixed cell visits. Complete capture
+runtime is 1,650.092 seconds and process peak working set 399.1 MiB; some capture
+work overlaps validation. These are software reference observations, not native
+FPS or a production speedup. Raw fixtures, counters and limitations are in the
+[Slice 1B.2 report](PLANET_TERRAIN_SLICE_1B_2_REPORT.md).
+
+Recommendation: **A — READY FOR SLICE 2**, with visual acceptance PARTIAL. No
+concrete fundamental representation/architecture blocker was found. Weak fine
+profiles remain authoring work, especially rocky 8 m; this does not accept the
+unmet visual target. The package is complete. Stop for reviewer/user discussion;
+do not start Slice 2 automatically.
+
+## 2026-10-06 Native Moon integration checkpoint
+
+IMPLEMENTED: gameplay and real-scale Solar System presets publish `RockyV5` as
+the Moon's `SurfaceDefinition`. The native definition adapter dispatches the exact
+selected complete field through existing workers, cache, adaptive LOD,
+stitch/morph, and the matching complete-query camera-clearance path. The legacy
+`terrain_definition` and `cratered_terrain_definition` helpers remain separately
+available for old fixtures. No GPU tile redesign or material-channel shading was
+added.
+
+The initial full-matrix debug and release suites failed because `terrain_workers`
+still used legacy `terrain().unwrap()` fixtures after surface-authority migration.
+Those fixtures require migration before the matrix can establish current status.
+Initial strict Clippy identified `manual_range_contains`; this was fixed, and both
+standalone strict Clippy runs pass. These and earlier focused passes do not establish
+a full-matrix pass. Final matrix evidence is pending.
+
+OBSERVED: the first `ai-check` pair exits successfully but terrain is inactive; it
+predates the fixture's recognition of the new surface authority and is retained as
+failed integration evidence. The subsequent
+[`ai-check-v2` pair](../target/native-moon/20261006-014148/ai-check-v2/summary.md)
+reports Moon / RockyV5, `complete_amplitude_bound`, ready radial LOD 1 versus desired
+30, and `quality_pending=true`, `settled=false`. Its PNG shows a coarse whole-body
+representation. This does not establish useful convergence, polished morphology,
+performance improvement, or visual acceptance.
+
+OBSERVED: the pre-fix native Moon pair is recorded in
+`native/captures/12764-1791251339393283700-4-moon-orbit/` (`viewport.png`,
+`snapshot.json`, `complete.json`). It reports source radial LOD 16, ready LOD 17,
+desired LOD 30, budget-constrained and quality-pending at 327,278 m clearance.
+The user rejected the latest screenshots for center detail, coarse edges and slow
+retained cover; visual acceptance is **FAILED** for those images. Final screenshots
+and current-source validation evidence remain pending. A later native sampling lease
+was interrupted at 20/100 samples; the script stopped before requesting a capture,
+and no capture was requested after interruption.
+
+Older preliminary cadence data in
+`target/moon-lod-fix/20261006/preliminary-performance.json` predates the latest
+selector and final normal stencil; it is not a performance claim for current source.
+Stale/minimized data in `native/readonly-cadence.json` has zero counters and provides
+no FPS evidence. No current performance claim is made.
+
+IMPLEMENTED: compositional refinement prioritizes the highest projected demand using
+the nearest point of each conservative patch ball, avoiding chart-center
+undersampling. Stale/coarsening checks use the same representation demand, and
+prefetch follows the selector's actual outstanding requests. This does not change
+the global `2H` certificate plus sphere-correspondence bound or certify its target.
+Native material/shadow presentation remains different from the reference; secant mesh
+normals are approximate. See the
+[implementation handoff](NATIVE_MOON_INTEGRATION_REPORT.md).
+
+### 2026-10-06 Native Moon compositional coarsening follow-up
+
+IMPLEMENTED: compositional coarsening batches up to 32 merges per update, while
+legacy coarsening remains one merge and refinement remains one step. Covers track
+all 32 merge parents in a fixed inline array; queued/building work is cancelled if
+any changed parent invalidates the merge. A regression now covers the singular-
+parent tracking gap found during review.
+
+VERIFIED: focused results for this update are app library 44/44, native Moon 4/4, adaptive 3/3,
+population 6/6, terrain workers 2/2, renderer library 44/44 and renderer demand
+1/1. Four final-lint gates, full workspace debug/release tests, rustdoc, long-orbits,
+bridge tests and all four native/GPU capture checks passed. Two initial matrix lint
+failures were repaired and superseded by strict reruns: 13 passing latest gates in
+`target/moon-lod-fix/20261006/completion.json`. The debug workspace run began before
+the final all-parent invalidation change; current focused debug and full release
+tests passed. Code checks do not establish visual or performance acceptance.
+
+OBSERVED: the latest pre-batch native orbit capture, at 15 seconds, reports source
+LOD 4 and desired LOD 7 and remains coarse. Human input ended the observation lease
+during close-in, before zoom-out. Visual acceptance remains **FAILED** for the
+user-rejected center-detail/coarse-edge/slow-retained-cover images; there is no
+final visual acceptance or current final-source FPS claim. Evidence is in
+`native-final/captures/18696-1791253169899094200-5-orbit/`. See the
+[integration handoff](NATIVE_MOON_INTEGRATION_REPORT.md) for implementation limits
+and earlier evidence history.

@@ -491,7 +491,7 @@ fn replacing_geometry_identity_drops_active_morph_and_old_pins() {
         TerrainIdentity(701),
         TerrainSeed(20),
         TerrainGeneratorVersion::V2,
-        identity.definition.config().clone(),
+        identity.definition.legacy().unwrap().config().clone(),
     );
     world.edit_terrain(body, Some(changed)).unwrap();
     let state = world.body(body).unwrap();

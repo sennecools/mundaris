@@ -143,6 +143,9 @@ Implementation agents should refresh it when their approved work changes priorit
 or blocker evidence; preserve source/date references rather than adding timeless claims.
 OpenCode's project-local `plan` profile activates this role on selecting Plan; see
 [workflow and permission limits](docs/opencode-workflow.md#reviewer--plan-mode).
+In Codex, use Plan mode or explicitly request reviewer-only discussion; OpenCode's
+`plan.md` is not loaded. See [Codex workflow](docs/codex-workflow.md) for the native
+Luna roles and launcher. Mode selection and runtime permissions remain separate.
 
 ## Mundaris Implementation Agent
 
@@ -195,10 +198,16 @@ Preserve evidence and distinguish fast checks from full validation.
   verification. Keep tightly coupled critical-path reasoning in the primary;
   correctness takes priority over concurrency. Request concise actionable reports.
 - Keep the current primary model user-selected. All `luna-*` agents use
-  `openai/gpt-6-luna` through the existing **ChatGPT OAuth subscription**, never Go,
-  OpenRouter, or API-key billing. Stop if that connection cannot be verified.
+  `gpt-6-luna` through the existing **ChatGPT OAuth subscription** (OpenCode uses
+  the qualified ID `openai/gpt-6-luna`), never Go, OpenRouter, or API-key billing.
+  Stop if that connection cannot be verified. In Codex, verify public
+  `codex login status`, use `.codex/agents/luna-*.toml`, and select the Luna model
+  explicitly when the native spawn tool exposes a model rather than a custom role.
+  Pass the matching role instructions, scope, inputs and verification budget;
+  avoid inheriting the entire parent conversation when selecting another model.
 
 Examples of useful independent surface-phase questions: adjacency/stitch indices,
 LOD-error math, culling, precision paths, benchmark evidence, and documentation
 consistency. Choose only scopes that the task's dependencies genuinely permit.
-See [OpenCode workflow](docs/opencode-workflow.md) for commands and execution details.
+See [Codex workflow](docs/codex-workflow.md) or
+[OpenCode workflow](docs/opencode-workflow.md) for commands and execution details.

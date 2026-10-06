@@ -107,6 +107,7 @@ pub struct CelestialBody {
     pub(crate) properties: BodyProperties,
     pub(crate) state: BodyState,
     pub(crate) terrain: Option<crate::terrain::TerrainDefinition>,
+    pub(crate) surface_definition: Option<crate::terrain::SurfaceDefinition>,
     pub(crate) terrain_revision: crate::terrain::TerrainRevision,
 }
 impl CelestialBody {
@@ -115,6 +116,15 @@ impl CelestialBody {
     }
     pub fn terrain_revision(&self) -> crate::terrain::TerrainRevision {
         self.terrain_revision
+    }
+    /// New compositional surface authority, when this body uses the surface path.
+    /// Legacy terrain remains available through [`Self::terrain`].
+    pub fn surface_definition(&self) -> Option<&crate::terrain::SurfaceDefinition> {
+        self.surface_definition.as_ref()
+    }
+    /// Whether this body has either a legacy terrain or compositional surface authority.
+    pub fn has_surface(&self) -> bool {
+        self.terrain.is_some() || self.surface_definition.is_some()
     }
     pub fn name(&self) -> &str {
         &self.name

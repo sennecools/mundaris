@@ -103,6 +103,7 @@ impl CelestialSystem {
             properties,
             state,
             terrain: None,
+            surface_definition: None,
             terrain_revision: Default::default(),
         });
         self.duplicate_flags.push(false);
@@ -125,6 +126,9 @@ impl CelestialSystem {
         if let Some(terrain) = &self.bodies[index].terrain {
             terrain.validate_radius(properties.reference_radius_m())?;
         }
+        if let Some(surface) = &self.bodies[index].surface_definition {
+            surface.validate_radius(properties.reference_radius_m())?;
+        }
         let revision = self.next_revision()?;
         self.bodies[index].name = name;
         self.bodies[index].properties = properties;
@@ -139,6 +143,9 @@ impl CelestialSystem {
         let index = self.index(id)?;
         if let Some(terrain) = &self.bodies[index].terrain {
             terrain.validate_radius(properties.reference_radius_m())?;
+        }
+        if let Some(surface) = &self.bodies[index].surface_definition {
+            surface.validate_radius(properties.reference_radius_m())?;
         }
         let revision = self.next_revision()?;
         self.bodies[index].properties = properties;
@@ -160,11 +167,34 @@ impl CelestialSystem {
         if let Some(definition) = &terrain {
             definition.validate_radius(body.properties.reference_radius_m())?;
         }
-        if body.terrain == terrain {
+        if body.terrain == terrain && body.surface_definition.is_none() {
             return Ok(());
         }
         let revision = body.terrain_revision.next()?;
         body.terrain = terrain;
+        body.surface_definition = None;
+        body.terrain_revision = revision;
+        Ok(())
+    }
+    /// Publish the compositional surface authority without changing celestial
+    /// revision, frames, sample instant or simulation history. It replaces any
+    /// legacy terrain authority on the same body.
+    pub fn edit_surface_definition(
+        &mut self,
+        id: BodyId,
+        surface: Option<crate::terrain::SurfaceDefinition>,
+    ) -> Result<(), CelestialSystemError> {
+        let index = self.index(id)?;
+        let body = &mut self.bodies[index];
+        if let Some(definition) = &surface {
+            definition.validate_radius(body.properties.reference_radius_m())?;
+        }
+        if body.surface_definition == surface && body.terrain.is_none() {
+            return Ok(());
+        }
+        let revision = body.terrain_revision.next()?;
+        body.terrain = None;
+        body.surface_definition = surface;
         body.terrain_revision = revision;
         Ok(())
     }

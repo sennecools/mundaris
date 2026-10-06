@@ -315,6 +315,9 @@ pub struct CelestialStaging {
     markers: Vec<CelestialMarker>,
     centers: Vec<(DVec3, f64)>,
     planetary: Vec<PlanetaryDraw>,
+    resident_tile: Option<crate::TileDraw>,
+    resident_hierarchy: Option<crate::ResidentHierarchyDraw>,
+    resident_regional: Option<crate::RegionalResidentDraw>,
 }
 #[derive(Clone, Copy)]
 pub(crate) struct PlanetaryDraw {
@@ -368,6 +371,9 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
         staging.centers.clear();
         staging.surface.clear();
         staging.planetary.clear();
+        staging.resident_tile = None;
+        staging.resident_hierarchy = None;
+        staging.resident_regional = None;
         staging.sky = None;
         Self {
             view,
@@ -388,6 +394,87 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
             return Err(RenderPreparationError::InvalidBudget);
         }
         self.range_m = range_m;
+        Ok(())
+    }
+
+    /// Stages one already-derived resident tile for the celestial depth pass.
+    /// The world remains authoritative; this only selects renderer data.
+    pub fn set_resident_tile(
+        &mut self,
+        draw: crate::TileDraw,
+    ) -> Result<(), RenderPreparationError> {
+        if self.staging.resident_hierarchy.is_some() || self.staging.resident_regional.is_some() {
+            self.failed = true;
+            return Err(RenderPreparationError::InvalidResidentTile);
+        }
+        if let Err(error) = draw.validate_view_transform(self.view.budget()) {
+            self.failed = true;
+            return Err(error);
+        }
+        let valid = draw.tile.validate_layout().is_ok()
+            && draw.anchor_view_m.is_finite()
+            && draw.body_to_view.is_finite()
+            && draw.sun_body.is_finite()
+            && draw.sun_body.length_squared() > 0.0
+            && draw.mode <= 5;
+        if !valid {
+            self.failed = true;
+            return Err(RenderPreparationError::InvalidResidentTile);
+        }
+        self.staging.resident_tile = Some(draw);
+        Ok(())
+    }
+
+    /// Stages one fixed parent/four-child resident hierarchy.
+    pub fn set_resident_hierarchy(
+        &mut self,
+        draw: crate::ResidentHierarchyDraw,
+    ) -> Result<(), RenderPreparationError> {
+        if self.staging.resident_tile.is_some()
+            || self.staging.resident_regional.is_some()
+            || draw.validate().is_err()
+            || draw
+                .parent
+                .validate_view_transform(self.view.budget())
+                .is_err()
+        {
+            self.failed = true;
+            return Err(RenderPreparationError::InvalidResidentTile);
+        }
+        for child in draw.children.iter().flatten() {
+            if child.validate_view_transform(self.view.budget()).is_err() {
+                self.failed = true;
+                return Err(RenderPreparationError::InvalidResidentTile);
+            }
+        }
+        self.staging.resident_hierarchy = Some(draw);
+        Ok(())
+    }
+
+    /// Stages a regional resident cover independently from selection and build work.
+    pub fn set_resident_regional(
+        &mut self,
+        draw: crate::RegionalResidentDraw,
+    ) -> Result<(), RenderPreparationError> {
+        if self.staging.resident_tile.is_some() || self.staging.resident_hierarchy.is_some() {
+            self.failed = true;
+            return Err(RenderPreparationError::InvalidResidentTile);
+        }
+        for patch in &draw.patches {
+            if patch
+                .own
+                .validate_view_transform(self.view.budget())
+                .is_err()
+                || patch
+                    .parent
+                    .validate_view_transform(self.view.budget())
+                    .is_err()
+            {
+                self.failed = true;
+                return Err(RenderPreparationError::InvalidResidentTile);
+            }
+        }
+        self.staging.resident_regional = Some(draw);
         Ok(())
     }
 
@@ -936,6 +1023,13 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
             })
         {
             Err(RenderPreparationError::FailedDebugFrame)
+        } else if (self.staging.resident_tile.is_some()
+            || self.staging.resident_hierarchy.is_some()
+            || self.staging.resident_regional.is_some())
+            && (!self.staging.surface.instances.is_empty()
+                || !self.staging.surface.fallback.is_empty())
+        {
+            Err(RenderPreparationError::InvalidResidentTile)
         } else {
             Ok(())
         }
@@ -963,6 +1057,8 @@ pub(crate) struct CelestialRenderer {
     line_pipeline: wgpu::RenderPipeline,
     polyline_pipeline: wgpu::RenderPipeline,
     projection: wgpu::Buffer,
+    projection_layout: wgpu::BindGroupLayout,
+    target_format: wgpu::TextureFormat,
     projection_group: wgpu::BindGroup,
     uniform_layout: wgpu::BindGroupLayout,
     uniforms: wgpu::Buffer,
@@ -977,6 +1073,7 @@ pub(crate) struct CelestialRenderer {
     indices: wgpu::Buffer,
     planetary: crate::planetary::PlanetaryRenderer,
     planetary_depth: wgpu::BindGroup,
+    resident_tile: Option<crate::resident_tile::ResidentTileRenderer>,
     _depth_texture: wgpu::Texture,
     depth: wgpu::TextureView,
 }
@@ -986,6 +1083,104 @@ impl CelestialRenderer {
     }
     pub(crate) fn last_surface_upload_profile(&self) -> crate::gpu_profile::CpuUploadProfile {
         self.surface.last_upload_profile()
+    }
+    pub(crate) fn last_resident_tile_report(&self) -> crate::ResidentTileReport {
+        self.resident_tile
+            .as_ref()
+            .map_or_else(Default::default, |renderer| renderer.report())
+    }
+    pub(crate) fn last_resident_hierarchy_report(&self) -> crate::ResidentHierarchyReport {
+        self.resident_tile
+            .as_ref()
+            .map_or_else(Default::default, |renderer| renderer.hierarchy_report())
+    }
+    pub(crate) fn last_resident_regional_report(&self) -> crate::RegionalResidentReport {
+        self.resident_tile
+            .as_ref()
+            .map_or_else(Default::default, |r| r.regional_report())
+    }
+    pub(crate) fn resident_on_submitted(&mut self, queue: &wgpu::Queue) {
+        if let Some(r) = &mut self.resident_tile {
+            r.on_submitted(queue);
+        }
+    }
+    pub(crate) fn validate_resident_regional(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        draw: &crate::RegionalResidentDraw,
+        index: usize,
+    ) -> Result<Vec<crate::ReconstructedTileVertex>, RenderPreparationError> {
+        if self.resident_tile.is_none() {
+            self.resident_tile = Some(crate::resident_tile::ResidentTileRenderer::new(
+                device,
+                self.target_format,
+                &self.projection_layout,
+            ));
+        }
+        self.resident_tile
+            .as_mut()
+            .ok_or(RenderPreparationError::InvalidResidentTile)?
+            .validate_regional_gpu(device, queue, &self.projection_group, draw, index)
+    }
+    pub(crate) fn validate_resident_tile(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        draw: &crate::TileDraw,
+    ) -> Result<Vec<crate::ReconstructedTileVertex>, RenderPreparationError> {
+        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        if self.resident_tile.is_none() {
+            self.resident_tile = Some(crate::resident_tile::ResidentTileRenderer::new(
+                device,
+                self.target_format,
+                &self.projection_layout,
+            ));
+        }
+        let result = self
+            .resident_tile
+            .as_mut()
+            .ok_or(RenderPreparationError::InvalidResidentTile)
+            .and_then(|resident| {
+                resident.validate_gpu(device, queue, &self.projection_group, draw)
+            });
+        if let Some(error) = pollster::block_on(device.pop_error_scope()) {
+            return Err(RenderPreparationError::GpuProgress(error.to_string()));
+        }
+        result
+    }
+    pub(crate) fn validate_resident_hierarchy(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        draw: &crate::ResidentHierarchyDraw,
+        patch_index: usize,
+    ) -> Result<Vec<crate::ReconstructedTileVertex>, RenderPreparationError> {
+        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        if self.resident_tile.is_none() {
+            self.resident_tile = Some(crate::resident_tile::ResidentTileRenderer::new(
+                device,
+                self.target_format,
+                &self.projection_layout,
+            ));
+        }
+        let result = self
+            .resident_tile
+            .as_mut()
+            .ok_or(RenderPreparationError::InvalidResidentTile)
+            .and_then(|resident| {
+                resident.validate_hierarchy_gpu(
+                    device,
+                    queue,
+                    &self.projection_group,
+                    draw,
+                    patch_index,
+                )
+            });
+        if let Some(error) = pollster::block_on(device.pop_error_scope()) {
+            return Err(RenderPreparationError::GpuProgress(error.to_string()));
+        }
+        result
     }
 
     pub(crate) fn new(
@@ -1061,6 +1256,8 @@ impl CelestialRenderer {
             line_pipeline,
             polyline_pipeline,
             projection,
+            projection_layout,
+            target_format: format,
             projection_group,
             uniform_layout,
             uniforms,
@@ -1080,6 +1277,7 @@ impl CelestialRenderer {
             indices,
             planetary,
             planetary_depth,
+            resident_tile: None,
             _depth_texture: depth_texture,
             depth,
         }
@@ -1103,6 +1301,42 @@ impl CelestialRenderer {
         let storage = &frame.staging;
         self.sky.upload(device, queue, storage.sky.as_ref());
         self.surface.upload(device, queue, &storage.surface)?;
+        if let Some(draw) = &storage.resident_regional {
+            if self.resident_tile.is_none() {
+                self.resident_tile = Some(crate::resident_tile::ResidentTileRenderer::new(
+                    device,
+                    self.target_format,
+                    &self.projection_layout,
+                ));
+            }
+            if let Some(resident) = &mut self.resident_tile {
+                resident.prepare_regional(device, queue, draw)?;
+            }
+        } else if let Some(draw) = &storage.resident_hierarchy {
+            if self.resident_tile.is_none() {
+                self.resident_tile = Some(crate::resident_tile::ResidentTileRenderer::new(
+                    device,
+                    self.target_format,
+                    &self.projection_layout,
+                ));
+            }
+            if let Some(resident_tile) = &mut self.resident_tile {
+                resident_tile.prepare_hierarchy(device, queue, draw)?;
+            }
+        } else if let Some(draw) = &storage.resident_tile {
+            if self.resident_tile.is_none() {
+                self.resident_tile = Some(crate::resident_tile::ResidentTileRenderer::new(
+                    device,
+                    self.target_format,
+                    &self.projection_layout,
+                ));
+            }
+            if let Some(resident_tile) = &mut self.resident_tile {
+                resident_tile.prepare(device, queue, draw)?;
+            }
+        } else if let Some(resident_tile) = &mut self.resident_tile {
+            resident_tile.clear_frame();
+        }
         self.planetary
             .upload(queue, &storage.planetary, frame.projection);
         grow(
@@ -1209,6 +1443,29 @@ impl CelestialRenderer {
             &storage.surface,
             timestamps,
         );
+        if (storage.resident_tile.is_some()
+            || storage.resident_hierarchy.is_some()
+            || storage.resident_regional.is_some())
+            && let Some(resident_tile) = &self.resident_tile
+        {
+            if let Some(queries) = timestamps.filter(|q| q.inside_passes()) {
+                queries.write_scope(&mut pass, 3);
+            }
+            if let Some(regional) = &storage.resident_regional {
+                resident_tile.draw_regional(&mut pass, &self.projection_group, regional);
+            } else if let Some(hierarchy) = &storage.resident_hierarchy {
+                resident_tile.draw_hierarchy(
+                    &mut pass,
+                    &self.projection_group,
+                    hierarchy.draw_children,
+                );
+            } else {
+                resident_tile.draw(&mut pass, &self.projection_group);
+            }
+            if let Some(queries) = timestamps.filter(|q| q.inside_passes()) {
+                queries.end_scope(&mut pass, 3);
+            }
+        }
         self.planetary
             .draw_shells(&mut pass, &storage.planetary, timestamps);
         drop(pass);
@@ -1297,7 +1554,11 @@ impl CelestialRenderer {
             {
                 scope_mask |= 1 << 8;
             }
-            if !storage.surface.instances.is_empty() {
+            if !storage.surface.instances.is_empty()
+                || storage.resident_tile.is_some()
+                || storage.resident_hierarchy.is_some()
+                || storage.resident_regional.is_some()
+            {
                 scope_mask |= 1 << 3;
             }
             if !storage.surface.fallback.is_empty() {

@@ -247,3 +247,179 @@ Phase 5 development is permitted despite retained Phase 4 acceptance debt and th
 accepted approximately 11 ms full-view preparation limitation. Outstanding platform/
 operator gates remain required before a later release-quality milestone; this design
 neither changes the frozen Phase 4 architecture nor claims those gates completed.
+
+## Procedural crater terrain foundation
+
+Phase 5.15 adds `CrateredV1` (code 3) as a distinct deterministic world algorithm.
+Immutable identity, seed, configuration and reference radius produce a compact
+body-fixed crater catalogue. Analytic profiles and gradients
+feed the existing query, certificate and terrain geometry paths. V1/V2 definitions
+retain their previous composition. The app's reusable crater recipe accepts any
+supported body radius and explicit seed; the existing Moon is its integration
+fixture. Procedural planetary-system assembly remains a separate domain task.
+
+Compact support permits regional height and derivative certificates to omit distant
+craters. Landmarks retain their complete height at every footprint; their curvature
+drives interpolation error. Crater profile differences across LODs are exactly zero;
+background noise and erosion remain filtered. Adaptive selection, stale transaction checks, prefetch and
+convergence use the same regional boundary certificate. Stitch owners share the
+same canonical direction, and interior boundary corrections are convex combinations
+of edge deltas within the patch cap. Background noise/erosion retain their global
+bounds. Catalogue and query workspace bytes enter the existing serial, worker and
+coordinator reservations. Quality thresholds are unchanged. The user explicitly
+retired the 128 MiB terrain ceiling on 2026-10-05; the demand-driven aggregate CPU
+terrain ceiling is now 512 MiB, including staging and transition reservations.
+This foundation does not establish whole-view convergence or visual acceptance;
+see the [contract](../MUNDARIS_PHASE_5_15_PROCEDURAL_CRATER_TERRAIN_FOUNDATION.md)
+and [handoff](PHASE_5_15_PROCEDURAL_CRATER_TERRAIN_FOUNDATION_REPORT.md).
+
+## Planet terrain redesign reference boundary
+
+The [Slice 1 contract](PLANET_TERRAIN_SLICE_1.md) begins a separate moon-like
+terrain path in `world::terrain`. `MoonTerrainDefinition` and `MoonLikeV1`/`MoonLikeV2` carry
+explicit immutable identity, seed and configuration; complete queries produce
+height, body-tangent gradient and correlated material weights. The existing
+V1/V2/CrateredV1 definitions and production terrain path retain their semantics.
+Slice 1B publishes compositional definitions through
+`CelestialBody::surface_definition()` and `CelestialSystem::edit_surface_definition()`.
+Legacy `terrain()`/`edit_terrain()` remain compatible. Publication selects one
+authority and clears the competing legacy/compositional definition, advances the
+terrain revision only, and validates the complete envelope before mutation.
+Body radius edits validate the selected authority before publication as well.
+
+The app's `moon_surface_reference` example consumes that world query for a
+temporary fixed-resolution software reference rasterizer. It retains f64 through
+sampling and observer-relative geometry, and records representation spacing and
+sampled residuals separately from complete normals/materials. These captures
+establish a visual review fixture, not GPU reconstruction, streaming convergence,
+native performance or user acceptance. The GPU tile/regular-patch replacement
+remains gated by the [redesign](PLANET_TERRAIN_RENDERING_REDESIGN.md).
+
+`MoonLikeV2` fills the first prototype's scale gaps with ten impact epochs and
+two independently seeded cell layouts per epoch. Convex age composition bounds
+overlap; regional plains modulate impact relief and correlated highland structure,
+with analytic mask derivatives included. V1 stays separately selectable with
+its original numerical semantics. The reference example uses fixed triangle
+meshes and a CPU triangle-ray index for cast-shadow comparisons; that index is
+disposable render data, not terrain authority, GPU tile residency or a
+collision/walking implementation. Local shadow queries use crop-only casters.
+
+The [redesign variety requirement](PLANET_TERRAIN_RENDERING_REDESIGN.md#variety-across-moons--user-clarification-2026-10-05)
+treats orbital role, body shape, structural terrain family, materials and optional
+atmosphere as separate definition choices. The implemented lunar family is not a
+generic appearance model for all moons. Its spherical reference, radial envelope
+and regolith/rock/basalt weights do not establish irregular, ice, volcanic or
+atmospheric-family capability by themselves. The [Slice 1B contract](PLANET_TERRAIN_SLICE_1B.md)
+adds `SurfaceDefinition` with independent shape, geological parameters, material
+definition and atmosphere descriptor. `RockyV3` composes the unchanged V2 oracle
+with a seeded body history; `IcyV1` and `VolcanicV1` supply distinct complete fields.
+Material format versions must agree with geological channel semantics; composition
+and regional contrast remain independent controls and cannot move terrain.
+
+`SurfaceGenerator` supplies complete radial shape/displacement, analytic tangent
+gradients, combined outward normal, four normalized material weights and explicit
+global envelopes. Shapes are positive radial graphs, including bounded asymmetric
+triaxial definitions. This represents star-shaped bodies only: arbitrary concavity,
+caves, overhangs and every contact-binary topology require a separate representation.
+See [ADR 0009](adr/0009-compositional-body-surfaces.md).
+
+The production clearance/navigation adapter reads the same selected world surface,
+including shape radius and gradient. These radial clearance queries are not solid
+collision or walking. The native adapter now dispatches the selected legacy or
+compositional authority into the existing worker/cache, adaptive selection,
+stitching and morph pipeline. The Solar System Moon selects `RockyV5` in both
+presets; each LOD queries that same complete field, and camera clearance uses the
+world-owned complete query. This reuses the current CPU tile architecture and
+renderer material presentation; it does not add GPU tile residency or four-channel
+material shading. The reference examples remain temporary fixed-grid renderers for
+family review. This integration makes no production performance or visual-approval
+claim. See the [native Moon integration handoff](NATIVE_MOON_INTEGRATION_REPORT.md).
+
+For compositional native surfaces the radial envelope must remain within the
+renderer’s existing ten-percent support limit. The safe patch error certificate
+uses twice the complete radial amplitude bound plus the sphere correspondence
+error, with zero footprint-profile delta. It does not provide a finite derivative
+certificate or demonstrate error convergence, so desired radial LODs can be
+pathological (the current Moon snapshot requests LOD 30) while a ready coarse cover
+remains `quality_pending`. The compositional field's material presentation,
+mesh-normal and shadow treatment have not migrated to the reference presentation.
+These quality limits remain under review; see the
+[native Moon integration handoff](NATIVE_MOON_INTEGRATION_REPORT.md).
+
+The first refinement fix adds a separate 1 px projected-sample-spacing demand
+signal; it can guide refinement without pretending that the global error target is
+certified. Optional snapshot fields identify whether refinement demand comes from
+`projected_sample_spacing` or `certified_error`, and expose `target_certifiable`.
+Compositional positions still come from the complete field. Approximate mesh normals
+use finite secants at the mesh footprint along three fixed body axes, avoiding a hard
+basis switch; about seven normal queries per vertex run on workers. Population caches
+the native identity and bound in eight fixed slots keyed by body, revision, exact
+definition and reference-radius bits, avoiding repeated generator compilation
+without retaining generator heap.
+
+Slice 1B.1 extends the same world-owned authority with versioned geological
+directors (`RockyV4`, `IcyV2`, `VolcanicV2`). Body phenotype biases smooth
+body-fixed province weights, which control family morphology and bounded local
+process composition. The prior algorithms retain their numerical semantics.
+`SurfaceGenerator::geological_controls()` exposes diagnostic history/province
+values without introducing camera or renderer inputs into generation. Individual
+director maps, neutral geometry and deterministic province crops belong to the
+reference evidence path. See [ADR 0010](adr/0010-geological-province-directors.md)
+and the [Slice 1B.1 contract](PLANET_TERRAIN_SLICE_1B_1.md). Production clearance
+continues to query selected world authority; new GPU/LOD rendering remains gated.
+
+Slice 1B.2 adds explicit `RockyV5`, `IcyV3` and `VolcanicV3` hierarchical
+residuals over their preserved province fields. Signed normalized larger process
+contributions provide parent morphology independently of broad elevation. Three
+physical regimes add family-specific local features and bounded continuous
+process networks; finer bands inherit already evaluated coarser contributions.
+`SurfaceGenerator::detail_diagnostics()` exposes derived band contributions,
+gradients and work from the complete authority. Historical query semantics remain
+versioned separately. The fixed reference package adds 8 m and same-feature crops,
+not a production LOD path. See [ADR 0011](adr/0011-hierarchical-geological-residuals.md)
+and the [Slice 1B.2 contract](PLANET_TERRAIN_SLICE_1B_2.md).
+
+## Development session boundary
+
+### Fixed resident terrain prototype
+
+The explicitly enabled Slice 2A/2B fixture is separate from the planetary adaptive
+selector. App's `ResidentTileBuilder` samples immutable world surface definitions
+into versioned radial-displacement/material tiles with a one-sample halo. Renderer
+owns their resident buffers, shared regular-grid topology, and presentation
+metadata. Shader reconstruction consumes derived payloads and contains no world
+surface-generation algorithms. Tile identity includes body/definition, radius,
+authority revisions, address, resolution, filter, and format; camera and lighting
+remain presentation inputs.
+
+The fixed hierarchy retains one parent and four children in five bounded slots.
+Child workers and uploads complete independently while the parent covers the
+whole region. Draw ownership transfers atomically after all four are resident.
+GPU morphing starts on the actual indexed parent triangles, preserving their raw
+normal varying and material interpolation, and ends on each child's derived tile.
+Both endpoints use the parent's local anchor and prepared observer-relative
+transform. Request epochs reject late worker results; slot generations protect
+publication. This prototype has no whole-body streaming, pressure eviction, or
+global mixed-level topology. See [ADR 0012](adr/0012-resident-terrain-tile-prototype.md)
+and [ADR 0013](adr/0013-fixed-resident-terrain-hierarchy.md).
+
+### Session interface
+
+The opt-in `developer-tools` application feature and `--dev-interface` flag expose
+the Phase 5.14 session interface. App owns typed operations, handle namespaces,
+bounded requests/receipts/events, control leases, and coherent observations. Only
+the native event-loop thread applies operations. Loopback transport and immutable
+PNG/JSON publication run on bounded IO workers. Ordinary launches create no
+endpoint, and idle enabled sessions request no readback or procedural diagnostic
+queries.
+
+Native and deterministic offscreen scenarios share the production application
+update/preparation path. Host adapters select presentation/readback and clock/work
+scheduling; they do not duplicate authoritative world or simulation state. Renderer
+owns actual acquired-surface copies after scene/UI composition, asynchronous map
+completion and explicit submitted/skipped outcomes. Submission and a presentation
+request do not prove monitor presentation. CLI and MCP remain thin app clients;
+world/simulation acquire no networking or assistant dependencies. See
+[ADR 0008](adr/0008-development-session-interface.md), the
+[phase contract](../MUNDARIS_PHASE_5_14_AI_ENGINE_DEVELOPMENT_INTERFACE.md), and
+[interface guide](AI_DEVELOPMENT_INTERFACE.md).

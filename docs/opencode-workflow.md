@@ -1,5 +1,9 @@
 # OpenCode orchestration
 
+For Codex, use the separate [Codex workflow](codex-workflow.md),
+`.codex/agents/luna-*.toml`, and `scripts/codex-parallel.ps1`. Both clients share
+root `AGENTS.md`; their agent formats and launchers are client-specific.
+
 ## Reviewer / Plan mode
 
 The user normally talks to **Plan** as Mundaris's reviewer, technical director, and

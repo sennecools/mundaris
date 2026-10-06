@@ -3,10 +3,12 @@ name = "mundaris_app"
 version.workspace = true
 edition.workspace = true
 publish = false
+default-run = "mundaris_app"
 
 [features]
 surface-profile = ["mundaris_renderer/surface-profile"]
 terrain-capture = ["mundaris_renderer/terrain-capture", "dep:png"]
+developer-tools = ["terrain-capture", "surface-profile", "mundaris_renderer/developer-tools", "dep:sha2", "dep:base64"]
 
 [dependencies]
 anyhow.workspace = true
@@ -22,6 +24,13 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 winit.workspace = true
+sha2 = { version = "0.10", optional = true }
+base64 = { version = "0.22", optional = true }
+
+[[bin]]
+name = "mundaris_dev"
+path = "src/bin/mundaris_dev.rs"
+required-features = ["developer-tools"]
 
 [dev-dependencies]
 criterion.workspace = true
@@ -69,6 +78,29 @@ required-features = ["terrain-capture"]
 [[example]]
 name = "developer_capture"
 required-features = ["terrain-capture"]
+
+[[example]]
+name = "moon_surface_reference"
+required-features = ["terrain-capture"]
+
+[[example]]
+name = "surface_family_reference"
+required-features = ["terrain-capture"]
+
+[[example]]
+name = "resident_tile_capture"
+required-features = ["developer-tools"]
+
+[[example]]
+name = "resident_hierarchy_capture"
+required-features = ["developer-tools"]
+
+[[example]]
+name = "regional_terrain_capture"
+required-features = ["developer-tools"]
+
+[[example]]
+name = "resident_tile_samples"
 
 [[bench]]
 name = "planet_terrain_view"

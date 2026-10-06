@@ -37,7 +37,22 @@ unchanged. [Current report](docs/PHASE_5_PLANETARY_PRESENTATION_REPORT.md) and
 [before/after evidence](docs/evidence/phase5-overnight-planetary/README.md) distinguish
 visual-layer implementation from still-open convergence and visual acceptance.
 
+**Native Moon surface integration (2026-10-06):** both Solar System presets now
+select the world-owned `RockyV5` surface for the Moon and route it through the
+existing native terrain workers, cache, adaptive LOD, stitch/morph path and complete
+clearance query. Live capture observed that path, but the user rejected the visual
+result and reported performance around 10 FPS. The capture remained
+`quality_pending=true` and `settled=false`; cadence samples and CPU stage timings
+are not GPU-FPS measurements. Visual and performance acceptance are **FAILED**;
+the cause is not yet established. See the
+[dated handoff](docs/NATIVE_MOON_INTEGRATION_REPORT.md), the offscreen pair, and
+the live capture at
+`native/captures/12764-1791251339393283700-4-moon-orbit/`.
+
 ## Prerequisites
+
+Development-agent setup: [Codex with Luna subagents](docs/codex-workflow.md) or
+the existing [OpenCode workflow](docs/opencode-workflow.md). Both use `AGENTS.md`.
 
 - Stable Rust with the `rustfmt` and `clippy` components (the included `rust-toolchain.toml` requests them).
 - Native graphics drivers and a desktop session to run the interactive application.
@@ -202,6 +217,132 @@ simulation and terrain collision/navigation remain unimplemented.
 
 ## Quality checks
 
+The [Slice 1B family contract](docs/PLANET_TERRAIN_SLICE_1B.md) adds compositional
+world-owned surfaces: rocky history, fractured ice, volcanic resurfacing and a
+bounded irregular shape stress fixture. Generate the deterministic 12-body
+reference package and comparison sheets in a new directory:
+
+```powershell
+cargo run --locked --release -p mundaris_app --features terrain-capture --example surface_family_reference -- target/terrain-redesign/slice1b/reference-reproduction --orbit-cells 384 --local-cells 384
+python scripts/surface-family-sheets.py target/terrain-redesign/slice1b/reference-reproduction
+```
+
+For a numerical replay of the same thirteen definitions without rendering:
+
+```powershell
+cargo run --locked --release -p mundaris_app --features terrain-capture --example surface_family_reference -- target/terrain-redesign/slice1b/corpus-reproduction --corpus-only
+```
+
+The sheet script requires Pillow. The package contains complete query corpora,
+definition/phenotype metadata, scale/geometry/material diagnostics, neutral lighting
+and labelled/unlabelled contact sheets. Native rendering retains the legacy terrain
+path; compositional body publication and radial clearance share the world query.
+This reference does not establish production performance, collision or user visual
+acceptance. [ADR 0009](docs/adr/0009-compositional-body-surfaces.md) records the
+star-shaped representation boundary and independent definition identities.
+The [Slice 1B report](docs/PLANET_TERRAIN_SLICE_1B_REPORT.md) separates automated
+verification, reference observations and remaining visual gates.
+
+The [Slice 1B.1 province contract](docs/PLANET_TERRAIN_SLICE_1B_1.md) adds
+versioned `RockyV4`, `IcyV2` and `VolcanicV2` geological directors. Select them
+explicitly to retain the historical family replay above:
+
+```powershell
+cargo run --locked --release -p mundaris_app --features terrain-capture --example surface_family_reference -- target/terrain-redesign/slice1b1/reference-reproduction --provinces --orbit-cells 384 --local-cells 384
+python scripts/surface-family-sheets.py target/terrain-redesign/slice1b1/reference-reproduction
+cargo run --locked --release -p mundaris_app --features terrain-capture --example surface_family_reference -- target/terrain-redesign/slice1b1/corpus-reproduction --provinces --corpus-only
+```
+
+The province package includes all twelve fixed bodies, retained unbiased crops,
+four deterministically selected provinces per family at 20 km, 2 km, 256 m and
+32 m, uniform-grey geometry, individual director/process maps and selection
+metadata. Targeted crops use an oblique inspection camera; standing-height
+regression crops remain separate. Scalar maps use labelled body or tangent-map
+projections rather than the perspective capture. The
+[Slice 1B.1 report](docs/PLANET_TERRAIN_SLICE_1B_1_REPORT.md) records numerical
+verification and visual limitations; [ADR 0010](docs/adr/0010-geological-province-directors.md)
+records ownership and preservation requirements. These captures do not establish
+native continuous approach or authorize Slice 2.
+
+The [Slice 1B.2 contract](docs/PLANET_TERRAIN_SLICE_1B_2.md) adds explicit
+`RockyV5`, `IcyV3` and `VolcanicV3` hierarchical geological residuals. Its
+reference mode retains a 384-cell local mesh and adds an 8 m crop, same-feature
+anchors, separate unbiased local crops and contribution diagnostics:
+
+```powershell
+cargo run --locked --release -p mundaris_app --features terrain-capture --example surface_family_reference -- target/terrain-redesign/slice1b2/reference-reproduction --hierarchy --orbit-cells 384 --local-cells 384
+python scripts/surface-family-sheets.py target/terrain-redesign/slice1b2/reference-reproduction
+cargo run --locked --release -p mundaris_app --features terrain-capture --example surface_family_reference -- target/terrain-redesign/slice1b2/corpus-reproduction --hierarchy --corpus-only
+cargo run --locked --release -p mundaris_app --example surface_hierarchy_cost -- target/terrain-redesign/slice1b2/query-cost-reproduction.json
+```
+
+Every output path must be new. The cost example compares complete parent and
+successor queries using identical authored parameters and three alternating-order
+scans; it excludes rendering and makes no native FPS claim. See
+[ADR 0011](docs/adr/0011-hierarchical-geological-residuals.md) for the authority
+boundary. The [Slice 1B.2 report](docs/PLANET_TERRAIN_SLICE_1B_2_REPORT.md) indexes
+the completed package, measured query cost and partial 8 m visual acceptance.
+Historical modes above remain separately reproducible.
+
+The opt-in resident GPU terrain prototype consumes those world-owned surfaces
+through derived tiles. [Slice 2A](docs/PLANET_TERRAIN_SLICE_2A_REPORT.md) proves one
+resident tile; [Slice 2B](docs/PLANET_TERRAIN_SLICE_2B_REPORT.md) extends only that fixed
+region to a pinned parent and four asynchronous children. It does not replace
+whole-body terrain selection. Generate paired transition evidence in a new path:
+
+```powershell
+cargo run --locked --release -p mundaris_app --features developer-tools --example resident_hierarchy_capture -- target/terrain-redesign/slice2b/reproduction
+cargo test --locked --release -p mundaris_app --all-features --test resident_hierarchy_world_gpu -- --ignored --nocapture
+cargo test --locked --release -p mundaris_renderer --all-features --test resident_hierarchy_gpu -- --ignored --nocapture
+```
+
+The `gpu_tile` developer command establishes a temporary published surface fixture;
+`gpu_hierarchy` requests its four canonical children, controls morph duration,
+injects worker delays, cancels requests, and explicitly requests GPU diagnostics.
+`gpu_tile_view` selects height, normal, material, UV, or grid inspection. Snapshots
+carry keys, physical slots, generations, readiness, morph fractions, upload bytes,
+resource capacities, and reconstruction residuals. Ordinary morph frames request
+no diagnostic readback. Disabling `gpu_tile` restores its original body authority
+and camera. The native wall-paced torture scenario is
+`scenarios/developer/gpu-hierarchy-transition.json`; the capture example controls
+exact transition endpoints separately. See
+[ADR 0013](docs/adr/0013-fixed-resident-terrain-hierarchy.md) for the fixed topology,
+parent retention, and raw normal/material interpolation policy.
+
+The [planet terrain redesign](docs/PLANET_TERRAIN_RENDERING_REDESIGN.md) starts with
+a [Slice 1 reference prototype](docs/PLANET_TERRAIN_SLICE_1.md). Generate its
+fixed-resolution moon terrain views and height/normal/material diagnostics with:
+
+```powershell
+cargo run --locked --release -p mundaris_app --features terrain-capture --example moon_surface_reference -- target/terrain-redesign/slice1-orbital/reference-reproduction --orbit-cells 768
+```
+
+Open the resulting `index.html` for the seed/view comparison. This temporary
+software reference renderer defaults to the world-owned `MoonLikeV2` definition;
+it does not replace the native application's terrain or validate GPU/LOD performance.
+The output directory must be new. Optional `--seed 2 --view orbit --orbit-cells 512`
+selects one fixture; `--terrain-version 1` replays the preserved V1 field. The
+default orbital grid has 512 cells per cube face. CPU rays against the represented
+triangles supply reference shadows; local crops omit casters outside their mesh.
+Raw and filtered materials, analytic and mesh normals, shadow visibility and
+unshadowed illumination remain separate diagnostics. User visual review is a
+separate gate. See the [orbital refinement handoff](docs/PLANET_TERRAIN_SLICE_1_ORBITAL_REPORT.md)
+and the [historical V1 handoff](docs/PLANET_TERRAIN_SLICE_1_REPORT.md).
+
+The opt-in [development session interface](docs/AI_DEVELOPMENT_INTERFACE.md)
+provides live inspection, leased control, native scene/UI captures, versioned
+scenarios and owned rebuild/replay through CLI and MCP:
+
+```powershell
+cargo run --locked --release -p mundaris_app --features developer-tools -- --solar-system --dev-interface
+cargo run --locked --release -p mundaris_app --features developer-tools --bin mundaris_dev -- sessions
+```
+
+`mundaris_app` remains the default binary. The project MCP adapter starts without
+launching an application; launch is an explicit tool. Use an explicit session when
+multiple apps are live. The existing Luna configuration and primary model choice
+are preserved. Ordinary app launches expose no development endpoint.
+
 For the fast developer review package, run `./scripts/ai-check.ps1`. It saves Git
 state, focused results, and a deterministic PNG/JSON pair in a fresh
 `target/ai-check/` run directory. This is **not full validation**. Native UI summaries
@@ -215,11 +356,23 @@ native interaction or visual acceptance on its own.
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
+cargo check --locked --workspace --all-targets --all-features
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace --all-features
+cargo test --locked --release --workspace --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --all-features --no-deps
 ```
 
 CI uses `--locked` for Cargo compilation/lint/test commands to enforce the committed `Cargo.lock`. Default tests remain headless; native GPU readback regressions are explicitly ignored and require a graphics adapter when selected. For interactive validation, run the app and check the panel, resize, minimize/restore, and clean exit. Compilation alone does not establish those runtime behaviors.
+
+`validate.ps1 -IncludeGpu` additionally selects the long-orbit checks, headless
+bridge tests and the ignored `native_close_surface`, `native_full_frame`,
+`developer_interface` and `developer_scenarios` GPU suites. The scenario suite
+repeats all four deterministic fixtures and compares checkpoint values and pixels.
+Native scenarios, actual stdio MCP, and fresh-session tool discovery remain
+separate evidence. No tooling gate closes terrain Acceptance A or visual/camera
+approval.
 
 ## Workspace map
 

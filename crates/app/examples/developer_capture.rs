@@ -1,13 +1,38 @@
 use anyhow::{Context, Result, ensure};
 use mundaris_app::developer_capture::{
-    DeveloperScene, capture_analytic_playback, capture_navigation_route, capture_scene,
-    capture_scene_at, default_output_directory, write_pair,
+    DeveloperScene, capture_analytic_playback, capture_crater_reference, capture_navigation_route,
+    capture_scene, capture_scene_at, default_output_directory, write_pair,
 };
 use std::path::PathBuf;
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let scene_arg = args.next();
+    if scene_arg.as_deref() == Some("crater-reference") {
+        let output = args
+            .next()
+            .map(PathBuf::from)
+            .context("usage: developer_capture crater-reference <output_directory> [seed]")?;
+        let seed = args
+            .next()
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .with_context(|| format!("parsing crater reference seed {value:?}"))
+            })
+            .transpose()?
+            .unwrap_or(0x4d_4f_4f_4e);
+        ensure!(
+            args.next().is_none(),
+            "usage: developer_capture crater-reference <output_directory> [seed]"
+        );
+        capture_crater_reference(&output, seed)?;
+        println!(
+            "wrote crater reference captures to {} with seed {seed}",
+            output.display()
+        );
+        return Ok(());
+    }
     let second = args.next();
     let (time_s, output) = match second.as_deref().and_then(|s| s.parse::<f64>().ok()) {
         Some(time_s) => (

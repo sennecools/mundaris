@@ -10,8 +10,14 @@ mod celestial_lines;
 mod celestial_view;
 mod debug;
 mod gpu_profile;
+#[cfg(feature = "developer-tools")]
+pub mod native_capture;
 pub mod planet_surface;
 mod planetary;
+pub mod regional_edges;
+pub mod regional_resident;
+pub mod resident_hierarchy;
+pub mod resident_tile;
 pub mod sky;
 #[cfg(feature = "terrain-capture")]
 pub mod terrain_capture;
@@ -22,6 +28,12 @@ pub use celestial_view::*;
 pub use debug::{DebugFrame, DebugLine, DebugProjection, DebugStaging};
 pub use gpu_profile::{CpuUploadProfile, GpuProfile, TimestampAvailability};
 pub use planetary::{PlanetLandProfile, PlanetaryConfig};
+pub use regional_resident::*;
+pub use resident_hierarchy::{HierarchyVertex, ResidentHierarchyDraw, ResidentHierarchyReport};
+pub use resident_tile::{
+    ReconstructedTileVertex, ResidentTileReport, TILE_FILTER_VERSION, TILE_FORMAT_VERSION,
+    TileData, TileDraw, TileGeometryError, TileKey, TilePublicationToken, TileSlotState, TileTexel,
+};
 pub use view::*;
 
 use std::sync::Arc;
@@ -55,6 +67,37 @@ pub enum RendererError {
     /// The GPU ran out of memory while acquiring a presentation frame.
     #[error("GPU ran out of memory while acquiring a frame")]
     OutOfMemory,
+    #[error("renderer submission identity space is exhausted")]
+    SubmissionIdExhausted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderSkipReason {
+    NotRenderedYet,
+    Suspended,
+    GpuPollFailed,
+    SurfaceLost,
+    SurfaceOutdated,
+    SurfaceTimeout,
+    SurfaceOther,
+    OutOfMemory,
+    PreparationFailed,
+    SubmissionIdExhausted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderOutcome {
+    Skipped(RenderSkipReason),
+    Submitted {
+        submission_id: u64,
+        presentation_requested: bool,
+    },
+}
+
+impl Default for RenderOutcome {
+    fn default() -> Self {
+        Self::Skipped(RenderSkipReason::NotRenderedYet)
+    }
 }
 
 /// Owns the native presentation surface, GPU device, and minimal egui integration.
@@ -73,11 +116,24 @@ pub struct Renderer {
     celestial: Option<celestial::CelestialRenderer>,
     timestamp_availability: TimestampAvailability,
     timestamp_slot: Option<gpu_profile::AsyncTimestampSlot>,
+    last_render_outcome: RenderOutcome,
+    submission_id: u64,
+    #[cfg(feature = "developer-tools")]
+    surface_copy_src_supported: bool,
+    #[cfg(feature = "developer-tools")]
+    native_capture: native_capture::NativeCapture,
+    #[cfg(feature = "developer-tools")]
+    developer_timestamp_gate: gpu_profile::DeveloperTimestampGate,
 }
 
 impl Renderer {
     pub fn pixels_per_point(&self) -> f32 {
         self.egui_context.pixels_per_point()
+    }
+
+    /// Outcome of the most recent render wrapper call.
+    pub fn last_render_outcome(&self) -> RenderOutcome {
+        self.last_render_outcome
     }
 
     /// Timestamp-query support enabled for this adapter.
@@ -93,6 +149,31 @@ impl Renderer {
             .map_or_else(Default::default, |slot| slot.latest)
     }
 
+    /// Submission that produced `latest_gpu_profile`, when timestamp readback is complete.
+    pub fn latest_gpu_profile_submission(&self) -> Option<u64> {
+        self.timestamp_slot
+            .as_ref()
+            .and_then(gpu_profile::AsyncTimestampSlot::latest_submission_id)
+    }
+
+    /// Suppress automatic new timestamp queries while developer diagnostics are idle.
+    /// Any query already in flight continues to be polled without waiting.
+    #[cfg(feature = "developer-tools")]
+    pub fn set_developer_observation_mode(&mut self, enabled: bool) {
+        self.developer_timestamp_gate.set_observation_mode(enabled);
+    }
+
+    /// Arm one query for the next submitted celestial frame. Returns false when
+    /// timestamp queries are unavailable on the selected adapter.
+    #[cfg(feature = "developer-tools")]
+    pub fn request_developer_gpu_timing(&mut self) -> bool {
+        if self.timestamp_slot.is_none() {
+            return false;
+        }
+        self.developer_timestamp_gate.request();
+        true
+    }
+
     /// Latest CPU-side terrain upload accounting from the production renderer.
     pub fn last_terrain_upload_profile(&self) -> gpu_profile::CpuUploadProfile {
         self.celestial
@@ -100,6 +181,90 @@ impl Renderer {
             .map_or_else(Default::default, |renderer| {
                 renderer.last_surface_upload_profile()
             })
+    }
+    /// Last resident derived-tile upload and allocation accounting.
+    pub fn last_resident_tile_report(&self) -> ResidentTileReport {
+        self.celestial
+            .as_ref()
+            .map_or_else(Default::default, |renderer| {
+                renderer.last_resident_tile_report()
+            })
+    }
+    /// Last five-slot resident hierarchy payload and readiness accounting.
+    pub fn last_resident_hierarchy_report(&self) -> ResidentHierarchyReport {
+        self.celestial
+            .as_ref()
+            .map_or_else(Default::default, |renderer| {
+                renderer.last_resident_hierarchy_report()
+            })
+    }
+    /// Focused GPU diagnostic. This explicit validation call waits for readback;
+    pub fn last_resident_regional_report(&self) -> RegionalResidentReport {
+        self.celestial
+            .as_ref()
+            .map_or_else(Default::default, |r| r.last_resident_regional_report())
+    }
+    /// Explicit diagnostic readback for one regional patch.
+    pub fn validate_resident_regional(
+        &mut self,
+        draw: &RegionalResidentDraw,
+        index: usize,
+    ) -> Result<Vec<ReconstructedTileVertex>, RenderPreparationError> {
+        if self.celestial.is_none() {
+            self.celestial = Some(celestial::CelestialRenderer::new(
+                &self.device,
+                &self.queue,
+                self.surface_config.format,
+                self.surface_config.width,
+                self.surface_config.height,
+            ));
+        }
+        self.celestial
+            .as_mut()
+            .ok_or(RenderPreparationError::InvalidResidentTile)?
+            .validate_resident_regional(&self.device, &self.queue, draw, index)
+    }
+    /// Focused GPU diagnostic. This explicit validation call waits for readback;
+    /// ordinary native frames never invoke it.
+    pub fn validate_resident_tile(
+        &mut self,
+        draw: &TileDraw,
+    ) -> Result<Vec<ReconstructedTileVertex>, RenderPreparationError> {
+        if self.celestial.is_none() {
+            self.celestial = Some(celestial::CelestialRenderer::new(
+                &self.device,
+                &self.queue,
+                self.surface_config.format,
+                self.surface_config.width,
+                self.surface_config.height,
+            ));
+        }
+        let celestial = self
+            .celestial
+            .as_mut()
+            .ok_or(RenderPreparationError::InvalidResidentTile)?;
+        celestial.validate_resident_tile(&self.device, &self.queue, draw)
+    }
+    /// Focused GPU reconstruction diagnostic for parent or child patch 0–4.
+    pub fn validate_resident_hierarchy(
+        &mut self,
+        draw: &ResidentHierarchyDraw,
+        patch_index: usize,
+    ) -> Result<Vec<ReconstructedTileVertex>, RenderPreparationError> {
+        if self.celestial.is_none() {
+            self.celestial = Some(celestial::CelestialRenderer::new(
+                &self.device,
+                &self.queue,
+                self.surface_config.format,
+                self.surface_config.width,
+                self.surface_config.height,
+            ));
+        }
+        let celestial = self
+            .celestial
+            .as_mut()
+            .ok_or(RenderPreparationError::InvalidResidentTile)?;
+        celestial.validate_resident_hierarchy(&self.device, &self.queue, draw, patch_index)
     }
     /// Last submitted sky upload accounting; unavailable before first submission.
     pub fn last_sky_resource_report(&self) -> Option<sky::SkyResourceReport> {
@@ -138,6 +303,10 @@ impl Renderer {
             .await?;
 
         let surface_capabilities = surface.get_capabilities(&adapter);
+        #[cfg(feature = "developer-tools")]
+        let surface_copy_src_supported = surface_capabilities
+            .usages
+            .contains(wgpu::TextureUsages::COPY_SRC);
         let format = surface_capabilities
             .formats
             .iter()
@@ -199,7 +368,52 @@ impl Renderer {
             celestial: None,
             timestamp_availability,
             timestamp_slot,
+            last_render_outcome: RenderOutcome::default(),
+            submission_id: 0,
+            #[cfg(feature = "developer-tools")]
+            surface_copy_src_supported,
+            #[cfg(feature = "developer-tools")]
+            native_capture: native_capture::NativeCapture::new(
+                adapter_info.name,
+                adapter_info.backend,
+            ),
+            #[cfg(feature = "developer-tools")]
+            developer_timestamp_gate: gpu_profile::DeveloperTimestampGate::default(),
         })
+    }
+
+    #[cfg(feature = "developer-tools")]
+    pub fn enable_native_capture(&mut self) -> Result<(), String> {
+        if self.native_capture.is_enabled() {
+            return Ok(());
+        }
+        self.native_capture
+            .enable(self.surface_copy_src_supported, self.surface_config.format)?;
+        self.surface_config.usage |= wgpu::TextureUsages::COPY_SRC;
+        if !self.suspended {
+            self.surface.configure(&self.device, &self.surface_config);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "developer-tools")]
+    pub fn request_native_capture(&mut self, capture_id: u64) -> Result<(), String> {
+        self.native_capture.request(capture_id)
+    }
+
+    #[cfg(feature = "developer-tools")]
+    pub fn poll_native_capture(
+        &mut self,
+    ) -> Result<Option<native_capture::NativeCaptureFrame>, String> {
+        self.device
+            .poll(wgpu::PollType::Poll)
+            .map_err(|error| format!("polling native capture readback: {error}"))?;
+        self.native_capture.poll()
+    }
+
+    #[cfg(feature = "developer-tools")]
+    pub fn cancel_native_capture(&mut self) {
+        self.native_capture.cancel();
     }
 
     /// Passes native window input to egui and reports whether it needs a repaint.
@@ -213,9 +427,17 @@ impl Renderer {
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             self.suspended = true;
+            #[cfg(feature = "developer-tools")]
+            self.native_capture.resized();
             return;
         }
 
+        let size_changed =
+            self.surface_config.width != width || self.surface_config.height != height;
+        if size_changed {
+            #[cfg(feature = "developer-tools")]
+            self.native_capture.resized();
+        }
         self.suspended = false;
         self.surface_config.width = width;
         self.surface_config.height = height;
@@ -247,7 +469,10 @@ impl Renderer {
         frame: &CelestialFrame<'_, '_, '_>,
         ui: impl FnMut(&egui::Context),
     ) -> Result<(), RendererError> {
-        frame.validate()?;
+        if let Err(error) = frame.validate() {
+            self.last_render_outcome = RenderOutcome::Skipped(RenderSkipReason::PreparationFailed);
+            return Err(error.into());
+        }
         self.render_frame(None, Some(frame), ui)
     }
 
@@ -257,36 +482,67 @@ impl Renderer {
         celestial_frame: Option<&CelestialFrame<'_, '_, '_>>,
         ui: impl FnMut(&egui::Context),
     ) -> Result<(), RendererError> {
+        self.last_render_outcome = RenderOutcome::Skipped(RenderSkipReason::PreparationFailed);
         if self.suspended {
+            self.last_render_outcome = RenderOutcome::Skipped(RenderSkipReason::Suspended);
             return Ok(());
         }
 
-        self.device.poll(wgpu::PollType::Poll).map_err(|error| {
-            RendererError::Preparation(RenderPreparationError::GpuProgress(error.to_string()))
-        })?;
-        let timestamp_active = celestial_frame.is_some()
+        if let Err(error) = self.device.poll(wgpu::PollType::Poll) {
+            self.last_render_outcome = RenderOutcome::Skipped(RenderSkipReason::GpuPollFailed);
+            return Err(RendererError::Preparation(
+                RenderPreparationError::GpuProgress(error.to_string()),
+            ));
+        }
+        let poll_timestamp_slot = celestial_frame.is_some();
+        #[cfg(feature = "developer-tools")]
+        let poll_timestamp_slot =
+            poll_timestamp_slot || self.developer_timestamp_gate.observation_mode();
+        let timestamp_slot_idle = poll_timestamp_slot
             && self
                 .timestamp_slot
                 .as_mut()
                 .is_some_and(|slot| slot.available());
+        #[cfg(feature = "developer-tools")]
+        let timestamp_active = self
+            .developer_timestamp_gate
+            .begin_if_idle(celestial_frame.is_some(), timestamp_slot_idle);
+        #[cfg(not(feature = "developer-tools"))]
+        let timestamp_active = celestial_frame.is_some() && timestamp_slot_idle;
 
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
-            Err(SurfaceError::Lost | SurfaceError::Outdated) => {
+            Err(SurfaceError::Lost) => {
                 self.surface.configure(&self.device, &self.surface_config);
+                self.last_render_outcome = RenderOutcome::Skipped(RenderSkipReason::SurfaceLost);
+                return Ok(());
+            }
+            Err(SurfaceError::Outdated) => {
+                self.surface.configure(&self.device, &self.surface_config);
+                self.last_render_outcome =
+                    RenderOutcome::Skipped(RenderSkipReason::SurfaceOutdated);
                 return Ok(());
             }
             Err(SurfaceError::Timeout) => {
                 warn!("timed out acquiring the next presentation frame");
+                self.last_render_outcome = RenderOutcome::Skipped(RenderSkipReason::SurfaceTimeout);
                 return Ok(());
             }
             Err(SurfaceError::OutOfMemory) => {
+                self.last_render_outcome = RenderOutcome::Skipped(RenderSkipReason::OutOfMemory);
                 return Err(RendererError::OutOfMemory);
             }
             Err(SurfaceError::Other) => {
                 warn!("surface could not acquire a frame; retrying on the next redraw");
+                self.last_render_outcome = RenderOutcome::Skipped(RenderSkipReason::SurfaceOther);
                 return Ok(());
             }
+        };
+
+        let Some(submission_id) = self.submission_id.checked_add(1) else {
+            self.last_render_outcome =
+                RenderOutcome::Skipped(RenderSkipReason::SubmissionIdExhausted);
+            return Err(RendererError::SubmissionIdExhausted);
         };
 
         let raw_input = self.egui_state.take_egui_input(self.window.as_ref());
@@ -331,7 +587,11 @@ impl Renderer {
                     self.surface_config.height,
                 )
             });
-            debug.draw(&self.device, &self.queue, &mut encoder, &view, frame)?;
+            if let Err(error) = debug.draw(&self.device, &self.queue, &mut encoder, &view, frame) {
+                self.last_render_outcome =
+                    RenderOutcome::Skipped(RenderSkipReason::PreparationFailed);
+                return Err(error.into());
+            }
         }
         let mut scope_mask = 0;
         if let Some(frame) = celestial_frame {
@@ -344,7 +604,7 @@ impl Renderer {
                     self.surface_config.height,
                 )
             });
-            scope_mask = celestial.draw(
+            let draw_result = celestial.draw(
                 &self.device,
                 &self.queue,
                 &mut encoder,
@@ -353,7 +613,15 @@ impl Renderer {
                 timestamp_active
                     .then(|| self.timestamp_slot.as_ref().map(|slot| &slot.queries))
                     .flatten(),
-            )?;
+            );
+            match draw_result {
+                Ok(mask) => scope_mask = mask,
+                Err(error) => {
+                    self.last_render_outcome =
+                        RenderOutcome::Skipped(RenderSkipReason::PreparationFailed);
+                    return Err(error.into());
+                }
+            }
         }
 
         {
@@ -388,17 +656,39 @@ impl Renderer {
             );
         }
 
+        #[cfg(feature = "developer-tools")]
+        self.native_capture.encode_copy(
+            &self.device,
+            &mut encoder,
+            &frame.texture,
+            self.surface_config.format,
+            self.surface_config.width,
+            self.surface_config.height,
+        );
+
         if timestamp_active && let Some(slot) = &self.timestamp_slot {
             slot.resolve(&mut encoder);
         }
         self.queue
             .submit(extra_command_buffers.into_iter().chain([encoder.finish()]));
+        if let Some(celestial) = &mut self.celestial {
+            celestial.resident_on_submitted(&self.queue);
+        }
+        self.submission_id = submission_id;
+        #[cfg(feature = "developer-tools")]
+        self.native_capture.submitted(submission_id);
         if timestamp_active && let Some(slot) = &mut self.timestamp_slot {
-            slot.map(self.queue.get_timestamp_period(), scope_mask);
+            slot.map(self.queue.get_timestamp_period(), scope_mask, submission_id);
+            #[cfg(feature = "developer-tools")]
+            self.developer_timestamp_gate.submitted();
         }
         // Wayland uses this notification to coordinate compositor frame callbacks.
         self.window.pre_present_notify();
         frame.present();
+        self.last_render_outcome = RenderOutcome::Submitted {
+            submission_id,
+            presentation_requested: true,
+        };
 
         for texture_id in &full_output.textures_delta.free {
             self.egui_renderer.free_texture(texture_id);

@@ -6,7 +6,7 @@ use glam::{DMat3, DQuat, DVec3};
 use mundaris_app::{
     celestial_labels::{LabelInput, LabelLayout, ScreenRect},
     planet_surface::PlanetSurfaceSession,
-    planet_terrain::{MAX_PENDING_PATCHES, MAX_TERRAIN_PATCHES},
+    planet_terrain::{MAX_PENDING_PATCHES, MAX_TERRAIN_PATCHES, TERRAIN_CPU_CAP_BYTES},
     solar_system::{SOLAR_SYSTEM_CONTENT, SolarBody, SolarSystemPreset},
     system_view::{OverviewScope, SystemViewBounds},
     terrain_population::TerrainPopulation,
@@ -967,7 +967,7 @@ fn run_scene(
         "capture exceeded pending-work cap"
     );
     ensure!(
-        population.cache.report().peak_aggregate_bytes <= 128 * 1024 * 1024,
+        population.cache.report().peak_aggregate_bytes <= TERRAIN_CPU_CAP_BYTES,
         "aggregate terrain ceiling exceeded"
     );
     writeln!(
@@ -978,8 +978,8 @@ fn run_scene(
         usize::from(population.active_body().is_some()),
         population.work.vertices_generated,
         population.cache.pending(),
-        112 * 1024 * 1024,
-        128 * 1024 * 1024,
+        TERRAIN_CPU_CAP_BYTES,
+        TERRAIN_CPU_CAP_BYTES,
         world.body_count() * size_of::<CelestialBody>(),
         sessions.len()
     )?;

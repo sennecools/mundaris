@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "preset": "solar-system",
+  "deterministic": true,
+  "initial_settings": [{ "action": "reset" }, { "action": "pause", "paused": true }],
+  "steps": [
+    { "action": { "action": "pause", "paused": true } },
+    { "action": { "action": "seek", "seconds": 86400.0 } },
+    { "checkpoint": { "name": "analytic-seek-forward", "predicate": { "path": "motion.published_time_s", "equals": 86400.0 }, "timeout_s": 20 } },
+    { "capture": { "name": "analytic-day-forward" } },
+    { "action": { "action": "rate", "multiplier": 1000.0 } },
+    { "action": { "action": "pause", "paused": false } },
+    { "action": { "action": "pause", "paused": false }, "duration_s": 1.0 },
+    { "action": { "action": "pause", "paused": true } },
+    { "checkpoint": { "name": "analytic-forward-ready", "predicate": { "path": "motion.published_time_s", "at_least": 86400.001, "at_most": 100000.0 }, "timeout_s": 20 } },
+    { "capture": { "name": "analytic-playback-forward" } },
+    { "action": { "action": "rate", "multiplier": -1000.0 } },
+    { "action": { "action": "pause", "paused": false }, "duration_s": 1.25 },
+    { "action": { "action": "pause", "paused": true } },
+    { "checkpoint": { "name": "analytic-reverse-ready", "predicate": { "path": "motion.published_time_s", "at_least": 0.0, "at_most": 86400.0 }, "timeout_s": 20 } },
+    { "capture": { "name": "analytic-playback-reverse" } },
+    { "action": { "action": "reset" } },
+    { "checkpoint": { "name": "analytic-reset-time-zero", "predicate": { "path": "motion.published_time_s", "equals": 0.0 }, "timeout_s": 20 } },
+    { "capture": { "name": "analytic-reset" } }
+  ]
+}

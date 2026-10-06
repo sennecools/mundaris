@@ -143,6 +143,41 @@ impl CelestialQueries {
 
 pub(crate) const QUERY_COUNT: u32 = 18;
 
+/// Controls automatic timestamp sampling while developer observation is active.
+/// Ordinary renderer use remains continuously sampled as before.
+#[cfg(feature = "developer-tools")]
+#[derive(Debug, Default)]
+pub(crate) struct DeveloperTimestampGate {
+    observation_mode: bool,
+    requested: bool,
+}
+
+#[cfg(feature = "developer-tools")]
+impl DeveloperTimestampGate {
+    pub fn set_observation_mode(&mut self, enabled: bool) {
+        self.observation_mode = enabled;
+    }
+
+    pub fn observation_mode(&self) -> bool {
+        self.observation_mode
+    }
+
+    pub fn request(&mut self) {
+        self.requested = true;
+    }
+
+    /// True only when a celestial frame can start in an idle query slot.
+    pub fn begin_if_idle(&self, has_celestial_frame: bool, slot_idle: bool) -> bool {
+        has_celestial_frame && slot_idle && (!self.observation_mode || self.requested)
+    }
+
+    /// Retain the request through skips and preparation errors; consume it only
+    /// after a timestamp-bearing frame has actually been submitted.
+    pub fn submitted(&mut self) {
+        self.requested = false;
+    }
+}
+
 /// One bounded native readback slot. A pending mapping makes the next frame skip
 /// query use rather than waiting for or overwriting the in-flight result.
 pub(crate) struct AsyncTimestampSlot {
@@ -151,6 +186,8 @@ pub(crate) struct AsyncTimestampSlot {
     readback: wgpu::Buffer,
     receiver: Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
     pub latest: GpuProfile,
+    latest_submission_id: Option<u64>,
+    pending_submission_id: Option<u64>,
     period_nanoseconds: f32,
     scope_mask: u16,
 }
@@ -175,6 +212,8 @@ impl AsyncTimestampSlot {
             }),
             receiver: None,
             latest: GpuProfile::default(),
+            latest_submission_id: None,
+            pending_submission_id: None,
             period_nanoseconds: 1.0,
             scope_mask: 0,
         })
@@ -192,13 +231,20 @@ impl AsyncTimestampSlot {
                         .map(|chunk| u64::from_le_bytes(*chunk))
                         .collect();
                     self.latest = decode(&ticks, self.period_nanoseconds, self.scope_mask);
+                    self.latest_submission_id = self.pending_submission_id.take();
                     drop(mapped);
                     self.readback.unmap();
                     self.receiver = None;
                 }
-                Ok(Err(_)) => self.receiver = None,
+                Ok(Err(_)) => {
+                    self.pending_submission_id = None;
+                    self.receiver = None;
+                }
                 Err(std::sync::mpsc::TryRecvError::Empty) => return false,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.receiver = None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.pending_submission_id = None;
+                    self.receiver = None;
+                }
             }
         }
         self.receiver.is_none()
@@ -215,15 +261,20 @@ impl AsyncTimestampSlot {
         );
     }
 
-    pub fn map(&mut self, period_nanoseconds: f32, scope_mask: u16) {
+    pub fn map(&mut self, period_nanoseconds: f32, scope_mask: u16, submission_id: u64) {
         self.period_nanoseconds = period_nanoseconds;
         self.scope_mask = scope_mask;
+        self.pending_submission_id = Some(submission_id);
         let (sender, receiver) = std::sync::mpsc::channel();
         self.readback
             .map_async(wgpu::MapMode::Read, .., move |result| {
                 let _ = sender.send(result);
             });
         self.receiver = Some(receiver);
+    }
+
+    pub fn latest_submission_id(&self) -> Option<u64> {
+        self.latest_submission_id
     }
 }
 
@@ -260,5 +311,25 @@ mod tests {
     fn reversed_or_missing_timestamp_pair_is_unavailable() {
         assert_eq!(decode(&[20, 10], 1.0, 1).celestial_pass, None);
         assert_eq!(decode(&[], 1.0, 1).celestial_pass, None);
+    }
+
+    #[cfg(feature = "developer-tools")]
+    #[test]
+    fn observation_gate_waits_for_celestial_idle_slot_and_submitted_sample() {
+        let mut gate = DeveloperTimestampGate::default();
+        assert!(gate.begin_if_idle(true, true));
+
+        gate.set_observation_mode(true);
+        assert!(!gate.begin_if_idle(true, true));
+        gate.request();
+        assert!(!gate.begin_if_idle(false, true));
+        assert!(!gate.begin_if_idle(true, false));
+        assert!(gate.begin_if_idle(true, true));
+
+        // Merely being eligible does not consume it: surface acquisition or
+        // frame preparation may still skip before submission.
+        assert!(gate.begin_if_idle(true, true));
+        gate.submitted();
+        assert!(!gate.begin_if_idle(true, true));
     }
 }

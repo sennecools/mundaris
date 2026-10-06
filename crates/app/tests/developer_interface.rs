@@ -99,7 +99,7 @@ impl Fixture {
         let mut sessions = self
             .world
             .bodies()
-            .filter(|(_, b)| b.terrain().is_some())
+            .filter(|(_, b)| b.has_surface())
             .map(|(id, _)| PlanetSurfaceSession::new(id, MAX_TERRAIN_PATCHES).unwrap())
             .collect::<Vec<_>>();
         self.terrain
@@ -122,16 +122,43 @@ impl Fixture {
 }
 
 #[test]
+fn moon_snapshot_identifies_the_native_compositional_authority() {
+    let mut fixture = Fixture::new(DeveloperScene::MoonOrbit);
+    fixture.admit();
+    let snapshot = fixture.snapshot();
+    assert_eq!(snapshot.terrain.active_body.as_ref().unwrap().index, 4);
+    assert_eq!(
+        snapshot.terrain.generator_algorithm.as_deref(),
+        Some("RockyV5")
+    );
+    assert_eq!(
+        snapshot.terrain.certificate_kind.as_deref(),
+        Some("complete_amplitude_bound")
+    );
+    assert_eq!(snapshot.terrain.settled, Some(false));
+    let mut older = serde_json::to_value(&snapshot).unwrap();
+    let terrain = older["terrain"].as_object_mut().unwrap();
+    terrain.remove("generator_algorithm");
+    terrain.remove("certificate_kind");
+    let older: DeveloperSnapshot = serde_json::from_value(older).unwrap();
+    assert!(older.terrain.generator_algorithm.is_none());
+    assert!(older.terrain.certificate_kind.is_none());
+}
+
+#[test]
 fn developer_snapshot_serializes_stable_names_units_and_null_measurements() {
     let snapshot = Fixture::new(DeveloperScene::EarthClose).snapshot();
     let json = serde_json::to_value(&snapshot).unwrap();
-    assert_eq!(json["schema_version"], 4);
+    assert_eq!(json["schema_version"], 5);
     assert_eq!(json["general"]["camera_mode"], "surface_inspection");
     assert_eq!(json["camera"]["reference_frame"], "body_fixed");
     assert!(json["performance"]["gpu_terrain_ms"].is_null());
     assert!(json["terrain"]["settled"].is_null());
     assert!(json["camera"]["navigation"].is_null());
-    assert_eq!(json["memory"]["cap_bytes"], 128 * 1024 * 1024);
+    assert_eq!(
+        json["memory"]["cap_bytes"],
+        mundaris_app::planet_terrain::TERRAIN_CPU_CAP_BYTES
+    );
     assert_eq!(
         serde_json::from_value::<DeveloperSnapshot>(json).unwrap(),
         snapshot

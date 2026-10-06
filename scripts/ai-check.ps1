@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-Run the focused Phase 5.12A developer capture, interface test, and formatting checks.
+Run focused developer capture, interface tests, and formatting checks.
 .DESCRIPTION
 Each invocation writes isolated evidence under target/ai-check/<timestamp> unless
 -OutputDirectory is supplied. The target must not already contain files.
@@ -109,6 +109,8 @@ try {
     $testLog = Join-Path $logsDirectory 'developer-interface.log'
     $null = Invoke-CheckedNative 'developer_interface' 'cargo' @('test', '--locked', '-p', 'mundaris_app', '--test', 'developer_interface') $testLog
     Copy-Item -LiteralPath $testLog -Destination $testResultsPath -Force
+    $null = Invoke-CheckedNative 'developer_commands' 'cargo' @('test','--locked','-p','mundaris_app','--features','developer-tools','--test','developer_commands') (Join-Path $logsDirectory 'developer-commands.log')
+    $null = Invoke-CheckedNative 'developer_bridge' 'cargo' @('test','--locked','-p','mundaris_app','--features','developer-tools','--test','developer_bridge') (Join-Path $logsDirectory 'developer-bridge.log')
     $null = Invoke-CheckedNative 'developer_capture' 'cargo' @(
         'run', '--locked', '--release', '-p', 'mundaris_app', '--features',
         'terrain-capture,surface-profile', '--example', 'developer_capture', '--',
@@ -129,7 +131,7 @@ try {
     $snapshotOk = $false
     try {
         $snapshot = Get-Content -LiteralPath (Join-Path $runDirectory "$Scene.json") -Raw | ConvertFrom-Json
-        if ($snapshot.schema_version -ne 4 -or $snapshot.capture.scene -ne $Scene -or $snapshot.capture.image -ne "$Scene.png") { throw 'Capture snapshot association mismatch.' }
+        if ($snapshot.schema_version -ne 5 -or $snapshot.capture.scene -ne $Scene -or $snapshot.capture.image -ne "$Scene.png") { throw 'Capture snapshot association mismatch.' }
         $expectedMode = switch ($Scene) { 'solar-overview' { 'system_orbit' } 'earth-close' { 'surface_inspection' } default { 'body_orbit' } }
         $expectedFocus = switch ($Scene) { 'solar-overview' { $null } 'moon-orbit' { 4 } default { 3 } }
         if ($snapshot.general.camera_mode -ne $expectedMode -or $snapshot.general.focused_body.index -ne $expectedFocus) { throw 'Capture camera/body fixture mismatch.' }
