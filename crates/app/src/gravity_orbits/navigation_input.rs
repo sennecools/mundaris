@@ -1,10 +1,82 @@
 //! Viewport-owned gestures and ordered event deltas. No camera or world mutation.
+//! Events arrive from the UI toolkit only while the pointer is over the viewport,
+//! in viewport logical pixels.
 use super::*;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerButton {
+    Primary,
+    Secondary,
+}
+
+/// Flight keys held for continuous local movement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlightKey {
+    Forward,
+    Back,
+    Left,
+    Right,
+    Down,
+    Up,
+}
+
+impl FlightKey {
+    const ALL: [Self; 6] = [
+        Self::Forward,
+        Self::Back,
+        Self::Left,
+        Self::Right,
+        Self::Down,
+        Self::Up,
+    ];
+    /// Maps W/S/A/D/Q/E text (any case) to a flight key.
+    pub fn from_text(text: &str) -> Option<Self> {
+        match text {
+            "w" | "W" => Some(Self::Forward),
+            "s" | "S" => Some(Self::Back),
+            "a" | "A" => Some(Self::Left),
+            "d" | "D" => Some(Self::Right),
+            "q" | "Q" => Some(Self::Down),
+            "e" | "E" => Some(Self::Up),
+            _ => None,
+        }
+    }
+    fn axis(self) -> DVec3 {
+        match self {
+            Self::Forward => -DVec3::Z,
+            Self::Back => DVec3::Z,
+            Self::Left => -DVec3::X,
+            Self::Right => DVec3::X,
+            Self::Down => -DVec3::Y,
+            Self::Up => DVec3::Y,
+        }
+    }
+}
+
+/// One toolkit-neutral viewport input event.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ViewportEvent {
+    PointerMoved([f32; 2]),
+    PointerButton {
+        pos: [f32; 2],
+        button: PointerButton,
+        pressed: bool,
+    },
+    PointerLeft,
+    /// Wheel movement in notches; positive moves forward / zooms in.
+    Wheel(f64),
+    Key {
+        key: FlightKey,
+        pressed: bool,
+    },
+    Boost(bool),
+    FocusChanged(bool),
+}
 
 #[derive(Default)]
 pub(super) struct ViewportInput {
-    pointer: Option<egui::Pos2>,
-    gesture: Option<egui::PointerButton>,
+    pointer: Option<[f32; 2]>,
+    gesture: Option<PointerButton>,
     keyboard_owner: bool,
     held: [bool; 6],
     boost: bool,
@@ -16,25 +88,14 @@ impl ViewportInput {
     pub fn owns_keyboard(&self) -> bool {
         self.keyboard_owner
     }
-    pub fn boost_active(&self) -> bool {
-        self.boost
-    }
-    pub fn pointer_position(&self) -> Option<egui::Pos2> {
-        self.pointer
-    }
-    pub fn set_boost(&mut self, active: bool) {
-        self.boost = active;
-    }
     pub fn cancel(&mut self) {
         *self = Self::default();
     }
     pub fn events(
         &mut self,
-        events: &[egui::Event],
-        viewport: egui::Rect,
+        events: &[ViewportEvent],
         local_look: bool,
         keyboard_blocked: bool,
-        pointer_blocked: impl Fn(egui::Pos2) -> bool,
         user_multiplier: f64,
     ) -> Vec<NavigationInput> {
         if keyboard_blocked {
@@ -48,95 +109,60 @@ impl ViewportInput {
                 ..Default::default()
             };
             match *event {
-                egui::Event::PointerButton {
+                ViewportEvent::PointerButton {
                     pos,
                     button,
                     pressed,
-                    ..
                 } => {
                     self.pointer = Some(pos);
                     if !pressed {
-                        // Releases end the owned gesture even outside the viewport.
                         if self.gesture == Some(button) {
                             self.gesture = None;
                         }
-                    } else if viewport.contains(pos) && !pointer_blocked(pos) {
+                    } else {
                         self.keyboard_owner = true;
                         let wanted = if local_look {
-                            egui::PointerButton::Secondary
+                            PointerButton::Secondary
                         } else {
-                            egui::PointerButton::Primary
+                            PointerButton::Primary
                         };
                         if button == wanted {
                             self.gesture = Some(button);
                         }
-                    } else {
-                        self.keyboard_owner = false;
-                        self.held = [false; 6];
-                        self.gesture = None;
                     }
                 }
-                egui::Event::PointerMoved(pos) => {
+                ViewportEvent::PointerMoved(pos) => {
                     if let Some(previous) = self.pointer
                         && self.gesture.is_some()
-                        && viewport.contains(pos)
-                        && !pointer_blocked(pos)
                     {
-                        let movement = pos - previous;
-                        delta.drag = [movement.x as f64, movement.y as f64];
+                        delta.drag = [
+                            f64::from(pos[0] - previous[0]),
+                            f64::from(pos[1] - previous[1]),
+                        ];
                     }
                     self.pointer = Some(pos);
                 }
-                egui::Event::PointerGone => {
+                ViewportEvent::PointerLeft => {
                     self.gesture = None;
                     self.pointer = None;
                 }
-                egui::Event::MouseWheel {
-                    unit, delta: wheel, ..
-                } => {
-                    if self
-                        .pointer
-                        .is_some_and(|p| viewport.contains(p) && !pointer_blocked(p))
-                    {
-                        // egui raw units: one line is one notch, 50 logical points
-                        // is one notch, one page is a viewport height. No quantization.
-                        delta.scroll_notches = wheel.y as f64
-                            * match unit {
-                                egui::MouseWheelUnit::Line => 1.0,
-                                egui::MouseWheelUnit::Point => 1.0 / 50.0,
-                                egui::MouseWheelUnit::Page => viewport.height() as f64 / 50.0,
-                            };
+                ViewportEvent::Wheel(notches) => {
+                    if self.pointer.is_some() {
+                        delta.scroll_notches = notches;
                     }
                 }
-                egui::Event::Key {
-                    key,
-                    pressed,
-                    modifiers,
-                    ..
-                } => {
-                    for (index, candidate) in [
-                        egui::Key::W,
-                        egui::Key::S,
-                        egui::Key::A,
-                        egui::Key::D,
-                        egui::Key::Q,
-                        egui::Key::E,
-                    ]
-                    .iter()
-                    .enumerate()
-                    {
-                        if key == *candidate {
-                            self.held[index] = pressed && self.keyboard_owner && !keyboard_blocked;
-                        }
-                    }
-                    if modifiers.shift {
-                        self.boost = !keyboard_blocked;
-                    }
+                ViewportEvent::Key { key, pressed } => {
+                    let index = FlightKey::ALL
+                        .iter()
+                        .position(|candidate| *candidate == key)
+                        .expect("flight key listed");
+                    self.held[index] = pressed && self.keyboard_owner && !keyboard_blocked;
                 }
-                egui::Event::WindowFocused(false) => {
-                    self.cancel();
+                ViewportEvent::Boost(active) => {
+                    self.boost = active && !keyboard_blocked;
                 }
-                _ => {}
+                ViewportEvent::FocusChanged(false) => self.cancel(),
+                ViewportEvent::FocusChanged(true) => {}
             }
             if delta.drag != [0.0; 2] || delta.scroll_notches != 0.0 {
                 output.push(delta);
@@ -144,16 +170,9 @@ impl ViewportInput {
         }
         let mut translation = DVec3::ZERO;
         if local_look && self.keyboard_owner && !keyboard_blocked {
-            for (held, axis) in self.held.iter().zip([
-                -DVec3::Z,
-                DVec3::Z,
-                -DVec3::X,
-                DVec3::X,
-                -DVec3::Y,
-                DVec3::Y,
-            ]) {
+            for (held, key) in self.held.iter().zip(FlightKey::ALL) {
                 if *held {
-                    translation += axis;
+                    translation += key.axis();
                 }
             }
         }
@@ -170,17 +189,16 @@ impl ViewportInput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn button(pos: egui::Pos2, pressed: bool) -> egui::Event {
-        egui::Event::PointerButton {
+    fn button(pos: [f32; 2], pressed: bool) -> ViewportEvent {
+        ViewportEvent::PointerButton {
             pos,
-            button: egui::PointerButton::Secondary,
+            button: PointerButton::Secondary,
             pressed,
-            modifiers: egui::Modifiers::default(),
         }
     }
     fn run(
         state: &mut ViewportInput,
-        events: &[egui::Event],
+        events: &[ViewportEvent],
         blocked: bool,
         focused: bool,
     ) -> Vec<NavigationInput> {
@@ -188,35 +206,18 @@ mod tests {
             state.cancel();
             return vec![NavigationInput::default()];
         }
-        state.events(
-            events,
-            egui::Rect::from_min_max(egui::pos2(100.0, 100.0), egui::pos2(500.0, 500.0)),
-            true,
-            blocked,
-            |_| false,
-            0.5,
-        )
+        state.events(events, true, blocked, 0.5)
     }
     #[test]
-    fn panel_press_cannot_acquire_drag_and_outside_release_ends_ownership() {
+    fn drag_follows_the_owned_button_and_release_ends_ownership() {
         let mut state = ViewportInput::default();
         let output = run(
             &mut state,
             &[
-                button(egui::pos2(20.0, 200.0), true),
-                egui::Event::PointerMoved(egui::pos2(200.0, 200.0)),
-            ],
-            false,
-            true,
-        );
-        assert!(output.iter().all(|i| i.drag == [0.0; 2]));
-        let output = run(
-            &mut state,
-            &[
-                button(egui::pos2(200.0, 200.0), true),
-                egui::Event::PointerMoved(egui::pos2(210.0, 200.0)),
-                button(egui::pos2(600.0, 200.0), false),
-                egui::Event::PointerMoved(egui::pos2(300.0, 200.0)),
+                button([200.0, 200.0], true),
+                ViewportEvent::PointerMoved([210.0, 200.0]),
+                button([210.0, 200.0], false),
+                ViewportEvent::PointerMoved([300.0, 200.0]),
             ],
             false,
             true,
@@ -225,18 +226,15 @@ mod tests {
         assert_eq!(output.len(), 2);
     }
     #[test]
-    fn focus_text_and_fractional_scroll_are_isolated() {
+    fn focus_blocking_and_fractional_scroll_are_isolated() {
         let mut state = ViewportInput::default();
-        let key = egui::Event::Key {
-            key: egui::Key::W,
-            physical_key: None,
+        let key = ViewportEvent::Key {
+            key: FlightKey::Forward,
             pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::default(),
         };
         run(
             &mut state,
-            &[button(egui::pos2(200.0, 200.0), true), key.clone()],
+            &[button([200.0, 200.0], true), key],
             false,
             true,
         );
@@ -253,21 +251,13 @@ mod tests {
         let output = run(
             &mut state,
             &[
-                egui::Event::PointerMoved(egui::pos2(200.0, 200.0)),
-                egui::Event::MouseWheel {
-                    unit: egui::MouseWheelUnit::Point,
-                    delta: egui::vec2(0.0, 12.5),
-                    modifiers: egui::Modifiers::default(),
-                    phase: egui::TouchPhase::Move,
-                },
+                ViewportEvent::PointerMoved([200.0, 200.0]),
+                ViewportEvent::Wheel(0.25),
             ],
             false,
             true,
         );
         assert_eq!(output[0].scroll_notches, 0.25);
         assert_eq!(output[0].speed_multiplier, 0.5);
-        println!(
-            "input: fractional points=12.5 notches=0.25; panel/text/focus cancellation verified"
-        );
     }
 }

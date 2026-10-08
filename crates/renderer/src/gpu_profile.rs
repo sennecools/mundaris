@@ -144,25 +144,6 @@ fn scope_decode_status(ticks: &[u64], period_nanoseconds: f32, scope_mask: u16) 
     (has_valid_scope, has_invalid_scope)
 }
 
-/// Selects the fastest explicitly advertised mode for uncapped measurement.
-/// The normal presentation path remains FIFO.
-pub(crate) fn select_present_mode(
-    supported: &[wgpu::PresentMode],
-    uncapped: bool,
-) -> wgpu::PresentMode {
-    if !uncapped {
-        return wgpu::PresentMode::Fifo;
-    }
-    [
-        wgpu::PresentMode::Immediate,
-        wgpu::PresentMode::Mailbox,
-        wgpu::PresentMode::Fifo,
-    ]
-    .into_iter()
-    .find(|mode| supported.contains(mode))
-    .unwrap_or(wgpu::PresentMode::Fifo)
-}
-
 pub(crate) fn decode(ticks: &[u64], period_nanoseconds: f32, scope_mask: u16) -> GpuProfile {
     let duration = |pair: usize| {
         let start = *ticks.get(pair * 2)?;
@@ -515,20 +496,6 @@ mod tests {
             decode(&ticks[..ticks.len() - 1], 1.0, FRAME_SCOPE_BIT).frame,
             None
         );
-    }
-
-    #[test]
-    fn uncapped_presentation_uses_supported_modes_in_priority_order() {
-        use wgpu::PresentMode::{Fifo, Immediate, Mailbox};
-
-        assert_eq!(
-            select_present_mode(&[Fifo, Mailbox, Immediate], true),
-            Immediate
-        );
-        assert_eq!(select_present_mode(&[Fifo, Mailbox], true), Mailbox);
-        assert_eq!(select_present_mode(&[Fifo], true), Fifo);
-        assert_eq!(select_present_mode(&[Immediate, Mailbox], false), Fifo);
-        assert_eq!(select_present_mode(&[], true), Fifo);
     }
 
     #[test]

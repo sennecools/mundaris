@@ -498,7 +498,7 @@ impl DeveloperService {
             let command = self.receipt(
                 "accepted",
                 demo.world().revision(),
-                json!({"source":"performance_lab"}),
+                json!({"source":"studio"}),
             );
             let id = self.sequence;
             match renderer

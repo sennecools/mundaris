@@ -15,14 +15,10 @@ cpu-time = { version = "1.0.0", optional = true }
 mundaris_math = { path = "../math" }
 naga.workspace = true
 glam.workspace = true
-egui.workspace = true
-egui-wgpu.workspace = true
-egui-winit.workspace = true
 pollster.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 wgpu.workspace = true
-winit.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

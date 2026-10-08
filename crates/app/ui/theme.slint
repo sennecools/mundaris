@@ -1,0 +1,52 @@
+// Design tokens for Mundaris Studio (docs/STUDIO_UI.md §6).
+// Every component reads colours, spacing and type sizes from here.
+
+export global Theme {
+    // Surfaces, darkest to lightest elevation.
+    out property <color> surface-0: #0b0e13;
+    out property <color> surface-1: #12161d;
+    out property <color> surface-2: #1a1f28;
+    out property <color> surface-3: #232a35;
+    out property <color> border: #2a313d;
+    out property <color> border-strong: #3a4352;
+
+    out property <color> text-primary: #e6e9ef;
+    out property <color> text-secondary: #9aa3b2;
+    out property <color> text-disabled: #5d6574;
+
+    out property <color> accent: #5b8cff;
+    out property <color> accent-soft: #5b8cff33;
+    out property <color> accent-text: #ffffff;
+
+    out property <color> ok: #4cc38a;
+    out property <color> warn: #f2b84b;
+    out property <color> error: #f2645c;
+    out property <color> info: #63b3ed;
+
+    // Categorical chart palette.
+    out property <color> series-1: #5b8cff;
+    out property <color> series-2: #f2b84b;
+    out property <color> series-3: #4cc38a;
+    out property <color> series-4: #c58af9;
+
+    out property <length> space-1: 4px;
+    out property <length> space-2: 8px;
+    out property <length> space-3: 12px;
+    out property <length> space-4: 16px;
+    out property <length> radius-small: 4px;
+    out property <length> radius: 6px;
+
+    out property <length> font-small: 11px;
+    out property <length> font-ui: 13px;
+    out property <length> font-heading: 15px;
+    out property <length> font-mono: 12px;
+    out property <string> mono-family: "Cascadia Mono";
+
+    // Tone codes shared with Rust: 0 normal, 1 ok, 2 warn, 3 error.
+    public pure function tone-color(tone: int) -> color {
+        if tone == 1 { return root.ok; }
+        if tone == 2 { return root.warn; }
+        if tone == 3 { return root.error; }
+        return root.text-primary;
+    }
+}

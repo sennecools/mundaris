@@ -1,95 +1,64 @@
-//! Presentation adapters share the application preparation and borrowing boundary.
+//! Presentation adapter shared by the application preparation and borrowing
+//! boundary. The scene renders into an offscreen texture; the UI toolkit
+//! presents it, so the host also carries the UI scale factor.
 use super::*;
-pub(super) enum FrameHost<'a> {
-    Native(&'a mut Renderer),
+pub(super) struct FrameHost<'a> {
+    pub renderer: &'a mut Renderer,
+    pub pixels_per_point: f32,
 }
 impl FrameHost<'_> {
     pub fn take_terrain_atlas_bounds(&mut self) -> Vec<mundaris_renderer::AtlasBounds> {
-        match self {
-            Self::Native(r) => r.take_terrain_atlas_bounds(),
-        }
+        self.renderer.take_terrain_atlas_bounds()
     }
     pub fn terrain_atlas_report(&self) -> mundaris_renderer::TerrainAtlasReport {
-        match self {
-            Self::Native(r) => r.terrain_atlas_report(),
-        }
+        self.renderer.terrain_atlas_report()
     }
     pub fn terrain_atlas_layer_limit(&self) -> u32 {
-        match self {
-            Self::Native(r) => r.terrain_atlas_layer_limit(),
-        }
+        self.renderer.terrain_atlas_layer_limit()
     }
     pub fn native_timestamp_sampling(
         &self,
     ) -> Option<crate::developer_snapshot::TimestampSamplingSnapshot> {
-        match self {
-            Self::Native(renderer) => Some(renderer.timestamp_profiling_metrics().into()),
-        }
+        Some(self.renderer.timestamp_profiling_metrics().into())
     }
     pub fn native_render_timings(&self) -> mundaris_renderer::NativeRenderTimings {
-        match self {
-            Self::Native(r) => r.native_render_timings(),
-        }
+        self.renderer.native_render_timings()
     }
     pub fn native_submission_id(&self) -> Option<u64> {
-        match self {
-            Self::Native(r) => match r.last_render_outcome() {
-                mundaris_renderer::RenderOutcome::Submitted { submission_id, .. } => {
-                    Some(submission_id)
-                }
-                _ => None,
-            },
+        match self.renderer.last_render_outcome() {
+            mundaris_renderer::RenderOutcome::Submitted { submission_id, .. } => {
+                Some(submission_id)
+            }
+            _ => None,
         }
     }
     pub fn presentation_mode_label(&self) -> String {
-        match self {
-            Self::Native(r) => format!("{:?}", r.presentation_mode()),
-        }
+        "ui-toolkit".into()
     }
     pub fn request_profile_timing(&mut self) {
         #[cfg(feature = "developer-tools")]
-        match self {
-            Self::Native(renderer) => {
-                renderer.request_developer_gpu_timing();
-            }
-        }
+        self.renderer.request_developer_gpu_timing();
     }
     pub fn pixels_per_point(&self) -> f32 {
-        match self {
-            Self::Native(r) => r.pixels_per_point(),
-        }
+        self.pixels_per_point
     }
     #[cfg(feature = "developer-tools")]
     pub fn deterministic(&self) -> bool {
         false
     }
     pub fn latest_gpu_profile(&self) -> mundaris_renderer::GpuProfile {
-        match self {
-            Self::Native(r) => r.latest_gpu_profile(),
-        }
+        self.renderer.latest_gpu_profile()
     }
     pub fn timestamp_availability(&self) -> mundaris_renderer::TimestampAvailability {
-        match self {
-            Self::Native(r) => r.timestamp_availability(),
-        }
+        self.renderer.timestamp_availability()
     }
     pub fn gpu_source_frame(&self) -> Option<u64> {
-        match self {
-            Self::Native(r) => r.latest_gpu_profile_submission(),
-        }
+        self.renderer.latest_gpu_profile_submission()
     }
-    pub fn render(&mut self, ui: impl FnMut(&egui::Context, &mut egui::Ui)) -> Result<()> {
-        match self {
-            Self::Native(r) => Ok(r.render(ui)?),
-        }
+    pub fn render_empty(&mut self) -> Result<()> {
+        Ok(self.renderer.render_empty()?)
     }
-    pub fn render_celestial(
-        &mut self,
-        frame: &CelestialFrame<'_, '_, '_>,
-        ui: impl FnMut(&egui::Context, &mut egui::Ui),
-    ) -> Result<()> {
-        match self {
-            Self::Native(r) => Ok(r.render_celestial(frame, ui)?),
-        }
+    pub fn render_celestial(&mut self, frame: &CelestialFrame<'_, '_, '_>) -> Result<()> {
+        Ok(self.renderer.render_celestial(frame)?)
     }
 }

@@ -17,9 +17,6 @@ publish = false
 [workspace.dependencies]
 anyhow = "1.0"
 criterion = { version = "0.8.2", default-features = false }
-egui = "0.36.2"
-egui-wgpu = "0.36.2"
-egui-winit = { version = "0.36.2", default-features = false, features = ["wayland", "x11"] }
 glam = "0.30"
 naga = { version = "30", features = ["wgsl-in"] }
 pollster = "0.4"
@@ -30,10 +27,11 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wgpu = "30"
-winit = "0.30"
 slint = { version = "=1.18.1", default-features = false, features = ["std", "compat-1-2", "accessibility", "backend-winit", "renderer-femtovg-wgpu", "unstable-wgpu-30"] }
 slint-build = "=1.18.1"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# Library crates also `#![forbid(unsafe_code)]` at their roots; the app binary
+# denies it because Slint-generated UI code allows it locally.
+unsafe_code = "deny"
 unused_must_use = "deny"

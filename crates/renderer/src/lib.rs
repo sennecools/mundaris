@@ -1,6 +1,7 @@
-//! Native GPU and editor-UI infrastructure for Mundaris.
+//! Native GPU rendering for Mundaris.
 //!
-//! This crate owns the presentation surface and its disposable frame resources.
+//! This crate renders the scene into an offscreen texture that the application
+//! presents inside its UI, and owns the disposable frame resources.
 //! It does not own authoritative world or simulation state.
 
 #![forbid(unsafe_code)]
@@ -36,37 +37,19 @@ pub use terrain_atlas::{
 };
 pub use view::*;
 
-use std::sync::Arc;
+use tracing::info;
 
-use egui_wgpu::ScreenDescriptor;
-use egui_winit::State as EguiWinitState;
-use tracing::{info, warn};
-
-use winit::{event::WindowEvent, window::Window};
-
-/// Failures that can occur while preparing or presenting a native renderer.
+/// Failures that can occur while creating the GPU context or rendering a frame.
 #[derive(Debug, thiserror::Error)]
 pub enum RendererError {
     #[error(transparent)]
     Preparation(#[from] RenderPreparationError),
-    /// The window surface could not be created.
-    #[error("creating the window presentation surface: {0}")]
-    CreateSurface(#[from] wgpu::CreateSurfaceError),
     /// No compatible GPU adapter was available.
     #[error("requesting a compatible GPU adapter: {0}")]
     RequestAdapter(#[from] wgpu::RequestAdapterError),
     /// The GPU rejected the requested device configuration.
     #[error("requesting a GPU device: {0}")]
     RequestDevice(#[from] wgpu::RequestDeviceError),
-    /// The adapter does not expose any compatible presentation format.
-    #[error("the selected adapter exposes no surface formats")]
-    NoSurfaceFormats,
-    /// The adapter does not expose any compatible alpha mode.
-    #[error("the selected adapter exposes no surface alpha modes")]
-    NoSurfaceAlphaModes,
-    /// The GPU ran out of memory while acquiring a presentation frame.
-    #[error("GPU ran out of memory while acquiring a frame")]
-    OutOfMemory,
     #[error("renderer submission identity space is exhausted")]
     SubmissionIdExhausted,
 }
@@ -76,11 +59,6 @@ pub enum RenderSkipReason {
     NotRenderedYet,
     Suspended,
     GpuPollFailed,
-    SurfaceLost,
-    SurfaceOutdated,
-    SurfaceTimeout,
-    SurfaceOther,
-    OutOfMemory,
     PreparationFailed,
     SubmissionIdExhausted,
 }
@@ -100,33 +78,129 @@ impl Default for RenderOutcome {
     }
 }
 
-/// Nonoverlapping CPU wall scopes for native rendering; scene encoding includes
-/// resident preparation. Submission IDs associate these scopes with GPU samples.
+/// Nonoverlapping CPU wall scopes for scene rendering. Submission IDs associate
+/// these scopes with GPU samples. UI composition and presentation belong to the
+/// application's UI toolkit and are not included.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct NativeRenderTimings {
     pub poll_ms: f64,
-    pub acquire_ms: f64,
-    pub ui_prepare_ms: f64,
-    /// Includes resident preparation and native scene command encoding.
     pub scene_encode_ms: f64,
-    pub ui_encode_ms: f64,
     pub submit_ms: f64,
-    pub present_ms: f64,
     pub total_ms: f64,
 }
 
-/// Owns the native presentation surface, GPU device, and minimal egui integration.
+/// One GPU instance, adapter, device and queue shared by the scene renderer and
+/// the application's UI toolkit. All handles are cheap clones of the same objects.
+#[derive(Clone)]
+pub struct GpuContext {
+    pub instance: wgpu::Instance,
+    pub adapter: wgpu::Adapter,
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    timestamp_availability: TimestampAvailability,
+}
+
+impl GpuContext {
+    /// Creates the high-performance device with the limits and features the
+    /// scene renderer needs (texture-array layers for the terrain atlas,
+    /// timestamp queries when available).
+    pub fn new() -> Result<Self, RendererError> {
+        pollster::block_on(Self::new_async())
+    }
+
+    async fn new_async() -> Result<Self, RendererError> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+                apply_limit_buckets: false,
+            })
+            .await?;
+        let adapter_info = adapter.get_info();
+        let requested_features = gpu_profile::available_features(&adapter);
+        let timestamp_availability = gpu_profile::availability(requested_features);
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("Mundaris device"),
+                required_features: requested_features,
+                // The terrain atlas needs more texture-array layers than the
+                // portable default; request what the adapter offers, capped.
+                required_limits: wgpu::Limits {
+                    max_texture_array_layers: adapter.limits().max_texture_array_layers.min(2048),
+                    ..wgpu::Limits::default()
+                },
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                memory_hints: wgpu::MemoryHints::default(),
+                trace: wgpu::Trace::Off,
+            })
+            .await?;
+        info!(
+            adapter = %adapter_info.name,
+            backend = ?adapter_info.backend,
+            "GPU adapter and device initialized"
+        );
+        Ok(Self {
+            instance,
+            adapter,
+            device,
+            queue,
+            timestamp_availability,
+        })
+    }
+}
+
+/// Colour format of the scene texture handed to the UI. The scene is rendered
+/// through an sRGB view so stored bytes are display-encoded.
+pub const SCENE_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+const SCENE_RENDER_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+
+struct SceneTarget {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    width: u32,
+    height: u32,
+}
+
+impl SceneTarget {
+    fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Scene viewport colour"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: SCENE_TEXTURE_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[SCENE_RENDER_FORMAT],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("Scene viewport sRGB render view"),
+            format: Some(SCENE_RENDER_FORMAT),
+            ..Default::default()
+        });
+        Self {
+            texture,
+            view,
+            width,
+            height,
+        }
+    }
+}
+
+/// Renders the scene into an offscreen viewport texture. Presentation, window
+/// ownership and UI belong to the application.
 pub struct Renderer {
-    _instance: wgpu::Instance,
-    surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    surface_config: wgpu::SurfaceConfiguration,
-    egui_context: egui::Context,
-    egui_state: EguiWinitState,
-    egui_renderer: egui_wgpu::Renderer,
-    window: Arc<Window>,
-    suspended: bool,
+    target: Option<SceneTarget>,
     debug: Option<debug::DebugRenderer>,
     celestial: Option<celestial::CelestialRenderer>,
     timestamp_availability: TimestampAvailability,
@@ -135,29 +209,42 @@ pub struct Renderer {
     submission_id: u64,
     native_render_timings: NativeRenderTimings,
     #[cfg(feature = "developer-tools")]
-    surface_copy_src_supported: bool,
-    #[cfg(feature = "developer-tools")]
     native_capture: native_capture::NativeCapture,
     #[cfg(feature = "developer-tools")]
     developer_timestamp_gate: gpu_profile::DeveloperTimestampGate,
 }
 
 impl Renderer {
-    /// CPU wall scopes for the latest submitted native frame; GPU times are separate.
+    pub fn new(context: &GpuContext) -> Self {
+        #[cfg(feature = "developer-tools")]
+        let adapter_info = context.adapter.get_info();
+        Self {
+            device: context.device.clone(),
+            queue: context.queue.clone(),
+            target: None,
+            debug: None,
+            celestial: None,
+            timestamp_availability: context.timestamp_availability,
+            timestamp_slot: gpu_profile::AsyncTimestampSlot::new(&context.device),
+            last_render_outcome: RenderOutcome::default(),
+            submission_id: 0,
+            native_render_timings: NativeRenderTimings::default(),
+            #[cfg(feature = "developer-tools")]
+            native_capture: native_capture::NativeCapture::new(
+                adapter_info.name,
+                adapter_info.backend,
+            ),
+            #[cfg(feature = "developer-tools")]
+            developer_timestamp_gate: gpu_profile::DeveloperTimestampGate::default(),
+        }
+    }
+
+    /// CPU wall scopes for the latest submitted scene frame; GPU times are separate.
     pub fn native_render_timings(&self) -> NativeRenderTimings {
         self.native_render_timings
     }
 
-    /// Effective surface configuration, including developer measurement overrides.
-    pub fn presentation_mode(&self) -> wgpu::PresentMode {
-        self.surface_config.present_mode
-    }
-
-    pub fn pixels_per_point(&self) -> f32 {
-        self.egui_context.pixels_per_point()
-    }
-
-    /// Outcome of the most recent render wrapper call.
+    /// Outcome of the most recent render call.
     pub fn last_render_outcome(&self) -> RenderOutcome {
         self.last_render_outcome
     }
@@ -233,129 +320,17 @@ impl Renderer {
             (report.catalogue_upload_count > 0).then_some(report)
         })
     }
-    /// Creates a surface and GPU device for the supplied native window.
-    pub fn new(window: Arc<Window>) -> Result<Self, RendererError> {
-        pollster::block_on(Self::new_async(window))
+
+    /// The scene texture of the latest render, in [`SCENE_TEXTURE_FORMAT`].
+    pub fn scene_texture(&self) -> Option<&wgpu::Texture> {
+        self.target.as_ref().map(|target| &target.texture)
     }
 
-    async fn new_async(window: Arc<Window>) -> Result<Self, RendererError> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let surface = instance.create_surface(Arc::clone(&window))?;
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                force_fallback_adapter: false,
-                compatible_surface: Some(&surface),
-                apply_limit_buckets: false,
-            })
-            .await?;
-        let adapter_info = adapter.get_info();
-        let requested_features = gpu_profile::available_features(&adapter);
-        let timestamp_availability = gpu_profile::availability(requested_features);
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("Mundaris device"),
-                required_features: requested_features,
-                // The terrain atlas needs more texture-array layers than the
-                // portable default; request what the adapter offers, capped.
-                required_limits: wgpu::Limits {
-                    max_texture_array_layers: adapter.limits().max_texture_array_layers.min(2048),
-                    ..wgpu::Limits::default()
-                },
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                memory_hints: wgpu::MemoryHints::default(),
-                trace: wgpu::Trace::Off,
-            })
-            .await?;
-
-        let surface_capabilities = surface.get_capabilities(&adapter);
-        #[cfg(feature = "developer-tools")]
-        let surface_copy_src_supported = surface_capabilities
-            .usages
-            .contains(wgpu::TextureUsages::COPY_SRC);
-        let format = surface_capabilities
-            .formats
-            .iter()
-            .copied()
-            .find(|format| format.is_srgb())
-            .ok_or(RendererError::NoSurfaceFormats)?;
-        let alpha_mode = surface_capabilities
-            .alpha_modes
-            .first()
-            .copied()
-            .ok_or(RendererError::NoSurfaceAlphaModes)?;
-        let uncapped = cfg!(feature = "developer-tools")
-            && std::env::var("MUNDARIS_UNCAPPED").is_ok_and(|value| value == "1");
-        let present_mode =
-            gpu_profile::select_present_mode(&surface_capabilities.present_modes, uncapped);
-        let desired_maximum_frame_latency = 2;
-        let window_size = window.inner_size();
-        let suspended = window_size.width == 0 || window_size.height == 0;
-        let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            width: window_size.width.max(1),
-            height: window_size.height.max(1),
-            present_mode,
-            desired_maximum_frame_latency,
-            alpha_mode,
-            view_formats: vec![],
-            color_space: wgpu::SurfaceColorSpace::Auto,
-        };
-        if !suspended {
-            surface.configure(&device, &surface_config);
-        }
-
-        let egui_context = egui::Context::default();
-        let egui_state = EguiWinitState::new(
-            egui_context.clone(),
-            egui::ViewportId::ROOT,
-            window.as_ref(),
-            Some(window.scale_factor() as f32),
-            window.theme(),
-            Some(device.limits().max_texture_dimension_2d as usize),
-        );
-        let egui_renderer =
-            egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
-
-        info!(
-            adapter = %adapter_info.name,
-            backend = ?adapter_info.backend,
-            supported_present_modes = ?surface_capabilities.present_modes,
-            selected_present_mode = ?present_mode,
-            desired_maximum_frame_latency,
-            "GPU adapter and presentation initialized"
-        );
-
-        let timestamp_slot = gpu_profile::AsyncTimestampSlot::new(&device);
-        Ok(Self {
-            _instance: instance,
-            surface,
-            device,
-            queue,
-            surface_config,
-            egui_context,
-            egui_state,
-            egui_renderer,
-            window,
-            suspended,
-            debug: None,
-            celestial: None,
-            timestamp_availability,
-            timestamp_slot,
-            last_render_outcome: RenderOutcome::default(),
-            submission_id: 0,
-            native_render_timings: NativeRenderTimings::default(),
-            #[cfg(feature = "developer-tools")]
-            surface_copy_src_supported,
-            #[cfg(feature = "developer-tools")]
-            native_capture: native_capture::NativeCapture::new(
-                adapter_info.name,
-                adapter_info.backend,
-            ),
-            #[cfg(feature = "developer-tools")]
-            developer_timestamp_gate: gpu_profile::DeveloperTimestampGate::default(),
-        })
+    /// Current scene viewport size in physical pixels, if allocated.
+    pub fn scene_size(&self) -> Option<[u32; 2]> {
+        self.target
+            .as_ref()
+            .map(|target| [target.width, target.height])
     }
 
     #[cfg(feature = "developer-tools")]
@@ -363,13 +338,7 @@ impl Renderer {
         if self.native_capture.is_enabled() {
             return Ok(());
         }
-        self.native_capture
-            .enable(self.surface_copy_src_supported, self.surface_config.format)?;
-        self.surface_config.usage |= wgpu::TextureUsages::COPY_SRC;
-        if !self.suspended {
-            self.surface.configure(&self.device, &self.surface_config);
-        }
-        Ok(())
+        self.native_capture.enable(true, SCENE_TEXTURE_FORMAT)
     }
 
     #[cfg(feature = "developer-tools")]
@@ -392,35 +361,25 @@ impl Renderer {
         self.native_capture.cancel();
     }
 
-    /// Passes native window input to egui and reports whether it needs a repaint.
-    pub fn on_window_event(&mut self, event: &WindowEvent) -> bool {
-        self.egui_state
-            .on_window_event(self.window.as_ref(), event)
-            .repaint
-    }
-
-    /// Updates presentation dimensions, deferring configuration while minimized.
+    /// Sizes the scene texture to the viewport, in physical pixels. A zero size
+    /// suspends rendering. A new texture is allocated only when the size changes.
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
-            self.suspended = true;
+            self.target = None;
             #[cfg(feature = "developer-tools")]
             self.native_capture.resized();
             return;
         }
-
-        let size_changed =
-            self.surface_config.width != width || self.surface_config.height != height;
-        if !size_changed && !self.suspended {
+        if self
+            .target
+            .as_ref()
+            .is_some_and(|target| target.width == width && target.height == height)
+        {
             return;
         }
-        if size_changed {
-            #[cfg(feature = "developer-tools")]
-            self.native_capture.resized();
-        }
-        self.suspended = false;
-        self.surface_config.width = width;
-        self.surface_config.height = height;
-        self.surface.configure(&self.device, &self.surface_config);
+        #[cfg(feature = "developer-tools")]
+        self.native_capture.resized();
+        self.target = Some(SceneTarget::new(&self.device, width, height));
         if let Some(debug) = &mut self.debug {
             debug.resize(&self.device, width, height);
         }
@@ -429,48 +388,39 @@ impl Renderer {
         }
     }
 
-    /// Clears and presents a frame containing UI supplied by the application.
-    pub fn render(
-        &mut self,
-        ui: impl FnMut(&egui::Context, &mut egui::Ui),
-    ) -> Result<(), RendererError> {
-        self.render_frame(None, None, ui)
+    /// Clears the scene texture without drawing scene content.
+    pub fn render_empty(&mut self) -> Result<(), RendererError> {
+        self.render_frame(None, None)
     }
 
-    /// Draws a completely validated, view-bound debug frame before application UI.
-    pub fn render_debug(
-        &mut self,
-        frame: &DebugFrame<'_, '_, '_>,
-        ui: impl FnMut(&egui::Context, &mut egui::Ui),
-    ) -> Result<(), RendererError> {
-        self.render_frame(Some(frame), None, ui)
+    /// Draws a completely validated, view-bound debug frame.
+    pub fn render_debug(&mut self, frame: &DebugFrame<'_, '_, '_>) -> Result<(), RendererError> {
+        self.render_frame(Some(frame), None)
     }
 
+    /// Draws a completely validated celestial frame into the scene texture.
     pub fn render_celestial(
         &mut self,
         frame: &CelestialFrame<'_, '_, '_>,
-        ui: impl FnMut(&egui::Context, &mut egui::Ui),
     ) -> Result<(), RendererError> {
         if let Err(error) = frame.validate() {
             self.last_render_outcome = RenderOutcome::Skipped(RenderSkipReason::PreparationFailed);
             return Err(error.into());
         }
-        self.render_frame(None, Some(frame), ui)
+        self.render_frame(None, Some(frame))
     }
 
     fn render_frame(
         &mut self,
         debug_frame: Option<&DebugFrame<'_, '_, '_>>,
         celestial_frame: Option<&CelestialFrame<'_, '_, '_>>,
-        mut ui: impl FnMut(&egui::Context, &mut egui::Ui),
     ) -> Result<(), RendererError> {
         let render_clock = std::time::Instant::now();
         self.native_render_timings = NativeRenderTimings::default();
-        self.last_render_outcome = RenderOutcome::Skipped(RenderSkipReason::PreparationFailed);
-        if self.suspended {
+        let Some(target) = &self.target else {
             self.last_render_outcome = RenderOutcome::Skipped(RenderSkipReason::Suspended);
             return Ok(());
-        }
+        };
 
         if let Err(error) = self.device.poll(wgpu::PollType::Poll) {
             self.last_render_outcome = RenderOutcome::Skipped(RenderSkipReason::GpuPollFailed);
@@ -508,37 +458,7 @@ impl Renderer {
                 slot.record_busy_skip(self.submission_id.checked_add(1));
             }
         }
-
         self.native_render_timings.poll_ms = render_clock.elapsed().as_secs_f64() * 1000.0;
-        let acquire_clock = std::time::Instant::now();
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.device, &self.surface_config);
-                self.last_render_outcome = RenderOutcome::Skipped(RenderSkipReason::SurfaceLost);
-                return Ok(());
-            }
-            wgpu::CurrentSurfaceTexture::Outdated => {
-                self.surface.configure(&self.device, &self.surface_config);
-                self.last_render_outcome =
-                    RenderOutcome::Skipped(RenderSkipReason::SurfaceOutdated);
-                return Ok(());
-            }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                warn!("timed out acquiring the next presentation frame");
-                self.last_render_outcome = RenderOutcome::Skipped(RenderSkipReason::SurfaceTimeout);
-                return Ok(());
-            }
-            wgpu::CurrentSurfaceTexture::Validation => {
-                warn!("surface could not acquire a frame; retrying on the next redraw");
-                self.last_render_outcome = RenderOutcome::Skipped(RenderSkipReason::SurfaceOther);
-                return Ok(());
-            }
-        };
-
-        self.native_render_timings.acquire_ms = acquire_clock.elapsed().as_secs_f64() * 1000.0;
-        let ui_clock = std::time::Instant::now();
 
         let Some(submission_id) = self.submission_id.checked_add(1) else {
             self.last_render_outcome =
@@ -546,52 +466,17 @@ impl Renderer {
             return Err(RendererError::SubmissionIdExhausted);
         };
 
-        let raw_input = self.egui_state.take_egui_input(self.window.as_ref());
-        let full_output = self.egui_context.run_ui(raw_input, |root_ui| {
-            let context = root_ui.ctx().clone();
-            ui(&context, root_ui);
-        });
-        self.egui_state
-            .handle_platform_output(self.window.as_ref(), full_output.platform_output);
-
-        let paint_jobs = self
-            .egui_context
-            .tessellate(full_output.shapes, full_output.pixels_per_point);
-        for (texture_id, image_deltas) in &full_output.textures_delta.set {
-            for image_delta in image_deltas {
-                self.egui_renderer.update_texture(
-                    &self.device,
-                    &self.queue,
-                    *texture_id,
-                    image_delta,
-                );
-            }
-        }
-
-        let screen_descriptor = ScreenDescriptor {
-            size_in_pixels: [self.surface_config.width, self.surface_config.height],
-            pixels_per_point: full_output.pixels_per_point,
-        };
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let (width, height) = (target.width, target.height);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Mundaris frame encoder"),
+                label: Some("Mundaris scene encoder"),
             });
         let frame_timing = timestamp_active
             && self
                 .timestamp_slot
                 .as_ref()
                 .is_some_and(|slot| slot.queries.inside_encoders());
-        let extra_command_buffers = self.egui_renderer.update_buffers(
-            &self.device,
-            &self.queue,
-            &mut encoder,
-            &paint_jobs,
-            &screen_descriptor,
-        );
         let frame_start = if frame_timing {
             let mut timing_encoder =
                 self.device
@@ -609,18 +494,38 @@ impl Renderer {
             None
         };
 
-        self.native_render_timings.ui_prepare_ms = ui_clock.elapsed().as_secs_f64() * 1000.0;
         let scene_clock = std::time::Instant::now();
+        if debug_frame.is_none() && celestial_frame.is_none() {
+            // Nothing to draw: clear so the UI never shows stale scene pixels.
+            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Scene clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target.view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.025,
+                            g: 0.035,
+                            b: 0.06,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
         if let Some(frame) = debug_frame {
             let debug = self.debug.get_or_insert_with(|| {
-                debug::DebugRenderer::new(
-                    &self.device,
-                    self.surface_config.format,
-                    self.surface_config.width,
-                    self.surface_config.height,
-                )
+                debug::DebugRenderer::new(&self.device, SCENE_RENDER_FORMAT, width, height)
             });
-            if let Err(error) = debug.draw(&self.device, &self.queue, &mut encoder, &view, frame) {
+            if let Err(error) =
+                debug.draw(&self.device, &self.queue, &mut encoder, &target.view, frame)
+            {
                 self.last_render_outcome =
                     RenderOutcome::Skipped(RenderSkipReason::PreparationFailed);
                 return Err(error.into());
@@ -632,16 +537,16 @@ impl Renderer {
                 celestial::CelestialRenderer::new(
                     &self.device,
                     &self.queue,
-                    self.surface_config.format,
-                    self.surface_config.width,
-                    self.surface_config.height,
+                    SCENE_RENDER_FORMAT,
+                    width,
+                    height,
                 )
             });
             let draw_result = celestial.draw(
                 &self.device,
                 &self.queue,
                 &mut encoder,
-                &view,
+                &target.view,
                 frame,
                 timestamp_active
                     .then(|| self.timestamp_slot.as_ref().map(|slot| &slot.queries))
@@ -656,50 +561,16 @@ impl Renderer {
                 }
             }
         }
-
         self.native_render_timings.scene_encode_ms = scene_clock.elapsed().as_secs_f64() * 1000.0;
-        let ui_encode_clock = std::time::Instant::now();
-        {
-            let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Mundaris frame clear and editor UI"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: if debug_frame.is_some() || celestial_frame.is_some() {
-                            wgpu::LoadOp::Load
-                        } else {
-                            wgpu::LoadOp::Clear(wgpu::Color {
-                                r: 0.025,
-                                g: 0.035,
-                                b: 0.06,
-                                a: 1.0,
-                            })
-                        },
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            self.egui_renderer.render(
-                &mut render_pass.forget_lifetime(),
-                &paint_jobs,
-                &screen_descriptor,
-            );
-        }
 
         #[cfg(feature = "developer-tools")]
         self.native_capture.encode_copy(
             &self.device,
             &mut encoder,
-            &frame.texture,
-            self.surface_config.format,
-            self.surface_config.width,
-            self.surface_config.height,
+            &target.texture,
+            SCENE_TEXTURE_FORMAT,
+            width,
+            height,
         );
 
         if frame_timing && let Some(slot) = &self.timestamp_slot {
@@ -709,18 +580,12 @@ impl Renderer {
             );
             scope_mask |= gpu_profile::FRAME_SCOPE_BIT;
         }
-
         if timestamp_active && let Some(slot) = &self.timestamp_slot {
             slot.resolve(&mut encoder);
         }
-        self.native_render_timings.ui_encode_ms = ui_encode_clock.elapsed().as_secs_f64() * 1000.0;
         let submit_clock = std::time::Instant::now();
-        self.queue.submit(
-            frame_start
-                .into_iter()
-                .chain(extra_command_buffers)
-                .chain([encoder.finish()]),
-        );
+        self.queue
+            .submit(frame_start.into_iter().chain([encoder.finish()]));
         if let Some(celestial) = &mut self.celestial {
             celestial.on_submitted();
         }
@@ -733,21 +598,11 @@ impl Renderer {
             self.developer_timestamp_gate.submitted();
         }
         self.native_render_timings.submit_ms = submit_clock.elapsed().as_secs_f64() * 1000.0;
-        let present_clock = std::time::Instant::now();
-        // Wayland uses this notification to coordinate compositor frame callbacks.
-        self.window.pre_present_notify();
-        self.queue.present(frame);
-        self.native_render_timings.present_ms = present_clock.elapsed().as_secs_f64() * 1000.0;
         self.native_render_timings.total_ms = render_clock.elapsed().as_secs_f64() * 1000.0;
         self.last_render_outcome = RenderOutcome::Submitted {
             submission_id,
             presentation_requested: true,
         };
-
-        for texture_id in &full_output.textures_delta.free {
-            self.egui_renderer.free_texture(texture_id);
-        }
-
         Ok(())
     }
 }

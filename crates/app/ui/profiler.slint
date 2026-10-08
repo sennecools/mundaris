@@ -1,0 +1,308 @@
+// Studio profiler: frame strip, per-frame CPU timeline, hot spans and GPU passes.
+import { ScrollView } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { Stat, ToolButton, SectionHeader, StatRow } from "widgets.slint";
+
+export struct FrameBar {
+    // Interval height relative to the strip (0..1).
+    height: float,
+    // Engine CPU share of the bar (0..1 of strip height).
+    cpu: float,
+    // 0 within budget, 2 over 16.7 ms, 3 over 33.3 ms.
+    tone: int,
+    selected: bool,
+}
+
+export struct LaneRow {
+    name: string,
+    first-row: int,
+    rows: int,
+}
+
+export struct SpanBox {
+    // Position and width relative to the frame window (0..1).
+    x: float,
+    width: float,
+    row: int,
+    name: string,
+    color: int,
+    selected: bool,
+}
+
+export struct Tick {
+    x: float,
+    text: string,
+}
+
+export struct HotSpan {
+    name: string,
+    last: string,
+    p50: string,
+    p95: string,
+    max: string,
+}
+
+export struct ProfilerData {
+    enabled: bool,
+    frozen: bool,
+    capturing: bool,
+    following: bool,
+    bars: [FrameBar],
+    budget: float,
+    lanes: [LaneRow],
+    spans: [SpanBox],
+    rows: int,
+    ticks: [Tick],
+    timeline-title: string,
+    empty-hint: string,
+    frame-stats: [Stat],
+    span-detail: [Stat],
+    hot: [HotSpan],
+    gpu-stats: [Stat],
+    export-status: string,
+}
+
+global Palette {
+    out property <[color]> spans: [#5b8cff, #4cc38a, #f2b84b, #c58af9, #63b3ed, #f28c6b, #9bd16b, #e07ab8];
+}
+
+component FrameStrip inherits Rectangle {
+    in property <[FrameBar]> bars;
+    in property <float> budget;
+    callback select(int);
+
+    background: Theme.surface-0;
+    border-radius: Theme.radius-small;
+    border-width: 1px;
+    border-color: Theme.border;
+    clip: true;
+
+    property <length> bar-width: self.width / max(1, root.bars.length);
+    for bar[index] in root.bars: Rectangle {
+        x: index * root.bar-width;
+        width: max(1px, root.bar-width - 1px);
+        height: root.height;
+        Rectangle {
+            y: parent.height * (1 - bar.height);
+            height: parent.height * bar.height;
+            background: bar.selected ? Theme.text-primary
+                : bar.tone == 3 ? Theme.error
+                : bar.tone == 2 ? Theme.warn : Theme.series-1;
+            opacity: bar.selected ? 1 : 0.75;
+        }
+        Rectangle {
+            y: parent.height * (1 - bar.cpu);
+            height: parent.height * bar.cpu;
+            background: Theme.series-3;
+            opacity: 0.85;
+        }
+        TouchArea {
+            clicked => { root.select(index); }
+        }
+    }
+    Rectangle {
+        y: root.height * (1 - root.budget);
+        height: 1px;
+        background: Theme.warn;
+        opacity: 0.6;
+    }
+}
+
+component Timeline inherits Rectangle {
+    in property <[LaneRow]> lanes;
+    in property <[SpanBox]> spans;
+    in property <int> rows;
+    in property <[Tick]> ticks;
+    in property <string> empty-hint;
+    callback select-span(int);
+
+    property <length> row-height: 18px;
+    property <length> label-width: 120px;
+    property <length> axis-height: 18px;
+
+    background: Theme.surface-0;
+    border-radius: Theme.radius-small;
+    border-width: 1px;
+    border-color: Theme.border;
+    clip: true;
+
+    if root.spans.length == 0: Text {
+        text: root.empty-hint;
+        color: Theme.text-disabled;
+        font-size: Theme.font-ui;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        wrap: word-wrap;
+    }
+
+    // Lane backgrounds and names.
+    for lane[index] in root.lanes: Rectangle {
+        x: 0;
+        y: root.axis-height + lane.first-row * root.row-height;
+        width: root.width;
+        height: lane.rows * root.row-height;
+        background: mod(index, 2) == 0 ? Theme.surface-1 : Theme.surface-0;
+        Text {
+            x: Theme.space-2;
+            width: root.label-width - Theme.space-2;
+            height: root.row-height;
+            text: lane.name;
+            font-size: Theme.font-small;
+            color: Theme.text-secondary;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+
+    // Time axis.
+    for tick in root.ticks: Rectangle {
+        x: root.label-width + tick.x * (root.width - root.label-width);
+        y: 0;
+        width: 1px;
+        height: root.height;
+        background: Theme.border;
+        Text {
+            x: 3px;
+            y: 2px;
+            text: tick.text;
+            font-size: Theme.font-small;
+            color: Theme.text-disabled;
+        }
+    }
+
+    for span[index] in root.spans: Rectangle {
+        x: root.label-width + span.x * (root.width - root.label-width);
+        y: root.axis-height + span.row * root.row-height + 1px;
+        width: max(1px, span.width * (root.width - root.label-width));
+        height: root.row-height - 2px;
+        border-radius: 2px;
+        background: Palette.spans[span.color];
+        opacity: span.selected ? 1 : 0.82;
+        border-width: span.selected ? 1px : 0px;
+        border-color: Theme.text-primary;
+        if self.width > 36px: Text {
+            x: 4px;
+            width: parent.width - 6px;
+            text: span.name;
+            font-size: Theme.font-small;
+            color: #0b0e13;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        TouchArea {
+            clicked => { root.select-span(index); }
+        }
+    }
+}
+
+export component Profiler inherits Rectangle {
+    in property <ProfilerData> data;
+    callback set-enabled(bool);
+    callback set-frozen(bool);
+    callback export();
+    callback capture();
+    callback select-frame(int);
+    callback follow-latest();
+    callback select-span(int);
+
+    background: Theme.surface-1;
+    HorizontalLayout {
+        padding: Theme.space-3;
+        spacing: Theme.space-3;
+        VerticalLayout {
+            horizontal-stretch: 1;
+            spacing: Theme.space-2;
+            HorizontalLayout {
+                spacing: Theme.space-1;
+                ToolButton {
+                    text: root.data.enabled ? "CPU spans on" : "CPU spans off";
+                    active: root.data.enabled;
+                    clicked => { root.set-enabled(!root.data.enabled); }
+                }
+                ToolButton {
+                    text: root.data.frozen ? "Frozen" : "Freeze";
+                    active: root.data.frozen;
+                    clicked => { root.set-frozen(!root.data.frozen); }
+                }
+                ToolButton {
+                    text: "Latest frame";
+                    active: root.data.following;
+                    clicked => { root.follow-latest(); }
+                }
+                ToolButton {
+                    text: root.data.capturing ? "Stop bad-frame capture" : "Capture bad frames";
+                    active: root.data.capturing;
+                    clicked => { root.capture(); }
+                }
+                ToolButton {
+                    text: "Export trace";
+                    clicked => { root.export(); }
+                }
+                Text {
+                    text: root.data.export-status;
+                    font-size: Theme.font-small;
+                    color: Theme.text-disabled;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    // Unbounded so this row never caps the window width.
+                    horizontal-stretch: 1;
+                    max-width: 100000px;
+                }
+            }
+            SectionHeader {
+                text: "FRAMES";
+                detail: "interval (bar) · engine CPU (green) · 16.7 ms line · click to inspect";
+            }
+            FrameStrip {
+                height: 56px;
+                bars: root.data.bars;
+                budget: root.data.budget;
+                select(index) => { root.select-frame(index); }
+            }
+            SectionHeader { text: "CPU TIMELINE"; detail: root.data.timeline-title; }
+            Timeline {
+                vertical-stretch: 1;
+                lanes: root.data.lanes;
+                spans: root.data.spans;
+                rows: root.data.rows;
+                ticks: root.data.ticks;
+                empty-hint: root.data.empty-hint;
+                select-span(index) => { root.select-span(index); }
+            }
+        }
+        ScrollView {
+            width: 330px;
+            VerticalLayout {
+                spacing: Theme.space-1;
+                alignment: start;
+                SectionHeader { text: "FRAME"; }
+                for stat in root.data.frame-stats: StatRow { stat: stat; }
+                if root.data.span-detail.length > 0: SectionHeader { text: "SELECTED SPAN"; }
+                for stat in root.data.span-detail: StatRow { stat: stat; }
+                SectionHeader { text: "GPU PASSES"; }
+                for stat in root.data.gpu-stats: StatRow { stat: stat; }
+                SectionHeader { text: "HOT SPANS"; detail: "last · p50 · p95 · max (ms)"; }
+                for row in root.data.hot: HorizontalLayout {
+                    height: 18px;
+                    spacing: Theme.space-1;
+                    Text {
+                        text: row.name;
+                        font-size: Theme.font-small;
+                        color: Theme.text-secondary;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    for value in [row.last, row.p50, row.p95, row.max]: Text {
+                        width: 40px;
+                        text: value;
+                        font-size: Theme.font-small;
+                        font-family: Theme.mono-family;
+                        color: Theme.text-primary;
+                        horizontal-alignment: right;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+    }
+}

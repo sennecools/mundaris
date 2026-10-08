@@ -76,28 +76,16 @@ impl GravityOrbitsDemo {
             DevCommand::Profiler {
                 enabled,
                 freeze,
-                view,
-                frame,
-                event,
                 export,
-                zoom,
-                pan,
-                fill_window,
             } => {
                 self.controls
-                    .performance_lab
+                    .profiler
                     .configure(
                         self.developer_snapshot.as_ref(),
-                        crate::performance_lab::ProfilerControls {
+                        crate::profiler::ProfilerControls {
                             enabled: *enabled,
                             freeze: *freeze,
-                            view: view.as_deref(),
-                            frame: *frame,
-                            event: *event,
                             export: *export,
-                            zoom: *zoom,
-                            pan: *pan,
-                            fill_window: *fill_window,
                         },
                     )
                     .map_err(|error| anyhow::anyhow!(error))?;

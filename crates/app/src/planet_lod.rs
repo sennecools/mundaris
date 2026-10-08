@@ -473,6 +473,7 @@ impl PlanetLod {
                 })
                 .collect();
             let selection = {
+                let _span = crate::engine_profile::span("Atlas selection");
                 let measured = &lod.bounds;
                 let bound = lod.height_bound_m;
                 select::select(
@@ -498,6 +499,7 @@ impl PlanetLod {
                 )
             };
 
+            let _requests_span = crate::engine_profile::span("Atlas requests and draw list");
             // Requests: base levels first, then missing selected nodes coarse-first.
             let mut wanted: Vec<(u8, f64, CubePatchAddress)> = Vec::new();
             if !self.hold {

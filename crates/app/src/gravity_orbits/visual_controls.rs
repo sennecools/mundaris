@@ -43,18 +43,3 @@ impl VisualCommand {
         Ok(())
     }
 }
-pub(super) fn checkbox(
-    ui: &mut egui::Ui,
-    controls: &mut Controls,
-    layer: Layer,
-    label: &str,
-) -> egui::Response {
-    let mut value = *layer.flag(controls);
-    let response = ui.checkbox(&mut value, label);
-    if response.changed() {
-        controls
-            .pending
-            .push_back(Command::Visual(VisualCommand::Layer(layer, value)));
-    }
-    response
-}

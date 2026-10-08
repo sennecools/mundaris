@@ -61,19 +61,7 @@ pub enum DevCommand {
         #[serde(default)]
         freeze: Option<bool>,
         #[serde(default)]
-        view: Option<String>,
-        #[serde(default)]
-        frame: Option<u64>,
-        #[serde(default)]
-        event: Option<u64>,
-        #[serde(default)]
         export: bool,
-        #[serde(default)]
-        zoom: Option<f64>,
-        #[serde(default)]
-        pan: Option<f64>,
-        #[serde(default)]
-        fill_window: Option<bool>,
     },
     Select {
         body: String,

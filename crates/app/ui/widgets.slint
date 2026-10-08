@@ -1,0 +1,150 @@
+// Small reusable controls in the Studio visual language.
+import { Theme } from "theme.slint";
+
+// One label/value row; values use the mono face so numbers do not jitter.
+export struct Stat {
+    label: string,
+    value: string,
+    // 0 normal, 1 ok, 2 warn, 3 error (Theme.tone-color).
+    tone: int,
+}
+
+export component ToolButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    in property <bool> enabled: true;
+    in property <string> tooltip;
+    callback clicked();
+
+    height: 28px;
+    min-width: 28px;
+    horizontal-stretch: 0;
+    border-radius: Theme.radius-small;
+    background: !root.enabled ? transparent
+        : root.active ? Theme.accent-soft
+        : touch.pressed ? Theme.surface-0
+        : touch.has-hover ? Theme.surface-3 : Theme.surface-2;
+    border-width: 1px;
+    border-color: root.active ? Theme.accent
+        : touch.has-hover ? Theme.border-strong : Theme.border;
+
+    HorizontalLayout {
+        padding-left: Theme.space-2;
+        padding-right: Theme.space-2;
+        Text {
+            text: root.text;
+            color: !root.enabled ? Theme.text-disabled
+                : Theme.text-primary;
+            font-size: Theme.font-ui;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+        }
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+// Mutually exclusive options shown inline (camera mode, rates).
+export component Segmented inherits Rectangle {
+    in property <[string]> options;
+    in property <int> selected;
+    callback chosen(int);
+
+    height: 28px;
+    border-radius: Theme.radius-small;
+    background: Theme.surface-0;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    HorizontalLayout {
+        padding: 2px;
+        spacing: 2px;
+        for option[index] in root.options: Rectangle {
+            border-radius: 3px;
+            background: index == root.selected ? Theme.surface-3
+                : seg-touch.has-hover ? Theme.surface-2 : transparent;
+            horizontal-stretch: 0;
+            min-width: seg-text.preferred-width + 2 * Theme.space-2;
+            seg-text := Text {
+                text: option;
+                font-size: Theme.font-ui;
+                color: index == root.selected ? Theme.text-primary : Theme.text-secondary;
+                vertical-alignment: center;
+                horizontal-alignment: center;
+            }
+            seg-touch := TouchArea {
+                clicked => { root.chosen(index); }
+            }
+        }
+    }
+}
+
+export component SectionHeader inherits HorizontalLayout {
+    in property <string> text;
+    in property <string> detail;
+    height: 22px;
+    Text {
+        text: root.text;
+        font-size: Theme.font-small;
+        font-weight: 700;
+        letter-spacing: 0.6px;
+        color: Theme.text-secondary;
+        vertical-alignment: center;
+    }
+    Text {
+        text: root.detail;
+        font-size: Theme.font-small;
+        color: Theme.text-disabled;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+    }
+}
+
+export component StatRow inherits HorizontalLayout {
+    in property <Stat> stat;
+    height: 20px;
+    spacing: Theme.space-2;
+    Text {
+        text: root.stat.label;
+        font-size: Theme.font-ui;
+        color: Theme.text-secondary;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    Text {
+        text: root.stat.value;
+        font-size: Theme.font-mono;
+        font-family: Theme.mono-family;
+        color: Theme.tone-color(root.stat.tone);
+        horizontal-alignment: right;
+        vertical-alignment: center;
+        horizontal-stretch: 0;
+    }
+}
+
+// A titled group of stats with an optional slot for controls.
+export component Card inherits Rectangle {
+    in property <string> title;
+    in property <string> detail;
+    in property <[Stat]> stats;
+
+    background: Theme.surface-1;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    VerticalLayout {
+        padding: Theme.space-3;
+        spacing: Theme.space-1;
+        SectionHeader {
+            text: root.title;
+            detail: root.detail;
+        }
+        for stat in root.stats: StatRow {
+            stat: stat;
+        }
+        @children
+    }
+}

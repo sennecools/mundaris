@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// Version of the JSON contract, independent of engine/world persistence formats.
-pub const SNAPSHOT_SCHEMA_VERSION: u32 = 7;
+pub const SNAPSHOT_SCHEMA_VERSION: u32 = 8;
 /// UI-only advisory ratio. This does not alter admission or the terrain cap.
 pub const MEMORY_NEAR_CAP_RATIO: f64 = 0.95;
 
@@ -221,10 +221,10 @@ impl From<mundaris_renderer::TimestampProfilingMetrics> for TimestampSamplingSna
 /// CPU stages are host elapsed times. GPU regular terrain and fallback are separate.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PerformanceSnapshot {
-    /// Renderer CPU scopes ordered poll, acquire, UI prepare, scene encode,
-    /// UI encode, submit, present, total. Scene encode includes resident preparation.
+    /// Scene renderer CPU scopes ordered poll, scene encode, submit, total.
+    /// UI composition and presentation run in the UI toolkit and are excluded.
     #[serde(default)]
-    pub native_render_cpu_ms: Option<[f64; 8]>,
+    pub native_render_cpu_ms: Option<[f64; 4]>,
     #[serde(default)]
     pub native_submission_id: Option<u64>,
     /// Cumulative nonblocking native timestamp sampling counters, with source IDs.
@@ -250,6 +250,10 @@ pub struct PerformanceSnapshot {
     pub diagnostics_ms: Option<f64>,
     #[serde(default)]
     pub ui_build_cpu_ms: Option<f64>,
+    /// CPU wall time the UI toolkit spent rendering the previous frame
+    /// (between its before- and after-rendering notifications).
+    #[serde(default)]
+    pub ui_render_ms: Option<f64>,
     pub update_ms: Option<f64>,
     pub terrain_update_ms: Option<f64>,
     pub preparation_ms: Option<f64>,
