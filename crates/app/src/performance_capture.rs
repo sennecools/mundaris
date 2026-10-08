@@ -8,14 +8,9 @@ use std::{
     io::{BufWriter, Write},
     path::PathBuf,
     process::Command,
-    sync::{
-        Arc,
-        mpsc::{self, Receiver, SyncSender},
-    },
+    sync::mpsc::{self, SyncSender},
     time::{Duration, Instant},
 };
-
-use crate::terrain_trace::TerrainTrace;
 
 #[cfg(feature = "developer-tools")]
 use sha2::{Digest, Sha256};
@@ -127,8 +122,6 @@ impl ProfileSampler {
 const PRE_FRAMES: usize = 512;
 const POST_FRAMES: usize = 64;
 const MAX_CAPTURES: usize = 4;
-const TRACE_REQUEST_CAPACITY: usize = 1;
-const TRACE_RESULT_CAPACITY: usize = 1;
 const PROFILE_RESULT_TIMEOUT: Duration = Duration::from_millis(1_500);
 
 #[derive(Clone, Copy)]
@@ -169,70 +162,6 @@ fn env_threshold(name: &str, default: f64, maximum: f64) -> f64 {
     parse_threshold(std::env::var(name).ok().as_deref(), default, maximum)
 }
 
-/// At most one deep terrain snapshot is requested or returned at a time.
-/// Snapshot construction, sorting, and JSON conversion all run on this worker.
-#[derive(Default)]
-pub struct TerrainTraceSampler {
-    request: Option<SyncSender<Arc<TerrainTrace>>>,
-    result: Option<Receiver<Result<Value, String>>>,
-}
-
-impl TerrainTraceSampler {
-    /// Start the bounded worker that snapshots and serializes terrain traces.
-    pub fn new() -> Self {
-        let (request_tx, request_rx) =
-            mpsc::sync_channel::<Arc<TerrainTrace>>(TRACE_REQUEST_CAPACITY);
-        let (result_tx, result_rx) =
-            mpsc::sync_channel::<Result<Value, String>>(TRACE_RESULT_CAPACITY);
-        let spawned = std::thread::Builder::new()
-            .name("terrain-trace-snapshot".into())
-            .spawn(move || {
-                while let Ok(trace) = request_rx.recv() {
-                    let _lane = crate::engine_profile::worker_scope_named("Terrain snapshot");
-                    let _span = crate::engine_profile::span("Terrain snapshot serialization");
-                    let preferred = crate::engine_profile::recent_job_ids();
-                    let result = serde_json::to_value(trace.snapshot_for_profile_jobs(&preferred))
-                        .map_err(|error| error.to_string());
-                    if result_tx.send(result).is_err() {
-                        break;
-                    }
-                }
-            });
-        if spawned.is_ok() {
-            Self {
-                request: Some(request_tx),
-                result: Some(result_rx),
-            }
-        } else {
-            Self {
-                request: None,
-                result: None,
-            }
-        }
-    }
-
-    /// Queue one immutable trace handle for background snapshot and JSON work.
-    /// Returns `false` if the worker is unavailable or the bounded slot is busy.
-    pub fn request(&mut self, trace: Arc<TerrainTrace>) -> bool {
-        if self.request.is_none() {
-            *self = Self::new();
-        }
-        self.request
-            .as_ref()
-            .is_some_and(|sender| matches!(sender.try_send(trace), Ok(())))
-    }
-
-    /// Return a completed successful snapshot without waiting for the worker.
-    /// A serialization failure is consumed and reported as unavailable.
-    pub fn poll(&self) -> Option<Value> {
-        self.poll_result().and_then(Result::ok)
-    }
-
-    fn poll_result(&self) -> Option<Result<Value, String>> {
-        self.result.as_ref()?.try_recv().ok()
-    }
-}
-
 #[derive(Clone, Serialize)]
 struct Frame {
     frame: u64,
@@ -262,10 +191,6 @@ struct Bundle {
     profile_error: Option<String>,
     profile_wait_ms: Option<u64>,
     profile_requested_at: Option<Instant>,
-    terrain_trace: Option<Value>,
-    terrain_trace_status: &'static str,
-    terrain_trace_error: Option<String>,
-    terrain_trace_requested_at: Option<Instant>,
     post_remaining: usize,
 }
 
@@ -336,7 +261,6 @@ pub struct PerformanceCapture {
     thresholds: CaptureThresholds,
     convergence: ConvergenceWatch,
     profile_sampler: Option<ProfileSampler>,
-    trace_sampler: Option<TerrainTraceSampler>,
     pub dropped: u64,
 }
 
@@ -362,7 +286,6 @@ impl PerformanceCapture {
             thresholds: CaptureThresholds::from_environment(),
             convergence: ConvergenceWatch::default(),
             profile_sampler: None,
-            trace_sampler: None,
             dropped: 0,
         }
     }
@@ -385,9 +308,6 @@ impl PerformanceCapture {
         self.requested = false;
         self.history.clear();
         if let Some(mut bundle) = self.pending.take() {
-            if bundle.terrain_trace_status == "pending" {
-                bundle.terrain_trace_status = "stopped_pending";
-            }
             if bundle.profile_status == "pending" {
                 bundle.profile_status = "stopped_pending";
                 bundle.profile_wait_ms = bundle
@@ -403,7 +323,6 @@ impl PerformanceCapture {
             }
         }
         self.writer = None;
-        self.trace_sampler = None;
         self.profile_sampler = None;
     }
 
@@ -413,56 +332,27 @@ impl PerformanceCapture {
 
     /// Returns a correlated native screenshot request name at trigger time.
     pub fn observe(&mut self, snapshot: &DeveloperSnapshot) -> Option<String> {
-        self.observe_with_trace(snapshot, None)
-    }
-
-    /// Capture using a shared terrain trace whose deep snapshot is made off-thread.
-    pub fn observe_with_trace(
-        &mut self,
-        snapshot: &DeveloperSnapshot,
-        trace: Option<Arc<TerrainTrace>>,
-    ) -> Option<String> {
         if !self.active {
             return None;
         }
         self.writer.as_ref()?;
-        let resident = snapshot
-            .resident_planetary
-            .as_deref()
-            .or(snapshot.resident_regional.as_ref());
-        let number = |pointer: &str| {
-            resident
-                .and_then(|r| r.pointer(pointer))
-                .and_then(Value::as_f64)
-        };
-        self.poll_trace_result();
-        if let Some(bundle) = &mut self.pending
-            && bundle.terrain_trace_status == "pending"
-            && bundle
-                .terrain_trace_requested_at
-                .is_some_and(|at| at.elapsed() >= PROFILE_RESULT_TIMEOUT)
-        {
-            bundle.terrain_trace_status = "timeout";
-            bundle.terrain_trace_error =
-                Some("terrain trace snapshot exceeded the bounded wait".into());
-            self.trace_sampler = None;
-        }
+        // Atlas terrain reports drawn nodes and completion, not a desired count,
+        // so the convergence-stall trigger stays inactive for it.
         let frame = Frame {
             frame: snapshot.general.frame_number,
             elapsed_ms: self.started.elapsed().as_secs_f64() * 1000.0,
             performance: snapshot.performance.clone(),
-            publication_ms: number("/publication_ms")
-                .or_else(|| number("/publication_pipeline/publication_ms")),
-            terrain_ms: number("/regional_advance_ms").or(snapshot.performance.terrain_update_ms),
-            queue_age_ms: number("/publication_pipeline/publication_backlog_age_ms"),
-            visible_convergence: number("/visible_convergence"),
-            center_convergence: number("/center_screen_convergence"),
-            desired: resident.and_then(|r| r["desired_count"].as_u64()),
-            drawable: resident.and_then(|r| r["drawable_count"].as_u64()),
-            generation: resident.and_then(|r| r["completed_build_count"].as_u64()),
+            publication_ms: None,
+            terrain_ms: snapshot.performance.terrain_update_ms,
+            queue_age_ms: None,
+            visible_convergence: None,
+            center_convergence: None,
+            desired: None,
+            drawable: Some(snapshot.terrain.visible_leaf_count as u64),
+            generation: None,
             upload_bytes: snapshot.performance.upload_bytes,
-            target_quality_reached: resident.and_then(|r| r["target_quality_reached"].as_bool()),
-            quality_pending: resident.and_then(|r| r["quality_pending"].as_bool()),
+            target_quality_reached: snapshot.terrain.settled,
+            quality_pending: snapshot.terrain.quality_pending,
         };
         let now = Instant::now();
         self.poll_profile_result(now);
@@ -518,37 +408,8 @@ impl PerformanceCapture {
             "rendering".into(),
             serde_json::to_value(&snapshot.rendering).unwrap_or(Value::Null),
         );
-        if let Some(resident) = resident.and_then(Value::as_object) {
-            for field in [
-                "publication_pipeline",
-                "desired_count",
-                "drawable_count",
-                "refinement_debt",
-                "visible_convergence",
-                "center_screen_convergence",
-                "configuration",
-                "quality_pending",
-                "target_quality_reached",
-                "useful_detail_reached",
-                "cpu_cached_bytes",
-                "gpu_accounted_bytes",
-                "tile_upload_bytes",
-            ] {
-                if let Some(value) = resident.get(field) {
-                    state.insert(field.into(), value.clone());
-                }
-            }
-        }
-        let mut trace_status = "unavailable";
-        if let Some(trace) = trace {
-            let sampler = self
-                .trace_sampler
-                .get_or_insert_with(TerrainTraceSampler::new);
-            trace_status = if sampler.request(trace) {
-                "pending"
-            } else {
-                "request_failed"
-            };
+        if let Some(atlas) = &snapshot.terrain_atlas {
+            state.insert("terrain_atlas".into(), atlas.clone());
         }
         self.pending = Some(Bundle {
             name: name.clone(),
@@ -563,10 +424,6 @@ impl PerformanceCapture {
             profile_error,
             profile_wait_ms: None,
             profile_requested_at,
-            terrain_trace: None,
-            terrain_trace_status: trace_status,
-            terrain_trace_error: None,
-            terrain_trace_requested_at: (trace_status == "pending").then(Instant::now),
             post_remaining: POST_FRAMES,
         });
         Some(name)
@@ -621,43 +478,11 @@ impl PerformanceCapture {
         }
     }
 
-    fn poll_trace_result(&mut self) {
-        let Some(result) = self
-            .trace_sampler
-            .as_ref()
-            .and_then(TerrainTraceSampler::poll_result)
-        else {
-            return;
-        };
-        let Some(bundle) = self.pending.as_mut() else {
-            return;
-        };
-        match result {
-            Ok(value) => {
-                let enabled = value
-                    .get("enabled")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                bundle.terrain_trace = Some(value);
-                bundle.terrain_trace_status = if enabled {
-                    "ready"
-                } else {
-                    "profiling_disabled"
-                };
-            }
-            Err(error) => {
-                bundle.terrain_trace_error = Some(error);
-                bundle.terrain_trace_status = "serialization_failed";
-            }
-        }
-    }
-
     fn finish_pending_if_ready(&mut self) {
-        let ready = self.pending.as_ref().is_some_and(|bundle| {
-            bundle.post_remaining == 0
-                && bundle.terrain_trace_status != "pending"
-                && bundle.profile_status != "pending"
-        });
+        let ready = self
+            .pending
+            .as_ref()
+            .is_some_and(|bundle| bundle.post_remaining == 0 && bundle.profile_status != "pending");
         if !ready {
             return;
         }
@@ -678,9 +503,6 @@ impl Drop for PerformanceCapture {
     fn drop(&mut self) {
         if let (Some(writer), Some(bundle)) = (&self.writer, self.pending.take()) {
             let mut bundle = bundle;
-            if bundle.terrain_trace_status == "pending" {
-                bundle.terrain_trace_status = "shutdown_pending";
-            }
             if bundle.profile_status == "pending" {
                 bundle.profile_status = "shutdown_pending";
                 bundle.profile_wait_ms = bundle
@@ -760,7 +582,6 @@ fn write_bundle(root: &std::path::Path, bundle: Bundle) -> std::io::Result<()> {
     let output = root.join(&bundle.name);
     fs::create_dir_all(&output)?;
     let identity = collect_identity();
-    let terrain_trace = bundle.terrain_trace.unwrap_or(Value::Null);
     write_json(
         output.join("summary.json"),
         &json!({
@@ -773,8 +594,6 @@ fn write_bundle(root: &std::path::Path, bundle: Bundle) -> std::io::Result<()> {
             "profile_status":bundle.profile_status,
             "profile_error":bundle.profile_error,
             "profile_wait_ms":bundle.profile_wait_ms,
-            "terrain_trace_status":bundle.terrain_trace_status,
-            "terrain_trace_error":bundle.terrain_trace_error,
             "thresholds":{
                 "frame_cpu_ms":env_threshold("MUNDARIS_CAPTURE_FRAME_CPU_MS",100.0,60_000.0),
                 "publication_ms":env_threshold("MUNDARIS_CAPTURE_PUBLICATION_MS",2.0,60_000.0),
@@ -797,28 +616,6 @@ fn write_bundle(root: &std::path::Path, bundle: Bundle) -> std::io::Result<()> {
     }
     frames.flush()?;
     write_json(output.join("resident_state.json"), &bundle.resident)?;
-    write_json(output.join("terrain_trace.json"), &terrain_trace)?;
-    write_json(output.join("terrain_jobs.json"), &terrain_trace["jobs"])?;
-    write_json(
-        output.join("queues.json"),
-        &json!({
-            "queues":terrain_trace["queues"],
-            "block_reasons":terrain_trace["block_reasons"],
-        }),
-    )?;
-    let mut events = BufWriter::new(
-        File::options()
-            .write(true)
-            .create_new(true)
-            .open(output.join("terrain_events.jsonl"))?,
-    );
-    if let Some(rows) = terrain_trace["events"].as_array() {
-        for event in rows {
-            serde_json::to_writer(&mut events, event)?;
-            writeln!(events)?;
-        }
-    }
-    events.flush()?;
     write_json(output.join("spans.json"), &bundle.profile)?;
     crate::profile_export::write_profile_trace(&output.join("timeline.json"), &bundle.profile, None)
 }
@@ -1014,24 +811,6 @@ mod tests {
             start + Duration::from_secs(30),
             Duration::from_secs(10)
         ));
-    }
-
-    #[test]
-    fn terrain_trace_sampler_returns_a_background_snapshot_without_blocking_request() {
-        let mut sampler = TerrainTraceSampler::new();
-        assert!(sampler.request(Arc::new(TerrainTrace::new())));
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            if let Some(snapshot) = sampler.poll() {
-                assert!(snapshot.is_object());
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "terrain trace worker did not finish"
-            );
-            std::thread::sleep(Duration::from_millis(1));
-        }
     }
 
     #[test]

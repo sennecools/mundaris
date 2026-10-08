@@ -11,7 +11,6 @@ surface-profile = ["dep:cpu-time"]
 terrain-capture = []
 
 [dependencies]
-meshopt = "=0.6.2"
 cpu-time = { version = "1.0.0", optional = true }
 mundaris_math = { path = "../math" }
 naga.workspace = true
@@ -36,14 +35,7 @@ harness = false
 name = "celestial_preparation"
 harness = false
 
-[[bench]]
-name = "planet_surface"
-harness = false
 
-[[bench]]
-name = "planet_surface_profile"
-harness = false
-required-features = ["surface-profile"]
 
 [lints]
 workspace = true

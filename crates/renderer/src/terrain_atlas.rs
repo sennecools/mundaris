@@ -24,6 +24,57 @@ pub const ATLAS_BOUNDS_GRID: usize = 4;
 const BOUNDS_WORDS_PER_JOB: usize = 2 * ATLAS_BOUNDS_GRID * ATLAS_BOUNDS_GRID;
 const BOUNDS_BYTES: u64 = (4 * BOUNDS_WORDS_PER_JOB * MAX_ATLAS_JOBS_PER_FRAME) as u64;
 
+/// Terrain visualization drawn by the atlas renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TerrainViewMode {
+    #[default]
+    Lit,
+    Height,
+    Normals,
+    Grid,
+    Level,
+    MorphFade,
+}
+
+impl TerrainViewMode {
+    pub const ALL: [Self; 6] = [
+        Self::Lit,
+        Self::Height,
+        Self::Normals,
+        Self::Grid,
+        Self::Level,
+        Self::MorphFade,
+    ];
+
+    /// Selector consumed by `terrain_atlas.wgsl`.
+    pub fn shader_mode(self) -> u32 {
+        match self {
+            Self::Lit => 0,
+            Self::Height => 1,
+            Self::Normals => 2,
+            Self::Grid => 5,
+            Self::Level => 6,
+            Self::MorphFade => 8,
+        }
+    }
+
+    /// Stable name used by snapshots, commands and the environment.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Lit => "lit",
+            Self::Height => "height",
+            Self::Normals => "normals",
+            Self::Grid => "grid",
+            Self::Level => "level",
+            Self::MorphFade => "morph_fade",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.name() == name)
+    }
+}
+
 /// Representation policy shared by producer, residency and draw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerrainAtlasConfig {

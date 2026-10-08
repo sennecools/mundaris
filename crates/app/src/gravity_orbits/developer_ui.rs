@@ -125,9 +125,9 @@ pub(super) fn left(ui: &mut egui::Ui, controls: &mut Controls, info: &UiInfo<'_>
         }
         if ui
             .add_enabled(
-                info.surfaces
-                    .iter()
-                    .any(|s| s.body() == info.ids[info.selected]),
+                info.system
+                    .body(info.ids[info.selected])
+                    .is_ok_and(|body| body.has_surface()),
                 egui::Button::new("Surface Navigation"),
             )
             .clicked()
@@ -400,139 +400,29 @@ pub(super) fn right(ui: &mut egui::Ui, controls: &mut Controls, info: &UiInfo<'_
     ui.add_space(8.0);
     ui.separator();
     ui.heading("Rendering");
-    let mut natural = controls.terrain_lighting.mode() == TerrainRenderMode::Natural;
-    if ui
-        .checkbox(&mut natural, "Natural terrain")
-        .on_hover_text(
-            "Switch presentation between Natural and Lit, without changing terrain geometry.",
-        )
-        .changed()
-    {
-        controls
-            .pending
-            .push_back(Command::Visual(visual_controls::VisualCommand::RenderMode(
-                if natural {
-                    TerrainRenderMode::Natural
-                } else {
-                    TerrainRenderMode::Lit
-                },
-            )));
-    }
-    ui.collapsing("Diagnostic rendering", |ui| {
-        visual_controls::checkbox(
-            ui,
-            controls,
-            visual_controls::Layer::Borders,
-            "Patch borders",
-        )
-        .on_hover_text("Draw chart patch boundaries, not additional geometry.");
-        visual_controls::checkbox(
-            ui,
-            controls,
-            visual_controls::Layer::LodColors,
-            "LOD colors",
-        )
-        .on_hover_text("Cyclic diagnostic palette, not a whole-screen quality measure.");
-        ui.checkbox(&mut controls.surface_style.face_colors, "Face colors");
-        egui::ComboBox::from_label("Shading")
-            .selected_text(render_mode_name(controls.terrain_lighting.mode()))
-            .show_ui(ui, |ui| {
-                for mode in TerrainRenderMode::ALL {
-                    if ui
-                        .selectable_label(
-                            controls.terrain_lighting.mode() == mode,
-                            render_mode_name(mode),
-                        )
-                        .clicked()
-                    {
-                        controls.pending.push_back(Command::Visual(
-                            visual_controls::VisualCommand::RenderMode(mode),
-                        ));
-                    }
+    visual_controls::checkbox(ui, controls, visual_controls::Layer::Terrain, "Atlas terrain")
+        .on_hover_text("Draw atlas terrain; when off, bodies fall back to reference spheres.");
+    egui::ComboBox::from_label("Terrain view")
+        .selected_text(controls.terrain_view.name())
+        .show_ui(ui, |ui| {
+            for mode in TerrainViewMode::ALL {
+                if ui
+                    .selectable_label(controls.terrain_view == mode, mode.name())
+                    .clicked()
+                {
+                    controls.pending.push_back(Command::Visual(
+                        visual_controls::VisualCommand::RenderMode(mode),
+                    ));
                 }
-            });
-    });
+            }
+        })
+        .response
+        .on_hover_text("Atlas terrain visualization: lit shading or a diagnostic view.");
     ui.add_space(8.0);
     ui.separator();
     ui.heading("Terrain");
     if let Some(s) = info.snapshot {
         ui.strong(&s.terrain.backend);
-        if let Some(r) = &s.resident_planetary {
-            for (label, field) in [
-                ("Desired tiles", "desired_count"),
-                ("CPU tiles", "cpu_cached_tiles"),
-                ("GPU tiles", "gpu_resident_tiles"),
-                ("Drawable tiles", "drawable_count"),
-                ("Fallback tiles", "gpu_fallback_count"),
-                ("Transitions", "active_transitions"),
-                ("Queued jobs", "worker_queued"),
-                ("Generating", "worker_running"),
-                ("Awaiting publication", "completion_backlog"),
-            ] {
-                row(ui, label, r[field].to_string());
-            }
-            row(
-                ui,
-                "Refinement debt",
-                format!("{:.3} px", r["refinement_debt"].as_f64().unwrap_or(0.0)),
-            );
-            row(
-                ui,
-                "Selection CPU",
-                format!(
-                    "{:.3} ms",
-                    r["selection_time_micros"].as_f64().unwrap_or(0.0) / 1000.0
-                ),
-            );
-            row(
-                ui,
-                "Publication CPU",
-                format!("{:.3} ms", r["publication_ms"].as_f64().unwrap_or(0.0)),
-            );
-            row(
-                ui,
-                "GPU prepare CPU",
-                format!("{:.3} ms", r["gpu_preparation_ms"].as_f64().unwrap_or(0.0)),
-            );
-            row(
-                ui,
-                "Content upload",
-                format!(
-                    "{} B",
-                    r["gpu_upload_bytes_per_frame"].as_u64().unwrap_or(0)
-                        + r["boundary_upload_bytes_per_frame"].as_u64().unwrap_or(0)
-                ),
-            );
-            row(
-                ui,
-                "Generation",
-                format!(
-                    "{:.2} tiles/s",
-                    r["generation_throughput_tiles_per_second"]
-                        .as_f64()
-                        .unwrap_or(0.0)
-                ),
-            );
-            row(
-                ui,
-                "CPU geometry",
-                format_bytes(
-                    r["resources"]["total_accounted_cpu_geometry_bytes"]
-                        .as_u64()
-                        .unwrap_or(0),
-                ),
-            );
-            row(
-                ui,
-                "GPU buffers",
-                format_bytes(
-                    r["resources"]["gpu_total_capacity_bytes"]
-                        .as_u64()
-                        .unwrap_or(0),
-                ),
-            );
-            ui.small("Requested buffers and retained payload; excludes driver overhead and worker stacks.");
-        }
         row(ui, "Source leaves", s.terrain.source_leaf_count.to_string());
         row(
             ui,

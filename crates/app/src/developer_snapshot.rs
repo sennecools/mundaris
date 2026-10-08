@@ -3,148 +3,20 @@
 
 use anyhow::{Result, ensure};
 use mundaris_math::FramePose;
-use mundaris_renderer::{CelestialProjection, GpuProfile, planet_surface::TerrainRenderMode};
+use mundaris_renderer::{CelestialProjection, GpuProfile};
 use mundaris_world::{BodyId, CoherentCelestialView};
-use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeMap};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
     celestial_camera::{CameraMode, NavigationDiagnostics},
     motion_session::MotionSnapshot,
-    terrain_population::TerrainPopulation,
 };
 
-use std::{ops::Deref, sync::Arc};
-
-/// Planetary resident telemetry with immutable trace and history shared by
-/// published snapshots. Summary lookups stay allocation-free through `Deref`;
-/// trace and history are merged only when serialized for export/capture.
-#[derive(Debug, Clone)]
-pub struct ResidentDiagnosticSnapshot {
-    summary: Arc<Value>,
-    history: Option<Arc<crate::gravity_orbits::RegionalFrameHistory>>,
-    terrain_trace: Option<Arc<Value>>,
-}
-
-impl ResidentDiagnosticSnapshot {
-    pub(crate) fn new(
-        summary: Value,
-        history: Option<Arc<crate::gravity_orbits::RegionalFrameHistory>>,
-        terrain_trace: Option<Arc<Value>>,
-    ) -> Self {
-        Self {
-            summary: Arc::new(summary),
-            history,
-            terrain_trace,
-        }
-    }
-
-    /// Latest sampled terrain trace, shared without copying its JSON tree.
-    pub fn terrain_trace(&self) -> Option<&Value> {
-        self.terrain_trace.as_deref()
-    }
-}
-
-impl Deref for ResidentDiagnosticSnapshot {
-    type Target = Value;
-
-    fn deref(&self) -> &Self::Target {
-        &self.summary
-    }
-}
-
-impl Serialize for ResidentDiagnosticSnapshot {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let Value::Object(summary) = self.summary.as_ref() else {
-            return self.summary.serialize(serializer);
-        };
-        let mut map = serializer.serialize_map(Some(
-            summary.len()
-                + if self.history.is_some() { 3 } else { 0 }
-                + usize::from(self.terrain_trace.is_some()),
-        ))?;
-        for (key, value) in summary {
-            if self.history.is_some()
-                && matches!(
-                    key.as_str(),
-                    "native_frame_samples" | "frame_intervals_ms" | "events"
-                )
-            {
-                continue;
-            }
-            if self.terrain_trace.is_some() && key == "terrain_trace" {
-                continue;
-            }
-            map.serialize_entry(key, value)?;
-        }
-        if let Some(history) = &self.history {
-            map.serialize_entry("native_frame_samples", &history.native_frame_samples)?;
-            map.serialize_entry("frame_intervals_ms", &history.frame_intervals_ms)?;
-            map.serialize_entry("events", history.events.as_ref())?;
-        }
-        if let Some(trace) = &self.terrain_trace {
-            map.serialize_entry("terrain_trace", trace.as_ref())?;
-        }
-        map.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for ResidentDiagnosticSnapshot {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let mut summary = Value::deserialize(deserializer)?;
-        let terrain_trace = summary
-            .as_object_mut()
-            .and_then(|object| object.remove("terrain_trace"))
-            .map(Arc::new);
-        Ok(Self {
-            summary: Arc::new(summary),
-            history: None,
-            terrain_trace,
-        })
-    }
-}
-
-impl PartialEq for ResidentDiagnosticSnapshot {
-    fn eq(&self, other: &Self) -> bool {
-        if Arc::ptr_eq(&self.summary, &other.summary)
-            && match (&self.history, &other.history) {
-                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
-                (None, None) => true,
-                _ => false,
-            }
-            && match (&self.terrain_trace, &other.terrain_trace) {
-                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
-                (None, None) => true,
-                _ => false,
-            }
-        {
-            return true;
-        }
-        match (serde_json::to_value(self), serde_json::to_value(other)) {
-            (Ok(left), Ok(right)) => left == right,
-            _ => false,
-        }
-    }
-}
-
 /// Version of the JSON contract, independent of engine/world persistence formats.
-pub const SNAPSHOT_SCHEMA_VERSION: u32 = 6;
+pub const SNAPSHOT_SCHEMA_VERSION: u32 = 7;
 /// UI-only advisory ratio. This does not alter admission or the terrain cap.
 pub const MEMORY_NEAR_CAP_RATIO: f64 = 0.95;
-
-pub fn render_mode_name(mode: TerrainRenderMode) -> &'static str {
-    match mode {
-        TerrainRenderMode::Natural => "natural",
-        TerrainRenderMode::Elevation => "elevation",
-        TerrainRenderMode::Lit => "lit",
-        TerrainRenderMode::Normals => "normals",
-        TerrainRenderMode::Diffuse => "diffuse",
-        TerrainRenderMode::Readability => "readability",
-        TerrainRenderMode::Slope => "slope",
-        TerrainRenderMode::SeaMask => "sea_mask",
-        TerrainRenderMode::RockWeight => "rock_weight",
-    }
-}
 
 /// A body association within this snapshot's world, not a persisted runtime handle.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -292,15 +164,6 @@ impl MemorySnapshot {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RenderingSnapshot {
-    #[serde(default)]
-    pub clusters: Option<serde_json::Value>,
-    #[serde(default)]
-    pub resident_cover_held: bool,
-    #[serde(default)]
-    pub resident_submitted_patch_count: usize,
-    /// Indexed triangles submitted before rasterization; not visible pixel coverage.
-    #[serde(default)]
-    pub resident_submitted_triangle_count: usize,
     pub terrain_render_mode: String,
     pub terrain_enabled: bool,
     pub patch_borders_enabled: bool,
@@ -458,18 +321,6 @@ pub struct DeveloperSnapshot {
     pub motion: Option<MotionSnapshot>,
     #[serde(default)]
     pub development: Option<DevelopmentSnapshot>,
-    /// Opt-in Slice 2A fixture telemetry from the same resident-tile submission.
-    #[serde(default)]
-    pub resident_tile: Option<Value>,
-    /// Opt-in Slice 2B parent/four-child readiness and transition telemetry.
-    #[serde(default)]
-    pub resident_hierarchy: Option<Value>,
-    /// Opt-in Slice 2C regional adaptive residency and refinement telemetry.
-    #[serde(default)]
-    pub resident_regional: Option<Value>,
-    /// Ordinary planetary resident runtime; distinct from finite fixtures.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resident_planetary: Option<ResidentDiagnosticSnapshot>,
     /// Atlas terrain runtime (ADR 0016).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terrain_atlas: Option<Value>,
@@ -530,9 +381,7 @@ pub struct SnapshotInput<'a> {
     pub paused: bool,
     pub simulation_speed: f64,
     pub projection: CelestialProjection,
-    pub terrain: &'a TerrainPopulation,
     pub terrain_clearance_m: Option<f64>,
-    pub drawn_mesh_clearance_m: Option<f64>,
     pub rendering: RenderingSnapshot,
     pub performance: PerformanceSnapshot,
     pub navigation: Option<NavigationDiagnostics>,
@@ -606,34 +455,6 @@ impl DeveloperSnapshot {
             distance = Some(p.length());
             altitude = Some(p.length() - world.body(id)?.properties().reference_radius_m());
         }
-        let active = input.terrain.active_body();
-        let active_authority = active.map(|id| world.body(id)).transpose()?;
-        let generator_algorithm = active_authority.and_then(|body| {
-            body.surface_definition()
-                .map(|definition| definition.terrain().algorithm().name().to_owned())
-                .or_else(|| {
-                    body.terrain().map(|definition| match definition.version() {
-                        mundaris_world::terrain::TerrainGeneratorVersion::V1 => "V1".to_owned(),
-                        mundaris_world::terrain::TerrainGeneratorVersion::V2 => "V2".to_owned(),
-                        mundaris_world::terrain::TerrainGeneratorVersion::CrateredV1 => {
-                            "CrateredV1".to_owned()
-                        }
-                    })
-                })
-        });
-        let certificate_kind = active_authority.map(|body| {
-            if body.surface_definition().is_some() {
-                "complete_amplitude_bound"
-            } else {
-                "filtered_derivative_bounds"
-            }
-            .to_owned()
-        });
-        let cover = &input.terrain.cover;
-        let diagnostic = cover.convergence;
-        let cache = input.terrain.cache.report();
-        let used = (cache.resident_bytes + cache.external_bytes) as u64;
-        let cap = crate::planet_terrain::TERRAIN_CPU_CAP_BYTES as u64;
         let mut snapshot = Self {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             general: GeneralSnapshot {
@@ -657,62 +478,23 @@ impl DeveloperSnapshot {
                 body_distance_m: distance,
                 reference_altitude_m: altitude,
                 terrain_clearance_m: input.terrain_clearance_m.filter(|x| x.is_finite()),
-                drawn_mesh_clearance_m: input.drawn_mesh_clearance_m.filter(|x| x.is_finite()),
+                drawn_mesh_clearance_m: None,
                 fov_y_degrees: input.projection.vertical_fov_rad().to_degrees(),
                 near_plane_m: input.projection.near_m(),
                 viewport_origin_pixels: input.projection.origin(),
                 viewport_size_pixels: input.projection.viewport(),
                 navigation: input.navigation,
             },
-            terrain: TerrainSnapshot {
-                backend: "LEGACY CPU MESH".into(),
-                active_body: active.map(body).transpose()?,
-                generator_algorithm,
-                certificate_kind,
-                refinement_demand_kind: active_authority.map(|body| {
-                    if body.surface_definition().is_some() {
-                        "projected_sample_spacing"
-                    } else {
-                        "certified_error"
-                    }
-                    .to_owned()
-                }),
-                target_certifiable: active.map(|_| diagnostic.target_certifiable),
-                source_radial_lod: active.and(diagnostic.rendered_local_lod),
-                ready_radial_lod: active.and(diagnostic.ready_local_lod),
-                desired_radial_lod: active.and(diagnostic.desired_local_lod),
-                source_leaf_count: cover.active().len(),
-                visible_leaf_count: cover.visible().len(),
-                quality_pending: active.map(|_| cover.report.quality_pending),
-                settled: active.map(|_| cover.report.settled),
-                ready: cover.ready(),
-                active_morph: cover.transition().is_some(),
-                morph_fraction: cover.transition().map(|(_, fraction)| fraction),
-                construction_pending: cover.construction_pending(),
-                budget_constrained: cover.report.budget_constrained,
-                transition_deferred: cover.transition_deferred,
-            },
-            work: WorkSnapshot {
-                worker_count: cache.worker_count,
-                worker_busy_count: cache.worker_jobs,
-                pending_requests: input.terrain.cache.pending(),
-                raw_resident_patches: cache.resident_patches,
-            },
-            memory: MemorySnapshot {
-                used_bytes: used,
-                cap_bytes: cap,
-                headroom_bytes: cap.saturating_sub(used),
-            },
+            // Filled by the atlas runtime (`PlanetLod::annotate_terrain`).
+            terrain: TerrainSnapshot::default(),
+            work: WorkSnapshot::default(),
+            memory: MemorySnapshot::default(),
             rendering: input.rendering,
             performance: input.performance,
             warnings: Vec::new(),
             capture: None,
             motion: input.motion,
             development: None,
-            resident_tile: None,
-            resident_hierarchy: None,
-            resident_regional: None,
-            resident_planetary: None,
             terrain_atlas: None,
             engine_profile: None,
             shared_scene: None,
@@ -789,54 +571,4 @@ pub fn format_milliseconds(value: Option<f64>) -> String {
 
 pub fn format_bytes(bytes: u64) -> String {
     format!("{:.1} MiB", bytes as f64 / 1_048_576.0)
-}
-
-#[cfg(test)]
-mod resident_diagnostic_snapshot_tests {
-    use super::*;
-
-    #[test]
-    fn trace_sidecar_preserves_exported_json_and_roundtrips_without_summary_copy() {
-        let trace = Arc::new(serde_json::json!({
-            "events": [{"sequence": 7, "stage": "generation"}],
-            "jobs": [{"id": 3}],
-        }));
-        let snapshot = ResidentDiagnosticSnapshot::new(
-            serde_json::json!({"frame_id": 19}),
-            None,
-            Some(Arc::clone(&trace)),
-        );
-
-        assert!(snapshot.get("terrain_trace").is_none());
-        assert!(std::ptr::eq(
-            snapshot.terrain_trace().unwrap(),
-            trace.as_ref()
-        ));
-        let expected = serde_json::json!({
-            "frame_id": 19,
-            "terrain_trace": {
-                "events": [{"sequence": 7, "stage": "generation"}],
-                "jobs": [{"id": 3}],
-            },
-        });
-        assert_eq!(serde_json::to_value(&snapshot).unwrap(), expected);
-
-        let decoded: ResidentDiagnosticSnapshot = serde_json::from_value(expected.clone()).unwrap();
-        assert!(decoded.get("terrain_trace").is_none());
-        assert_eq!(decoded.terrain_trace(), Some(&expected["terrain_trace"]));
-        assert_eq!(serde_json::to_value(decoded).unwrap(), expected);
-    }
-
-    #[test]
-    fn snapshot_without_profile_trace_keeps_trace_absent() {
-        // The fixture only attaches this sidecar while profiling is enabled.
-        // Keep the default/profile-disabled shape free of a placeholder trace.
-        let snapshot =
-            ResidentDiagnosticSnapshot::new(serde_json::json!({"frame_id": 19}), None, None);
-        assert!(snapshot.terrain_trace().is_none());
-        assert_eq!(
-            serde_json::to_value(snapshot).unwrap(),
-            serde_json::json!({"frame_id": 19})
-        );
-    }
 }

@@ -462,12 +462,6 @@ fn moon_surface_is_native_rocky_v5_and_clearance_queries_the_same_field() {
             .unwrap();
         let edited_moon = system.body(moon_id).unwrap();
         assert_eq!(edited_moon.surface_definition(), Some(&original_surface));
-        assert_eq!(
-            mundaris_app::planet_terrain::TerrainGeometryIdentity::from_body(moon_id, edited_moon)
-                .unwrap()
-                .radius_m,
-            edited_radius_m
-        );
     }
 }
 

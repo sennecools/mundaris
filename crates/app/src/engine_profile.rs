@@ -12,7 +12,6 @@
 //! span takes only its lane lock. When disabled,
 //! creating a span returns an inert guard after one relaxed atomic load.
 
-use mundaris_renderer::resident_tile::TileKey;
 use serde::Serialize;
 use std::{
     cell::RefCell,
@@ -26,7 +25,7 @@ use std::{
 };
 
 #[cfg(feature = "surface-profile")]
-use mundaris_renderer::planet_surface::CpuStageTimer;
+use mundaris_renderer::CpuStageTimer;
 
 const MAX_LANES: usize = 16;
 const MAIN_EVENT_CAPACITY: usize = 8_192;
@@ -83,27 +82,6 @@ impl ProfileJobIdentity {
     pub fn capture_id(self) -> u64 {
         match self {
             Self::Tile { capture_id, .. } | Self::BoundaryBatch { capture_id, .. } => capture_id,
-        }
-    }
-
-    pub fn tile(key: &TileKey, job_id: u64, origin_frame_id: u64, dispatch_frame_id: u64) -> Self {
-        let [x, y] = key.address.coordinates();
-        Self::Tile {
-            job_id,
-            capture_id: capture_id(),
-            origin_frame_id,
-            dispatch_frame_id,
-            body_identity: key.body_identity,
-            surface_revision: key.surface_revision,
-            material_revision: key.material_revision,
-            radius_bits: key.radius_bits,
-            face: key.address.face() as u8,
-            level: key.address.level(),
-            x,
-            y,
-            cells: key.cells,
-            format_version: key.format_version,
-            filter_version: key.filter_version,
         }
     }
 

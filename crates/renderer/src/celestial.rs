@@ -148,56 +148,6 @@ mod tests {
         );
         assert!(frame.staging.uniforms[24..].iter().all(|&b| b == 0));
     }
-    #[test]
-    fn generated_surface_missing_geometry_poisons_celestial_frame() {
-        use mundaris_math::surface::{CubeFace, CubePatchAddress};
-        use std::num::NonZeroU64;
-        let tree = FrameTree::new(NonZeroU64::new(1).unwrap());
-        let root = tree.root();
-        let view = PreparedView::new(
-            &tree.evaluate(),
-            FramePose::new(
-                FramePosition::new(root, LocalPosition::try_metres(DVec3::Z * 1000.0).unwrap()),
-                UnitRotation::identity(),
-            ),
-            crate::RenderPrecisionBudget::near_debug(),
-        )
-        .unwrap();
-        let topology = crate::planet_surface::SurfaceTopology::new();
-        let address = CubePatchAddress::root(CubeFace::PositiveZ);
-        let patch = crate::planet_surface::ActiveSurfacePatch {
-            address,
-            metadata: crate::planet_surface::PatchMetadata::build(address, &topology).unwrap(),
-            stitch_mask: 0,
-            error_pixels: 0.0,
-        };
-        let projection = CelestialProjection::try_new(1280, 800, 1.0, 0.1).unwrap();
-        let body = CelestialRenderBody {
-            body_fixed_frame: root,
-            reference_radius_m: 10.0,
-            color: [0.2, 0.5, 1.0, 1.0],
-            unlit: false,
-            selected: false,
-        };
-        let mut staging = CelestialStaging::default();
-        let sphere = Icosphere::new();
-        let mut frame = CelestialFrame::new(&view, &mut staging, projection, &sphere);
-        assert!(
-            frame
-                .append_generated_surface(
-                    body,
-                    &[patch],
-                    &[],
-                    &topology,
-                    crate::planet_surface::SurfaceStyle::default()
-                )
-                .is_err()
-        );
-        assert!(matches!(
-            frame.validate(),
-            Err(RenderPreparationError::FailedDebugFrame)
-        ));
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -252,7 +202,6 @@ pub fn select_marker(markers: &[CelestialMarker], point: [f32; 2]) -> Option<usi
 #[derive(Default)]
 pub struct CelestialStaging {
     sky: Option<crate::sky::SkyPrepared>,
-    surface: crate::planet_surface::SurfaceStaging,
     vertices: Vec<u8>,
     uniforms: Vec<u8>,
     lines: Vec<u8>,
@@ -260,15 +209,11 @@ pub struct CelestialStaging {
     draws: Vec<u32>,
     markers: Vec<CelestialMarker>,
     centers: Vec<(DVec3, f64)>,
-    resident_tile: Option<crate::TileDraw>,
-    resident_hierarchy: Option<crate::ResidentHierarchyDraw>,
-    resident_regional: Option<crate::RegionalResidentDraw>,
     terrain_atlas: Option<crate::TerrainAtlasFrame>,
 }
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CelestialPreparationReport {
     pub sky: Option<crate::sky::SkyPreparationReport>,
-    pub surface: crate::planet_surface::SurfacePreparationReport,
     pub triangles: usize,
     pub markers: usize,
     pub trail_segments: usize,
@@ -302,10 +247,6 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
         staging.draws.clear();
         staging.markers.clear();
         staging.centers.clear();
-        staging.surface.clear();
-        staging.resident_tile = None;
-        staging.resident_hierarchy = None;
-        staging.resident_regional = None;
         staging.terrain_atlas = None;
         staging.sky = None;
         Self {
@@ -330,96 +271,9 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
         Ok(())
     }
 
-    /// Stages one already-derived resident tile for the celestial depth pass.
-    /// The world remains authoritative; this only selects renderer data.
-    pub fn set_resident_tile(
-        &mut self,
-        draw: crate::TileDraw,
-    ) -> Result<(), RenderPreparationError> {
-        if self.staging.resident_hierarchy.is_some() || self.staging.resident_regional.is_some() {
-            self.failed = true;
-            return Err(RenderPreparationError::InvalidResidentTile);
-        }
-        if let Err(error) = draw.validate_view_transform(self.view.budget()) {
-            self.failed = true;
-            return Err(error);
-        }
-        let valid = draw.tile.validate_layout().is_ok()
-            && draw.anchor_view_m.is_finite()
-            && draw.body_to_view.is_finite()
-            && draw.sun_body.is_finite()
-            && draw.sun_body.length_squared() > 0.0
-            && draw.mode <= 5;
-        if !valid {
-            self.failed = true;
-            return Err(RenderPreparationError::InvalidResidentTile);
-        }
-        self.staging.resident_tile = Some(draw);
-        Ok(())
-    }
-
-    /// Stages one fixed parent/four-child resident hierarchy.
-    pub fn set_resident_hierarchy(
-        &mut self,
-        draw: crate::ResidentHierarchyDraw,
-    ) -> Result<(), RenderPreparationError> {
-        if self.staging.resident_tile.is_some()
-            || self.staging.resident_regional.is_some()
-            || draw.validate().is_err()
-            || draw
-                .parent
-                .validate_view_transform(self.view.budget())
-                .is_err()
-        {
-            self.failed = true;
-            return Err(RenderPreparationError::InvalidResidentTile);
-        }
-        for child in draw.children.iter().flatten() {
-            if child.validate_view_transform(self.view.budget()).is_err() {
-                self.failed = true;
-                return Err(RenderPreparationError::InvalidResidentTile);
-            }
-        }
-        self.staging.resident_hierarchy = Some(draw);
-        Ok(())
-    }
-
-    /// Stages a regional resident cover independently from selection and build work.
-    pub fn set_resident_regional(
-        &mut self,
-        draw: crate::RegionalResidentDraw,
-    ) -> Result<(), RenderPreparationError> {
-        if self.staging.resident_tile.is_some() || self.staging.resident_hierarchy.is_some() {
-            self.failed = true;
-            return Err(RenderPreparationError::InvalidResidentTile);
-        }
-        for patch in &draw.patches {
-            if patch
-                .own
-                .validate_view_transform(draw.precision_budget(&patch.own))
-                .is_err()
-                || patch
-                    .parent
-                    .validate_view_transform(draw.precision_budget(&patch.parent))
-                    .is_err()
-            {
-                self.failed = true;
-                return Err(RenderPreparationError::InvalidResidentTile);
-            }
-        }
-        self.staging.resident_regional = Some(draw);
-        Ok(())
-    }
-
     /// Stages atlas producer jobs and instanced terrain draws (ADR 0016).
     pub fn set_terrain_atlas(&mut self, atlas: crate::TerrainAtlasFrame) {
         self.staging.terrain_atlas = Some(atlas);
-    }
-
-    /// Sets renderer-only terrain shading for this frame. Directions and terrain
-    /// normals use body-fixed axes; this does not change reusable geometry.
-    pub fn set_terrain_lighting(&mut self, lighting: crate::planet_surface::TerrainLighting) {
-        self.staging.surface.lighting = lighting;
     }
 
     /// Content projection used for this frame, including viewport and origin.
@@ -455,7 +309,6 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
     pub fn report(&self) -> CelestialPreparationReport {
         CelestialPreparationReport {
             sky: self.staging.sky.as_ref().map(|s| s.report()),
-            surface: self.staging.surface.report,
             ..self.report
         }
     }
@@ -633,98 +486,6 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
         }
         result
     }
-    pub fn append_surface(
-        &mut self,
-        body: CelestialRenderBody,
-        patches: &[crate::planet_surface::ActiveSurfacePatch],
-        topology: &crate::planet_surface::SurfaceTopology,
-        style: crate::planet_surface::SurfaceStyle,
-    ) -> Result<(), RenderPreparationError> {
-        let result = self.validate().and_then(|()| {
-            self.staging
-                .surface
-                .append(self.view, self.projection, body, patches, topology, style)
-        });
-        if result.is_err() {
-            self.failed = true;
-        }
-        result
-    }
-    /// Appends borrowed, pre-generated body-fixed terrain through the same
-    /// source-centred precision and clipping path as smooth surface patches.
-    pub fn append_generated_surface(
-        &mut self,
-        body: CelestialRenderBody,
-        patches: &[crate::planet_surface::ActiveSurfacePatch],
-        geometry: &[&crate::planet_surface::GeneratedSurfacePatch],
-        topology: &crate::planet_surface::SurfaceTopology,
-        style: crate::planet_surface::SurfaceStyle,
-    ) -> Result<(), RenderPreparationError> {
-        let result = self.validate().and_then(|()| {
-            self.staging.surface.append_generated(
-                self.view,
-                self.projection,
-                body,
-                patches,
-                geometry,
-                topology,
-                style,
-            )
-        });
-        if result.is_err() {
-            self.failed = true;
-        }
-        result
-    }
-    /// Adaptive terrain accepts only geometry reconciled against a complete
-    /// ready cover, so visibility cannot accidentally omit a boundary owner.
-    pub fn append_stitched_surface(
-        &mut self,
-        body: CelestialRenderBody,
-        patches: &[crate::planet_surface::ActiveSurfacePatch],
-        surface: &crate::planet_surface::StitchedSurface,
-        topology: &crate::planet_surface::SurfaceTopology,
-        style: crate::planet_surface::SurfaceStyle,
-    ) -> Result<(), RenderPreparationError> {
-        let result = self.validate().and_then(|()| {
-            self.staging.surface.append_stitched(
-                self.view,
-                self.projection,
-                body,
-                patches,
-                surface,
-                topology,
-                style,
-            )
-        });
-        if result.is_err() {
-            self.failed = true;
-        }
-        result
-    }
-    /// Draws a compatible overlay, not unrelated interpolated grid arrays.
-    pub fn append_surface_transition(
-        &mut self,
-        body: CelestialRenderBody,
-        transition: &crate::planet_surface::SurfaceTransition,
-        fraction: f64,
-        style: crate::planet_surface::SurfaceStyle,
-    ) -> Result<(), RenderPreparationError> {
-        let result = self.validate().and_then(|()| {
-            self.staging.surface.append_transition(
-                self.view,
-                self.projection,
-                body,
-                transition,
-                fraction,
-                style,
-            )
-        });
-        if result.is_err() {
-            self.failed = true;
-        }
-        result
-    }
     pub fn append_historical_lines(
         &mut self,
         source: FrameId,
@@ -814,13 +575,6 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
     pub fn validate(&self) -> Result<(), RenderPreparationError> {
         if self.failed {
             Err(RenderPreparationError::FailedDebugFrame)
-        } else if (self.staging.resident_tile.is_some()
-            || self.staging.resident_hierarchy.is_some()
-            || self.staging.resident_regional.is_some())
-            && (!self.staging.surface.instances.is_empty()
-                || !self.staging.surface.fallback.is_empty())
-        {
-            Err(RenderPreparationError::InvalidResidentTile)
         } else {
             Ok(())
         }
@@ -842,9 +596,7 @@ fn pack(position: [f32; 3], normal: [f32; 3], bytes: &mut Vec<u8>, normal_w: f32
 }
 
 pub(crate) struct CelestialRenderer {
-    cluster_settings: crate::ClusterSettings,
     sky: crate::sky::SkyRenderer,
-    surface: crate::planet_surface::PlanetSurfaceRenderer,
     sphere_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
     polyline_pipeline: wgpu::RenderPipeline,
@@ -863,51 +615,15 @@ pub(crate) struct CelestialRenderer {
     polylines: wgpu::Buffer,
     polyline_capacity: u64,
     indices: wgpu::Buffer,
-    resident_tile: Option<crate::resident_tile::ResidentTileRenderer>,
     terrain_atlas: Option<crate::terrain_atlas::TerrainAtlasRenderer>,
     _depth_texture: wgpu::Texture,
     depth: wgpu::TextureView,
 }
 impl CelestialRenderer {
-    pub(crate) fn set_cluster_settings(&mut self, settings: crate::ClusterSettings) {
-        self.cluster_settings = settings;
-    }
-    pub(crate) fn cluster_report(&self) -> crate::ClusterReport {
-        self.resident_tile
-            .as_ref()
-            .map_or_else(Default::default, |r| r.cluster_report())
-    }
     pub(crate) fn last_sky_resource_report(&self) -> crate::sky::SkyResourceReport {
         self.sky.report()
     }
-    pub(crate) fn last_surface_upload_profile(&self) -> crate::gpu_profile::CpuUploadProfile {
-        self.surface.last_upload_profile()
-    }
-    pub(crate) fn last_resident_tile_report(&self) -> crate::ResidentTileReport {
-        self.resident_tile
-            .as_ref()
-            .map_or_else(Default::default, |renderer| renderer.report())
-    }
-    pub(crate) fn last_resident_hierarchy_report(&self) -> crate::ResidentHierarchyReport {
-        self.resident_tile
-            .as_ref()
-            .map_or_else(Default::default, |renderer| renderer.hierarchy_report())
-    }
-    pub(crate) fn last_resident_regional_report(&self) -> crate::RegionalResidentReport {
-        self.resident_tile
-            .as_ref()
-            .map_or_else(Default::default, |r| r.regional_report())
-    }
-    #[cfg(feature = "developer-tools")]
-    pub(crate) fn last_submitted_regional_draw(
-        &self,
-    ) -> Option<(crate::RegionalResidentDraw, Vec<usize>, bool)> {
-        self.resident_tile.as_ref()?.last_submitted_regional_draw()
-    }
-    pub(crate) fn resident_on_submitted(&mut self, queue: &wgpu::Queue) {
-        if let Some(r) = &mut self.resident_tile {
-            r.on_submitted(queue);
-        }
+    pub(crate) fn on_submitted(&mut self) {
         if let Some(atlas) = &mut self.terrain_atlas {
             atlas.on_submitted();
         }
@@ -922,85 +638,6 @@ impl CelestialRenderer {
             .as_ref()
             .map_or_else(Default::default, |atlas| atlas.report())
     }
-    pub(crate) fn validate_resident_regional(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        draw: &crate::RegionalResidentDraw,
-        index: usize,
-    ) -> Result<Vec<crate::ReconstructedTileVertex>, RenderPreparationError> {
-        if self.resident_tile.is_none() {
-            self.resident_tile = Some(crate::resident_tile::ResidentTileRenderer::new(
-                device,
-                self.target_format,
-                &self.projection_layout,
-            ));
-        }
-        self.resident_tile
-            .as_mut()
-            .ok_or(RenderPreparationError::InvalidResidentTile)?
-            .validate_regional_gpu(device, queue, &self.projection_group, draw, index)
-    }
-    pub(crate) fn validate_resident_tile(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        draw: &crate::TileDraw,
-    ) -> Result<Vec<crate::ReconstructedTileVertex>, RenderPreparationError> {
-        device.push_error_scope(wgpu::ErrorFilter::Validation);
-        if self.resident_tile.is_none() {
-            self.resident_tile = Some(crate::resident_tile::ResidentTileRenderer::new(
-                device,
-                self.target_format,
-                &self.projection_layout,
-            ));
-        }
-        let result = self
-            .resident_tile
-            .as_mut()
-            .ok_or(RenderPreparationError::InvalidResidentTile)
-            .and_then(|resident| {
-                resident.validate_gpu(device, queue, &self.projection_group, draw)
-            });
-        if let Some(error) = pollster::block_on(device.pop_error_scope()) {
-            return Err(RenderPreparationError::GpuProgress(error.to_string()));
-        }
-        result
-    }
-    pub(crate) fn validate_resident_hierarchy(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        draw: &crate::ResidentHierarchyDraw,
-        patch_index: usize,
-    ) -> Result<Vec<crate::ReconstructedTileVertex>, RenderPreparationError> {
-        device.push_error_scope(wgpu::ErrorFilter::Validation);
-        if self.resident_tile.is_none() {
-            self.resident_tile = Some(crate::resident_tile::ResidentTileRenderer::new(
-                device,
-                self.target_format,
-                &self.projection_layout,
-            ));
-        }
-        let result = self
-            .resident_tile
-            .as_mut()
-            .ok_or(RenderPreparationError::InvalidResidentTile)
-            .and_then(|resident| {
-                resident.validate_hierarchy_gpu(
-                    device,
-                    queue,
-                    &self.projection_group,
-                    draw,
-                    patch_index,
-                )
-            });
-        if let Some(error) = pollster::block_on(device.pop_error_scope()) {
-            return Err(RenderPreparationError::GpuProgress(error.to_string()));
-        }
-        result
-    }
-
     pub(crate) fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -1062,12 +699,6 @@ impl CelestialRenderer {
         let (depth_texture, depth) = depth(device, width, height);
         Self {
             sky: crate::sky::SkyRenderer::new(device, format),
-            surface: crate::planet_surface::PlanetSurfaceRenderer::new(
-                device,
-                queue,
-                format,
-                &projection_layout,
-            ),
             sphere_pipeline,
             line_pipeline,
             polyline_pipeline,
@@ -1091,9 +722,7 @@ impl CelestialRenderer {
             ),
             polyline_capacity: 32,
             indices,
-            resident_tile: None,
             terrain_atlas: None,
-            cluster_settings: crate::ClusterSettings::default(),
             _depth_texture: depth_texture,
             depth,
         }
@@ -1115,43 +744,6 @@ impl CelestialRenderer {
         frame.validate()?;
         let storage = &frame.staging;
         self.sky.upload(device, queue, storage.sky.as_ref());
-        self.surface.upload(device, queue, &storage.surface)?;
-        if let Some(draw) = &storage.resident_regional {
-            if self.resident_tile.is_none() {
-                self.resident_tile = Some(crate::resident_tile::ResidentTileRenderer::new(
-                    device,
-                    self.target_format,
-                    &self.projection_layout,
-                ));
-            }
-            if let Some(resident) = &mut self.resident_tile {
-                resident.prepare_regional(device, queue, draw)?;
-            }
-        } else if let Some(draw) = &storage.resident_hierarchy {
-            if self.resident_tile.is_none() {
-                self.resident_tile = Some(crate::resident_tile::ResidentTileRenderer::new(
-                    device,
-                    self.target_format,
-                    &self.projection_layout,
-                ));
-            }
-            if let Some(resident_tile) = &mut self.resident_tile {
-                resident_tile.prepare_hierarchy(device, queue, draw)?;
-            }
-        } else if let Some(draw) = &storage.resident_tile {
-            if self.resident_tile.is_none() {
-                self.resident_tile = Some(crate::resident_tile::ResidentTileRenderer::new(
-                    device,
-                    self.target_format,
-                    &self.projection_layout,
-                ));
-            }
-            if let Some(resident_tile) = &mut self.resident_tile {
-                resident_tile.prepare(device, queue, draw)?;
-            }
-        } else if let Some(resident_tile) = &mut self.resident_tile {
-            resident_tile.clear_frame();
-        }
         if let Some(atlas_frame) = &storage.terrain_atlas
             && let Some(config) = atlas_frame.config
         {
@@ -1175,15 +767,6 @@ impl CelestialRenderer {
                     .prepare(device, queue, encoder, atlas_frame)
                     .map_err(RenderPreparationError::TerrainAtlas)?;
             }
-        }
-        if let Some(resident) = &mut self.resident_tile {
-            resident.prepare_clusters(
-                device,
-                queue,
-                encoder,
-                frame.projection,
-                self.cluster_settings,
-            );
         }
         grow(
             device,
@@ -1283,35 +866,6 @@ impl CelestialRenderer {
         {
             queries.end_scope(&mut pass, 7);
         }
-        self.surface.draw(
-            &mut pass,
-            &self.projection_group,
-            &storage.surface,
-            timestamps,
-        );
-        if (storage.resident_tile.is_some()
-            || storage.resident_hierarchy.is_some()
-            || storage.resident_regional.is_some())
-            && let Some(resident_tile) = &self.resident_tile
-        {
-            if let Some(queries) = timestamps.filter(|q| q.inside_passes()) {
-                queries.write_scope(&mut pass, 3);
-            }
-            if let Some(regional) = &storage.resident_regional {
-                resident_tile.draw_regional(&mut pass, &self.projection_group, regional);
-            } else if let Some(hierarchy) = &storage.resident_hierarchy {
-                resident_tile.draw_hierarchy(
-                    &mut pass,
-                    &self.projection_group,
-                    hierarchy.draw_children,
-                );
-            } else {
-                resident_tile.draw(&mut pass, &self.projection_group);
-            }
-            if let Some(queries) = timestamps.filter(|q| q.inside_passes()) {
-                queries.end_scope(&mut pass, 3);
-            }
-        }
         if storage.terrain_atlas.is_some()
             && let Some(atlas) = &self.terrain_atlas
         {
@@ -1372,15 +926,8 @@ impl CelestialRenderer {
             {
                 scope_mask |= 1 << 8;
             }
-            if !storage.surface.instances.is_empty()
-                || storage.resident_tile.is_some()
-                || storage.resident_hierarchy.is_some()
-                || storage.resident_regional.is_some()
-            {
+            if storage.terrain_atlas.is_some() && self.terrain_atlas.is_some() {
                 scope_mask |= 1 << 3;
-            }
-            if !storage.surface.fallback.is_empty() {
-                scope_mask |= 1 << 4;
             }
             if !storage.draws.is_empty() {
                 scope_mask |= 1 << 7;

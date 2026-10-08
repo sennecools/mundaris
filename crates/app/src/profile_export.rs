@@ -118,9 +118,9 @@ pub fn chrome_trace(profile: &Value, snapshot: Option<&DeveloperSnapshot>) -> Va
         "export_events_omitted":omitted,"profile_metadata":profile,
         "observation_gpu_measurements":snapshot.map(|s| &s.performance),
         "observation_frame":snapshot.map(|s| s.general.frame_number),
-        "terrain_trace":snapshot.and_then(|s| s.resident_planetary.as_ref()?.terrain_trace()),
+        "terrain_atlas":snapshot.and_then(|s| s.terrain_atlas.as_ref()),
         "limits":{"bytes":MAX_BYTES,"events":MAX_EVENTS},
-        "interpretation":"Blank CPU time is unknown. Job/dependency IDs are recorded associations, not proof of a complete critical path. Terrain trace clock has a separate origin. GPU values are asynchronous durations; never aligned on the CPU axis."
+        "interpretation":"Blank CPU time is unknown. Job/dependency IDs are recorded associations, not proof of a complete critical path. GPU values are asynchronous durations; never aligned on the CPU axis."
     }})
 }
 

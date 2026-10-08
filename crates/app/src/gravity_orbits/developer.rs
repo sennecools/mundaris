@@ -17,42 +17,11 @@ impl GravityOrbitsDemo {
     pub fn developer_last_snapshot(&self) -> Option<&DeveloperSnapshot> {
         self.developer_snapshot.as_ref()
     }
-    pub fn developer_accuracy(&self, renderer: &Renderer) -> Result<serde_json::Value> {
-        let snapshot = self
-            .developer_snapshot
-            .as_ref()
-            .context("no submitted snapshot")?;
-        let body = self.planetary.body.context("no resident body")?;
-        let authority = self.system.body(body)?;
-        let definition = authority
-            .surface_definition()
-            .context("no surface authority")?;
-        let generator = mundaris_world::terrain::SurfaceGenerator::new(
-            definition,
-            authority.properties().reference_radius_m(),
-        )?;
-        let (draw, active, fallback) = renderer
-            .last_submitted_regional_draw()
-            .context("no current submitted retained draw")?;
-        let projection = self.content_projection(snapshot.camera.near_plane_m)?;
-        ensure!(
-            projection.viewport() == snapshot.camera.viewport_size_pixels
-                && projection.origin() == snapshot.camera.viewport_origin_pixels,
-            "accuracy viewport differs from submitted snapshot"
-        );
-        let mut result = crate::terrain_accuracy::sample_visible_terrain_accuracy(
-            draw, active, fallback, projection, generator, 1.0,
-        );
-        result["submission_id"] = serde_json::json!(snapshot.performance.native_submission_id);
-        result["frame_number"] = serde_json::json!(snapshot.general.frame_number);
-        result["shared_scene"] = serde_json::json!(snapshot.shared_scene);
-        result["integration_note"] = serde_json::json!(
-            "One accuracy observation; replay postprocessing integrates fixed weighted samples over actual observation times. Its 1-second sample integral is not a full replay integral."
-        );
-        Ok(result)
-    }
+    /// Atlas arrival fade duration from the content LOD policy.
     pub(crate) fn developer_morph_duration_ms(&self) -> u64 {
-        self.controls.terrain_morph_ms
+        self.atlas
+            .policy()
+            .map_or(0, |policy| (policy.arrival_seconds * 1000.0).round() as u64)
     }
     pub fn developer_set_automation(&mut self, owner: Option<&str>) {
         self.controls.automation_owner = owner.map(str::to_owned);
@@ -254,9 +223,7 @@ impl GravityOrbitsDemo {
             DevCommand::SingleStep { forward } => self.single_step(*forward),
             DevCommand::Reset => self.reset_motion(),
             DevCommand::RenderMode { mode } => {
-                let mode = TerrainRenderMode::ALL
-                    .into_iter()
-                    .find(|&m| crate::developer_snapshot::render_mode_name(m) == mode)
+                let mode = TerrainViewMode::from_name(mode)
                     .ok_or_else(|| anyhow::anyhow!("unsupported render mode"))?;
                 self.command(Command::Visual(visual_controls::VisualCommand::RenderMode(
                     mode,
@@ -269,60 +236,9 @@ impl GravityOrbitsDemo {
                 )))
             }
             DevCommand::ResidentCoverHold { enabled } => {
-                if self.atlas.enabled {
-                    // Atlas terrain: freeze request generation (draws continue).
-                    self.atlas.hold = *enabled;
-                    return Ok(());
-                }
-                ensure!(
-                    !*enabled || self.planetary.runtime.has_coverage(),
-                    "hold requires resident coverage"
-                );
-                self.planetary.hold_cover = *enabled;
+                // Freeze atlas request generation; drawing continues.
+                self.atlas.hold = *enabled;
                 Ok(())
-            }
-            DevCommand::ClusterRendering {
-                mode,
-                debug,
-                triangle_edges,
-                cluster_edges,
-                freeze,
-            } => {
-                use mundaris_renderer::{ClusterDebug, ClusterMode, ClusterSettings};
-                let mode = match mode.as_str() {
-                    "reference" => ClusterMode::Reference,
-                    "culling" => ClusterMode::Culling,
-                    "lod" => ClusterMode::Lod,
-                    _ => bail!("unsupported cluster mode"),
-                };
-                let debug = match debug.as_str() {
-                    "lit" => ClusterDebug::Lit,
-                    "clusters" => ClusterDebug::Clusters,
-                    "lod" => ClusterDebug::Lod,
-                    "residency" => ClusterDebug::Residency,
-                    _ => bail!("unsupported cluster debug mode"),
-                };
-                ensure!(
-                    !*freeze
-                        || (mode != ClusterMode::Reference
-                            && self.controls.cluster_report.resident_regions > 0),
-                    "freeze requires a resident cluster cut"
-                );
-                self.controls.cluster_settings = ClusterSettings {
-                    mode,
-                    debug,
-                    triangle_edges: *triangle_edges,
-                    cluster_edges: *cluster_edges,
-                    freeze: *freeze,
-                };
-                Ok(())
-            }
-            DevCommand::SkySetting { .. } => bail!("sky presentation is retired"),
-            DevCommand::GpuTile { .. }
-            | DevCommand::GpuTileView { .. }
-            | DevCommand::GpuHierarchy { .. }
-            | DevCommand::GpuRegional { .. } => {
-                bail!("standalone fixture scenes are retired; use shared-system body navigation")
             }
         }
     }

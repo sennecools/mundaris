@@ -98,7 +98,7 @@ impl CelestialProjection {
         {
             return Err(RenderPreparationError::InvalidDebugGeometry);
         }
-        Ok(crate::planet_surface::sphere_projected_error(
+        Ok(sphere_projected_error(
             error_fraction * radius,
             center,
             radius,
@@ -338,4 +338,24 @@ pub fn reference_sphere_occludes(target: DVec3, center: DVec3, radius_m: f64) ->
     }
     let ratio = perpendicular / radius_m;
     along - radius_m * (1.0 - ratio * ratio).sqrt() < distance
+}
+
+/// Conservative projected size in pixels of a world-space error `error` metres
+/// on a ball of `ball_radius` centred at view-space `center`.
+pub(crate) fn sphere_projected_error(
+    error: f64,
+    center: DVec3,
+    ball_radius: f64,
+    projection: CelestialProjection,
+) -> f64 {
+    let z0 = (-center.z - ball_radius).max(projection.near_m());
+    if error >= z0 * 0.5 {
+        return f64::INFINITY;
+    }
+    let z = z0 - error;
+    let [w, h] = projection.viewport();
+    let ty = (projection.vertical_fov_rad() * 0.5).tan();
+    let tx = ty * w as f64 / h as f64;
+    let lever = (1.0 + (tx + error / z).powi(2) + (ty + error / z).powi(2)).sqrt();
+    projection.focal_pixels() * error / z * lever
 }

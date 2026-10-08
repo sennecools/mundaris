@@ -38,10 +38,6 @@ wgpu.workspace = true
 pollster.workspace = true
 
 [[example]]
-name = "phase2g_profile"
-required-features = ["developer-tools"]
-
-[[example]]
 name = "phase2g_vista"
 required-features = ["developer-tools"]
 
@@ -55,39 +51,6 @@ harness = false
 
 [[bench]]
 name = "orbit_guides"
-harness = false
-
-[[bench]]
-name = "planet_surface_approach"
-harness = false
-
-[[bench]]
-name = "planet_terrain_generation"
-harness = false
-
-[[bench]]
-name = "planet_terrain_erosion"
-harness = false
-
-
-
-
-
-
-
-
-
-
-
-[[example]]
-name = "resident_tile_samples"
-
-[[bench]]
-name = "planet_terrain_view"
-harness = false
-
-[[bench]]
-name = "terrain_lighting"
 harness = false
 
 

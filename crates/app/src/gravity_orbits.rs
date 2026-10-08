@@ -1,10 +1,9 @@
 //! Composition of authoritative physics, coherent projection and disposable debug views.
 use crate::developer_snapshot::{
     DeveloperSnapshot, PerformanceSnapshot, RenderingSnapshot, SnapshotInput, format_bytes,
-    format_distance, format_milliseconds, render_mode_name,
+    format_distance, format_milliseconds,
 };
 use crate::motion_session::{AnalyticSession, MotionSession, MotionSnapshot};
-use crate::planet_surface::*;
 use crate::{celestial_camera::*, trails::*};
 use crate::{
     celestial_labels::*, celestial_selection::*, interactive_clock::*, orbit_guides::*,
@@ -13,7 +12,6 @@ use crate::{
 use anyhow::{Context, Result};
 use glam::DVec3;
 use mundaris_math::*;
-use mundaris_renderer::planet_surface::*;
 use mundaris_renderer::*;
 use mundaris_simulation::*;
 use mundaris_world::*;
@@ -59,7 +57,6 @@ enum Command {
     Velocity(DVec3),
     Rename(String),
     TrailMode(bool),
-    TerrainPreview(bool),
     TrailReference(BodyId),
 }
 #[cfg(feature = "developer-tools")]
@@ -67,13 +64,8 @@ mod developer;
 mod developer_ui;
 mod frame_host;
 mod navigation_input;
-mod planetary;
-mod regional_fixture;
-pub(crate) use regional_fixture::RegionalFrameHistory;
 mod visual_controls;
 struct Controls {
-    cluster_settings: mundaris_renderer::ClusterSettings,
-    cluster_report: mundaris_renderer::ClusterReport,
     performance_lab: crate::performance_lab::PerformanceLab,
     #[cfg(feature = "developer-tools")]
     automation_owner: Option<String>,
@@ -82,10 +74,7 @@ struct Controls {
     snapshot_export_status: Option<String>,
     terrain_preview: bool,
     sun_from_star: bool,
-    terrain_lighting: TerrainLighting,
-    terrain_morph_ms: u64,
-    surface_bounds: bool,
-    surface_style: SurfaceStyle,
+    terrain_view: TerrainViewMode,
     approach: Option<(f64, f64, Duration)>,
     clearance_target: f64,
     terrain_guard_m: Option<f64>,
@@ -125,8 +114,6 @@ struct Controls {
 impl Controls {
     fn new(body: &CelestialBody) -> Self {
         Self {
-            cluster_settings: mundaris_renderer::ClusterSettings::default(),
-            cluster_report: mundaris_renderer::ClusterReport::default(),
             performance_lab: {
                 let mut lab = crate::performance_lab::PerformanceLab::default();
                 lab.open = std::env::var("MUNDARIS_PERFORMANCE_LAB").is_ok_and(|s| s == "1");
@@ -143,14 +130,7 @@ impl Controls {
             snapshot_export_status: None,
             terrain_preview: false,
             sun_from_star: false,
-            terrain_lighting: terrain_lighting_from_environment(),
-            terrain_morph_ms: std::env::var("MUNDARIS_TERRAIN_MORPH_MS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(150)
-                .min(1000),
-            surface_bounds: false,
-            surface_style: SurfaceStyle::default(),
+            terrain_view: terrain_view_from_environment(),
             approach: None,
             clearance_target: 1e11,
             terrain_guard_m: None,
@@ -223,15 +203,11 @@ pub struct GravityOrbitsDemo {
     navigation_wall_at: Option<Instant>,
     developer_frame_number: u64,
     terrain_clearance: Option<crate::terrain_inspection::TerrainClearance>,
-    ready_mesh_probe: Option<crate::surface_probe::ReadyMeshProbe>,
     clearance_query_us: f64,
-    terrain: crate::terrain_population::TerrainPopulation,
-    planetary: planetary::PlanetaryTerrain,
     atlas: crate::planet_lod::PlanetLod,
     presentation: Vec<crate::shared_system::BodyPresentation>,
     scene_sha256: String,
     camera_sha256: String,
-    surfaces: Vec<PlanetSurfaceSession>,
     surface_owners: Vec<bool>,
     system: CelestialSystem,
     motion: MotionSession,
@@ -297,47 +273,12 @@ fn inspection_near_plane(clearance_m: f64) -> f64 {
     }
 }
 
-fn terrain_lighting_from_environment() -> TerrainLighting {
-    terrain_lighting_configuration(
-        std::env::var("MUNDARIS_TERRAIN_MODE").ok().as_deref(),
-        std::env::var("MUNDARIS_TERRAIN_SUN").ok().as_deref(),
-    )
-}
-
-fn terrain_lighting_configuration(mode: Option<&str>, sun: Option<&str>) -> TerrainLighting {
-    let mut lighting = TerrainLighting::default();
-    let preset = match sun {
-        Some("overhead") => Some(TerrainSunPreset::Overhead),
-        Some("side") => Some(TerrainSunPreset::Side),
-        Some("grazing") => Some(TerrainSunPreset::Grazing),
-        Some("terminator") => Some(TerrainSunPreset::Terminator),
-        Some("night") => Some(TerrainSunPreset::Night),
-        _ => None,
-    };
-    let sun = preset.map_or_else(
-        || lighting.sun_direction_body(),
-        |preset| preset.direction_body(),
-    );
-    let mode = match mode {
-        Some("planetary" | "natural") => TerrainRenderMode::Natural,
-        Some("elevation") => TerrainRenderMode::Elevation,
-        Some("lit") => TerrainRenderMode::Lit,
-        Some("normals") => TerrainRenderMode::Normals,
-        Some("diffuse") => TerrainRenderMode::Diffuse,
-        Some("readability" | "surface") => TerrainRenderMode::Readability,
-        Some("slope") => TerrainRenderMode::Slope,
-        Some("sea-mask") => TerrainRenderMode::SeaMask,
-        Some("rock-weight") => TerrainRenderMode::RockWeight,
-        _ => lighting.mode(),
-    };
-    lighting = TerrainLighting::try_new(
-        sun,
-        lighting.ambient_strength(),
-        lighting.diffuse_strength(),
-        mode,
-    )
-    .unwrap_or_default();
-    lighting
+/// Terrain view selected at launch; `MUNDARIS_TERRAIN_MODE` takes a view-mode name.
+fn terrain_view_from_environment() -> TerrainViewMode {
+    std::env::var("MUNDARIS_TERRAIN_MODE")
+        .ok()
+        .and_then(|name| TerrainViewMode::from_name(&name))
+        .unwrap_or_default()
 }
 
 impl GravityOrbitsDemo {
@@ -461,9 +402,6 @@ impl GravityOrbitsDemo {
         selection.select(&system, ids[selected])?;
         let mut controls = Controls::new(system.body(ids[selected])?);
         controls.terrain_preview = true;
-        controls.terrain_lighting = controls
-            .terrain_lighting
-            .with_mode(TerrainRenderMode::Natural);
         controls.sun_from_star = true;
         controls.trails = false;
         controls.guide_visible = false;
@@ -494,14 +432,6 @@ impl GravityOrbitsDemo {
         camera.developer_set_surface_pose(&pair, body, pose)?;
         camera.target_clearance(&pair, clearance)?;
         camera.enter_surface_inspection(&pair, body)?;
-        let enabled: Vec<_> = system
-            .bodies()
-            .filter_map(|(id, body)| body.has_surface().then_some(id))
-            .collect();
-        let surfaces = enabled
-            .into_iter()
-            .map(|id| PlanetSurfaceSession::new(id, 2048))
-            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             #[cfg(feature = "developer-tools")]
             developer_session: None,
@@ -520,20 +450,11 @@ impl GravityOrbitsDemo {
             profile_snapshot: None,
             diagnostic_capture_request: None,
             terrain_clearance: None,
-            ready_mesh_probe: None,
             clearance_query_us: 0.0,
-            terrain: crate::terrain_population::TerrainPopulation::new()?,
-            planetary: planetary::PlanetaryTerrain::new(true),
-            // Temporary developer toggle back to the resident path; removal
-            // condition: atlas Phase 3 native acceptance (ADR 0016).
-            atlas: crate::planet_lod::PlanetLod::new(
-                (std::env::var("MUNDARIS_TERRAIN_BACKEND").as_deref() != Ok("resident"))
-                    .then_some(lod),
-            ),
+            atlas: crate::planet_lod::PlanetLod::new(Some(lod)),
             presentation,
             scene_sha256,
             camera_sha256,
-            surfaces,
             surface_owners: Vec::new(),
             system,
             motion,
@@ -901,7 +822,7 @@ impl GravityOrbitsDemo {
                 .look_at_body(&self.projection.coherent_view(&self.system)?, target)?,
             Command::SurfaceInspection => {
                 anyhow::ensure!(
-                    self.surfaces.iter().any(|s| s.body() == id),
+                    self.system.body(id)?.has_surface(),
                     "selected body has no surface capability"
                 );
                 self.camera
@@ -1192,11 +1113,6 @@ impl GravityOrbitsDemo {
                 MotionSession::Newtonian(runner) => runner.rename(&mut self.system, id, &name)?,
                 MotionSession::Analytic(a) => a.rename(&mut self.system, id, &name)?,
             },
-            Command::TerrainPreview(enabled) => {
-                visual_controls::VisualCommand::Layer(visual_controls::Layer::Terrain, enabled)
-                    .apply(&mut self.controls)?;
-                self.controls.surface_style.elevation_colors = enabled;
-            }
             Command::Visual(command) => command.apply(&mut self.controls)?,
             Command::TrailMode(relative) => {
                 let mode = if relative {
@@ -1597,12 +1513,6 @@ impl GravityOrbitsDemo {
         }
         self.set_lifecycle_drawable(true);
         self.developer_frame_number = self.developer_frame_number.saturating_add(1);
-        self.controls.cluster_report = renderer.cluster_report();
-        if self.controls.cluster_settings.mode == mundaris_renderer::ClusterMode::Reference {
-            self.controls.cluster_settings.freeze = false;
-        }
-        self.planetary.cluster_freeze = self.controls.cluster_settings.freeze;
-        renderer.set_cluster_settings(self.controls.cluster_settings);
         crate::engine_profile::set_enabled(self.controls.performance_lab.enabled);
         if crate::engine_profile::is_enabled() {
             renderer.request_profile_timing();
@@ -1674,7 +1584,6 @@ impl GravityOrbitsDemo {
         self.controls.pixels_per_point = scale;
         self.terrain_clearance = self.camera.recorded_terrain_clearance();
         self.clearance_query_us = self.camera.navigation_diagnostics().terrain_query_us;
-        self.ready_mesh_probe = None;
         let view = PreparedView::new(
             &pair.evaluation(),
             self.camera.pose(),
@@ -1708,123 +1617,10 @@ impl GravityOrbitsDemo {
         }
         let near = inspection_near_plane(clearance);
         let projection = self.content_projection(near)?;
-        let population_pose = self.camera.pose();
-        let population_near = near;
         self.surface_owners.clear();
         self.surface_owners.resize(self.requests.len(), false);
-        let atlas_active = self.atlas.enabled;
-        let planetary_active = self.planetary.enabled && !atlas_active;
-        if atlas_active {
-            self.planetary.runtime.suspend();
-        }
-        let mut planetary_candidate = if planetary_active && self.controls.terrain_preview {
-            self.terrain.resident_candidate(
-                &pair,
-                &view,
-                projection,
-                &self.requests,
-                &mut self.surfaces,
-            )?
-        } else {
-            None
-        };
-        if planetary_active
-            && self.controls.terrain_preview
-            && self.planetary.runtime.has_coverage()
-            && let Some(old) = self.planetary.body
-            && planetary_candidate != Some(old)
-            && let Some(index) = self.ids.iter().position(|&id| id == old)
-            && !self.terrain.resident_far_ready(
-                &view,
-                projection,
-                self.requests[index],
-                &self.sphere,
-            )?
-        {
-            planetary_candidate = Some(old);
-        }
-        let mut planetary_binding_ready = false;
-        if let Some(body) = planetary_candidate {
-            let identity = self
-                .ids
-                .iter()
-                .position(|&id| id == body)
-                .ok_or_else(|| anyhow::anyhow!("resident body association missing"))?
-                as u64
-                + 1;
-            if self.planetary.body != Some(body) {
-                self.controls.cluster_settings.freeze = false;
-                self.planetary.cluster_freeze = false;
-                renderer.set_cluster_settings(self.controls.cluster_settings);
-            }
-            planetary_binding_ready = self.planetary.bind(body, identity, &pair)?;
-        }
-        if planetary_active && planetary_candidate.is_none() {
-            self.planetary.runtime.suspend();
-        }
-        if let Some(terrain) = self.terrain_clearance
-            && self.terrain.active_body() == Some(terrain.body)
-        {
-            self.ready_mesh_probe =
-                crate::surface_probe::ready_mesh_probe(&self.terrain.cover, terrain.location)?;
-        }
-        if let Some(terrain) = self.terrain_clearance {
-            clearance = terrain.clearance_m;
-            if let Some(mesh) = self.ready_mesh_probe {
-                clearance = clearance.min(terrain.camera_radius_m - mesh.radius_m);
-            }
-        }
-        let near = inspection_near_plane(clearance);
-        let projection = self.content_projection(near)?;
-        // The optional debug guard may have changed only the observer after ready
-        // publication. Source-centred conversion must use the resulting pose.
-        let view = PreparedView::new(
-            &pair.evaluation(),
-            self.camera.pose(),
-            RenderPrecisionBudget::near_debug(),
-        )?;
-        if (self.camera.pose() != population_pose || near != population_near)
-            && let Some(active) = self.terrain.active_body()
-            && let Some(index) = self.ids.iter().position(|&id| id == active)
-        {
-            // A guard correction or tighter mesh-relative near plane must not
-            // draw the previous observer's frustum subset for one frame.
-            self.terrain.cover.prepare_visible(&SurfaceViewInput {
-                view: &view,
-                body_fixed_frame: self.requests[index].body_fixed_frame,
-                reference_radius_m: self.requests[index].reference_radius_m,
-                projection,
-            })?;
-        }
-        let mut lighting = self.controls.terrain_lighting;
-        if self.controls.sun_from_star
-            && let Some(active) = if planetary_active {
-                self.planetary.body
-            } else {
-                self.terrain.active_body()
-            }
-        {
-            let body = pair.system().body(active)?;
-            let star = pair.system().body(self.ids[0])?;
-            let direction = body
-                .state()
-                .body_to_system()
-                .inverse()
-                .rotate_direction(Direction3::try_new(
-                    star.state().center_in_system().metres()
-                        - body.state().center_in_system().metres(),
-                )?)?
-                .unit();
-            lighting = TerrainLighting::try_new(
-                direction,
-                lighting.ambient_strength(),
-                lighting.diffuse_strength(),
-                lighting.mode(),
-            )?;
-        }
         let mut frame = CelestialFrame::new(&view, &mut self.staging, projection, &self.sphere);
-        frame.set_terrain_lighting(lighting);
-        if atlas_active {
+        if self.controls.terrain_preview {
             let _span = crate::engine_profile::span("Atlas terrain preparation");
             self.atlas
                 .receive_bounds(renderer.take_terrain_atlas_bounds());
@@ -1853,16 +1649,11 @@ impl GravityOrbitsDemo {
                     sun_body,
                 });
             }
-            let mode = match lighting.mode() {
-                TerrainRenderMode::Normals => 2,
-                TerrainRenderMode::Elevation => 1,
-                _ => 0,
-            };
             let atlas_frame = self.atlas.prepare(
                 &view,
                 projection,
                 &inputs,
-                mode,
+                self.controls.terrain_view.shader_mode(),
                 renderer.terrain_atlas_layer_limit(),
             )?;
             for body in self.atlas.drawn_bodies() {
@@ -1872,97 +1663,8 @@ impl GravityOrbitsDemo {
             }
             frame.set_terrain_atlas(atlas_frame);
         }
-        let mut planetary_submitted = false;
-        if planetary_active
-            && planetary_binding_ready
-            && let Some(body) = self.planetary.body
-            && planetary_candidate == Some(body)
-        {
-            let body_frame = pair.projection().frames_for(body)?.body_fixed;
-            if let Some(draw) = self.planetary.prepare(
-                &view,
-                body_frame,
-                projection,
-                lighting,
-                self.presentation[self
-                    .ids
-                    .iter()
-                    .position(|id| *id == body)
-                    .context("missing body presentation")?]
-                .appearance,
-                renderer.last_resident_regional_report(),
-                elapsed,
-                renderer.deterministic(),
-            )? {
-                frame.set_resident_regional(draw)?;
-                planetary_submitted = true;
-            }
-            if self.planetary.runtime.has_coverage()
-                && let Some(index) = self.ids.iter().position(|&id| id == body)
-            {
-                self.surface_owners[index] = true;
-            }
-        }
         let prepared = (|| -> Result<()> {
             frame.append_body_observations(&self.requests, &self.surface_owners)?;
-            if self.controls.surface_bounds {
-                for session in &self.surfaces {
-                    let index = self
-                        .ids
-                        .iter()
-                        .position(|&id| id == session.body())
-                        .expect("surface body");
-                    let body = self.requests[index];
-                    for patch in session.lod().active_visible().iter().take(8) {
-                        let (center, radius) = patch.metadata.ball(
-                            body.reference_radius_m,
-                            SurfaceExtent::smooth(body.reference_radius_m),
-                        )?;
-                        let mut lines = Vec::with_capacity(49);
-                        for (a, b) in [
-                            (DVec3::X, DVec3::Y),
-                            (DVec3::Y, DVec3::Z),
-                            (DVec3::Z, DVec3::X),
-                        ] {
-                            for i in 0..16 {
-                                let endpoints = [i, i + 1].map(|k| {
-                                    let angle = k as f64 * std::f64::consts::TAU / 16.0;
-                                    center + radius * (a * angle.cos() + b * angle.sin())
-                                });
-                                lines.push(DebugLine {
-                                    endpoints: [
-                                        FramePosition::new(
-                                            body.body_fixed_frame,
-                                            LocalPosition::try_metres(endpoints[0])?,
-                                        ),
-                                        FramePosition::new(
-                                            body.body_fixed_frame,
-                                            LocalPosition::try_metres(endpoints[1])?,
-                                        ),
-                                    ],
-                                    color: [0.3, 0.9, 0.3, 1.0],
-                                });
-                            }
-                        }
-                        if let Some((axis, _, _)) = patch.metadata.normal_envelope() {
-                            lines.push(DebugLine {
-                                endpoints: [
-                                    FramePosition::new(
-                                        body.body_fixed_frame,
-                                        LocalPosition::try_metres(center)?,
-                                    ),
-                                    FramePosition::new(
-                                        body.body_fixed_frame,
-                                        LocalPosition::try_metres(center + axis * radius)?,
-                                    ),
-                                ],
-                                color: [1.0, 0.6, 0.1, 1.0],
-                            });
-                        }
-                        frame.append_historical_lines(body.body_fixed_frame, &lines)?;
-                    }
-                }
-            }
             for curve in &self.curves {
                 frame.append_polylines(&[CelestialPolyline {
                     points: &curve.points,
@@ -2046,7 +1748,6 @@ impl GravityOrbitsDemo {
             gpu_timestamp_capability: format!("{:?}", renderer.timestamp_availability()),
             preparation_ms: Some(preparation_ms),
             gpu_source_frame: renderer.gpu_source_frame(),
-            upload_bytes: Some(report.surface.uploaded_bytes as u64),
             ..Default::default()
         }
         .with_gpu(renderer.latest_gpu_profile(), "latest_completed");
@@ -2054,8 +1755,6 @@ impl GravityOrbitsDemo {
         let performance = PerformanceSnapshot {
             update_ms: Some(update_ms),
             frame_cpu_ms: Some(update_ms + preparation_ms),
-            terrain_update_ms: Some(self.terrain.profile.total.as_secs_f64() * 1000.0),
-            terrain_preparation_ms: Some(report.surface.profile.total.as_secs_f64() * 1000.0),
             ..performance
         };
         let mut snapshot = DeveloperSnapshot::collect(SnapshotInput {
@@ -2087,35 +1786,17 @@ impl GravityOrbitsDemo {
             simulation_speed: self.motion.rate().multiplier(),
             motion: Some(self.motion.snapshot(&self.system)),
             projection,
-            terrain: &self.terrain,
             terrain_clearance_m: self.terrain_clearance.map(|c| c.clearance_m),
-            drawn_mesh_clearance_m: self
-                .terrain_clearance
-                .zip(self.ready_mesh_probe)
-                .map(|(c, m)| c.camera_radius_m - m.radius_m),
             rendering: RenderingSnapshot {
-                terrain_render_mode: render_mode_name(self.controls.terrain_lighting.mode()).into(),
-                terrain_enabled: self.controls.terrain_preview,
-                patch_borders_enabled: self.controls.surface_style.borders,
-                lod_colors_enabled: self.controls.surface_style.lod_colors,
+                terrain_render_mode: self.controls.terrain_view.name().into(),
+                terrain_enabled: true,
+                patch_borders_enabled: self.controls.terrain_view == TerrainViewMode::Grid,
+                lod_colors_enabled: self.controls.terrain_view == TerrainViewMode::Level,
                 navigation_markers_enabled: self.controls.markers,
-                ..Default::default()
             },
             performance,
         })?;
         snapshot.engine_profile = self.profile_snapshot.clone();
-        let cluster = renderer.cluster_report();
-        snapshot.rendering.clusters = Some(serde_json::json!({
-            "enabled":cluster.enabled,"mode":format!("{:?}",cluster.active_mode),"debug":format!("{:?}",self.controls.cluster_settings.debug),
-            "freeze_active":cluster.freeze_active,"resident_regions":cluster.resident_regions,"pending_regions":cluster.pending_regions,
-            "selected_clusters":cluster.selected_clusters,"selected_fine_clusters":cluster.selected_fine_clusters,"selected_coarse_clusters":cluster.selected_coarse_clusters,"selected_transition_clusters":cluster.selected_transition_clusters,"resident_clusters":cluster.resident_clusters,"submitted_triangles":cluster.submitted_triangles,"draw_commands":cluster.draw_commands,
-            "cpu_bytes":cluster.cpu_bytes,"gpu_bytes":cluster.gpu_bytes,"build_micros":cluster.build_micros,"selection_cpu_micros":cluster.selection_cpu_micros,
-            "all_build_micros":cluster.all_build_micros,"queue_wait_micros":cluster.queue_wait_micros,"max_queue_wait_micros":cluster.max_queue_wait_micros,
-            "completed_builds":cluster.completed_builds,"failed_builds":cluster.failed_builds,"evicted_before_selection":cluster.evicted_before_selection,"upload_bytes":cluster.upload_bytes,
-            "gpu_selection_ms":cluster.gpu_selection_ms,"gpu_render_ms":cluster.gpu_render_ms,"fallback_regions":cluster.fallback_regions,"rebuilds":cluster.rebuilds,"reason":cluster.reason,"counters_scope":cluster.counters_scope,
-            "triangle_edges":self.controls.cluster_settings.triangle_edges,"cluster_edges":self.controls.cluster_settings.cluster_edges,
-            "finite_mesh_error_px":mundaris_renderer::cluster::FINITE_MESH_ERROR_PX,"source_quality_accepted":false
-        }));
         snapshot.shared_scene = Some(serde_json::json!({
             "id": crate::shared_system::SCENE_NAME,
             "scene_sha256": self.scene_sha256,
@@ -2127,17 +1808,8 @@ impl GravityOrbitsDemo {
                 "definition_revision": body.definition_revision,
             })).collect::<Vec<_>>(),
         }));
-        if planetary_active {
-            self.planetary.annotate_previous(
-                &mut snapshot,
-                &self.ids,
-                &self.system,
-                planetary_binding_ready,
-            )?;
-        } else if atlas_active {
-            self.atlas
-                .annotate_terrain(&mut snapshot.terrain, &self.ids, &self.system);
-        }
+        self.atlas
+            .annotate_terrain(&mut snapshot.terrain, &self.ids, &self.system);
         // Opt-in native evidence scratch export of this exact prepared state.
         // Disabled for ordinary launches; collection remains observational.
         if let Some(path) = &self.navigation_snapshot_path {
@@ -2148,14 +1820,8 @@ impl GravityOrbitsDemo {
         let info = UiInfo {
             snapshot: Some(&snapshot),
             terrain_clearance: self.terrain_clearance,
-            ready_mesh_probe: self.ready_mesh_probe,
             clearance_query_us: self.clearance_query_us,
             owned_surface_count: self.surface_owners.iter().filter(|&&owned| owned).count(),
-            terrain_body: self.terrain.active_body(),
-            terrain_cache: self.terrain.cache.report(),
-            terrain_cover: &self.terrain.cover,
-            terrain_work: self.terrain.work,
-            surfaces: &self.surfaces,
             system: &self.system,
             projection: &self.projection,
             motion: &self.motion,
@@ -2232,68 +1898,7 @@ impl GravityOrbitsDemo {
                 .with_gpu(renderer.latest_gpu_profile(), "same_frame_offscreen");
             snapshot.performance.gpu_source_frame = Some(self.developer_frame_number);
         }
-        if planetary_active {
-            let mut resident_report = renderer.last_resident_regional_report();
-            if !planetary_submitted {
-                resident_report.preparation_micros = 0;
-                resident_report.tile_upload_bytes = 0;
-                resident_report.boundary_upload_bytes = 0;
-                resident_report.metadata_upload_bytes = 0;
-                resident_report.tile_upload_count = 0;
-                resident_report.boundary_upload_count = 0;
-                resident_report.deferred_upload_count = 0;
-                resident_report.transfer_staging_bytes = 0;
-                resident_report.validation_readback_bytes = 0;
-            }
-            let resident_prepare_ms = resident_report.preparation_micros as f64 / 1000.0;
-            snapshot.rendering.resident_submitted_patch_count = if planetary_submitted {
-                resident_report.prepare_patch_count
-            } else {
-                0
-            };
-            let cells = self
-                .planetary
-                .runtime
-                .template_tile()
-                .map_or(0, |tile| tile.key.cells as usize);
-            snapshot.rendering.resident_submitted_triangle_count = snapshot
-                .rendering
-                .resident_submitted_patch_count
-                .saturating_mul(cells * cells * 2);
-            snapshot.performance.gpu_preparation_cpu_ms = Some(resident_prepare_ms);
-            snapshot.performance.frame_cpu_ms = snapshot
-                .performance
-                .frame_cpu_ms
-                .map(|cpu| cpu + resident_prepare_ms);
-            snapshot.performance.terrain_preparation_ms = Some(resident_prepare_ms);
-            snapshot.performance.upload_bytes = Some(
-                resident_report.tile_upload_bytes
-                    + resident_report.boundary_upload_bytes
-                    + resident_report.metadata_upload_bytes,
-            );
-            self.planetary.runtime.observe(resident_report);
-            let diagnostics_started = Instant::now();
-            // Retiring the preceding snapshot is diagnostic CPU work too.
-            // Keep it inside the measured host/diagnostic interval rather than
-            // leaving its allocations to be dropped after timing is finalized.
-            #[cfg(feature = "developer-tools")]
-            drop(self.developer_snapshot.take());
-            self.planetary.annotate(
-                &mut snapshot,
-                &self.ids,
-                &self.system,
-                planetary_binding_ready,
-            )?;
-            snapshot.performance.diagnostics_ms =
-                Some(diagnostics_started.elapsed().as_secs_f64() * 1000.0);
-            snapshot.performance.frame_cpu_ms = snapshot.performance.frame_cpu_ms.map(|cpu| {
-                cpu + ui_build_cpu_ms + diagnostics_started.elapsed().as_secs_f64() * 1000.0
-            });
-            snapshot.performance.host_frame_ms =
-                Some(host_frame_started.elapsed().as_secs_f64() * 1000.0);
-        }
-        if atlas_active {
-            snapshot.terrain.backend = "ATLAS CDLOD".into();
+        {
             let ids = &self.ids;
             let system = &self.system;
             snapshot.terrain_atlas = Some(self.atlas.snapshot(|body| {
@@ -2307,13 +1912,11 @@ impl GravityOrbitsDemo {
         }
         snapshot.performance.host_frame_ms =
             Some(host_frame_started.elapsed().as_secs_f64() * 1000.0);
-        if atlas_active {
-            self.atlas.record_frame(
-                native_interval_ms,
-                snapshot.performance.host_frame_ms,
-                renderer.terrain_atlas_report().jobs as usize,
-            );
-        }
+        self.atlas.record_frame(
+            native_interval_ms,
+            snapshot.performance.host_frame_ms,
+            renderer.terrain_atlas_report().jobs as usize,
+        );
         drop(frame_span);
         let profiler_started = Instant::now();
         if let Some(profile) = self.profile_sampler.poll_value() {
@@ -2331,11 +1934,7 @@ impl GravityOrbitsDemo {
             }
         }
         snapshot.engine_profile = self.profile_snapshot.clone();
-        let capture_trace = self.planetary.runtime.trace();
-        if let Some(name) = self
-            .performance_capture
-            .observe_with_trace(&snapshot, capture_trace)
-        {
+        if let Some(name) = self.performance_capture.observe(&snapshot) {
             self.diagnostic_capture_request = Some(name);
         }
         if std::mem::take(&mut self.controls.performance_lab.capture_requested) {
@@ -2352,13 +1951,6 @@ impl GravityOrbitsDemo {
         if profile_sample_due {
             self.controls.performance_lab.ingest(&snapshot, None);
         }
-        if planetary_active && planetary_candidate.is_some() {
-            self.planetary.runtime.record_native_frame(
-                &snapshot.performance,
-                self.developer_frame_number,
-                native_interval_ms,
-            );
-        }
         #[cfg(feature = "developer-tools")]
         if self.developer_session.is_some() || renderer.deterministic() {
             self.developer_snapshot = Some(snapshot);
@@ -2369,22 +1961,11 @@ impl GravityOrbitsDemo {
             update_ms,
             pump_ms = self.pump_ms,
             preparation_ms,
-            surface_ms = report.surface.profile.total.as_secs_f64() * 1000.0,
             clearance_query_us = self.clearance_query_us,
-            population = ?self.terrain.profile,
-            adaptive = ?self.terrain.cover.profile,
-            selector = ?self.terrain.cover.report.profile,
-            workers = ?self.terrain.work.profile,
-            preparation = ?report.surface.profile,
-            terrain_upload = ?renderer.last_terrain_upload_profile(),
             latest_completed_gpu_query = ?renderer.latest_gpu_profile(),
             render_present_ms = render_started.elapsed().as_secs_f64() * 1000.0,
-            patches = report.surface.patches,
-            samples = report.surface.samples,
-            bytes = report.surface.uploaded_bytes,
-            draws = report.surface.draws,
             dpi = scale,
-            "surface CPU/cadence probe (render includes UI/acquire/upload/submit/present, not GPU duration)"
+            "frame CPU/cadence probe (render includes UI/acquire/upload/submit/present, not GPU duration)"
         );
         Ok(())
     }
@@ -2402,14 +1983,8 @@ impl GravityOrbitsDemo {
             UiInfo {
                 snapshot: None,
                 terrain_clearance: self.terrain_clearance,
-                ready_mesh_probe: self.ready_mesh_probe,
                 clearance_query_us: self.clearance_query_us,
                 owned_surface_count: self.surface_owners.iter().filter(|&&owned| owned).count(),
-                terrain_body: self.terrain.active_body(),
-                terrain_cache: self.terrain.cache.report(),
-                terrain_cover: &self.terrain.cover,
-                terrain_work: self.terrain.work,
-                surfaces: &self.surfaces,
                 system: &self.system,
                 projection: &self.projection,
                 motion: &self.motion,
@@ -2560,14 +2135,8 @@ impl GravityOrbitsDemo {
 struct UiInfo<'a> {
     snapshot: Option<&'a crate::developer_snapshot::DeveloperSnapshot>,
     terrain_clearance: Option<crate::terrain_inspection::TerrainClearance>,
-    ready_mesh_probe: Option<crate::surface_probe::ReadyMeshProbe>,
     clearance_query_us: f64,
     owned_surface_count: usize,
-    terrain_body: Option<BodyId>,
-    terrain_cache: crate::planet_terrain::TerrainCacheReport,
-    terrain_cover: &'a crate::planet_terrain::AdaptiveTerrainCover,
-    terrain_work: crate::planet_terrain::TerrainWorkReport,
-    surfaces: &'a [PlanetSurfaceSession],
     system: &'a CelestialSystem,
     projection: &'a CelestialFrameProjection,
     motion: &'a MotionSession,
@@ -2706,7 +2275,7 @@ fn draw_engineering_ui(
         ui.separator();
         if let (Some(advance), Some(diagnostics), Some(drift)) = (info.advance, info.diagnostics, info.drift) {
         ui.label(format!("{} bodies / {} pairs / {} new force passes this update",info.system.body_count(),pair_count(info.system.body_count()).expect("valid count"),advance.force_passes));
-        ui.label(format!("{} far / {} surface owners · terrain active: {}",info.system.body_count()-info.owned_surface_count,info.owned_surface_count,info.terrain_body.and_then(|id|info.system.body(id).ok()).map_or("none",|body|body.name())));
+        ui.label(format!("{} far / {} surface owners",info.system.body_count()-info.owned_surface_count,info.owned_surface_count));
         ui.label(format!("Diagnostic sample tick {} / {:.3} s",info.sampled_tick,diagnostics.sampled_time.seconds_since_epoch()));
         ui.label(format!("E {:.8e} J / drift {:.3e} J / normalized {:.3e}{}",diagnostics.total_energy_j(),drift.energy_j,drift.relative_energy,if drift.uses_near_zero_energy_scale {" (K0+|U0| scale)"} else {" (|E0| scale)"}));
         ui.label(format!("P drift {:.3e} kg m/s / P/Qp {:.3e}",drift.momentum_kg_m_s.length(),drift.normalized_momentum));
@@ -2790,34 +2359,25 @@ fn draw_ui(
     }
     egui::SidePanel::right("planet surface / inspection").exact_width(300.0).resizable(false).show(context,|ui| {
             egui::ScrollArea::vertical().show(ui,|ui| {
-            crate::cluster_panel::show(ui, &mut controls.cluster_settings, &controls.cluster_report);
             developer_ui::right(ui, controls, info);
             ui.separator();
             ui.collapsing("Advanced terrain diagnostics", |ui| {
-            if info.camera.focused_body().is_some() {
-            let id=info.camera.focused_body().expect("focused surface");
+            if let Some(id)=info.camera.focused_body() {
             let pair=info.projection.coherent_view(info.system).expect("coherent UI");
             ui.collapsing("Camera precision / clearance / navigation", |ui| {
-            ui.label(if controls.terrain_preview {"Procedural terrain checkpoint · adaptive ready cover"} else {"Smooth sphere · zero terrain height · one connected body"});
             if let Some(c)=info.terrain_clearance {
                 ui.strong(format!("Terrain clearance: {:+.2} m",c.clearance_m));
                 if c.clearance_m<0.0 {ui.colored_label(egui::Color32::RED,"INSIDE TERRAIN (complete field)");}
                 else {ui.label("Above complete displaced terrain");}
                 ui.monospace(format!("Centre distance {:.3} m\nSphere altitude {:+.3} m\nTerrain elevation {:+.3} m\nDisplaced radius {:.3} m\nAnalytic slope {:.2}°",c.camera_radius_m,c.sphere_altitude_m,c.terrain_elevation_m,c.surface_radius_m,c.slope_angle_rad.to_degrees()));
                 ui.small(format!("Body {} · direction {:?} · cumulative controller complete-query time {:.1} µs",info.system.body(id).expect("body").name(),c.location.direction().unit(),info.clearance_query_us));
-                if let Some(mesh)=info.ready_mesh_probe {
-                    let clearance=c.camera_radius_m-mesh.radius_m;
-                    ui.strong(format!("Drawn mesh clearance: {clearance:+.2} m"));
-                    if clearance<0.0 {ui.colored_label(egui::Color32::RED,"INSIDE DRAWN MESH — ready LOD differs from complete terrain");}
-                    ui.monospace(format!("Under camera {:?} · LOD {}\nMesh footprint {:.3} m{}",mesh.patch,mesh.patch.level(),mesh.footprint_m,if mesh.morphing {" · morphing"}else{""}));
-                } else {ui.colored_label(egui::Color32::YELLOW,"Drawn surface under camera unavailable / not admitted or not ready");}
                 egui::ComboBox::from_label("Debug terrain guard").selected_text(controls.terrain_guard_m.map_or("Disabled".into(),|m|format!("{m} m"))).show_ui(ui,|ui| {
                     for minimum in [None,Some(2.0),Some(10.0),Some(100.0)] {
                         let label=minimum.map_or("Disabled".into(),|m|format!("{m} m"));
                         if ui.selectable_label(controls.terrain_guard_m==minimum,label).clicked() {controls.pending.push_back(Command::TerrainGuard(minimum));}
                     }
                 });
-                ui.small("Guard protects sampled complete-terrain radial clearance (reference-sphere fallback when unavailable), not collision. Pending drawn mesh may intersect the observer; it does not clamp navigation.");
+                ui.small("Guard protects sampled complete-terrain radial clearance (reference-sphere fallback when unavailable), not collision.");
             } else if info.system.body(id).is_ok_and(|body|!body.has_surface()) {
                 ui.label("Non-terrain / far-only body: no rocky terrain query");
                 if let Ok(clearance)=info.camera.measured_clearance(&pair,id) {ui.label(format!("Reference-sphere altitude {}",compact_distance(clearance)));}
@@ -2837,130 +2397,6 @@ fn draw_ui(
                 if ui.button("Single physical step +h").clicked() {controls.pending.push_back(Command::Single(true));}
                 ui.horizontal_wrapped(|ui| {for &target in info.ids {if target!=id&&ui.button(format!("Look at {}",info.system.body(target).expect("body").name())).clicked() {controls.pending.push_back(Command::LookBody(target));}}});
             }
-            });
-            ui.collapsing("Debug rendering / lighting", |ui| {
-            visual_controls::checkbox(ui,controls,visual_controls::Layer::Borders,"Patch borders");visual_controls::checkbox(ui,controls,visual_controls::Layer::LodColors,"LOD colours");ui.checkbox(&mut controls.surface_style.face_colors,"Face IDs / colours");ui.checkbox(&mut controls.surface_style.underside,"No-cull underside diagnostic");
-            ui.checkbox(&mut controls.surface_bounds,"Bounds / normal envelope axes (bounded)");
-            let mut preview=controls.terrain_preview;
-            if ui.checkbox(&mut preview,"Resident terrain").changed() {controls.pending.push_back(Command::TerrainPreview(preview));}
-            if controls.terrain_preview {
-                ui.label("Authored planetary material");
-                ui.checkbox(&mut controls.sun_from_star,"Use central star direction (disable for lighting presets)");
-                ui.add(egui::Slider::new(&mut controls.terrain_morph_ms,0..=1000).text("Morph ms (0: static)").clamping(egui::SliderClamping::Always));
-                ui.checkbox(&mut controls.surface_style.elevation_colors,"Derived terrain elevation colours");
-                let mut enabled = matches!(controls.terrain_lighting.mode(),TerrainRenderMode::Lit|TerrainRenderMode::Readability|TerrainRenderMode::Natural);
-                if ui.checkbox(&mut enabled, "Terrain lighting enabled").changed() {
-                    controls.pending.push_back(Command::Visual(visual_controls::VisualCommand::RenderMode(if enabled { TerrainRenderMode::Lit } else { TerrainRenderMode::Elevation })));
-                }
-                egui::ComboBox::from_label("Terrain shading mode").selected_text(format!("{:?}", controls.terrain_lighting.mode())).show_ui(ui, |ui| {
-                    for mode in TerrainRenderMode::ALL {
-                        if ui.selectable_label(controls.terrain_lighting.mode() == mode, format!("{mode:?}")).clicked() {
-                            controls.pending.push_back(Command::Visual(visual_controls::VisualCommand::RenderMode(mode)));
-                        }
-                    }
-                });
-                egui::ComboBox::from_label("Body-fixed sun preset").selected_text("Choose preset").show_ui(ui, |ui| {
-                    for (label, preset) in [("Overhead", TerrainSunPreset::Overhead), ("Side", TerrainSunPreset::Side), ("Grazing", TerrainSunPreset::Grazing), ("Terminator", TerrainSunPreset::Terminator), ("Night", TerrainSunPreset::Night)] {
-                        if ui.button(label).clicked() {
-                            let old = controls.terrain_lighting;
-                            if let Ok(value) = TerrainLighting::try_new(preset.direction_body(), old.ambient_strength(), old.diffuse_strength(), old.mode()) { controls.terrain_lighting = value; }
-                        }
-                    }
-                });
-                let mut sun = controls.terrain_lighting.sun_direction_body();
-                let mut sun_changed = false;
-                ui.horizontal(|ui| {
-                    for (label, component) in [("Sun X", &mut sun.x), ("Y", &mut sun.y), ("Z", &mut sun.z)] {
-                        sun_changed |= ui.add(egui::DragValue::new(component).speed(0.01).prefix(label)).changed();
-                    }
-                });
-                let lighting = controls.terrain_lighting;
-                if sun_changed && let Ok(value) = TerrainLighting::try_new(sun, lighting.ambient_strength(), lighting.diffuse_strength(), lighting.mode()) { controls.terrain_lighting = value; }
-                let mut ambient = controls.terrain_lighting.ambient_strength();
-                if ui.add(egui::Slider::new(&mut ambient, 0.0..=1.0).text("Ambient")).changed() {
-                    let value = controls.terrain_lighting;
-                    if let Ok(updated) = TerrainLighting::try_new(value.sun_direction_body(), ambient, value.diffuse_strength().min(1.0 - ambient), value.mode()) { controls.terrain_lighting = updated; }
-                }
-                let mut diffuse = controls.terrain_lighting.diffuse_strength();
-                if ui.add(egui::Slider::new(&mut diffuse, 0.0..=1.0).text("Diffuse")).changed() {
-                    let value = controls.terrain_lighting;
-                    if let Ok(updated) = TerrainLighting::try_new(value.sun_direction_body(), value.ambient_strength().min(1.0 - diffuse), diffuse, value.mode()) { controls.terrain_lighting = updated; }
-                }
-            }
-            });
-            if controls.terrain_preview {
-                let c=info.terrain_cache;let w=info.terrain_work;
-                ui.collapsing("Cache", |ui| {
-                ui.monospace(format!("Terrain: {} resident, {} pending; {} vertices / {} patches this frame, {:.3} ms; {:.2} MiB (peak {:.2}); evictions {}",c.resident_patches,w.pending_patches,w.vertices_generated,w.patches_completed,w.elapsed.as_secs_f64()*1000.0,c.resident_bytes as f64/1048576.0,c.peak_bytes as f64/1048576.0,c.evictions));
-                ui.small(format!("Hits {} · misses {} · evictions {}", c.hits, c.misses, c.evictions));
-                });
-                let cover=info.terrain_cover;
-                let d=cover.convergence;
-                ui.collapsing("LOD", |ui| {
-                ui.label("Desired LOD").on_hover_text("The camera-radial level the error model currently wants.");
-                ui.label("Ready LOD").on_hover_text("Highest camera-radial level whose raw terrain is resident; not necessarily displayed.");
-                ui.label("Displayed / source LOD").on_hover_text("Level currently contributing to the rendered source surface. Radial, not whole-view quality.");
-                ui.monospace(format!("Desired local LOD: {:?}\nReady local LOD: {:?}\nRendered source LOD: {:?}",d.desired_local_lod,d.ready_local_lod,d.rendered_local_lod));
-                ui.monospace(format!("Useful target LOD: {:?} · certificate target: {:?}\nDesired width {:.6} m · Grid16 spacing {:.6} m\nRendered spacing {:.6} m · evaluator footprint {:.6} m\nConservative pixel footprint {:.6} m · depth floor {:.6} m",d.useful_target_lod,d.certificate_limited_target_lod,d.desired_patch_width_m,d.desired_sample_spacing_m,d.rendered_sample_spacing_m,d.terrain_footprint_m,d.pixel_footprint_m,d.projected_depth_floor_m));
-                let px=d.desired_error_pixels;
-                ui.small(format!("Desired projected error px: sphere {:.4e} · interpolation {:.4e} · unresolved {:.4e} · boundary {:.4e} · morph {:.4e} · numeric {:.4e}\nTOTAL {:.4e} px · dominant: {}",px[0],px[1],px[2],px[3],px[4],px[5],d.desired_total_pixels,d.dominant_term));
-                ui.small(format!("Represented height bound {:.3} m (not interpolation error). Targets above are radial certificates, not whole-view quality.",d.represented_height_bound_m));
-                ui.monospace(format!("Desired patches: {}{} · ready source: {}\nPending work: {} · queue: {} · workers: {}/{}\nActive morphs: {} · building cover: {} · blocked transactions: {}",
-                    cover.report.desired_patches,if cover.report.desired_estimate_incomplete {" (incomplete estimate)"}else{""},cover.active().len(),w.pending_patches,c.queued_patches,c.worker_jobs,c.worker_count,
-                    usize::from(cover.transition().is_some()),cover.construction_pending(),cover.report.deferred_transactions));
-                ui.small(format!("Main thread: scheduling {:.3} ms · raw publication {:.3} ms · cover publication {:.3} ms · diagnostics {:.3} ms. Worker CPU completed this frame {:.3} ms / {} samples; last stitch {:.3} ms / morph {:.3} ms",
-                    w.scheduling.as_secs_f64()*1000.0,w.publication.as_secs_f64()*1000.0,cover.result_publication.as_secs_f64()*1000.0,d.diagnostic_cpu.as_secs_f64()*1000.0,
-                    w.worker_cpu.as_secs_f64()*1000.0,w.worker_samples_completed,cover.worker_stitch_cpu.as_secs_f64()*1000.0,cover.worker_morph_cpu.as_secs_f64()*1000.0));
-                let e=d.local_error;
-                ui.small(format!("Local certificate metres: sphere {:.3e} · interpolation {:.3e} · unresolved {:.3e} · boundary {:.3e} · morph {:.3e} · numeric {:.3e}",e.sphere_m,e.filtered_interpolation_m,e.unresolved_m,e.boundary_constraint_m,e.morph_remaining_m,e.numeric_m));
-                if !d.target_certifiable {ui.colored_label(egui::Color32::YELLOW,"Local pixel target not certifiable by LOD30; not merely queued work");}
-                else if cover.report.budget_constrained {ui.label("Local target certifiable; current refinement resource-constrained");}
-                else if d.rendered_local_lod<d.desired_local_lod {ui.label("Local target certifiable; generation / replacement pending");}
-                });
-                ui.collapsing("Workers / raw timings", |ui| {
-                ui.small(format!("Workers {}/{} busy · queue {} · pending {}", c.worker_jobs, c.worker_count, c.queued_patches, w.pending_patches));
-                ui.small(format!("Scheduling {:.3} ms · raw publication {:.3} ms · cover publication {:.3} ms · diagnostic {:.3} ms", w.scheduling.as_secs_f64()*1000.0, w.publication.as_secs_f64()*1000.0, cover.result_publication.as_secs_f64()*1000.0, d.diagnostic_cpu.as_secs_f64()*1000.0));
-                });
-                ui.collapsing("Memory", |ui| {
-                ui.small(format!("Worker reservations {:.2} MiB · stacks/scratch {:.2} MiB · completed cover reservation {:.2} MiB · cancellations {}",
-                    c.worker_reserved_bytes as f64/1048576.0,c.worker_fixed_bytes as f64/1048576.0,c.completed_unpublished_bytes as f64/1048576.0,c.cancellations));
-                if cover.transition_deferred {ui.colored_label(egui::Color32::YELLOW,"Transition reservation cannot fit replacement; complete source retained. Reset terrain or explicitly change morph duration to retry.");}
-                ui.small(format!("Accounted aggregate {:.2} MiB / peak {:.2} MiB; {} pinned. Selector {:.3} ms / stitching {:.3} ms / morph construction {:.3} ms",(c.resident_bytes+c.external_bytes) as f64/1048576.0,c.peak_aggregate_bytes as f64/1048576.0,c.pinned_patches,cover.selection_preparation.as_secs_f64()*1000.0,cover.stitch_preparation.as_secs_f64()*1000.0,cover.morph_preparation.as_secs_f64()*1000.0));
-                });
-                ui.collapsing("Transitions / source coverage", |ui| {
-                if let Some((mesh,fraction))=cover.transition() {
-                    ui.small(format!("One synchronized morph: {:.1}% / {} overlay triangles; source {} / target {} changed leaves; remaining displacement {:.3} m",fraction*100.0,mesh.triangles().len(),mesh.affected_old().len(),mesh.affected_new().len(),mesh.max_displacement_m()*(1.0-fraction)));
-                }
-                ui.small(format!("Published source cover {} / visible regular {}; selector counts below refer to target readiness",cover.active().len(),cover.visible().len()));
-                let levels=cover.visible().iter().map(|p|p.address.level());
-                let min=levels.clone().min();let max=levels.max();
-                ui.monospace(format!("Visible LOD {:?}–{:?} · covering {} · visible {}\nReady source leaves {} · pending {} · active morphs {}",min,max,cover.active().len(),cover.visible().len(),if cover.ready(){cover.active().len()}else{0},w.pending_patches,usize::from(cover.transition().is_some())));
-                if controls.surface_style.lod_colors {
-                    ui.horizontal_wrapped(|ui| {for level in 0..=max.unwrap_or(0).min(30) {
-                        let color=lod_color(level);
-                        ui.colored_label(egui::Color32::from_rgb((color[0]*255.0) as u8,(color[1]*255.0) as u8,(color[2]*255.0) as u8),format!("L{level}"));
-                    }});
-                    ui.small("Hue repeats every 12 levels; numeric LOD readouts disambiguate.");
-                }
-                ui.label("Adaptive displaced stitching / ready-cover morphs; terrain-under-camera query is independent of patch UV.");
-                });
-            }
-            ui.collapsing("Bounds / per-body LOD / precision", |ui| {
-            if let Some(pointer)=context.input(|i|i.pointer.hover_pos()) {
-                let pixels=[f64::from(pointer.x*context.pixels_per_point()),f64::from(pointer.y*context.pixels_per_point())];
-                if let Some(session)=info.surfaces.iter().find(|s|s.body()==id)&&let Ok(Some(patch))=session.hovered_patch(&pair,info.camera.pose(),info.celestial_projection,pixels) {ui.monospace(format!("Pointer patch {patch:?}"));}
-            }
-            for session in info.surfaces {let r=session.report;
-                ui.label(format!("{} {:?} · far error {:.4} px",info.system.body(session.body()).expect("body").name(),session.state(),session.far_error_pixels));
-                ui.small(format!("Desired {}{} / balanced {} / active {} / visible {} / level {} / error {:.4} px",r.desired_patches,if r.desired_estimate_incomplete {" (incomplete estimate)"}else{""},r.balanced_patches,r.active_patches,r.visible_patches,r.max_level,r.max_error_pixels));
-                ui.small(format!("Split {} merge {} balance {} · deferred {} constrained {}{}",r.splits,r.merges,r.balance_splits,r.deferred_transactions,r.constrained_refinements,if r.quality_pending {" · quality pending"}else{""}));
-                ui.small(format!("Cover/scratch {} bytes · sample time {:.3} s",r.scratch_bytes,info.system.sample_time().seconds_since_epoch()));
-                ui.small(format!("Horizon {} frustum {} · cache {} records / {} bytes, hit {} miss {} evict {}",r.horizon_culled,r.frustum_culled,r.cache_records,r.cache_bytes,r.cache_hits,r.cache_misses,r.cache_evictions));
-                if r.budget_constrained {ui.colored_label(egui::Color32::YELLOW,"Budget constrains requested quality; complete coarser cover retained");}
-                ui.push_id(session.body(),|ui|ui.collapsing("Bounded patch addresses / stitch masks",|ui| {for patch in session.lod().active_visible().iter().take(16) {ui.monospace(format!("{:?} mask {:04b} · {:.4} px",patch.address,patch.stitch_mask,patch.error_pixels));}}));
-            }
-            let r=info.report.surface;ui.small(format!("{} draws / {} samples / {} clipped fallback + {} morph triangles / {} upload bytes",r.draws,r.samples,r.fallback_triangles,r.morph_triangles,r.uploaded_bytes));
-            ui.small(format!("Narrowing {:.4e} px / GPU projection {:.4e} px · staging {} bytes",r.max_projected_error_pixels,r.max_gpu_projection_error_pixels,r.allocated_staging_bytes));
             });
             }
             });

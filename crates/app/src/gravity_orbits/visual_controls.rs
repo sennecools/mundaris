@@ -7,8 +7,6 @@ pub(super) enum Layer {
     Labels,
     Trails,
     Guides,
-    Borders,
-    LodColors,
 }
 impl Layer {
     #[cfg(feature = "developer-tools")]
@@ -19,8 +17,6 @@ impl Layer {
             "labels" => Self::Labels,
             "trails" => Self::Trails,
             "guides" => Self::Guides,
-            "patch_borders" => Self::Borders,
-            "lod_colors" => Self::LodColors,
             _ => anyhow::bail!("unsupported layer"),
         })
     }
@@ -31,21 +27,17 @@ impl Layer {
             Self::Labels => &mut controls.labels,
             Self::Trails => &mut controls.trails,
             Self::Guides => &mut controls.guide_visible,
-            Self::Borders => &mut controls.surface_style.borders,
-            Self::LodColors => &mut controls.surface_style.lod_colors,
         }
     }
 }
 pub(super) enum VisualCommand {
-    RenderMode(TerrainRenderMode),
+    RenderMode(TerrainViewMode),
     Layer(Layer, bool),
 }
 impl VisualCommand {
     pub fn apply(self, controls: &mut Controls) -> Result<()> {
         match self {
-            Self::RenderMode(mode) => {
-                controls.terrain_lighting = controls.terrain_lighting.with_mode(mode)
-            }
+            Self::RenderMode(mode) => controls.terrain_view = mode,
             Self::Layer(layer, value) => *layer.flag(controls) = value,
         };
         Ok(())

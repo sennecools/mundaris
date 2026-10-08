@@ -1141,12 +1141,7 @@ impl PerformanceLab {
                 );
             });
         egui::CollapsingHeader::new("Raw backend telemetry · advanced").show(ui, |ui| {
-            for (name, value) in [
-                ("Planetary resident", snapshot.resident_planetary.as_deref()),
-                ("Regional resident", snapshot.resident_regional.as_ref()),
-                ("Hierarchy resident", snapshot.resident_hierarchy.as_ref()),
-                ("Tile fixture", snapshot.resident_tile.as_ref()),
-            ] {
+            for (name, value) in [("Terrain atlas", snapshot.terrain_atlas.as_ref())] {
                 if let Some(value) = value {
                     ui.label(RichText::new(name).strong());
                     ui.monospace(truncate(&value.to_string(), 900));
@@ -2462,10 +2457,7 @@ fn find_jobs(value: &Value) -> Option<&Vec<Value>> {
 }
 
 fn resident_value(snapshot: &DeveloperSnapshot) -> Option<&Value> {
-    snapshot
-        .resident_planetary
-        .as_deref()
-        .or(snapshot.resident_regional.as_ref())
+    snapshot.terrain_atlas.as_ref()
 }
 
 fn resident_number(resident: Option<&Value>, pointer: &str) -> Option<f64> {
@@ -2475,12 +2467,10 @@ fn resident_number(resident: Option<&Value>, pointer: &str) -> Option<f64> {
         .filter(|value| value.is_finite() && *value >= 0.0)
 }
 
-fn resident_trace(snapshot: &DeveloperSnapshot) -> Option<&Value> {
-    snapshot
-        .resident_planetary
-        .as_ref()
-        .and_then(|resident| resident.terrain_trace())
-        .or_else(|| snapshot.resident_regional.as_ref()?.get("terrain_trace"))
+/// Per-job terrain traces belonged to the retired resident pipeline; the atlas
+/// producer reports aggregate counts only.
+fn resident_trace(_snapshot: &DeveloperSnapshot) -> Option<&Value> {
+    None
 }
 
 fn resident_latest_sample_number(resident: Option<&Value>, field: &str) -> Option<f64> {
@@ -3020,10 +3010,6 @@ mod timeline_tests {
             shared_scene: None,
             motion: None,
             development: None,
-            resident_tile: None,
-            resident_hierarchy: None,
-            resident_regional: None,
-            resident_planetary: None,
             terrain_atlas: None,
             engine_profile: Some(Arc::new(json!({"generated_at_ns":1,"lanes":[]}))),
         };

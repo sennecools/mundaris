@@ -89,10 +89,17 @@ $content = Get-ContentSnapshot $contentRoot
 
 if ($Build) {
     Push-Location $repo
+    # Cargo reports progress on stderr; Windows PowerShell 5.1 turns that into a
+    # terminating error under 'Stop', so judge the build by its exit code only.
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     try {
         & cargo build --locked --release -p mundaris_app --bin mundaris_app --bin mundaris_dev --features developer-tools --target-dir (Join-Path $repo 'target') *> (Join-Path $runDirectory 'build.log')
         if ($LASTEXITCODE -ne 0) { throw "Locked release developer-tools build failed; see $(Join-Path $runDirectory 'build.log')" }
-    } finally { Pop-Location }
+    } finally {
+        $ErrorActionPreference = $previousPreference
+        Pop-Location
+    }
 }
 if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
     throw "Ordinary mundaris_app release executable is missing. Run this script with -Build: $executable"

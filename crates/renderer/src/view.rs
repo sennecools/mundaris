@@ -98,8 +98,6 @@ pub enum RenderPreparationError {
     InvalidDebugGeometry,
     #[error("debug frame contains a failed batch and cannot be submitted")]
     FailedDebugFrame,
-    #[error("resident terrain tile data or draw parameters are invalid")]
-    InvalidResidentTile,
     #[error("GPU progress during bounded resource growth: {0}")]
     GpuProgress(String),
     #[error("terrain atlas: {0}")]

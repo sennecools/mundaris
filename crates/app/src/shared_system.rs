@@ -3,7 +3,6 @@
 use anyhow::{Context, Result, ensure};
 use glam::{DQuat, DVec3};
 use mundaris_math::*;
-use mundaris_renderer::ResidentMaterialAppearance;
 use mundaris_world::{terrain::*, *};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -126,7 +125,6 @@ struct TerrainContent {
     profile: Option<ProfileContent>,
     material_composition: [f64; 2],
     material_contrast: f64,
-    appearance: AppearanceContent,
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -147,34 +145,6 @@ struct DetailContent {
     footprint_m: f64,
     amplitude_m: f64,
 }
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AppearanceContent {
-    material_colors: [[f32; 3]; 4],
-    natural_colors: [[f32; 3]; 4],
-    base_color: [f32; 3],
-    dark_color: [f32; 3],
-    ambient: f32,
-    diffuse: f32,
-    curvature_darkening: f32,
-    curvature_lightening: f32,
-}
-impl AppearanceContent {
-    fn validated(&self) -> Result<ResidentMaterialAppearance> {
-        let appearance = ResidentMaterialAppearance {
-            material_colors: self.material_colors,
-            natural_colors: self.natural_colors,
-            base_color: self.base_color,
-            dark_color: self.dark_color,
-            ambient: self.ambient,
-            diffuse: self.diffuse,
-            curvature_darkening: self.curvature_darkening,
-            curvature_lightening: self.curvature_lightening,
-        };
-        appearance.validate()?;
-        Ok(appearance)
-    }
-}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -192,7 +162,6 @@ pub struct BodyPresentation {
     pub semantic_id: String,
     pub color: [f32; 4],
     pub unlit: bool,
-    pub appearance: ResidentMaterialAppearance,
     pub definition_sha256: Option<String>,
     pub definition_revision: Option<u32>,
 }
@@ -255,7 +224,7 @@ fn terrain_definition(
     root: &Path,
     name: &str,
     radius_m: f64,
-) -> Result<(SurfaceDefinition, ResidentMaterialAppearance, String, u32)> {
+) -> Result<(SurfaceDefinition, String, u32)> {
     let (content, hash): (TerrainContent, _) = parse(&local_path(root, name)?)?;
     ensure!(
         content.schema == 1 && content.revision > 0 && !content.id.is_empty(),
@@ -346,12 +315,7 @@ fn terrain_definition(
         definition = definition.with_height_profile(root_profile)?;
     }
     definition.validate_radius(radius_m)?;
-    Ok((
-        definition,
-        content.appearance.validated()?,
-        hash,
-        content.revision,
-    ))
+    Ok((definition, hash, content.revision))
 }
 
 impl SharedTestSystem {
@@ -405,15 +369,13 @@ impl SharedTestSystem {
                 semantic_id: body.id.clone(),
                 color: body.color,
                 unlit: body.unlit,
-                appearance: ResidentMaterialAppearance::default(),
                 definition_sha256: None,
                 definition_revision: None,
             };
             if let Some(terrain) = &body.terrain {
-                let (definition, appearance, hash, revision) =
+                let (definition, hash, revision) =
                     terrain_definition(root, terrain, body.radius_m)?;
                 system.edit_surface_definition(id, Some(definition))?;
-                style.appearance = appearance;
                 style.definition_sha256 = Some(hash);
                 style.definition_revision = Some(revision);
             }

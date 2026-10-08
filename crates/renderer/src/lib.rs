@@ -8,20 +8,12 @@
 mod celestial;
 mod celestial_lines;
 mod celestial_view;
-pub mod cluster;
-mod cluster_gpu;
-pub mod cluster_region;
-mod cluster_runtime;
+#[cfg(feature = "surface-profile")]
+mod cpu_profile;
 mod debug;
-pub mod field_compute;
 mod gpu_profile;
 #[cfg(feature = "developer-tools")]
 pub mod native_capture;
-pub mod planet_surface;
-pub mod regional_edges;
-pub mod regional_resident;
-pub mod resident_hierarchy;
-pub mod resident_tile;
 pub mod sky;
 pub mod terrain_atlas;
 #[cfg(feature = "terrain-capture")]
@@ -30,23 +22,17 @@ mod view;
 pub use celestial::*;
 pub use celestial_lines::{CelestialLineStyle, CelestialPolyline, PolylinePreparationReport};
 pub use celestial_view::*;
-pub use cluster::{ClusterDebug, ClusterMode, ClusterReport, ClusterSettings};
+#[cfg(feature = "surface-profile")]
+pub use cpu_profile::CpuStageTimer;
 pub use debug::{DebugFrame, DebugLine, DebugProjection, DebugStaging};
 pub use gpu_profile::{
     CpuUploadProfile, GpuProfile, TimestampAvailability, TimestampProfilingMetrics,
-};
-pub use regional_resident::*;
-pub use resident_hierarchy::{HierarchyVertex, ResidentHierarchyDraw, ResidentHierarchyReport};
-pub use resident_tile::{
-    ReconstructedTileVertex, ResidentMaterialAppearance, ResidentTileReport, TILE_FILTER_VERSION,
-    TILE_FORMAT_VERSION, TileData, TileDraw, TileGeometryError, TileKey, TilePublicationToken,
-    TileSlotState, TileTexel,
 };
 pub use terrain_atlas::{
     ATLAS_BOUNDS_GRID, AtlasBounds, AtlasChart, AtlasFieldsConstants, AtlasImageLevel,
     AtlasInstance, AtlasProduceJob, AtlasProfileLayer, AtlasSampleSource, AtlasSource,
     AtlasTileKind, MAX_ATLAS_JOBS_PER_FRAME, ProducedTileReadback, TerrainAtlasConfig,
-    TerrainAtlasFrame, TerrainAtlasReport, produce_for_validation,
+    TerrainAtlasFrame, TerrainAtlasReport, TerrainViewMode, produce_for_validation,
 };
 pub use view::*;
 
@@ -131,7 +117,6 @@ pub struct NativeRenderTimings {
 
 /// Owns the native presentation surface, GPU device, and minimal egui integration.
 pub struct Renderer {
-    cluster_settings: ClusterSettings,
     _instance: wgpu::Instance,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -226,36 +211,6 @@ impl Renderer {
         true
     }
 
-    /// Latest CPU-side terrain upload accounting from the production renderer.
-    pub fn last_terrain_upload_profile(&self) -> gpu_profile::CpuUploadProfile {
-        self.celestial
-            .as_ref()
-            .map_or_else(Default::default, |renderer| {
-                renderer.last_surface_upload_profile()
-            })
-    }
-    /// Last resident derived-tile upload and allocation accounting.
-    pub fn last_resident_tile_report(&self) -> ResidentTileReport {
-        self.celestial
-            .as_ref()
-            .map_or_else(Default::default, |renderer| {
-                renderer.last_resident_tile_report()
-            })
-    }
-    /// Last five-slot resident hierarchy payload and readiness accounting.
-    pub fn last_resident_hierarchy_report(&self) -> ResidentHierarchyReport {
-        self.celestial
-            .as_ref()
-            .map_or_else(Default::default, |renderer| {
-                renderer.last_resident_hierarchy_report()
-            })
-    }
-    /// Focused GPU diagnostic. This explicit validation call waits for readback;
-    pub fn last_resident_regional_report(&self) -> RegionalResidentReport {
-        self.celestial
-            .as_ref()
-            .map_or_else(Default::default, |r| r.last_resident_regional_report())
-    }
     /// Produced atlas height bounds delivered since the last call.
     pub fn take_terrain_atlas_bounds(&mut self) -> Vec<AtlasBounds> {
         self.celestial
@@ -270,84 +225,6 @@ impl Renderer {
     /// Device limit on atlas texture-array layers.
     pub fn terrain_atlas_layer_limit(&self) -> u32 {
         self.device.limits().max_texture_array_layers
-    }
-    pub fn set_cluster_settings(&mut self, settings: ClusterSettings) {
-        self.cluster_settings = settings;
-    }
-    pub fn cluster_report(&self) -> ClusterReport {
-        self.celestial
-            .as_ref()
-            .map_or_else(Default::default, |r| r.cluster_report())
-    }
-    /// Lazily clone the actually submitted retained terrain for an explicit accuracy pass.
-    #[cfg(feature = "developer-tools")]
-    pub fn last_submitted_regional_draw(&self) -> Option<(RegionalResidentDraw, Vec<usize>, bool)> {
-        if !matches!(self.last_render_outcome(), RenderOutcome::Submitted { .. }) {
-            return None;
-        }
-        self.celestial.as_ref()?.last_submitted_regional_draw()
-    }
-    /// Explicit diagnostic readback for one regional patch.
-    pub fn validate_resident_regional(
-        &mut self,
-        draw: &RegionalResidentDraw,
-        index: usize,
-    ) -> Result<Vec<ReconstructedTileVertex>, RenderPreparationError> {
-        if self.celestial.is_none() {
-            self.celestial = Some(celestial::CelestialRenderer::new(
-                &self.device,
-                &self.queue,
-                self.surface_config.format,
-                self.surface_config.width,
-                self.surface_config.height,
-            ));
-        }
-        self.celestial
-            .as_mut()
-            .ok_or(RenderPreparationError::InvalidResidentTile)?
-            .validate_resident_regional(&self.device, &self.queue, draw, index)
-    }
-    /// Focused GPU diagnostic. This explicit validation call waits for readback;
-    /// ordinary native frames never invoke it.
-    pub fn validate_resident_tile(
-        &mut self,
-        draw: &TileDraw,
-    ) -> Result<Vec<ReconstructedTileVertex>, RenderPreparationError> {
-        if self.celestial.is_none() {
-            self.celestial = Some(celestial::CelestialRenderer::new(
-                &self.device,
-                &self.queue,
-                self.surface_config.format,
-                self.surface_config.width,
-                self.surface_config.height,
-            ));
-        }
-        let celestial = self
-            .celestial
-            .as_mut()
-            .ok_or(RenderPreparationError::InvalidResidentTile)?;
-        celestial.validate_resident_tile(&self.device, &self.queue, draw)
-    }
-    /// Focused GPU reconstruction diagnostic for parent or child patch 0–4.
-    pub fn validate_resident_hierarchy(
-        &mut self,
-        draw: &ResidentHierarchyDraw,
-        patch_index: usize,
-    ) -> Result<Vec<ReconstructedTileVertex>, RenderPreparationError> {
-        if self.celestial.is_none() {
-            self.celestial = Some(celestial::CelestialRenderer::new(
-                &self.device,
-                &self.queue,
-                self.surface_config.format,
-                self.surface_config.width,
-                self.surface_config.height,
-            ));
-        }
-        let celestial = self
-            .celestial
-            .as_mut()
-            .ok_or(RenderPreparationError::InvalidResidentTile)?;
-        celestial.validate_resident_hierarchy(&self.device, &self.queue, draw, patch_index)
     }
     /// Last submitted sky upload accounting; unavailable before first submission.
     pub fn last_sky_resource_report(&self) -> Option<sky::SkyResourceReport> {
@@ -462,7 +339,6 @@ impl Renderer {
             suspended,
             debug: None,
             celestial: None,
-            cluster_settings: ClusterSettings::default(),
             timestamp_availability,
             timestamp_slot,
             last_render_outcome: RenderOutcome::default(),
@@ -750,7 +626,6 @@ impl Renderer {
                     self.surface_config.height,
                 )
             });
-            celestial.set_cluster_settings(self.cluster_settings);
             let draw_result = celestial.draw(
                 &self.device,
                 &self.queue,
@@ -835,7 +710,7 @@ impl Renderer {
                 .chain([encoder.finish()]),
         );
         if let Some(celestial) = &mut self.celestial {
-            celestial.resident_on_submitted(&self.queue);
+            celestial.on_submitted();
         }
         self.submission_id = submission_id;
         #[cfg(feature = "developer-tools")]

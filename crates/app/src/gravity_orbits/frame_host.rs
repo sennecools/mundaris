@@ -19,16 +19,6 @@ impl FrameHost<'_> {
             Self::Native(r) => r.terrain_atlas_layer_limit(),
         }
     }
-    pub fn set_cluster_settings(&mut self, settings: mundaris_renderer::ClusterSettings) {
-        match self {
-            Self::Native(r) => r.set_cluster_settings(settings),
-        }
-    }
-    pub fn cluster_report(&self) -> mundaris_renderer::ClusterReport {
-        match self {
-            Self::Native(r) => r.cluster_report(),
-        }
-    }
     pub fn native_timestamp_sampling(
         &self,
     ) -> Option<crate::developer_snapshot::TimestampSamplingSnapshot> {
@@ -69,6 +59,7 @@ impl FrameHost<'_> {
             Self::Native(r) => r.pixels_per_point(),
         }
     }
+    #[cfg(feature = "developer-tools")]
     pub fn deterministic(&self) -> bool {
         false
     }
@@ -82,20 +73,9 @@ impl FrameHost<'_> {
             Self::Native(r) => r.timestamp_availability(),
         }
     }
-    pub fn last_resident_regional_report(&self) -> mundaris_renderer::RegionalResidentReport {
-        match self {
-            Self::Native(r) => r.last_resident_regional_report(),
-        }
-    }
     pub fn gpu_source_frame(&self) -> Option<u64> {
         match self {
             Self::Native(r) => r.latest_gpu_profile_submission(),
-        }
-    }
-    #[cfg(feature = "surface-profile")]
-    pub fn last_terrain_upload_profile(&self) -> mundaris_renderer::CpuUploadProfile {
-        match self {
-            Self::Native(r) => r.last_terrain_upload_profile(),
         }
     }
     pub fn render(&mut self, ui: impl FnMut(&egui::Context)) -> Result<()> {

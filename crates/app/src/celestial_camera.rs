@@ -133,7 +133,7 @@ pub struct CelestialCamera {
     carrier_center: Option<DVec3>,
     flight_speed_m_s: f64,
     flight_log_scale: Option<f64>,
-    inspection: Option<crate::planet_surface::SurfaceInspectionAnchor>,
+    inspection: Option<crate::surface_anchor::SurfaceInspectionAnchor>,
     navigation_envelope: bool,
     terrain_clearance_guard_m: Option<f64>,
     terrain_approach: bool,
@@ -397,7 +397,7 @@ impl CelestialCamera {
         let frame = pair.projection().frames_for(body)?.body_fixed;
         let pose = pair.evaluation().reexpress_pose(self.pose, frame)?;
         let radius = pair.system().body(body)?.properties().reference_radius_m();
-        let anchor = crate::planet_surface::SurfaceInspectionAnchor::new(
+        let anchor = crate::surface_anchor::SurfaceInspectionAnchor::new(
             body,
             pose.position().local().metres(),
             radius,
@@ -448,7 +448,7 @@ impl CelestialCamera {
             clearance > 0.0,
             "fixture observer must clear the published complete surface; clearance {clearance} m"
         );
-        let anchor = crate::planet_surface::SurfaceInspectionAnchor::new(
+        let anchor = crate::surface_anchor::SurfaceInspectionAnchor::new(
             body,
             position,
             radius,
@@ -600,7 +600,7 @@ impl CelestialCamera {
             .reexpress_pose(pose, self.pose.position().frame())?;
         if self.mode == CameraMode::SurfaceInspection {
             let anchor = self.inspection.expect("inspection owns anchor");
-            self.inspection = Some(crate::planet_surface::SurfaceInspectionAnchor::new(
+            self.inspection = Some(crate::surface_anchor::SurfaceInspectionAnchor::new(
                 body,
                 guarded,
                 pair.system().body(body)?.properties().reference_radius_m(),
@@ -644,7 +644,7 @@ impl CelestialCamera {
                 FramePosition::new(fixed, LocalPosition::try_metres(position)?),
                 pose.orientation(),
             );
-            self.inspection = Some(crate::planet_surface::SurfaceInspectionAnchor::new(
+            self.inspection = Some(crate::surface_anchor::SurfaceInspectionAnchor::new(
                 body,
                 position,
                 pair.system().body(body)?.properties().reference_radius_m(),
@@ -1567,7 +1567,7 @@ impl CelestialCamera {
                     .ok_or_else(|| anyhow::anyhow!("surface anchor missing"))?;
                 let p = self.pose.position().local().metres();
                 let radius = pair.system().body(id)?.properties().reference_radius_m();
-                let next = crate::planet_surface::SurfaceInspectionAnchor::new(
+                let next = crate::surface_anchor::SurfaceInspectionAnchor::new(
                     id,
                     p,
                     radius,
@@ -1848,7 +1848,7 @@ mod tests {
         // Static orientation/position seed only, not ordinary approach evidence.
         let p = DVec3::new(100.0, radius + 100_000.0, 0.0);
         let anchor =
-            crate::planet_surface::SurfaceInspectionAnchor::new(body, p, radius, None).unwrap();
+            crate::surface_anchor::SurfaceInspectionAnchor::new(body, p, radius, None).unwrap();
         let horizon = anchor.body_from_regional.rotation().quaternion();
         camera.pose = FramePose::new(
             FramePosition::new(fixed, LocalPosition::try_metres(p).unwrap()),

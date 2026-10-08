@@ -35,10 +35,6 @@ fn malformed_nonfinite_and_unknown_operations_do_not_mutate_authority() {
             multiplier: f64::INFINITY,
         },
         DevCommand::Clearance { meters: -1.0 },
-        DevCommand::SkySetting {
-            setting: "intensity".into(),
-            value: 5.0,
-        },
         DevCommand::RenderMode {
             mode: "invalid".into(),
         },
