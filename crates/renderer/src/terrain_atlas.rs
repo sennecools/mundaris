@@ -440,8 +440,8 @@ impl TerrainAtlasRenderer {
         let produce_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Terrain atlas producer layout"),
-                bind_group_layouts: &[&produce_layout, &source_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&produce_layout), Some(&source_layout)],
+                immediate_size: 0,
             });
         let compute = |entry| {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -608,8 +608,8 @@ impl TerrainAtlasRenderer {
         );
         let draw_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Terrain atlas draw layout"),
-            bind_group_layouts: &[projection_layout, &draw_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(projection_layout), Some(&draw_layout)],
+            immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Terrain atlas reverse-Z instanced draw"),
@@ -618,11 +618,11 @@ impl TerrainAtlasRenderer {
                 module: &draw_shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: 12,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &wgpu::vertex_attr_array![0 => Float32x3],
-                }],
+                })],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &draw_shader,
@@ -641,13 +641,13 @@ impl TerrainAtlasRenderer {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::GreaterEqual,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
             multisample: Default::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         // Static grid contents are uploaded by the first `prepare`.
@@ -713,7 +713,14 @@ impl TerrainAtlasRenderer {
             match readback.state.load(Ordering::Acquire) {
                 3 => {
                     {
-                        let view = readback.buffer.slice(..).get_mapped_range();
+                        // A failed mapping drops this batch; its nodes keep their
+                        // conservative bounds until produced again.
+                        let Ok(view) = readback.buffer.slice(..).get_mapped_range() else {
+                            readback.buffer.unmap();
+                            readback.tokens.clear();
+                            readback.state.store(0, Ordering::Release);
+                            continue;
+                        };
                         for (index, token) in readback.tokens.iter().enumerate() {
                             let word = |offset: usize| {
                                 let start = (index * BOUNDS_WORDS_PER_JOB + offset) * 4;
@@ -1064,7 +1071,10 @@ pub fn produce_for_validation(
             .poll(wgpu::PollType::wait_indefinitely())
             .map_err(|error| error.to_string())?;
         let side = config.height_side() as usize;
-        let view = heights.slice(..).get_mapped_range();
+        let view = heights
+            .slice(..)
+            .get_mapped_range()
+            .map_err(|error| error.to_string())?;
         let mut height_values = Vec::with_capacity(side * side);
         for y in 0..side {
             for x in 0..side {
@@ -1074,7 +1084,10 @@ pub fn produce_for_validation(
         }
         drop(view);
         let side = config.normal_side() as usize;
-        let view = normals.slice(..).get_mapped_range();
+        let view = normals
+            .slice(..)
+            .get_mapped_range()
+            .map_err(|error| error.to_string())?;
         let mut normal_values = Vec::with_capacity(side * side);
         for y in 0..side {
             for x in 0..side {

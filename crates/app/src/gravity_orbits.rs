@@ -572,11 +572,9 @@ impl GravityOrbitsDemo {
             && event.state == ElementState::Pressed
             && !event.repeat
             && self.controls.viewport_input.owns_keyboard()
-            && !self
-                .controls
-                .ui_context
-                .as_ref()
-                .is_some_and(|c| c.wants_keyboard_input() || c.memory(|m| m.focused().is_some()))
+            && !self.controls.ui_context.as_ref().is_some_and(|c| {
+                c.egui_wants_keyboard_input() || c.memory(|m| m.focused().is_some())
+            })
         {
             let command = match event.physical_key {
                 PhysicalKey::Code(KeyCode::KeyF) => Some(Command::Focus {
@@ -634,11 +632,13 @@ impl GravityOrbitsDemo {
                     unit: egui::MouseWheelUnit::Line,
                     delta: egui::vec2(*x, *y),
                     modifiers: egui::Modifiers::default(),
+                    phase: egui::TouchPhase::Move,
                 },
                 MouseScrollDelta::PixelDelta(p) => egui::Event::MouseWheel {
                     unit: egui::MouseWheelUnit::Point,
                     delta: egui::vec2((p.x / scale) as f32, (p.y / scale) as f32),
                     modifiers: egui::Modifiers::default(),
+                    phase: egui::TouchPhase::Move,
                 },
             }),
             WindowEvent::KeyboardInput { event, .. } => {
@@ -714,7 +714,7 @@ impl GravityOrbitsDemo {
             let blocked = context
                 .as_ref()
                 .map_or(self.controls.keyboard_blocked, |c| {
-                    c.wants_keyboard_input() || c.memory(|m| m.focused().is_some())
+                    c.egui_wants_keyboard_input() || c.memory(|m| m.focused().is_some())
                 });
             let inputs = self.controls.viewport_input.events(
                 &[event],
@@ -1541,7 +1541,7 @@ impl GravityOrbitsDemo {
         let update_ms = update_started.elapsed().as_secs_f64() * 1000.0;
         if !self.coherent {
             let (info, controls) = self.ui_info(CelestialPreparationReport::default(), 0.0, 0.0);
-            renderer.render(|ctx| draw_ui(ctx, controls, &info, &[]))?;
+            renderer.render(|ctx, root| draw_ui(ctx, root, controls, &info, &[]))?;
             return Ok(());
         }
         let scale = renderer.pixels_per_point() as f64;
@@ -1739,7 +1739,7 @@ impl GravityOrbitsDemo {
             ));
             let (info, controls) =
                 self.ui_info(CelestialPreparationReport::default(), near, preparation_ms);
-            renderer.render(|ctx| draw_ui(ctx, controls, &info, &[]))?;
+            renderer.render(|ctx, root| draw_ui(ctx, root, controls, &info, &[]))?;
             return Ok(());
         }
         let report = frame.report();
@@ -1865,10 +1865,10 @@ impl GravityOrbitsDemo {
         let render_started = Instant::now();
         let submission_span = crate::engine_profile::span("GPU submission / presentation");
         let mut ui_build_cpu_ms = 0.0;
-        renderer.render_celestial(&frame, |context| {
+        renderer.render_celestial(&frame, |context, root| {
             let _span = crate::engine_profile::span("UI");
             let ui_started = Instant::now();
-            draw_ui(context, controls, &info, frame.markers());
+            draw_ui(context, root, controls, &info, frame.markers());
             ui_build_cpu_ms += ui_started.elapsed().as_secs_f64() * 1000.0;
         })?;
         drop(submission_span);
@@ -2171,12 +2171,13 @@ struct UiInfo<'a> {
     coarse_curves: usize,
 }
 fn draw_engineering_ui(
-    context: &egui::Context,
+    _context: &egui::Context,
+    root: &mut egui::Ui,
     controls: &mut Controls,
     info: &UiInfo<'_>,
     markers: &[CelestialMarker],
 ) {
-    egui::SidePanel::left("celestial body inspector").exact_width(320.0).resizable(false).show(context,|ui| {
+    egui::Panel::left("celestial body inspector").exact_size(320.0).resizable(false).show(root,|ui| {
         egui::ScrollArea::vertical().show(ui,|ui| {
         developer_ui::left(ui, controls, info);
         ui.separator();
@@ -2346,6 +2347,7 @@ fn draw_engineering_ui(
 
 fn draw_ui(
     context: &egui::Context,
+    root: &mut egui::Ui,
     controls: &mut Controls,
     info: &UiInfo<'_>,
     markers: &[CelestialMarker],
@@ -2357,7 +2359,7 @@ fn draw_ui(
     } else {
         controls.performance_lab.draw(context, None, None);
     }
-    egui::SidePanel::right("planet surface / inspection").exact_width(300.0).resizable(false).show(context,|ui| {
+    egui::Panel::right("planet surface / inspection").exact_size(300.0).resizable(false).show(root,|ui| {
             egui::ScrollArea::vertical().show(ui,|ui| {
             developer_ui::right(ui, controls, info);
             ui.separator();
@@ -2402,7 +2404,7 @@ fn draw_ui(
             });
             });
         });
-    egui::TopBottomPanel::top("exact playback and navigation").show(context,|ui| {
+    egui::Panel::top("exact playback and navigation").show(root,|ui| {
         ui.horizontal(|ui|{
             ui.heading("Mundaris");
             if ui.button(if info.motion.paused(){"▶ Resume"}else{"⏸ Pause"}).clicked(){controls.pending.push_back(Command::Pause(!info.motion.paused()));}
@@ -2438,14 +2440,14 @@ fn draw_ui(
         } else { ui.small("Direct analytic sampling: no integration backlog, force passes, replay or conservation-fidelity claim."); }
         });
     });
-    egui::TopBottomPanel::bottom("celestial semantics legend").exact_height(28.0).show(context,|ui|{
+    egui::Panel::bottom("celestial semantics legend").exact_size(28.0).show(root,|ui|{
         ui.horizontal(|ui|{ui.small(if info.motion.is_analytic(){"Dashed = authored ORBIT GUIDE · Solid/fading = published HISTORY · Rings/labels = navigation overlays"}else{"Dashed = instantaneous two-body ORBIT GUIDE · Solid/fading = committed HISTORY · Rings/labels = navigation overlays"});
             if let Some(gap)=info.gap_diagnostic {ui.colored_label(egui::Color32::YELLOW,gap);}else if let Some(error)=info.diagnostic {ui.colored_label(egui::Color32::LIGHT_RED,error);}
         });
     });
-    draw_engineering_ui(context, controls, info, markers);
+    draw_engineering_ui(context, root, controls, info, markers);
     let scale = context.pixels_per_point();
-    egui::CentralPanel::default().frame(egui::Frame::NONE).show(context,|ui|{
+    egui::CentralPanel::default().frame(egui::Frame::NONE).show(root,|ui|{
         let rect=ui.max_rect();
         controls.ui_context=Some(context.clone());
         controls.scene_layer=Some(ui.layer_id());
@@ -2505,7 +2507,7 @@ fn draw_ui(
         }
         if input.pointer.primary_released(){controls.gesture_start=None;}
         let local_look=matches!(info.camera.mode(),CameraMode::FreeFlight|CameraMode::SurfaceInspection);
-        let keyboard_blocked=context.wants_keyboard_input() || context.memory(|m|m.focused().is_some());
+        let keyboard_blocked=context.egui_wants_keyboard_input() || context.memory(|m|m.focused().is_some());
         controls.keyboard_blocked=keyboard_blocked;
         let automation_active={
             #[cfg(feature="developer-tools")]
@@ -2526,7 +2528,7 @@ fn draw_ui(
     if !controls.native_events
         && controls.input_focused
         && context.input(|i| i.focused)
-        && !context.wants_keyboard_input()
+        && !context.egui_wants_keyboard_input()
         && !context.memory(|m| m.focused().is_some())
     {
         context.input(|input| {

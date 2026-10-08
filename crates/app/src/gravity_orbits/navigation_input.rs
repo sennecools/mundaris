@@ -258,6 +258,7 @@ mod tests {
                     unit: egui::MouseWheelUnit::Point,
                     delta: egui::vec2(0.0, 12.5),
                     modifiers: egui::Modifiers::default(),
+                    phase: egui::TouchPhase::Move,
                 },
             ],
             false,

@@ -78,7 +78,7 @@ impl FrameHost<'_> {
             Self::Native(r) => r.latest_gpu_profile_submission(),
         }
     }
-    pub fn render(&mut self, ui: impl FnMut(&egui::Context)) -> Result<()> {
+    pub fn render(&mut self, ui: impl FnMut(&egui::Context, &mut egui::Ui)) -> Result<()> {
         match self {
             Self::Native(r) => Ok(r.render(ui)?),
         }
@@ -86,7 +86,7 @@ impl FrameHost<'_> {
     pub fn render_celestial(
         &mut self,
         frame: &CelestialFrame<'_, '_, '_>,
-        ui: impl FnMut(&egui::Context),
+        ui: impl FnMut(&egui::Context, &mut egui::Ui),
     ) -> Result<()> {
         match self {
             Self::Native(r) => Ok(r.render_celestial(frame, ui)?),

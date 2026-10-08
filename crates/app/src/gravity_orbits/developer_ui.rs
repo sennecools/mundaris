@@ -400,8 +400,13 @@ pub(super) fn right(ui: &mut egui::Ui, controls: &mut Controls, info: &UiInfo<'_
     ui.add_space(8.0);
     ui.separator();
     ui.heading("Rendering");
-    visual_controls::checkbox(ui, controls, visual_controls::Layer::Terrain, "Atlas terrain")
-        .on_hover_text("Draw atlas terrain; when off, bodies fall back to reference spheres.");
+    visual_controls::checkbox(
+        ui,
+        controls,
+        visual_controls::Layer::Terrain,
+        "Atlas terrain",
+    )
+    .on_hover_text("Draw atlas terrain; when off, bodies fall back to reference spheres.");
     egui::ComboBox::from_label("Terrain view")
         .selected_text(controls.terrain_view.name())
         .show_ui(ui, |ui| {

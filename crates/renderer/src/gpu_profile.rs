@@ -362,7 +362,11 @@ impl AsyncTimestampSlot {
         if let Some(receiver) = &self.receiver {
             match receiver.try_recv() {
                 Ok(Ok(())) => {
-                    let mapped = self.readback.get_mapped_range(..);
+                    let Ok(mapped) = self.readback.get_mapped_range(..) else {
+                        self.pending_submission_id = None;
+                        self.receiver = None;
+                        return false;
+                    };
                     let ticks: Vec<u64> = mapped
                         .as_chunks::<8>()
                         .0

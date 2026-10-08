@@ -837,6 +837,7 @@ impl CelestialRenderer {
             }),
             timestamp_writes: timestamps.map(|queries| queries.pass_writes(0)),
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         let [x, y] = frame.projection.origin();
         let [w, h] = frame.projection.viewport();
@@ -900,6 +901,7 @@ impl CelestialRenderer {
                 }),
                 timestamp_writes: timestamps.map(|queries| queries.pass_writes(2)),
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             let [x, y] = frame.projection.origin();
             let [w, h] = frame.projection.viewport();
@@ -1060,8 +1062,8 @@ fn pipeline(
 ) -> wgpu::RenderPipeline {
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("Celestial debug pipeline layout"),
-        bind_group_layouts: layouts,
-        push_constant_ranges: &[],
+        bind_group_layouts: &layouts.iter().copied().map(Some).collect::<Vec<_>>(),
+        immediate_size: 0,
     });
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("Observer-relative celestial shader"),
@@ -1074,11 +1076,11 @@ fn pipeline(
             module: &shader,
             entry_point: Some("vs_main"),
             compilation_options: Default::default(),
-            buffers: &[wgpu::VertexBufferLayout {
+            buffers: &[Some(wgpu::VertexBufferLayout {
                 array_stride: 32,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &wgpu::vertex_attr_array![0=>Float32x4,1=>Float32x4],
-            }],
+            })],
         },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
@@ -1105,13 +1107,13 @@ fn pipeline(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: !lines,
-            depth_compare: wgpu::CompareFunction::GreaterEqual,
+            depth_write_enabled: Some(!lines),
+            depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
             stencil: Default::default(),
             bias: Default::default(),
         }),
         multisample: Default::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     })
 }

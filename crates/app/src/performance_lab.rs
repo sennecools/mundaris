@@ -1769,7 +1769,6 @@ fn timeline_gesture(
             *timeline_range = Some(next.pan(-scroll.x as f64 / axis.width().max(1.0) as f64));
             ui.input_mut(|input| {
                 input.smooth_scroll_delta = Vec2::ZERO;
-                input.raw_scroll_delta = Vec2::ZERO;
             });
         }
     }

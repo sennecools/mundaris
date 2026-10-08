@@ -1092,12 +1092,14 @@ mod tests {
         let policy = loaded.lod;
         let camera = DVec3::from_array(loaded.camera.position_body_m).normalize();
         let (device, queue) = pollster::block_on(async {
-            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+            let instance =
+                wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
             let adapter = instance
                 .request_adapter(&wgpu::RequestAdapterOptions {
                     power_preference: wgpu::PowerPreference::HighPerformance,
                     force_fallback_adapter: false,
                     compatible_surface: None,
+                    apply_limit_buckets: false,
                 })
                 .await
                 .expect("GPU adapter");

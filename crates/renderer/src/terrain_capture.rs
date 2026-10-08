@@ -39,12 +39,13 @@ impl TerrainCaptureRenderer {
         if width == 0 || height == 0 {
             return Err(RenderPreparationError::InvalidBudget);
         }
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 force_fallback_adapter: false,
                 compatible_surface: None,
+                apply_limit_buckets: false,
             })
             .await
             .map_err(|error| RenderPreparationError::GpuProgress(error.to_string()))?;
@@ -150,9 +151,9 @@ impl TerrainCaptureRenderer {
     ) -> Result<Vec<u8>, RenderPreparationError> {
         // Capture fixtures must report invalid production draw state as a test
         // failure, not panic during backend teardown. Pop on every Result path.
-        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let error_scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let result = self.render_inner(frame);
-        if let Some(error) = pollster::block_on(self.device.pop_error_scope()) {
+        if let Some(error) = pollster::block_on(error_scope.pop()) {
             return Err(RenderPreparationError::GpuProgress(error.to_string()));
         }
         result
@@ -256,7 +257,9 @@ impl TerrainCaptureRenderer {
                 .recv()
                 .map_err(|error| RenderPreparationError::GpuProgress(error.to_string()))?
                 .map_err(|error| RenderPreparationError::GpuProgress(error.to_string()))?;
-            let mapped = timestamp_readback.get_mapped_range(..);
+            let mapped = timestamp_readback
+                .get_mapped_range(..)
+                .map_err(|error| RenderPreparationError::GpuProgress(error.to_string()))?;
             let ticks: Vec<u64> = mapped
                 .as_chunks::<8>()
                 .0
@@ -268,7 +271,10 @@ impl TerrainCaptureRenderer {
             drop(mapped);
             timestamp_readback.unmap();
         }
-        let mapped = self.readback.get_mapped_range(..);
+        let mapped = self
+            .readback
+            .get_mapped_range(..)
+            .map_err(|error| RenderPreparationError::GpuProgress(error.to_string()))?;
         let row_bytes = self.width as usize * 4;
         let padded_row_bytes = self.padded_bytes_per_row as usize;
         let mut rgba = Vec::with_capacity(row_bytes * self.height as usize);

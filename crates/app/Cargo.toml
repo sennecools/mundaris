@@ -24,6 +24,7 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 winit.workspace = true
+slint.workspace = true
 sha2 = "0.10"
 base64 = { version = "0.22", optional = true }
 
@@ -56,3 +57,6 @@ harness = false
 
 [lints]
 workspace = true
+
+[build-dependencies]
+slint-build.workspace = true
