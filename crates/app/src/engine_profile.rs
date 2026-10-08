@@ -12,6 +12,7 @@
 //! span takes only its lane lock. When disabled,
 //! creating a span returns an inert guard after one relaxed atomic load.
 
+use mundaris_renderer::resident_tile::TileKey;
 use serde::Serialize;
 use std::{
     cell::RefCell,
@@ -44,14 +45,178 @@ pub enum WorkerIdentity {
     Numeric(u64),
 }
 
+/// Stable identity carried by profiler-only worker envelopes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProfileJobIdentity {
+    Tile {
+        job_id: u64,
+        capture_id: u64,
+        origin_frame_id: u64,
+        dispatch_frame_id: u64,
+        body_identity: u64,
+        surface_revision: u64,
+        material_revision: u64,
+        radius_bits: u64,
+        face: u8,
+        level: u8,
+        x: u32,
+        y: u32,
+        cells: u32,
+        format_version: u32,
+        filter_version: u32,
+    },
+    BoundaryBatch {
+        job_id: u64,
+        capture_id: u64,
+        origin_frame_id: u64,
+        dispatch_frame_id: u64,
+        topology_revision: u64,
+        tile_count: u32,
+        upstream_job_ids: [u64; 8],
+        upstream_job_count: u8,
+        upstream_jobs_omitted: u32,
+    },
+}
+
+impl ProfileJobIdentity {
+    pub fn capture_id(self) -> u64 {
+        match self {
+            Self::Tile { capture_id, .. } | Self::BoundaryBatch { capture_id, .. } => capture_id,
+        }
+    }
+
+    pub fn tile(key: &TileKey, job_id: u64, origin_frame_id: u64, dispatch_frame_id: u64) -> Self {
+        let [x, y] = key.address.coordinates();
+        Self::Tile {
+            job_id,
+            capture_id: capture_id(),
+            origin_frame_id,
+            dispatch_frame_id,
+            body_identity: key.body_identity,
+            surface_revision: key.surface_revision,
+            material_revision: key.material_revision,
+            radius_bits: key.radius_bits,
+            face: key.address.face() as u8,
+            level: key.address.level(),
+            x,
+            y,
+            cells: key.cells,
+            format_version: key.format_version,
+            filter_version: key.filter_version,
+        }
+    }
+
+    pub fn boundary_batch(
+        job_id: u64,
+        origin_frame_id: u64,
+        dispatch_frame_id: u64,
+        topology_revision: u64,
+        tile_count: u32,
+        upstream: impl IntoIterator<Item = u64>,
+    ) -> Self {
+        let mut upstream_job_ids = [0; 8];
+        let mut upstream_job_count = 0;
+        let mut upstream_jobs_omitted = 0u32;
+        for id in upstream {
+            if usize::from(upstream_job_count) < upstream_job_ids.len() {
+                upstream_job_ids[usize::from(upstream_job_count)] = id;
+                upstream_job_count += 1;
+            } else {
+                upstream_jobs_omitted = upstream_jobs_omitted.saturating_add(1);
+            }
+        }
+        Self::BoundaryBatch {
+            job_id,
+            capture_id: capture_id(),
+            origin_frame_id,
+            dispatch_frame_id,
+            topology_revision,
+            tile_count,
+            upstream_job_ids,
+            upstream_job_count,
+            upstream_jobs_omitted,
+        }
+    }
+}
+
+/// Current recording generation. Old queued context is never reused after clear.
+pub fn capture_id() -> u64 {
+    profiler().capture_id.load(Ordering::Relaxed)
+}
+
+/// Copy scalar job context for an explicitly spawned child task.
+pub fn current_job_identity() -> Option<ProfileJobIdentity> {
+    if !is_enabled() {
+        return None;
+    }
+    THREAD_STATE
+        .with(|state| state.borrow().job_identity)
+        .filter(|identity| identity.capture_id() == capture_id())
+}
+
+/// Bounded completed-job preference for the off-thread terrain snapshot. This
+/// retains exact ID links for completed work as well as the pending frontier.
+pub fn recent_job_ids() -> Vec<u64> {
+    let snapshot = snapshot();
+    let mut events = snapshot
+        .lanes
+        .iter()
+        .flat_map(|lane| &lane.events)
+        .filter(|event| event.job_identity.is_some())
+        .collect::<Vec<_>>();
+    events.sort_unstable_by_key(|event| std::cmp::Reverse(event.end_ns));
+    let mut ids = Vec::with_capacity(64);
+    for event in events {
+        let Some(identity) = event.job_identity else {
+            continue;
+        };
+        let candidates: &[u64] = match &identity {
+            ProfileJobIdentity::Tile { job_id, .. } => std::slice::from_ref(job_id),
+            ProfileJobIdentity::BoundaryBatch {
+                upstream_job_ids,
+                upstream_job_count,
+                ..
+            } => &upstream_job_ids[..usize::from(*upstream_job_count)],
+        };
+        for id in candidates {
+            if !ids.contains(id) {
+                ids.push(*id);
+            }
+            if ids.len() == 64 {
+                return ids;
+            }
+        }
+    }
+    ids
+}
+
+/// Monotonic process-local identity for one admitted asynchronous task.
+pub fn next_job_id() -> u64 {
+    profiler().next_job_id.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Typed reason for an instrumented blocking wait. Uninstrumented blank time
+/// remains unknown and is not assigned an inferred cause.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileWaitReason {
+    TerrainWorkerQueue,
+    BoundaryPreparationQueue,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ProfileEvent {
     pub event_id: u64,
+    pub capture_id: u64,
+    pub nesting_depth: usize,
     pub parent_event_id: Option<u64>,
     /// Identifies the originating OS thread when a stable lane is reused by
     /// short-lived threads across batches.
     pub thread_sequence: u64,
     pub name: &'static str,
+    pub job_identity: Option<ProfileJobIdentity>,
+    pub wait_reason: Option<ProfileWaitReason>,
     pub frame_id: u64,
     pub start_ns: u64,
     pub end_ns: u64,
@@ -97,6 +262,9 @@ pub struct ProfileSnapshot {
     /// True only when the process was launched with
     /// `MUNDARIS_PROFILE_THREAD_CPU=1` and the `surface-profile` feature.
     pub thread_cpu_timing_enabled: bool,
+    pub capture_id: u64,
+    pub dropped_nesting: u64,
+    pub snapshot_events_omitted: usize,
     pub generated_at_ns: u64,
     pub frame_id: u64,
     /// If present, timeline events and rolling samples ending before this
@@ -121,6 +289,7 @@ struct ThreadState {
     lane_id: Option<usize>,
     thread_sequence: u64,
     worker_scoped: bool,
+    job_identity: Option<ProfileJobIdentity>,
     stack: [u64; MAX_NESTING],
     depth: usize,
 }
@@ -131,6 +300,7 @@ impl ThreadState {
             lane_id: None,
             thread_sequence: 0,
             worker_scoped: false,
+            job_identity: None,
             stack: [0; MAX_NESTING],
             depth: 0,
         }
@@ -205,9 +375,7 @@ impl EventRing {
     }
 
     fn clear(&mut self) {
-        for entry in &mut self.entries {
-            *entry = None;
-        }
+        self.entries.fill(None);
         self.next = 0;
         self.len = 0;
         self.dropped = 0;
@@ -312,7 +480,10 @@ struct Budget {
 struct Profiler {
     enabled: AtomicBool,
     frame_id: AtomicU64,
+    capture_id: AtomicU64,
+    dropped_nesting: AtomicU64,
     next_event_id: AtomicU64,
+    next_job_id: AtomicU64,
     next_thread_sequence: AtomicU64,
     dropped_lane_registrations: AtomicU64,
     lanes: Mutex<Vec<Arc<Lane>>>,
@@ -326,7 +497,10 @@ impl Profiler {
         Self {
             enabled: AtomicBool::new(false),
             frame_id: AtomicU64::new(0),
+            capture_id: AtomicU64::new(1),
+            dropped_nesting: AtomicU64::new(0),
             next_event_id: AtomicU64::new(1),
+            next_job_id: AtomicU64::new(1),
             next_thread_sequence: AtomicU64::new(1),
             dropped_lane_registrations: AtomicU64::new(0),
             lanes: Mutex::new(Vec::with_capacity(MAX_LANES)),
@@ -480,17 +654,30 @@ pub fn set_budget_ns(name: &'static str, threshold_ns: Option<u64>) -> bool {
 /// Starts a named CPU span. Names must be compile-time static strings. The
 /// returned RAII guard records when dropped.
 pub fn span(name: &'static str) -> ProfileSpan {
+    span_with_metadata(name, None)
+}
+
+/// Starts a measured wait span and labels only the explicitly known blocker.
+pub fn wait_span(name: &'static str, reason: ProfileWaitReason) -> ProfileSpan {
+    let mut span = span_with_metadata(name, None);
+    if span.active {
+        span.wait_reason = Some(reason);
+    }
+    span
+}
+
+fn span_with_metadata(name: &'static str, wait_reason: Option<ProfileWaitReason>) -> ProfileSpan {
     let profiler = profiler();
     if !profiler.enabled.load(Ordering::Relaxed) {
         return ProfileSpan::disabled();
     }
 
-    let start;
     let mut lane_id = None;
     let mut event_id = 0;
     let mut parent_event_id = None;
     let mut thread_sequence = 0;
     let mut depth = 0;
+    let mut job_identity = None;
     THREAD_STATE.with(|state| {
         let mut state = state.borrow_mut();
         if state.thread_sequence == 0 {
@@ -503,6 +690,9 @@ pub fn span(name: &'static str) -> ProfileSpan {
         }
         lane_id = state.lane_id;
         thread_sequence = state.thread_sequence;
+        job_identity = state
+            .job_identity
+            .filter(|identity| identity.capture_id() == capture_id());
         depth = state.depth;
         if lane_id.is_some() && depth < MAX_NESTING {
             event_id = profiler.next_event_id.fetch_add(1, Ordering::Relaxed);
@@ -516,15 +706,19 @@ pub fn span(name: &'static str) -> ProfileSpan {
         return ProfileSpan::disabled();
     };
     if depth >= MAX_NESTING {
+        profiler.dropped_nesting.fetch_add(1, Ordering::Relaxed);
         return ProfileSpan::disabled();
     }
-    start = now_ns();
+    let start = now_ns();
     ProfileSpan {
         name,
         lane_id: Some(lane_id),
         event_id,
+        capture_id: capture_id(),
         parent_event_id,
         thread_sequence,
+        job_identity,
+        wait_reason,
         depth,
         frame_id: profiler.frame_id.load(Ordering::Relaxed),
         start_ns: start,
@@ -544,6 +738,40 @@ pub fn worker_scope(worker_id: u64) -> WorkerScope {
 /// Selects a stable static-name worker lane for this thread until dropped.
 pub fn worker_scope_named(name: &'static str) -> WorkerScope {
     worker_scope_identity(WorkerIdentity::Named(name))
+}
+
+/// Installs a stable job identity on this thread until dropped. Callers must
+/// carry identities explicitly with queued jobs so execution may occur on a
+/// different thread or frame from the originating request.
+pub fn job_scope(identity: ProfileJobIdentity) -> JobScope {
+    let active = is_enabled() && identity.capture_id() == capture_id();
+    let previous = THREAD_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let previous = state.job_identity;
+        if active {
+            state.job_identity = Some(identity);
+        }
+        previous
+    });
+    JobScope {
+        previous,
+        active,
+        _not_send: PhantomData,
+    }
+}
+
+pub struct JobScope {
+    previous: Option<ProfileJobIdentity>,
+    active: bool,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl Drop for JobScope {
+    fn drop(&mut self) {
+        if self.active {
+            THREAD_STATE.with(|state| state.borrow_mut().job_identity = self.previous);
+        }
+    }
 }
 
 fn worker_scope_identity(identity: WorkerIdentity) -> WorkerScope {
@@ -588,7 +816,10 @@ pub struct ProfileSpan {
     name: &'static str,
     lane_id: Option<usize>,
     event_id: u64,
+    capture_id: u64,
     parent_event_id: Option<u64>,
+    job_identity: Option<ProfileJobIdentity>,
+    wait_reason: Option<ProfileWaitReason>,
     thread_sequence: u64,
     depth: usize,
     frame_id: u64,
@@ -605,7 +836,10 @@ impl ProfileSpan {
             name: "",
             lane_id: None,
             event_id: 0,
+            capture_id: 0,
             parent_event_id: None,
+            job_identity: None,
+            wait_reason: None,
             thread_sequence: 0,
             depth: 0,
             frame_id: 0,
@@ -630,11 +864,18 @@ impl Drop for ProfileSpan {
                 state.finish_span(self.depth, self.event_id);
             }
         });
+        if self.capture_id != capture_id() {
+            return;
+        }
         let event = ProfileEvent {
             event_id: self.event_id,
+            capture_id: self.capture_id,
+            nesting_depth: self.depth,
             parent_event_id: self.parent_event_id,
             thread_sequence: self.thread_sequence,
             name: self.name,
+            job_identity: self.job_identity,
+            wait_reason: self.wait_reason,
             frame_id: self.frame_id,
             start_ns: self.start_ns,
             end_ns,
@@ -676,6 +917,7 @@ fn snapshot_impl(since_ns: Option<u64>) -> ProfileSnapshot {
         let data = lock(&lane.data);
         let mut events = Vec::with_capacity(data.events.len);
         data.events.copy_since(since_ns, &mut events);
+        events.retain(|event| event.capture_id == capture_id());
         events.sort_unstable_by_key(|event| event.start_ns);
         lane_snapshots.push(ProfileLaneSnapshot {
             lane_id: lane.id,
@@ -713,7 +955,10 @@ fn snapshot_impl(since_ns: Option<u64>) -> ProfileSnapshot {
         })
         .collect();
     ProfileSnapshot {
-        schema_version: 1,
+        schema_version: 2,
+        snapshot_events_omitted: 0,
+        capture_id: capture_id(),
+        dropped_nesting: profiler.dropped_nesting.load(Ordering::Relaxed),
         enabled: is_enabled(),
         thread_cpu_timing_enabled: profiler.thread_cpu_timing_enabled,
         generated_at_ns: now,
@@ -729,6 +974,8 @@ fn snapshot_impl(since_ns: Option<u64>) -> ProfileSnapshot {
 /// registration stable for already-running workers.
 pub fn clear() {
     let profiler = profiler();
+    profiler.capture_id.fetch_add(1, Ordering::Relaxed);
+    profiler.dropped_nesting.store(0, Ordering::Relaxed);
     for lane in lock(&profiler.lanes).iter() {
         let mut data = lock(&lane.data);
         data.events.clear();
@@ -809,9 +1056,13 @@ mod tests {
         let lane = local_lane();
         let parent = ProfileEvent {
             event_id: 10,
+            capture_id: 1,
+            nesting_depth: 0,
             parent_event_id: None,
             thread_sequence: 1,
             name: "parent",
+            job_identity: None,
+            wait_reason: None,
             frame_id: 42,
             start_ns: 1,
             end_ns: 9,
@@ -820,9 +1071,13 @@ mod tests {
         };
         let child = ProfileEvent {
             event_id: 11,
+            capture_id: 1,
+            nesting_depth: 0,
             parent_event_id: Some(10),
             thread_sequence: 1,
             name: "child",
+            job_identity: None,
+            wait_reason: None,
             frame_id: 42,
             start_ns: 3,
             end_ns: 6,
@@ -861,9 +1116,13 @@ mod tests {
         for event_id in 1..=3 {
             ring.push(ProfileEvent {
                 event_id,
+                capture_id: 1,
+                nesting_depth: 0,
                 parent_event_id: None,
                 thread_sequence: 1,
                 name: "bounded",
+                job_identity: None,
+                wait_reason: None,
                 frame_id: 0,
                 start_ns: event_id,
                 end_ns: event_id,
@@ -932,5 +1191,87 @@ mod tests {
     fn disabled_span_is_inert() {
         let span = ProfileSpan::disabled();
         assert!(!span.active);
+    }
+
+    #[test]
+    fn stable_job_identity_can_cross_threads_and_frames() {
+        let identity = ProfileJobIdentity::Tile {
+            job_id: 9,
+            capture_id: 1,
+            origin_frame_id: 11,
+            dispatch_frame_id: 12,
+            body_identity: 7,
+            surface_revision: 3,
+            material_revision: 4,
+            radius_bits: 99,
+            face: 0,
+            level: 5,
+            x: 8,
+            y: 11,
+            cells: 64,
+            format_version: 1,
+            filter_version: 1,
+        };
+        let worker_identity = std::thread::spawn(move || {
+            let mut worker_state = ThreadState::new();
+            worker_state.job_identity = Some(identity);
+            worker_state.job_identity
+        })
+        .join()
+        .unwrap();
+        assert_eq!(worker_identity, Some(identity));
+
+        let encoded = serde_json::to_value(identity).unwrap();
+        assert_eq!(encoded["kind"], "tile");
+        assert_eq!(encoded["body_identity"], 7);
+        assert_eq!(encoded["surface_revision"], 3);
+        assert_eq!(encoded["level"], 5);
+    }
+
+    #[test]
+    fn wait_reason_is_a_typed_export_value() {
+        let encoded = serde_json::to_value(ProfileWaitReason::TerrainWorkerQueue).unwrap();
+        assert_eq!(encoded, "terrain_worker_queue");
+    }
+
+    #[test]
+    fn real_worker_scope_restores_job_on_unwind_and_rejects_old_capture_context() {
+        let previous_enabled = is_enabled();
+        set_enabled(true);
+        let identity = ProfileJobIdentity::boundary_batch(next_job_id(), 31, 32, 7, 3, [5, 6]);
+        let captured = std::thread::spawn(move || {
+            let _lane = worker_scope_named("test scoped worker");
+            let _job = job_scope(identity);
+            let _ = std::panic::catch_unwind(|| {
+                let other = ProfileJobIdentity::boundary_batch(next_job_id(), 41, 42, 8, 1, []);
+                let _nested_job = job_scope(other);
+                let _span = span("test nested worker");
+                panic!("synthetic unwind");
+            });
+            assert_eq!(current_job_identity(), Some(identity));
+            begin_frame(99);
+            let _span = span("test scoped execution");
+            identity
+        })
+        .join()
+        .unwrap();
+        let captured_id = match captured {
+            ProfileJobIdentity::BoundaryBatch { job_id, .. } => job_id,
+            _ => unreachable!(),
+        };
+        let snap = snapshot();
+        assert!(
+            snap.lanes
+                .iter()
+                .flat_map(|lane| &lane.events)
+                .any(|event| event.name == "test scoped execution"
+                    && event.frame_id == 99
+                    && event.job_identity == Some(captured))
+        );
+        clear();
+        assert!(next_job_id() > captured_id);
+        let _old = job_scope(captured);
+        assert_eq!(current_job_identity(), None);
+        set_enabled(previous_enabled);
     }
 }

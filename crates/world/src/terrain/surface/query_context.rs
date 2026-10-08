@@ -5,6 +5,7 @@ use mundaris_math::surface::SurfaceLocation;
 
 pub(super) const PROVINCE_FEATURE_FAMILY: u8 = 1;
 pub(super) const HIERARCHICAL_FEATURE_FAMILY: u8 = 2;
+pub(super) const MOON_FIELDS_FEATURE_FAMILY: u8 = 3;
 const CACHE_CAPACITY: usize = 8192;
 
 /// Compact immutable data derived from one geological feature cell.
@@ -86,6 +87,9 @@ impl<'a> SurfaceQueryContext<'a> {
         self.stats
     }
 
+    // The cache's stable key is the full family/band/layout/cell tuple; keep
+    // these explicit arguments at the existing internal call boundary.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn feature<F>(
         &mut self,
         family: u8,
@@ -125,6 +129,8 @@ impl<'a> SurfaceQueryContext<'a> {
         feature
     }
 
+    // Mirrors `feature` so cached controls and recipes use identical keys.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn controls<F>(
         &mut self,
         family: u8,
@@ -150,11 +156,10 @@ impl<'a> SurfaceQueryContext<'a> {
         if let Some(entry) = self.entries[index]
             .as_ref()
             .filter(|entry| entry.key == key)
+            && let Some(controls) = entry.controls
         {
-            if let Some(controls) = entry.controls {
-                self.stats.controls_hits = self.stats.controls_hits.saturating_add(1);
-                return Ok(controls);
-            }
+            self.stats.controls_hits = self.stats.controls_hits.saturating_add(1);
+            return Ok(controls);
         }
         self.stats.controls_misses = self.stats.controls_misses.saturating_add(1);
         let controls = create()?;

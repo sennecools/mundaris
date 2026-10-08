@@ -16,6 +16,8 @@ use std::time::Duration;
 
 pub(super) struct PlanetaryTerrain {
     pub enabled: bool,
+    pub hold_cover: bool,
+    pub cluster_freeze: bool,
     pub body: Option<BodyId>,
     pub runtime: RegionalFixture,
     binding: Option<(SurfaceDefinition, u64, u64)>,
@@ -28,6 +30,8 @@ impl PlanetaryTerrain {
     pub fn new(enabled: bool) -> Self {
         Self {
             enabled,
+            hold_cover: false,
+            cluster_freeze: false,
             body: None,
             runtime: RegionalFixture::default(),
             binding: None,
@@ -60,6 +64,8 @@ impl PlanetaryTerrain {
             return Ok(true);
         }
         self.binding_ready = false;
+        self.hold_cover = false;
+        self.cluster_freeze = false;
         self.last_summary = None;
         let generator = SurfaceGenerator::new(definition, radius)?;
         if self.runtime.configure_planetary(
@@ -67,7 +73,7 @@ impl PlanetaryTerrain {
             TileBuildIdentity {
                 body_identity: identity,
                 surface_revision: revision,
-                material_revision: revision,
+                material_revision: definition.material_identity(),
             },
             32,
         )? {
@@ -85,6 +91,7 @@ impl PlanetaryTerrain {
         body_frame: FrameId,
         projection: CelestialProjection,
         lighting: TerrainLighting,
+        appearance: mundaris_renderer::ResidentMaterialAppearance,
         report: RegionalResidentReport,
         elapsed: Duration,
         deterministic: bool,
@@ -101,14 +108,20 @@ impl PlanetaryTerrain {
             direction(DVec3::Z)?,
         );
         self.runtime.observe(report);
-        self.runtime.set_planetary_view(body_to_view, projection)?;
+        // The cover's visibility is part of the saved selection view. Its draw
+        // transforms below still follow the inspection camera while frozen.
+        if !self.cluster_freeze {
+            self.runtime.set_planetary_view(body_to_view, projection)?;
+        }
         let projection_scale = projection.focal_pixels();
-        self.runtime.advance(
-            source.observer_in_source().metres(),
-            projection_scale,
-            elapsed,
-            deterministic,
-        )?;
+        if !self.hold_cover && !self.cluster_freeze {
+            self.runtime.advance(
+                source.observer_in_source().metres(),
+                projection_scale,
+                elapsed,
+                deterministic,
+            )?;
+        }
         self.radial_levels = self
             .runtime
             .radial_levels(source.observer_in_source().metres());
@@ -133,9 +146,11 @@ impl PlanetaryTerrain {
             mode: match lighting.mode() {
                 mundaris_renderer::planet_surface::TerrainRenderMode::Normals => 2,
                 mundaris_renderer::planet_surface::TerrainRenderMode::Elevation => 1,
+                mundaris_renderer::planet_surface::TerrainRenderMode::Natural => 11,
                 _ => 0,
             },
             sun_body: lighting.sun_direction_body(),
+            appearance,
         };
         Ok(Some(self.runtime.draw(&draw)?))
     }
@@ -194,7 +209,18 @@ impl PlanetaryTerrain {
         if !self.enabled {
             return Ok(());
         }
-        snapshot.terrain.backend = "RESIDENT TILE".into();
+        snapshot.terrain.backend = if snapshot
+            .rendering
+            .clusters
+            .as_ref()
+            .is_some_and(|v| v["enabled"].as_bool() == Some(true))
+        {
+            "CLUSTER + RESIDENT FALLBACK"
+        } else {
+            "RESIDENT TILE"
+        }
+        .into();
+        snapshot.rendering.resident_cover_held = self.hold_cover || self.cluster_freeze;
         if let Some(body) = self.body {
             let state = system.body(body)?;
             snapshot.terrain.active_body = ids.iter().position(|&id| id == body).map(|index| {
@@ -280,7 +306,7 @@ impl PlanetaryTerrain {
 mod tests {
     #[test]
     fn solar_system_defaults_to_world_owned_resident_moon() {
-        let mut demo = crate::GravityOrbitsDemo::solar_system(false).unwrap();
+        let mut demo = crate::GravityOrbitsDemo::shared_test_system().unwrap();
         assert!(demo.planetary.enabled);
         let (body, definition, radius, revision) = demo
             .system
@@ -307,8 +333,6 @@ mod tests {
             6
         );
         assert!(!demo.planetary.runtime.has_coverage());
-        demo.use_legacy_terrain();
-        assert!(!demo.planetary.enabled);
     }
 
     #[test]
@@ -317,7 +341,7 @@ mod tests {
         use mundaris_world::terrain::{
             SurfaceAlgorithm, SurfaceDefinition, TerrainIdentity, TerrainSeed,
         };
-        let mut demo = crate::GravityOrbitsDemo::solar_system(false).unwrap();
+        let mut demo = crate::GravityOrbitsDemo::shared_test_system().unwrap();
         let body = demo
             .system
             .bodies()

@@ -6,14 +6,29 @@ use super::{
 };
 use glam::{DMat3, DVec3};
 use mundaris_math::{Direction3, noise::gradient_noise, surface::SurfaceLocation};
+mod authoring;
+pub use authoring::{
+    AffineRandomRange, GeologicalAffineControl, GeologicalDistribution,
+    MoonCraterProfileDefinition, MoonFieldBandDefinition, MoonFieldDefinition,
+};
 mod shape;
 pub use shape::*;
 mod director;
 mod geology;
 mod hierarchy;
+mod moon_fields;
+mod moon_profile;
 mod provinces;
 mod query_context;
 pub use hierarchy::SurfaceDetailDiagnostics;
+pub use moon_fields::{
+    MAX_MOON_CRATER_INPUTS, MOON_CRATER_BAND_BUDGETS_M, MoonCraterInput, MoonFieldEvaluationF32,
+    MoonFieldPointInputs,
+};
+pub use moon_profile::{
+    MoonProfileEvaluationDiagnostics, TerrainHeightDetailLayer, TerrainHeightProfile,
+};
+use moon_profile::{NoopProfileObserver, ProfileObserver, TimedProfileObserver};
 pub use query_context::{SurfaceQueryCacheStats, SurfaceQueryContext};
 
 /// Independent geological algorithm namespaces; parameters remain explicit.
@@ -28,6 +43,10 @@ pub enum SurfaceAlgorithm {
     VolcanicV1,
     VolcanicV2,
     VolcanicV3,
+    /// Seeded planetary/regional/local Moon profiles with compact f64 recipes.
+    MoonFieldsV1,
+    /// Immutable periodic height profile sampled through seamless triplanar charts.
+    MoonProfileV1,
 }
 impl SurfaceAlgorithm {
     pub const fn code(self) -> u64 {
@@ -41,6 +60,8 @@ impl SurfaceAlgorithm {
             Self::VolcanicV1 => 0x564f_4c43_0000_0001,
             Self::VolcanicV2 => 0x564f_4c43_0000_0002,
             Self::VolcanicV3 => 0x564f_4c43_0000_0003,
+            Self::MoonFieldsV1 => 0x4d4f_4f4e_4649_0001,
+            Self::MoonProfileV1 => 0x4d4f_4f4e_5052_0001,
         }
     }
     pub const fn name(self) -> &'static str {
@@ -54,6 +75,8 @@ impl SurfaceAlgorithm {
             Self::VolcanicV1 => "VolcanicV1",
             Self::VolcanicV2 => "VolcanicV2",
             Self::VolcanicV3 => "VolcanicV3",
+            Self::MoonFieldsV1 => "MoonFieldsV1",
+            Self::MoonProfileV1 => "MoonProfileV1",
         }
     }
 
@@ -64,6 +87,18 @@ impl SurfaceAlgorithm {
                 "basin_margin",
                 "resurfaced_plains",
                 "structural_uplands",
+            ],
+            Self::MoonFieldsV1 => [
+                "basin_floor",
+                "ancient_highlands",
+                "mare_plains",
+                "impact_ejecta",
+            ],
+            Self::MoonProfileV1 => [
+                "source_highlands",
+                "source_basins",
+                "mare_plains",
+                "source_ejecta",
             ],
             Self::IcyV1 | Self::IcyV2 | Self::IcyV3 => [
                 "old_ice",
@@ -87,6 +122,18 @@ impl SurfaceAlgorithm {
                 "basin_deformation",
                 "burial_smoothing",
                 "structural_ridges",
+            ],
+            Self::MoonFieldsV1 => [
+                "planetary_basin_relief",
+                "regional_impact_history",
+                "crater_degradation",
+                "regolith_breakdown",
+            ],
+            Self::MoonProfileV1 => [
+                "profile_macro_relief",
+                "profile_regional_relief",
+                "profile_local_relief",
+                "regional_material_expression",
             ],
             Self::IcyV1 | Self::IcyV2 | Self::IcyV3 => [
                 "retained_impacts",
@@ -132,56 +179,7 @@ pub struct GeologicalParameters {
 }
 impl GeologicalParameters {
     pub fn generated(algorithm: SurfaceAlgorithm, seed: TerrainSeed) -> Self {
-        let salt = mix(seed.0 ^ algorithm.code() ^ 0x5048_454e_4f54_0001);
-        let age = 0.12 + 0.86 * unit(salt ^ 1);
-        let activity = (1.0 - age) * (0.55 + 0.45 * unit(salt ^ 2));
-        let (resurfacing, retention, relief, scale) = match algorithm {
-            SurfaceAlgorithm::RockyV3 => (
-                0.05 + 0.78 * activity,
-                0.25 + 0.75 * age,
-                0.004 + 0.005 * age,
-                0.17 + 0.18 * unit(salt ^ 3),
-            ),
-            SurfaceAlgorithm::RockyV4 | SurfaceAlgorithm::RockyV5 => (
-                0.05 + 0.78 * activity,
-                0.25 + 0.75 * age,
-                0.004 + 0.005 * age,
-                0.17 + 0.18 * unit(salt ^ 3),
-            ),
-            SurfaceAlgorithm::IcyV1 => (
-                0.15 + 0.75 * activity,
-                0.10 + 0.65 * age,
-                0.002 + 0.004 * activity,
-                0.16 + 0.18 * unit(salt ^ 3),
-            ),
-            SurfaceAlgorithm::IcyV2 | SurfaceAlgorithm::IcyV3 => (
-                0.15 + 0.75 * activity,
-                0.10 + 0.65 * age,
-                0.002 + 0.004 * activity,
-                0.16 + 0.18 * unit(salt ^ 3),
-            ),
-            SurfaceAlgorithm::VolcanicV1 => (
-                0.45 + 0.48 * (1.0 - age),
-                0.05 + 0.65 * age,
-                0.003 + 0.006 * activity,
-                0.18 + 0.22 * unit(salt ^ 3),
-            ),
-            SurfaceAlgorithm::VolcanicV2 | SurfaceAlgorithm::VolcanicV3 => (
-                0.45 + 0.48 * (1.0 - age),
-                0.05 + 0.65 * age,
-                0.003 + 0.006 * activity,
-                0.18 + 0.22 * unit(salt ^ 3),
-            ),
-        };
-        Self {
-            age,
-            activity,
-            resurfacing_fraction: resurfacing,
-            impact_retention: retention,
-            relief_fraction: relief,
-            feature_scale_fraction: scale,
-            orientation_radians: unit(salt ^ 4) * std::f64::consts::TAU,
-        }
+        GeologicalDistribution::generate_default(algorithm, seed)
     }
     fn validate(self) -> Result<(), TerrainError> {
         if [
@@ -223,6 +221,7 @@ impl GeologicalParameters {
 pub struct SurfaceTerrainDefinition {
     algorithm: SurfaceAlgorithm,
     parameters: GeologicalParameters,
+    distribution: Option<GeologicalDistribution>,
 }
 impl SurfaceTerrainDefinition {
     pub fn new(
@@ -233,13 +232,27 @@ impl SurfaceTerrainDefinition {
         Ok(Self {
             algorithm,
             parameters,
+            distribution: None,
         })
     }
     pub fn generated(algorithm: SurfaceAlgorithm, seed: TerrainSeed) -> Self {
         Self {
             algorithm,
             parameters: GeologicalParameters::generated(algorithm, seed),
+            distribution: None,
         }
+    }
+    pub fn generated_with_distribution(
+        algorithm: SurfaceAlgorithm,
+        seed: TerrainSeed,
+        distribution: GeologicalDistribution,
+    ) -> Result<Self, TerrainError> {
+        let parameters = distribution.generate(algorithm, seed)?;
+        Ok(Self {
+            algorithm,
+            parameters,
+            distribution: (!distribution.same_as_default(algorithm)).then_some(distribution),
+        })
     }
     pub fn algorithm(self) -> SurfaceAlgorithm {
         self.algorithm
@@ -247,8 +260,15 @@ impl SurfaceTerrainDefinition {
     pub fn parameters(self) -> GeologicalParameters {
         self.parameters
     }
+    pub fn distribution(self) -> Option<GeologicalDistribution> {
+        self.distribution
+    }
     pub fn configuration_identity(self) -> u64 {
-        mix(self.algorithm.code() ^ self.parameters.identity())
+        mix(self.algorithm.code()
+            ^ self.parameters.identity()
+            ^ self
+                .distribution
+                .map_or(0, GeologicalDistribution::configuration_identity))
     }
 }
 
@@ -267,7 +287,10 @@ impl SurfaceMaterialVersion {
     fn for_algorithm(algorithm: SurfaceAlgorithm) -> Self {
         match algorithm {
             SurfaceAlgorithm::RockyV3 => Self::RockyV1,
-            SurfaceAlgorithm::RockyV4 | SurfaceAlgorithm::RockyV5 => Self::RockyV2,
+            SurfaceAlgorithm::RockyV4
+            | SurfaceAlgorithm::RockyV5
+            | SurfaceAlgorithm::MoonFieldsV1
+            | SurfaceAlgorithm::MoonProfileV1 => Self::RockyV2,
             SurfaceAlgorithm::IcyV1 => Self::IcyV1,
             SurfaceAlgorithm::IcyV2 | SurfaceAlgorithm::IcyV3 => Self::IcyV2,
             SurfaceAlgorithm::VolcanicV1 => Self::VolcanicV1,
@@ -401,6 +424,8 @@ pub struct SurfaceDefinition {
     material: SurfaceMaterialDefinition,
     atmosphere: SurfaceAtmosphere,
     atmosphere_identity: u64,
+    height_profile: Option<TerrainHeightProfile>,
+    moon_fields: Option<MoonFieldDefinition>,
 }
 impl SurfaceDefinition {
     pub fn new(
@@ -426,6 +451,8 @@ impl SurfaceDefinition {
             material,
             atmosphere,
             atmosphere_identity,
+            height_profile: None,
+            moon_fields: None,
         })
     }
     pub fn generated(
@@ -447,7 +474,47 @@ impl SurfaceDefinition {
             },
             atmosphere: SurfaceAtmosphere::Airless,
             atmosphere_identity: 0x4149_524c_4553_5301,
+            height_profile: None,
+            moon_fields: None,
         }
+    }
+    pub fn with_height_profile(
+        mut self,
+        profile: TerrainHeightProfile,
+    ) -> Result<Self, TerrainError> {
+        if self.terrain.algorithm != SurfaceAlgorithm::MoonProfileV1 {
+            return Err(TerrainError::InvalidConfig);
+        }
+        self.height_profile = Some(profile);
+        Ok(self)
+    }
+    pub fn with_moon_fields(
+        mut self,
+        definition: MoonFieldDefinition,
+    ) -> Result<Self, TerrainError> {
+        if self.terrain.algorithm != SurfaceAlgorithm::MoonFieldsV1 {
+            return Err(TerrainError::InvalidConfig);
+        }
+        definition.validate()?;
+        self.moon_fields = (!definition.same_as_default()).then_some(definition);
+        Ok(self)
+    }
+    pub fn with_geological_distribution(
+        mut self,
+        distribution: GeologicalDistribution,
+    ) -> Result<Self, TerrainError> {
+        self.terrain = SurfaceTerrainDefinition::generated_with_distribution(
+            self.terrain.algorithm,
+            self.seed,
+            distribution,
+        )?;
+        Ok(self)
+    }
+    pub fn moon_fields(&self) -> Option<&MoonFieldDefinition> {
+        self.moon_fields.as_ref()
+    }
+    pub fn height_profile(&self) -> Option<&TerrainHeightProfile> {
+        self.height_profile.as_ref()
     }
     pub fn identity(&self) -> TerrainIdentity {
         self.identity
@@ -471,7 +538,18 @@ impl SurfaceDefinition {
         mix(self.seed.0 ^ self.identity.0.rotate_left(19) ^ 0x4745_4f4c_4f47_0001)
     }
     pub fn terrain_identity(&self) -> u64 {
-        mix(self.terrain_seed() ^ self.terrain.configuration_identity())
+        let profile_identity = self.height_profile.as_ref().map_or(0, |profile| {
+            profile
+                .identity_words()
+                .into_iter()
+                .fold(0, |hash, word| mix(hash ^ word))
+        });
+        mix(self.terrain_seed()
+            ^ self.terrain.configuration_identity()
+            ^ profile_identity
+            ^ self
+                .moon_fields
+                .map_or(0, MoonFieldDefinition::configuration_identity))
     }
     pub fn geometry_identity(&self) -> u64 {
         mix(self.terrain_identity() ^ self.shape.configuration_identity())
@@ -541,11 +619,14 @@ impl SurfaceSample {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // Keep existing compiled source storage unchanged in the rendering comparison.
 enum GeologicalField {
     Rocky(Box<MoonTerrainGenerator>),
     Other(geology::GeologyField),
     Province(provinces::ProvinceField),
     Hierarchical(Box<hierarchy::HierarchicalField>),
+    MoonFields(moon_fields::MoonFieldsV1),
+    MoonProfile(moon_profile::MoonProfileField),
 }
 /// Immutable compiled query adapter shared by reference and production callers.
 #[derive(Debug, Clone)]
@@ -610,6 +691,25 @@ impl SurfaceGenerator {
                 let bound = g.absolute_height_bound_m();
                 (GeologicalField::Hierarchical(Box::new(g)), bound)
             }
+            SurfaceAlgorithm::MoonFieldsV1 => {
+                let g = moon_fields::MoonFieldsV1::new(
+                    p,
+                    definition.terrain_seed(),
+                    radius_m,
+                    definition.moon_fields.unwrap_or_default(),
+                )?;
+                let bound = g.absolute_height_bound_m();
+                (GeologicalField::MoonFields(g), bound)
+            }
+            SurfaceAlgorithm::MoonProfileV1 => {
+                let profile = definition
+                    .height_profile
+                    .as_ref()
+                    .ok_or(TerrainError::InvalidConfig)?;
+                let g = moon_profile::MoonProfileField::new(profile.clone(), radius_m)?;
+                let bound = g.absolute_height_bound_m();
+                (GeologicalField::MoonProfile(g), bound)
+            }
             algorithm => {
                 let g =
                     geology::GeologyField::new(algorithm, p, definition.terrain_seed(), radius_m)?;
@@ -638,16 +738,19 @@ impl SurfaceGenerator {
     }
 
     /// Heap payload currently retained by this compiled generator's owned
-    /// allocations. It counts `Box` payloads and excludes allocator metadata,
+    /// allocations. It counts `Box`, profile-map, and detail-metadata payloads
+    /// while counting Arc-shared profile maps once, and excludes allocator metadata,
     /// the inline `SurfaceGenerator` itself, and caller-owned diagnostic output.
-    /// `SurfaceDefinition` and `ShapeDefinition` are fixed-size values without
-    /// heap storage, and the geology algorithms retain no variable-sized data.
+    /// Profile allocations shared between the inline definition and compiled
+    /// field are counted once through the field. Other geological state is inline.
     pub fn resident_heap_bytes(&self) -> usize {
         match &self.field {
             GeologicalField::Rocky(_) => std::mem::size_of::<MoonTerrainGenerator>(),
             GeologicalField::Other(_) => 0,
             GeologicalField::Province(field) => field.resident_heap_bytes(),
             GeologicalField::Hierarchical(field) => field.resident_heap_bytes(),
+            GeologicalField::MoonFields(_) => 0,
+            GeologicalField::MoonProfile(field) => field.resident_heap_bytes(),
         }
     }
 
@@ -661,7 +764,8 @@ impl SurfaceGenerator {
 
     /// Upper bound, in heap payload bytes, for a compiled surface generator
     /// across all supported algorithms, including its scalar/batch query
-    /// workspace. Current compiled fields have only fixed `Box` payloads:
+    /// workspace. Current compiled fields have fixed `Box` payloads plus bounded
+    /// profile maps and detail metadata:
     /// Rocky V3 stores one Moon generator; Rocky V4 stores a province field and
     /// a Moon history; Rocky V5 adds a hierarchy field around that same parent.
     /// Definitions, shapes, history tables, and other field state are inline.
@@ -674,6 +778,7 @@ impl SurfaceGenerator {
             std::mem::size_of::<hierarchy::HierarchicalField>() + province_with_rocky_history;
         moon.max(province_with_rocky_history)
             .max(hierarchical_with_rocky_history)
+            .max(moon_profile::MAX_PROFILE_WORKING_HEAP_BYTES)
     }
     pub fn definition(&self) -> &SurfaceDefinition {
         &self.definition
@@ -700,7 +805,10 @@ impl SurfaceGenerator {
             GeologicalField::Hierarchical(field) => {
                 Ok(Some(field.controls(location.direction().unit())?))
             }
-            GeologicalField::Rocky(_) | GeologicalField::Other(_) => Ok(None),
+            GeologicalField::Rocky(_)
+            | GeologicalField::Other(_)
+            | GeologicalField::MoonFields(_) => Ok(None),
+            GeologicalField::MoonProfile(_) => Ok(None),
         }
     }
 
@@ -812,6 +920,7 @@ impl SurfaceGenerator {
                     });
                 }
             }
+            GeologicalField::MoonFields(_) | GeologicalField::MoonProfile(_) => {}
             GeologicalField::Rocky(_) => {
                 let p = self.definition.terrain.parameters;
                 let frequency = 2.2 + 3.0 * p.activity;
@@ -916,8 +1025,47 @@ impl SurfaceGenerator {
         SurfaceQueryContext::new(self)
     }
 
+    /// Prepare bounded f64 scalar recipe inputs for the experimental MoonFieldsV1
+    /// derived-field producer. These contain terrain height and material data;
+    /// callers must separately query and apply the body shape. This API is not
+    /// collision or world authority. Other algorithms remain on their existing path.
+    pub fn prepare_moon_field_point(
+        &self,
+        location: SurfaceLocation,
+    ) -> Result<MoonFieldPointInputs, TerrainError> {
+        let GeologicalField::MoonFields(field) = &self.field else {
+            return Err(TerrainError::InvalidConfig);
+        };
+        let mut inputs = field.prepare(location.direction().unit())?;
+        let regional_signal = inputs.regional().clamp(-1.0, 1.0);
+        inputs.set_material_emphasis(
+            self.definition.material.composition,
+            self.definition.material.regional_contrast,
+            regional_signal,
+        );
+        Ok(inputs)
+    }
+
     pub fn evaluate_point(&self, location: SurfaceLocation) -> Result<SurfaceSample, TerrainError> {
-        self.evaluate_point_inner(location, None)
+        self.evaluate_point_inner(location, None, &mut NoopProfileObserver)
+    }
+
+    /// Evaluate one MoonProfile point and collect opt-in source-layer timings.
+    /// Other geology paths return `InvalidConfig`; use `evaluate_point` for them.
+    pub fn evaluate_moon_profile_point_profiled(
+        &self,
+        location: SurfaceLocation,
+        diagnostics: &mut MoonProfileEvaluationDiagnostics,
+    ) -> Result<SurfaceSample, TerrainError> {
+        if !matches!(self.field, GeologicalField::MoonProfile(_)) {
+            return Err(TerrainError::InvalidConfig);
+        }
+        *diagnostics = MoonProfileEvaluationDiagnostics::default();
+        let started = std::time::Instant::now();
+        let mut observer = TimedProfileObserver(diagnostics);
+        let result = self.evaluate_point_inner(location, None, &mut observer);
+        diagnostics.total_surface_evaluation_ns = started.elapsed().as_nanos();
+        result
     }
 
     fn evaluate_point_with_context(
@@ -925,13 +1073,14 @@ impl SurfaceGenerator {
         location: SurfaceLocation,
         context: &mut SurfaceQueryContext<'_>,
     ) -> Result<SurfaceSample, TerrainError> {
-        self.evaluate_point_inner(location, Some(context))
+        self.evaluate_point_inner(location, Some(context), &mut NoopProfileObserver)
     }
 
-    fn evaluate_point_inner(
+    fn evaluate_point_inner<O: ProfileObserver>(
         &self,
         location: SurfaceLocation,
         mut context: Option<&mut SurfaceQueryContext<'_>>,
+        observer: &mut O,
     ) -> Result<SurfaceSample, TerrainError> {
         let n = location.direction().unit();
         let shape = self
@@ -1002,11 +1151,26 @@ impl SurfaceGenerator {
                 };
                 (s.height_m, s.gradient_m, s.weights, s.work)
             }
+            GeologicalField::MoonFields(g) => g.evaluate(n, context)?,
+            GeologicalField::MoonProfile(g) => {
+                let s = g.evaluate_observed(n, observer)?;
+                (
+                    s.height_m,
+                    s.gradient_m,
+                    s.weights,
+                    SurfaceQueryWork::default(),
+                )
+            }
         };
-        let material_noise =
-            gradient_noise(mix(self.definition.seed.0 ^ 0x4d41_5445_5249_0001), n * 7.0)
-                .map_err(|_| TerrainError::NonFiniteResult)?
-                .value;
+        let material_noise = match &self.field {
+            GeologicalField::MoonFields(field) => field.material_modulation(n),
+            GeologicalField::MoonProfile(_) => 0.0,
+            _ => {
+                gradient_noise(mix(self.definition.seed.0 ^ 0x4d41_5445_5249_0001), n * 7.0)
+                    .map_err(|_| TerrainError::NonFiniteResult)?
+                    .value
+            }
+        };
         let m = self.definition.material;
         for (index, w) in weights.iter_mut().enumerate() {
             let emphasis = (index as f64 - 1.5) / 1.5;
@@ -1115,7 +1279,9 @@ mod landmark_probe_tests {
                     | SurfaceAlgorithm::VolcanicV2
                     | SurfaceAlgorithm::RockyV5
                     | SurfaceAlgorithm::IcyV3
-                    | SurfaceAlgorithm::VolcanicV3 => false,
+                    | SurfaceAlgorithm::VolcanicV3
+                    | SurfaceAlgorithm::MoonFieldsV1 => false,
+                    SurfaceAlgorithm::MoonProfileV1 => false,
                 });
             }
         }
@@ -1138,12 +1304,19 @@ mod memory_accounting_tests {
             SurfaceAlgorithm::VolcanicV1,
             SurfaceAlgorithm::VolcanicV2,
             SurfaceAlgorithm::VolcanicV3,
+            SurfaceAlgorithm::MoonFieldsV1,
+            SurfaceAlgorithm::MoonProfileV1,
         ] {
-            let definition = SurfaceDefinition::generated(
+            let mut definition = SurfaceDefinition::generated(
                 crate::terrain::TerrainIdentity(0x1234),
                 crate::terrain::TerrainSeed(0x5eed),
                 algorithm,
             );
+            if algorithm == SurfaceAlgorithm::MoonProfileV1 {
+                let profile =
+                    TerrainHeightProfile::from_u16_le(2, 2, &[0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+                definition = definition.with_height_profile(profile).unwrap();
+            }
             let generator = SurfaceGenerator::new(&definition, 109_000.0).unwrap();
             assert_eq!(generator.query_workspace_bytes(), 0, "{algorithm:?}");
             assert!(

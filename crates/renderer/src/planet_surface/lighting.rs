@@ -128,7 +128,6 @@ pub struct TerrainLighting {
     diffuse: f32,
     mode: TerrainRenderMode,
     readability: Option<TerrainReadability>,
-    land_profile: Option<crate::PlanetLandProfile>,
 }
 
 impl Default for TerrainLighting {
@@ -139,7 +138,6 @@ impl Default for TerrainLighting {
             diffuse: 0.94,
             mode: TerrainRenderMode::Lit,
             readability: None,
-            land_profile: None,
         }
     }
 }
@@ -176,7 +174,6 @@ impl TerrainLighting {
             diffuse,
             mode,
             readability: None,
-            land_profile: None,
         })
     }
 
@@ -205,11 +202,6 @@ impl TerrainLighting {
         self
     }
 
-    pub(crate) fn with_planet_profile(mut self, profile: crate::PlanetLandProfile) -> Self {
-        self.land_profile = Some(profile);
-        self
-    }
-
     /// Packs the 64-byte uniform: lighting controls followed by readability thresholds.
     pub(crate) fn packed(self, target_srgb: bool) -> [f32; 16] {
         let config = self.readability.unwrap_or(TerrainReadability {
@@ -229,12 +221,7 @@ impl TerrainLighting {
             self.diffuse,
             self.mode as u32 as f32,
             f32::from(target_srgb),
-            match self.land_profile {
-                Some(crate::PlanetLandProfile::Earth) => 0.0,
-                Some(crate::PlanetLandProfile::Rock) => 1.0,
-                Some(crate::PlanetLandProfile::Mars) => 2.0,
-                None => 0.0,
-            },
+            0.0,
             config.sea_level_m as f32,
             config.highland_start_m as f32,
             config.highland_full_m as f32,

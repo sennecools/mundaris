@@ -3,11 +3,6 @@ use super::*;
 #[derive(Clone, Copy)]
 pub(super) enum Layer {
     Terrain,
-    Ocean,
-    Clouds,
-    Atmosphere,
-    #[cfg(feature = "developer-tools")]
-    Sky,
     Markers,
     Labels,
     Trails,
@@ -20,10 +15,6 @@ impl Layer {
     pub fn named(name: &str) -> Result<Self> {
         Ok(match name {
             "terrain" => Self::Terrain,
-            "ocean" => Self::Ocean,
-            "clouds" => Self::Clouds,
-            "atmosphere" => Self::Atmosphere,
-            "sky" => Self::Sky,
             "markers" => Self::Markers,
             "labels" => Self::Labels,
             "trails" => Self::Trails,
@@ -36,11 +27,6 @@ impl Layer {
     fn flag(self, controls: &mut Controls) -> &mut bool {
         match self {
             Self::Terrain => &mut controls.terrain_preview,
-            Self::Ocean => &mut controls.planetary_ocean,
-            Self::Clouds => &mut controls.planetary_clouds,
-            Self::Atmosphere => &mut controls.planetary_atmosphere,
-            #[cfg(feature = "developer-tools")]
-            Self::Sky => &mut controls.sky.enabled,
             Self::Markers => &mut controls.markers,
             Self::Labels => &mut controls.labels,
             Self::Trails => &mut controls.trails,
@@ -53,7 +39,6 @@ impl Layer {
 pub(super) enum VisualCommand {
     RenderMode(TerrainRenderMode),
     Layer(Layer, bool),
-    Sky(mundaris_renderer::sky::SkySettings),
 }
 impl VisualCommand {
     pub fn apply(self, controls: &mut Controls) -> Result<()> {
@@ -62,7 +47,6 @@ impl VisualCommand {
                 controls.terrain_lighting = controls.terrain_lighting.with_mode(mode)
             }
             Self::Layer(layer, value) => *layer.flag(controls) = value,
-            Self::Sky(settings) => controls.sky = settings.try_validate()?,
         };
         Ok(())
     }

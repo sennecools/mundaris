@@ -83,6 +83,7 @@ struct Transition {
 }
 
 #[derive(Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)] // Retain value identity without changing camera/source behavior for this comparison.
 enum TerrainAuthority {
     Legacy(mundaris_world::terrain::TerrainDefinition),
     Compositional(mundaris_world::terrain::SurfaceDefinition),
@@ -416,7 +417,6 @@ impl CelestialCamera {
     }
     /// Set a fixture-controlled observer while retaining the normal surface
     /// inspection controller and the same published body-fixed frame.
-    #[cfg(feature = "developer-tools")]
     pub(crate) fn developer_set_surface_pose(
         &mut self,
         pair: &CoherentCelestialView<'_>,
@@ -469,7 +469,10 @@ impl CelestialCamera {
         self.wheel_pending = DVec3::ZERO;
         self.terrain_approach = true;
         self.initialize_surface_angles(anchor.tangent.up().unit());
-        self.developer_fixture_pose = Some(pose);
+        #[cfg(feature = "developer-tools")]
+        {
+            self.developer_fixture_pose = Some(pose);
+        }
         Ok(())
     }
     pub fn look_surface_horizon(&mut self) -> Result<()> {
@@ -647,6 +650,9 @@ impl CelestialCamera {
                 pair.system().body(body)?.properties().reference_radius_m(),
                 self.inspection.map(|a| a.tangent),
             )?);
+            // The radial target changes the observer even when navigation is idle.
+            // Refresh the recorded sample used by UI and developer snapshots.
+            self.sample_clearance(pair, body, self.pose)?;
             return Ok(());
         }
         ensure!(

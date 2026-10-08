@@ -19,6 +19,17 @@ struct DrawParams {
     parent: TileParams,
     hierarchy: vec4<f32>, // child anchor in parent axes, morph fraction
     patch_info: vec4<f32>, // 0 single, 1 hierarchy parent, 2 child; quadrant xy
+    material_color_0: vec4<f32>,
+    material_color_1: vec4<f32>,
+    material_color_2: vec4<f32>,
+    material_color_3: vec4<f32>,
+    natural_color_0: vec4<f32>,
+    natural_color_1: vec4<f32>,
+    natural_color_2: vec4<f32>,
+    natural_color_3: vec4<f32>,
+    base_color: vec4<f32>,
+    dark_color: vec4<f32>,
+    appearance: vec4<f32>, // ambient, diffuse, curvature darkening, lightening
 }
 struct TileSample { geometry: vec4<f32>, material: vec4<f32> }
 struct TriangleValue { position: vec3<f32>, normal_varying: vec3<f32>, material: vec4<f32> }
@@ -217,10 +228,10 @@ struct VertexOut {
     } else if mode == 2u {
         color = normal * 0.5 + vec3<f32>(0.5);
     } else if mode == 3u {
-        color = input.material.x * vec3<f32>(0.72, 0.54, 0.30)
-            + input.material.y * vec3<f32>(0.34, 0.38, 0.42)
-            + input.material.z * vec3<f32>(0.45, 0.30, 0.22)
-            + input.material.w * vec3<f32>(0.78, 0.73, 0.64);
+        color = input.material.x * params.material_color_0.xyz
+            + input.material.y * params.material_color_1.xyz
+            + input.material.z * params.material_color_2.xyz
+            + input.material.w * params.material_color_3.xyz;
     } else if mode == 4u {
         color = vec3<f32>(input.uv, 0.0);
     } else if mode == 5u {
@@ -249,6 +260,24 @@ struct VertexOut {
         } else {
             color = vec3<f32>(0.12, 0.82, 0.28);
         }
+    } else if mode == 12u {
+        color = vec3<f32>(238.0,174.0,83.0)/255.0;
+    } else if mode == 13u {
+        color = vec3<f32>(166.0,131.0,255.0)/255.0;
+    } else if mode == 14u {
+        color = vec3<f32>(232.0,104.0,111.0)/255.0;
+    } else if mode == 11u {
+        // Neutral rocky palette: regolith, substrate, basalt and ejecta.
+        // Weights are semantic channels, never RGB values.
+        color = input.material.x * params.natural_color_0.xyz
+            + input.material.y * params.natural_color_1.xyz
+            + input.material.z * params.natural_color_2.xyz
+            + input.material.w * params.natural_color_3.xyz;
+        let curvature = clamp(1.0 - length(input.normal_varying), 0.0, 1.0);
+        color = mix(color, params.dark_color.xyz, curvature * params.appearance.z);
+        color = mix(color, params.base_color.xyz, curvature * params.appearance.w);
+        let diffuse = max(dot(normal, normalize(params.own.sun.xyz)), 0.0);
+        color *= params.appearance.x + params.appearance.y * diffuse;
     } else {
         let diffuse = max(dot(normal, normalize(params.own.sun.xyz)), 0.0);
         color *= 0.2 + 0.8 * diffuse;

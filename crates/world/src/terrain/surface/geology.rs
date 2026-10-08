@@ -86,7 +86,9 @@ impl GeologyField {
             | SurfaceAlgorithm::IcyV2
             | SurfaceAlgorithm::IcyV3
             | SurfaceAlgorithm::VolcanicV2
-            | SurfaceAlgorithm::VolcanicV3 => return Err(TerrainError::InvalidConfig),
+            | SurfaceAlgorithm::VolcanicV3
+            | SurfaceAlgorithm::MoonFieldsV1
+            | SurfaceAlgorithm::MoonProfileV1 => return Err(TerrainError::InvalidConfig),
         };
         let bound_m = if relief == 0.0 {
             0.0
@@ -183,7 +185,9 @@ impl GeologyField {
             | SurfaceAlgorithm::IcyV2
             | SurfaceAlgorithm::IcyV3
             | SurfaceAlgorithm::VolcanicV2
-            | SurfaceAlgorithm::VolcanicV3 => return Err(TerrainError::InvalidConfig),
+            | SurfaceAlgorithm::VolcanicV3
+            | SurfaceAlgorithm::MoonFieldsV1
+            | SurfaceAlgorithm::MoonProfileV1 => return Err(TerrainError::InvalidConfig),
         };
         let mut probes = Vec::with_capacity(labels.len() * 4);
         for (epoch, epoch_labels) in labels.iter().enumerate() {
@@ -209,7 +213,9 @@ impl GeologyField {
                         | SurfaceAlgorithm::IcyV2
                         | SurfaceAlgorithm::IcyV3
                         | SurfaceAlgorithm::VolcanicV2
-                        | SurfaceAlgorithm::VolcanicV3 => 0.0,
+                        | SurfaceAlgorithm::VolcanicV3
+                        | SurfaceAlgorithm::MoonFieldsV1
+                        | SurfaceAlgorithm::MoonProfileV1 => 0.0,
                     };
                     selected_impact = Some((center.normalize(), support));
                 }
@@ -224,7 +230,9 @@ impl GeologyField {
                     | SurfaceAlgorithm::IcyV2
                     | SurfaceAlgorithm::IcyV3
                     | SurfaceAlgorithm::VolcanicV2
-                    | SurfaceAlgorithm::VolcanicV3 => false,
+                    | SurfaceAlgorithm::VolcanicV3
+                    | SurfaceAlgorithm::MoonFieldsV1
+                    | SurfaceAlgorithm::MoonProfileV1 => false,
                 };
                 if selected_surface.is_none() && present {
                     selected_surface = Some(center.normalize());
@@ -291,7 +299,9 @@ impl GeologyField {
             | SurfaceAlgorithm::IcyV2
             | SurfaceAlgorithm::IcyV3
             | SurfaceAlgorithm::VolcanicV2
-            | SurfaceAlgorithm::VolcanicV3 => return Err(TerrainError::InvalidConfig),
+            | SurfaceAlgorithm::VolcanicV3
+            | SurfaceAlgorithm::MoonFieldsV1
+            | SurfaceAlgorithm::MoonProfileV1 => return Err(TerrainError::InvalidConfig),
         };
         let mut work = SurfaceQueryWork {
             accepted_features: Some(0),
@@ -358,7 +368,9 @@ impl GeologyField {
                 | SurfaceAlgorithm::IcyV2
                 | SurfaceAlgorithm::IcyV3
                 | SurfaceAlgorithm::VolcanicV2
-                | SurfaceAlgorithm::VolcanicV3 => {}
+                | SurfaceAlgorithm::VolcanicV3
+                | SurfaceAlgorithm::MoonFieldsV1
+                | SurfaceAlgorithm::MoonProfileV1 => {}
             }
         })?;
         if let Some(probes) = chosen {
@@ -389,7 +401,9 @@ impl GeologyField {
             | SurfaceAlgorithm::IcyV2
             | SurfaceAlgorithm::IcyV3
             | SurfaceAlgorithm::VolcanicV2
-            | SurfaceAlgorithm::VolcanicV3 => return Err(TerrainError::InvalidConfig),
+            | SurfaceAlgorithm::VolcanicV3
+            | SurfaceAlgorithm::MoonFieldsV1
+            | SurfaceAlgorithm::MoonProfileV1 => return Err(TerrainError::InvalidConfig),
         };
         normalize_weights(&mut weights);
         if !height.is_finite()
@@ -1171,7 +1185,9 @@ fn algorithm_tag(algorithm: SurfaceAlgorithm) -> u64 {
         | SurfaceAlgorithm::IcyV2
         | SurfaceAlgorithm::IcyV3
         | SurfaceAlgorithm::VolcanicV2
-        | SurfaceAlgorithm::VolcanicV3 => 0,
+        | SurfaceAlgorithm::VolcanicV3
+        | SurfaceAlgorithm::MoonFieldsV1
+        | SurfaceAlgorithm::MoonProfileV1 => 0,
     }
 }
 fn unit(key: u64) -> f64 {
@@ -1351,7 +1367,9 @@ mod tests {
                     | SurfaceAlgorithm::IcyV2
                     | SurfaceAlgorithm::IcyV3
                     | SurfaceAlgorithm::VolcanicV2
-                    | SurfaceAlgorithm::VolcanicV3 => false,
+                    | SurfaceAlgorithm::VolcanicV3
+                    | SurfaceAlgorithm::MoonFieldsV1
+                    | SurfaceAlgorithm::MoonProfileV1 => false,
                 });
                 assert!((direction.length() - 1.0).abs() < 1.0e-12);
                 let sample = f.evaluate(direction).unwrap();

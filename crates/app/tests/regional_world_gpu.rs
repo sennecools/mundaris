@@ -230,6 +230,7 @@ fn make_tile_draw(
         body_to_view,
         mode: 0,
         sun_body: DVec3::new(0.3, 0.7, 0.5).normalize(),
+        appearance: Default::default(),
     })
 }
 

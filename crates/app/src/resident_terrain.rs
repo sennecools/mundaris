@@ -11,6 +11,8 @@ use mundaris_math::{Direction3, surface::CubePatchAddress};
 use mundaris_world::terrain::{
     SurfaceAtmosphere, SurfaceGenerator, SurfaceQueryContext, TerrainError,
 };
+mod fields;
+pub use fields::{FieldDensity, FieldStatistics, SharedFieldPages};
 
 pub use mundaris_renderer::resident_tile::{TileData, TileKey, TileTexel};
 
@@ -35,6 +37,8 @@ pub struct TileBuildIdentity {
 pub struct TileBuildDiagnostics {
     pub elapsed: Duration,
     pub authoritative_query_count: u64,
+    pub derived_field_capacity_bytes: usize,
+    pub derived_field_retained_bytes: usize,
     pub texel_dimensions: [u32; 2],
     pub patch_grid_vertex_dimensions: [u32; 2],
     pub payload_bytes: usize,
@@ -148,7 +152,7 @@ impl ResidentTileBuilder {
         address: CubePatchAddress,
         cells: u32,
     ) -> Result<(TileData, TileBuildDiagnostics), TileBuildError> {
-        Self::build_inner(generator, identity, address, cells, None)
+        Self::build_inner(generator, identity, address, cells, None, None)
     }
 
     /// Build a tile with a bounded query context borrowed from this generator.
@@ -165,10 +169,17 @@ impl ResidentTileBuilder {
         if query_filter_step_m(generator.radius_m(), address, cells)?
             > QUERY_CACHE_FILTER_STEP_LIMIT_M
         {
-            return Self::build_inner(generator, identity, address, cells, None);
+            return Self::build_inner(generator, identity, address, cells, None, None);
         }
         let mut context = generator.query_context();
-        Self::build_inner(generator, identity, address, cells, Some(&mut context))
+        Self::build_inner(
+            generator,
+            identity,
+            address,
+            cells,
+            Some(&mut context),
+            None,
+        )
     }
 
     /// Explicit name for the uncached reference path used in matched comparisons.
@@ -178,7 +189,34 @@ impl ResidentTileBuilder {
         address: CubePatchAddress,
         cells: u32,
     ) -> Result<(TileData, TileBuildDiagnostics), TileBuildError> {
-        Self::build_inner(generator, identity, address, cells, None)
+        Self::build_inner(generator, identity, address, cells, None, None)
+    }
+
+    /// Field approximation is independently versioned from the exact filter.
+    pub fn field_tile_key(
+        generator: &SurfaceGenerator,
+        identity: TileBuildIdentity,
+        address: CubePatchAddress,
+        cells: u32,
+        density: FieldDensity,
+    ) -> Result<TileKey, TileBuildError> {
+        let mut key = Self::tile_key(generator, identity, address, cells)?;
+        key.filter_version = density.filter_version();
+        Ok(key)
+    }
+
+    /// Sample reusable fields on workers; the exact anchor remains world-owned.
+    pub fn build_fields(
+        generator: &SurfaceGenerator,
+        identity: TileBuildIdentity,
+        address: CubePatchAddress,
+        cells: u32,
+        fields: &SharedFieldPages,
+    ) -> Result<(TileData, TileBuildDiagnostics), TileBuildError> {
+        if !fields.matches(generator, identity) {
+            return Err(TileBuildError::InvalidSample);
+        }
+        Self::build_inner(generator, identity, address, cells, None, Some(fields))
     }
 
     fn build_inner(
@@ -187,6 +225,7 @@ impl ResidentTileBuilder {
         address: CubePatchAddress,
         cells: u32,
         mut context: Option<&mut SurfaceQueryContext<'_>>,
+        fields: Option<&SharedFieldPages>,
     ) -> Result<(TileData, TileBuildDiagnostics), TileBuildError> {
         if !cells.is_power_of_two() || !(1..=TileData::MAX_CELLS).contains(&cells) {
             return Err(TileBuildError::InvalidCells);
@@ -224,13 +263,19 @@ impl ResidentTileBuilder {
                         .into_iter()
                         .enumerate()
                 {
-                    let sample = evaluate(generator, sample_direction, context.as_deref_mut())?;
+                    let (radius, material, queries) = if let Some(fields) = fields {
+                        let (value, queries) = fields.sample(sample_direction, address.level())?;
+                        (value.radius_m, value.material, queries)
+                    } else {
+                        let sample = evaluate(generator, sample_direction, context.as_deref_mut())?;
+                        (sample.radius_m(), sample.material_weights(), 1)
+                    };
                     let weight = if sample_index == 0 { 0.25 } else { 0.125 };
-                    radial_sum += sample.radius_m() * weight;
-                    for (sum, value) in material_sum.iter_mut().zip(sample.material_weights()) {
+                    radial_sum += radius * weight;
+                    for (sum, value) in material_sum.iter_mut().zip(material) {
                         *sum += value * weight;
                     }
-                    query_count += 1;
+                    query_count += queries;
                 }
                 let offset = radial_sum - anchor_radius_m;
                 let material = normalize_material(material_sum)?;
@@ -251,7 +296,11 @@ impl ResidentTileBuilder {
             }
         }
 
-        let key = Self::tile_key(generator, identity, address, cells)?;
+        let key = if let Some(fields) = fields {
+            Self::field_tile_key(generator, identity, address, cells, fields.density())?
+        } else {
+            Self::tile_key(generator, identity, address, cells)?
+        };
         let payload_bytes = texel_count * std::mem::size_of::<TileTexel>();
         let tile = TileData {
             key,
@@ -302,6 +351,8 @@ impl ResidentTileBuilder {
             TileBuildDiagnostics {
                 elapsed: started.elapsed(),
                 authoritative_query_count: query_count + 6,
+                derived_field_capacity_bytes: fields.map_or(0, |f| f.statistics().capacity_bytes),
+                derived_field_retained_bytes: fields.map_or(0, |f| f.statistics().retained_bytes),
                 texel_dimensions: [side, side],
                 patch_grid_vertex_dimensions: [cells + 1, cells + 1],
                 payload_bytes,
@@ -517,6 +568,9 @@ fn exact_definition_words(generator: &SurfaceGenerator) -> Vec<u64> {
         definition.seed().0,
         definition.terrain().algorithm().code(),
     ]);
+    if let Some(profile) = definition.height_profile() {
+        words.extend(profile.identity_words());
+    }
     let parameters = definition.terrain().parameters();
     words.extend([
         canonical_f64_bits(parameters.age),
@@ -602,6 +656,33 @@ mod query_context_tests {
     use mundaris_world::terrain::{
         SurfaceAlgorithm, SurfaceDefinition, TerrainIdentity, TerrainSeed,
     };
+
+    #[test]
+    fn profile_bytes_are_part_of_tile_content_identity() {
+        let mut bytes = vec![0u8; 32];
+        let definition = |bytes: &[u8]| {
+            SurfaceDefinition::generated(
+                TerrainIdentity(5),
+                TerrainSeed(2),
+                SurfaceAlgorithm::MoonProfileV1,
+            )
+            .with_height_profile(
+                mundaris_world::terrain::TerrainHeightProfile::from_u16_le(4, 4, bytes).unwrap(),
+            )
+            .unwrap()
+        };
+        let first = SurfaceGenerator::new(&definition(&bytes), 109_081.776_8).unwrap();
+        bytes[7] = 1;
+        let second = SurfaceGenerator::new(&definition(&bytes), 109_081.776_8).unwrap();
+        assert_ne!(
+            exact_definition_words(&first),
+            exact_definition_words(&second)
+        );
+        assert_ne!(
+            first.definition().terrain_identity(),
+            second.definition().terrain_identity()
+        );
+    }
 
     fn generator() -> SurfaceGenerator {
         generator_at_radius(1_737_400.0)
@@ -895,11 +976,12 @@ mod query_context_tests {
         let mut workspace_bytes = 0usize;
         for repetition in 0..3 {
             for (index, address) in corpus.iter().copied().enumerate() {
-                for cached_first in [(index + repetition) % 2 == 0] {
+                {
+                    let cached_first = (index + repetition) % 2 == 0;
                     let mut run_cached = || {
                         let started = Instant::now();
                         let (_, diagnostics) =
-                            ResidentTileBuilder::build_cached(&generator, identity, address, 32)
+                            ResidentTileBuilder::build_cached(generator, identity, address, 32)
                                 .unwrap();
                         let elapsed_ns = started.elapsed().as_nanos() as u64;
                         cached_nanos.push(elapsed_ns);
@@ -924,7 +1006,7 @@ mod query_context_tests {
                     };
                     let mut run_uncached = || {
                         let started = Instant::now();
-                        ResidentTileBuilder::build_uncached(&generator, identity, address, 32)
+                        ResidentTileBuilder::build_uncached(generator, identity, address, 32)
                             .unwrap();
                         let elapsed_ns = started.elapsed().as_nanos() as u64;
                         uncached_nanos.push(elapsed_ns);

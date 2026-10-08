@@ -393,6 +393,8 @@ pub enum TerrainError {
     RevisionOverflow,
     #[error("terrain batch input/output lengths differ")]
     LengthMismatch,
+    #[error("invalid terrain height profile dimensions or byte payload")]
+    InvalidHeightProfile,
     #[error("nonfinite terrain query result")]
     NonFiniteResult,
 }

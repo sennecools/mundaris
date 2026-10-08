@@ -1,8 +1,8 @@
 use glam::DVec3;
 use mundaris_math::surface::{CubeFace, CubePatchAddress};
 use mundaris_renderer::{
-    TILE_FILTER_VERSION, TILE_FORMAT_VERSION, TileData, TileGeometryError, TileKey, TileSlotState,
-    TileTexel,
+    ResidentMaterialAppearance, TILE_FILTER_VERSION, TILE_FORMAT_VERSION, TileData,
+    TileGeometryError, TileKey, TileSlotState, TileTexel,
 };
 
 fn tile(address: CubePatchAddress, cells: u32, displacement: impl Fn(u32, u32) -> f32) -> TileData {
@@ -32,6 +32,26 @@ fn tile(address: CubePatchAddress, cells: u32, displacement: impl Fn(u32, u32) -
         min_max_radial_offset_m: [-10.0, 10.0],
         texels,
     }
+}
+
+#[test]
+fn publication_key_snapshots_survive_caller_edits_and_independent_slot_clones() {
+    let mut key = tile(CubePatchAddress::root(CubeFace::PositiveZ), 4, |_, _| 0.0).key;
+    let original = key.clone();
+    let mut slot = TileSlotState::default();
+    let token = slot.request(&key).unwrap();
+    let repeated = slot.request(&key.clone()).unwrap();
+    assert_eq!(token.generation(), repeated.generation());
+    assert_eq!(token.key(), &original);
+    let mut independent = slot.clone();
+    let cloned_token = token.clone();
+    key.definition_words[0] += 1;
+    let replacement = independent.request(&key).unwrap();
+    assert!(!independent.accept_publication(&cloned_token, &original));
+    assert!(independent.accept_publication(&replacement, &key));
+    assert!(slot.accept_publication(&cloned_token, &original));
+    assert!(!slot.accept_publication(&cloned_token, &key));
+    assert_eq!(cloned_token.key(), &original);
 }
 
 #[test]
@@ -101,6 +121,37 @@ fn shader_validation_matches_wgsl_entry_point_types() {
     )
     .validate(&module)
     .expect("resident tile WGSL validates");
+    let draw_params = module
+        .types
+        .iter()
+        .find(|(_, ty)| ty.name.as_deref() == Some("DrawParams"))
+        .map(|(_, ty)| &ty.inner)
+        .expect("resident draw parameter struct exists");
+    let naga::TypeInner::Struct { span, .. } = draw_params else {
+        panic!("resident draw parameters must be a struct");
+    };
+    assert_eq!(
+        *span as u64, 560,
+        "WGSL draw ABI matches the packed Rust size"
+    );
+}
+
+#[test]
+fn authored_resident_appearance_rejects_malformed_colors_and_shading() {
+    let default = ResidentMaterialAppearance::default();
+    assert_eq!(
+        ResidentMaterialAppearance::try_new(default).unwrap(),
+        default
+    );
+
+    let mut bad_color = default;
+    bad_color.natural_colors[2][1] = f32::NAN;
+    assert_eq!(bad_color.validate(), Err(TileGeometryError::InvalidTile));
+
+    let mut bad_lighting = default;
+    bad_lighting.ambient = 0.4;
+    bad_lighting.diffuse = 0.8;
+    assert_eq!(bad_lighting.validate(), Err(TileGeometryError::InvalidTile));
 }
 
 #[test]
@@ -127,6 +178,7 @@ fn staged_view_anchor_and_rotation_must_survive_checked_gpu_narrowing() {
         body_to_view: DMat3::IDENTITY,
         mode: 0,
         sun_body: DVec3::Z,
+        appearance: Default::default(),
     };
     let budget = RenderPrecisionBudget::near_debug();
     assert!(draw.validate_view_transform(budget).is_ok());
@@ -173,6 +225,7 @@ fn gpu_uniform_f64_inputs_must_remain_finite_after_narrowing() {
         body_to_view: DMat3::IDENTITY,
         mode: 0,
         sun_body: DVec3::Z,
+        appearance: Default::default(),
     };
     draw.sun_body = DVec3::splat(1.0e39);
     assert!(matches!(
@@ -188,9 +241,10 @@ mod gpu_precision {
     use mundaris_math::*;
     use mundaris_renderer::{
         CelestialFrame, CelestialProjection, CelestialStaging, Icosphere, PreparedView,
+        RegionalBoundaryEndpoints, RegionalPatchDraw, RegionalResidentDraw, RegionalTileUpload,
         RenderPrecisionBudget, TileDraw, terrain_capture::TerrainCaptureRenderer,
     };
-    use std::{num::NonZeroU64, sync::Arc};
+    use std::{collections::BTreeMap, num::NonZeroU64, sync::Arc};
 
     fn rotation(axis: DVec3, radians: f64) -> UnitRotation {
         UnitRotation::from_axis_angle(Direction3::try_new(axis).unwrap(), radians).unwrap()
@@ -226,6 +280,333 @@ mod gpu_precision {
             min_max_radial_offset_m: [-0.22, 0.22],
             texels,
         }
+    }
+
+    fn regional_cover(
+        tile: Arc<TileData>,
+        publication: mundaris_renderer::TilePublicationToken,
+        include_upload: bool,
+    ) -> RegionalResidentDraw {
+        let address = tile.key.address;
+        let boundary = mundaris_renderer::regional_edges::build_boundaries(&BTreeMap::from([(
+            address,
+            Arc::clone(&tile),
+        )]))
+        .unwrap()
+        .remove(&address)
+        .unwrap();
+        let draw = TileDraw {
+            tile,
+            publication,
+            anchor_view_m: DVec3::ZERO,
+            body_to_view: DMat3::IDENTITY,
+            mode: 10,
+            sun_body: DVec3::Z,
+            appearance: Default::default(),
+        };
+        RegionalResidentDraw {
+            planetary: false,
+            capacity: 1,
+            cells: draw.tile.key.cells,
+            uploads: include_upload
+                .then(|| RegionalTileUpload {
+                    slot: 0,
+                    tile: draw.clone(),
+                })
+                .into_iter()
+                .collect(),
+            patches: vec![RegionalPatchDraw {
+                own_slot: 0,
+                parent_slot: 0,
+                own: draw.clone(),
+                parent: draw,
+                morph_fraction: 1.0,
+                boundary_fraction: 1.0,
+                quadrant: None,
+                quality_fallback: false,
+                boundary_endpoints: Arc::new(RegionalBoundaryEndpoints {
+                    version: 1,
+                    own_coarse: boundary.clone(),
+                    own_fine: boundary.clone(),
+                    parent: boundary,
+                }),
+            }],
+        }
+    }
+
+    fn render_regional(
+        renderer: &mut TerrainCaptureRenderer,
+        staging: &mut CelestialStaging,
+        view: &PreparedView<'_>,
+        projection: CelestialProjection,
+        sphere: &Icosphere,
+        draw: RegionalResidentDraw,
+    ) -> Result<Vec<u8>, mundaris_renderer::RenderPreparationError> {
+        let mut frame = CelestialFrame::new(view, staging, projection, sphere);
+        frame.set_resident_regional(draw)?;
+        renderer.render(&frame)
+    }
+
+    #[test]
+    #[ignore = "requires a real GPU adapter; exercises cached regional preparation and invalidation"]
+    fn regional_cached_prepare_reuses_latest_cover_and_invalidates_on_changes() {
+        const CELLS: u32 = 2;
+        let mut renderer = TerrainCaptureRenderer::new(32, 32)
+            .expect("GPU adapter required; do not silently skip this renderer regression");
+        let mut slot = TileSlotState::default();
+        let address = CubePatchAddress::root(CubeFace::PositiveZ);
+        let tile = Arc::new(gpu_tile(80_000.0, address, CELLS));
+        let publication = slot.request(&tile.key).unwrap();
+        let uploaded = regional_cover(Arc::clone(&tile), publication.clone(), true);
+        let mut resident = uploaded.clone();
+        resident.uploads.clear();
+
+        let tree = FrameTree::new(NonZeroU64::new(73).unwrap());
+        let root = tree.root();
+        let evaluation = tree.evaluate();
+        let observer = FramePose::new(
+            position(root, DVec3::new(0.0, 0.0, 80_010.0)),
+            UnitRotation::identity(),
+        );
+        let view =
+            PreparedView::new(&evaluation, observer, RenderPrecisionBudget::near_debug()).unwrap();
+        let projection = CelestialProjection::try_new(32, 32, 60.0_f64.to_radians(), 0.1).unwrap();
+        let sphere = Icosphere::new();
+        let mut staging = CelestialStaging::default();
+
+        // Establish the physical slot, then run one ordinary upload-free prep
+        // to establish an eligible latest cover.
+        render_regional(
+            &mut renderer,
+            &mut staging,
+            &view,
+            projection,
+            &sphere,
+            uploaded,
+        )
+        .unwrap();
+        render_regional(
+            &mut renderer,
+            &mut staging,
+            &view,
+            projection,
+            &sphere,
+            resident.clone(),
+        )
+        .unwrap();
+        assert!(
+            !renderer
+                .last_resident_regional_report()
+                .preparation_cache_hit
+        );
+
+        // The next exact cover skips validation, packing and metadata writes,
+        // while its one used physical slot remains associated with submission.
+        render_regional(
+            &mut renderer,
+            &mut staging,
+            &view,
+            projection,
+            &sphere,
+            resident.clone(),
+        )
+        .unwrap();
+        let report = renderer.last_resident_regional_report();
+        assert!(report.preparation_cache_hit);
+        assert_eq!(report.prepare_distinct_slot_count, 1);
+        assert_eq!(report.tile_upload_bytes, 0);
+        assert_eq!(report.boundary_upload_bytes, 0);
+        assert_eq!(report.metadata_upload_bytes, 0);
+        assert_eq!(report.tile_upload_count, 0);
+        assert_eq!(report.boundary_upload_count, 0);
+
+        // Camera and transition changes remain on the full preparation path.
+        let mut camera = resident.clone();
+        camera.patches[0].own.anchor_view_m.x = 1.0;
+        camera.patches[0].parent.anchor_view_m.x = 1.0;
+        render_regional(
+            &mut renderer,
+            &mut staging,
+            &view,
+            projection,
+            &sphere,
+            camera.clone(),
+        )
+        .unwrap();
+        assert!(
+            !renderer
+                .last_resident_regional_report()
+                .preparation_cache_hit
+        );
+        render_regional(
+            &mut renderer,
+            &mut staging,
+            &view,
+            projection,
+            &sphere,
+            camera.clone(),
+        )
+        .unwrap();
+        assert!(
+            renderer
+                .last_resident_regional_report()
+                .preparation_cache_hit
+        );
+
+        let mut morph = camera.clone();
+        morph.patches[0].morph_fraction = 0.75;
+        morph.patches[0].boundary_fraction = 0.75;
+        render_regional(
+            &mut renderer,
+            &mut staging,
+            &view,
+            projection,
+            &sphere,
+            morph.clone(),
+        )
+        .unwrap();
+        assert!(
+            !renderer
+                .last_resident_regional_report()
+                .preparation_cache_hit
+        );
+
+        let mut endpoints = morph.clone();
+        let mut replacement_endpoints = (*endpoints.patches[0].boundary_endpoints).clone();
+        replacement_endpoints.version += 1;
+        endpoints.patches[0].boundary_endpoints = Arc::new(replacement_endpoints);
+        render_regional(
+            &mut renderer,
+            &mut staging,
+            &view,
+            projection,
+            &sphere,
+            endpoints,
+        )
+        .unwrap();
+        assert!(
+            !renderer
+                .last_resident_regional_report()
+                .preparation_cache_hit
+        );
+
+        // Growing the declared resource pool invalidates eligibility even if
+        // the used patch and all of its presentation values remain unchanged.
+        let mut grown = morph.clone();
+        grown.capacity = 2;
+        render_regional(
+            &mut renderer,
+            &mut staging,
+            &view,
+            projection,
+            &sphere,
+            grown.clone(),
+        )
+        .unwrap();
+        assert!(
+            !renderer
+                .last_resident_regional_report()
+                .preparation_cache_hit
+        );
+
+        // A rejected transaction clears eligibility; the following valid
+        // cover must be fully prepared once before exact hits resume.
+        let mut invalid = grown.clone();
+        invalid.patches[0].morph_fraction = f32::NAN;
+        assert!(
+            render_regional(
+                &mut renderer,
+                &mut staging,
+                &view,
+                projection,
+                &sphere,
+                invalid,
+            )
+            .is_err()
+        );
+        render_regional(
+            &mut renderer,
+            &mut staging,
+            &view,
+            projection,
+            &sphere,
+            grown.clone(),
+        )
+        .unwrap();
+        assert!(
+            !renderer
+                .last_resident_regional_report()
+                .preparation_cache_hit
+        );
+        render_regional(
+            &mut renderer,
+            &mut staging,
+            &view,
+            projection,
+            &sphere,
+            grown,
+        )
+        .unwrap();
+        assert!(
+            renderer
+                .last_resident_regional_report()
+                .preparation_cache_hit
+        );
+
+        // A changed tile key and publication generation with an upload also
+        // misses the old latest-cover cache.
+        let mut replacement_tile = gpu_tile(80_000.0, address, CELLS);
+        replacement_tile.key.surface_revision += 1;
+        let replacement_tile = Arc::new(replacement_tile);
+        let replacement_key = replacement_tile.key.clone();
+        let replacement_token = slot.request(&replacement_tile.key).unwrap();
+        let mut replacement = regional_cover(replacement_tile, replacement_token, true);
+        replacement.capacity = 2;
+        replacement.uploads[0].slot = 1;
+        replacement.patches[0].own_slot = 1;
+        replacement.patches[0].parent_slot = 1;
+        render_regional(
+            &mut renderer,
+            &mut staging,
+            &view,
+            projection,
+            &sphere,
+            replacement.clone(),
+        )
+        .unwrap();
+        assert!(
+            !renderer
+                .last_resident_regional_report()
+                .preparation_cache_hit
+        );
+        replacement.uploads.clear();
+        render_regional(
+            &mut renderer,
+            &mut staging,
+            &view,
+            projection,
+            &sphere,
+            replacement.clone(),
+        )
+        .unwrap();
+        assert!(
+            !renderer
+                .last_resident_regional_report()
+                .preparation_cache_hit
+        );
+        render_regional(
+            &mut renderer,
+            &mut staging,
+            &view,
+            projection,
+            &sphere,
+            replacement,
+        )
+        .unwrap();
+        let report = renderer.last_resident_regional_report();
+        assert!(report.preparation_cache_hit);
+        assert_eq!(report.prepare_distinct_slot_count, 1);
+        assert_eq!(report.slots[1].key.as_ref(), Some(&replacement_key));
     }
 
     #[test]
@@ -322,6 +703,7 @@ mod gpu_precision {
                     body_to_view,
                     mode: 2,
                     sun_body: DVec3::new(0.3, -0.4, 0.8).normalize(),
+                    appearance: Default::default(),
                 };
 
                 {

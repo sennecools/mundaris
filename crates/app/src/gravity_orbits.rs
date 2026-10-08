@@ -5,7 +5,7 @@ use crate::developer_snapshot::{
 };
 use crate::motion_session::{AnalyticSession, MotionSession, MotionSnapshot};
 use crate::planet_surface::*;
-use crate::{celestial_camera::*, gravity_fixtures::*, trails::*};
+use crate::{celestial_camera::*, trails::*};
 use crate::{
     celestial_labels::*, celestial_selection::*, interactive_clock::*, orbit_guides::*,
     playback_metrics::*, system_view::*,
@@ -25,7 +25,6 @@ use std::{
 
 enum Command {
     Visual(visual_controls::VisualCommand),
-    ValidationRoute,
     LookBody(BodyId),
     SurfaceInspection,
     BodyOrbit,
@@ -41,7 +40,6 @@ enum Command {
     SeekSeconds(f64),
     CancelSeek,
     Reset,
-    Load(GravityFixture),
     Select(BodyId),
     Focus { fixed: bool, fit: bool },
     Overview,
@@ -64,21 +62,18 @@ enum Command {
     TerrainPreview(bool),
     TrailReference(BodyId),
 }
-mod analytic_validation;
 #[cfg(feature = "developer-tools")]
 mod developer;
 mod developer_ui;
 mod frame_host;
-#[cfg(feature = "developer-tools")]
-mod hierarchy_fixture;
 mod navigation_input;
 mod planetary;
 mod regional_fixture;
 pub(crate) use regional_fixture::RegionalFrameHistory;
-#[cfg(feature = "developer-tools")]
-mod resident_fixture;
 mod visual_controls;
 struct Controls {
+    cluster_settings: mundaris_renderer::ClusterSettings,
+    cluster_report: mundaris_renderer::ClusterReport,
     performance_lab: crate::performance_lab::PerformanceLab,
     #[cfg(feature = "developer-tools")]
     automation_owner: Option<String>,
@@ -88,17 +83,12 @@ struct Controls {
     terrain_preview: bool,
     sun_from_star: bool,
     terrain_lighting: TerrainLighting,
-    planetary_ocean: bool,
-    planetary_clouds: bool,
-    planetary_atmosphere: bool,
-    sky: mundaris_renderer::sky::SkySettings,
     terrain_morph_ms: u64,
     surface_bounds: bool,
     surface_style: SurfaceStyle,
     approach: Option<(f64, f64, Duration)>,
     clearance_target: f64,
     terrain_guard_m: Option<f64>,
-    reference_sea_level_m: Option<f64>,
     pending: VecDeque<Command>,
     seek_seconds: f64,
     name: String,
@@ -135,6 +125,8 @@ struct Controls {
 impl Controls {
     fn new(body: &CelestialBody) -> Self {
         Self {
+            cluster_settings: mundaris_renderer::ClusterSettings::default(),
+            cluster_report: mundaris_renderer::ClusterReport::default(),
             performance_lab: {
                 let mut lab = crate::performance_lab::PerformanceLab::default();
                 lab.open = std::env::var("MUNDARIS_PERFORMANCE_LAB").is_ok_and(|s| s == "1");
@@ -152,10 +144,6 @@ impl Controls {
             terrain_preview: false,
             sun_from_star: false,
             terrain_lighting: terrain_lighting_from_environment(),
-            planetary_ocean: true,
-            planetary_clouds: true,
-            planetary_atmosphere: true,
-            sky: mundaris_renderer::sky::SkySettings::default(),
             terrain_morph_ms: std::env::var("MUNDARIS_TERRAIN_MORPH_MS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -166,7 +154,6 @@ impl Controls {
             approach: None,
             clearance_target: 1e11,
             terrain_guard_m: None,
-            reference_sea_level_m: None,
             pending: VecDeque::new(),
             seek_seconds: 0.0,
             name: body.name().into(),
@@ -225,22 +212,13 @@ pub struct GravityOrbitsDemo {
     profile_sample_at: Option<Instant>,
     profile_snapshot: Option<std::sync::Arc<serde_json::Value>>,
     diagnostic_capture_request: Option<String>,
-    lab_benchmark: Option<(Vec<f64>, usize, Instant)>,
     #[cfg(feature = "developer-tools")]
     developer_session: Option<String>,
     #[cfg(feature = "developer-tools")]
     developer_snapshot: Option<DeveloperSnapshot>,
     #[cfg(feature = "developer-tools")]
-    developer_offscreen: Option<mundaris_renderer::terrain_capture::TerrainCaptureRenderer>,
     #[cfg(feature = "developer-tools")]
     developer_navigation: Option<(Duration, NavigationInput)>,
-    #[cfg(feature = "developer-tools")]
-    resident_tile: resident_fixture::ResidentTileFixture,
-    #[cfg(feature = "developer-tools")]
-    resident_hierarchy: hierarchy_fixture::ResidentHierarchyFixture,
-    #[cfg(feature = "developer-tools")]
-    resident_regional: regional_fixture::RegionalFixture,
-    sky_definition: std::sync::Arc<mundaris_renderer::sky::SkyDefinition>,
     navigation_snapshot_path: Option<std::path::PathBuf>,
     navigation_wall_at: Option<Instant>,
     developer_frame_number: u64,
@@ -249,10 +227,9 @@ pub struct GravityOrbitsDemo {
     clearance_query_us: f64,
     terrain: crate::terrain_population::TerrainPopulation,
     planetary: planetary::PlanetaryTerrain,
-    scenario: GravityFixture,
-    validation_route: Option<SurfaceValidationRoute>,
-    solar_validation: Option<(Duration, usize)>,
-    analytic_validation: Option<analytic_validation::Route>,
+    presentation: Vec<crate::shared_system::BodyPresentation>,
+    scene_sha256: String,
+    camera_sha256: String,
     surfaces: Vec<PlanetSurfaceSession>,
     surface_owners: Vec<bool>,
     system: CelestialSystem,
@@ -261,8 +238,9 @@ pub struct GravityOrbitsDemo {
     camera: CelestialCamera,
     ids: Vec<BodyId>,
     selection: BodySelection,
-    system_namespace: u64,
     tree_namespace: u64,
+    #[cfg(feature = "developer-tools")]
+    system_namespace: u64,
     overview_center_m: DVec3,
     overview_extent_m: f64,
     trails: TrailHistory,
@@ -306,11 +284,6 @@ struct VisualCurve {
     width: f32,
     style: CelestialLineStyle,
     relative: Vec<DVec3>,
-}
-struct SurfaceValidationRoute {
-    elapsed: Duration,
-    next: usize,
-    physical_target: u64,
 }
 
 /// Retain the 0.1 m floor and existing infinite reverse-Z depth path. Relief can
@@ -370,55 +343,6 @@ impl GravityOrbitsDemo {
     #[cfg(feature = "developer-tools")]
     pub(crate) fn take_diagnostic_capture_request(&mut self) -> Option<String> {
         self.diagnostic_capture_request.take()
-    }
-
-    fn start_lab_benchmark(
-        &mut self,
-        route: crate::performance_lab::BenchmarkScenario,
-    ) -> Result<()> {
-        let Some(moon) = self.ids.iter().copied().find(|id| {
-            self.system
-                .body(*id)
-                .is_ok_and(|body| body.name() == "Moon")
-        }) else {
-            self.diagnostic = Some("Moon benchmark requires a Solar System preset".into());
-            return Ok(());
-        };
-        self.command(Command::Pause(true))?;
-        self.command(Command::Select(moon))?;
-        self.command(Command::Focus {
-            fixed: true,
-            fit: true,
-        })?;
-        self.command(Command::LookBody(moon))?;
-        self.command(Command::SurfaceInspection)?;
-        let clearances = match route {
-            crate::performance_lab::BenchmarkScenario::MoonCloseInspection => vec![25.0],
-            _ => route
-                .clearance_checkpoints_km()
-                .iter()
-                .map(|km| km * 1000.0)
-                .collect(),
-        };
-        self.lab_benchmark = Some((clearances, 0, Instant::now() - Duration::from_secs(31)));
-        Ok(())
-    }
-
-    fn advance_lab_benchmark(&mut self) -> Result<()> {
-        let Some((clearances, next, at)) = &mut self.lab_benchmark else {
-            return Ok(());
-        };
-        if at.elapsed() < Duration::from_secs(30) {
-            return Ok(());
-        }
-        let Some(clearance) = clearances.get(*next).copied() else {
-            self.lab_benchmark = None;
-            return Ok(());
-        };
-        *next += 1;
-        *at = Instant::now();
-        self.performance_capture.request();
-        self.command(Command::Clearance(clearance))
     }
 
     /// Read-only authority and publication access for diagnostics/regression fixtures.
@@ -485,90 +409,25 @@ impl GravityOrbitsDemo {
     pub fn set_relative_trails(&mut self, relative: bool) -> Result<()> {
         self.command(Command::TrailMode(relative))
     }
-    pub fn new() -> Result<Self> {
-        let mut demo = Self::create(GravityFixture::Hierarchy, 1, 1)?;
-        if std::env::var("MUNDARIS_PHASE4_VALIDATE").as_deref() == Ok("1") {
-            demo.start_surface_validation()?;
-        }
-        if std::env::var("MUNDARIS_PHASE5_TERRAIN").as_deref() == Ok("1") {
-            demo.command(Command::TerrainPreview(true))?;
-        }
-        Ok(demo)
-    }
-    /// Ordinary development content; the original physical fixtures remain selectable.
-    pub fn solar_system(real_scale: bool) -> Result<Self> {
-        let scenario = if real_scale {
-            GravityFixture::RealSolarSystem
-        } else {
-            GravityFixture::GameplaySolarSystem
-        };
-        let mut demo = Self::create(scenario, 1, 1)?;
-        demo.command(Command::TerrainPreview(true))?;
-        if std::env::var("MUNDARIS_SOLAR_VALIDATE").as_deref() == Ok("1") {
-            demo.solar_validation = Some((Duration::ZERO, 0));
-        }
-        if std::env::var("MUNDARIS_ANALYTIC_VALIDATE").as_deref() == Ok("1") {
-            demo.analytic_validation = Some(analytic_validation::Route::new(
-                std::env::var_os("MUNDARIS_ANALYTIC_VALIDATE_READY").map(std::path::PathBuf::from),
-            ));
-        }
-        Ok(demo)
-    }
-    /// Explicit comparison backend for native terrain acceptance routes.
-    pub fn use_legacy_terrain(&mut self) {
-        self.planetary.enabled = false;
-        self.planetary.runtime.disable();
-    }
-    /// Optional operator route through the same production controls and renderer.
-    pub fn start_surface_validation(&mut self) -> Result<()> {
-        anyhow::ensure!(
-            self.ids.len() == 3,
-            "surface route requires the hierarchy fixture"
-        );
-        let physical_target = self
-            .motion
-            .newtonian()
-            .ok_or_else(|| anyhow::anyhow!("route requires Newtonian history"))?
-            .tick()
-            .checked_add(20)
-            .ok_or_else(|| anyhow::anyhow!("validation tick overflow"))?;
-        self.controls.pending.push_back(Command::Pause(true));
-        self.controls.pending.push_back(Command::Overview);
-        self.validation_route = Some(SurfaceValidationRoute {
-            elapsed: Duration::ZERO,
-            next: 0,
-            physical_target,
-        });
-        Ok(())
-    }
-    fn create(
-        scenario: GravityFixture,
-        system_namespace: u64,
-        tree_namespace: u64,
-    ) -> Result<Self> {
-        let namespace = NonZeroU64::new(system_namespace)
-            .ok_or_else(|| anyhow::anyhow!("zero system namespace"))?;
-        let (system, motion) = match scenario {
-            GravityFixture::GameplaySolarSystem | GravityFixture::RealSolarSystem => {
-                let preset = if scenario == GravityFixture::RealSolarSystem {
-                    crate::solar_system::SolarSystemPreset::real_scale()
-                } else {
-                    crate::solar_system::SolarSystemPreset::gameplay()
-                };
-                let (mut system, definition) = preset.create_analytic(namespace)?;
-                let analytic = AnalyticSession::new(&mut system, definition)?;
-                (system, MotionSession::Analytic(Box::new(analytic)))
-            }
-            _ => {
-                let system = scenario.create(namespace)?;
-                let mut runner = FixedStepRunner::new(
-                    &system,
-                    SimulationConfig::try_new(scenario.fixed_step_s())?,
-                )?;
-                runner.set_rate(PlaybackRate::try_multiplier(1000.0)?);
-                (system, MotionSession::Newtonian(Box::new(runner)))
-            }
-        };
+    pub fn shared_test_system() -> Result<Self> {
+        let system_namespace = 1;
+        let tree_namespace = 1;
+        let loaded = crate::shared_system::SharedTestSystem::load_canonical(
+            NonZeroU64::new(system_namespace).context("zero system namespace")?,
+        )?;
+        let crate::shared_system::SharedTestSystem {
+            mut system,
+            motion: definition,
+            presentation,
+            initial_body_index: selected,
+            camera: camera_state,
+            scene_sha256,
+            camera_sha256,
+        } = loaded;
+        let mut analytic = AnalyticSession::new(&mut system, definition)?;
+        analytic.set_rate(PlaybackRate::try_multiplier(camera_state.rate)?);
+        analytic.set_paused(camera_state.paused);
+        let motion = MotionSession::Analytic(Box::new(analytic));
         let projection = CelestialFrameProjection::build(
             &system,
             NonZeroU64::new(tree_namespace)
@@ -593,43 +452,50 @@ impl GravityOrbitsDemo {
         )?;
         let center = bounds.center_m();
         let extent = bounds.radius_m();
-        let camera =
+        let mut camera =
             CelestialCamera::overview(&projection.coherent_view(&system)?, center, extent)?;
         let ids: Vec<_> = system.bodies().map(|(id, _)| id).collect();
-        let selected = if matches!(
-            scenario,
-            GravityFixture::GameplaySolarSystem | GravityFixture::RealSolarSystem
-        ) {
-            3
-        } else {
-            1
-        };
         let mut selection = BodySelection::default();
         selection.select(&system, ids[selected])?;
         let mut controls = Controls::new(system.body(ids[selected])?);
-        if matches!(
-            scenario,
-            GravityFixture::GameplaySolarSystem | GravityFixture::RealSolarSystem
-        ) {
-            controls.terrain_preview = true;
-            if std::env::var("MUNDARIS_TERRAIN_MODE").is_err() {
-                controls.terrain_lighting = controls
-                    .terrain_lighting
-                    .with_mode(TerrainRenderMode::Natural);
-            }
-            controls.sun_from_star = std::env::var("MUNDARIS_TERRAIN_SUN").is_err();
-            controls.surface_style.elevation_colors = true;
-        }
+        controls.terrain_preview = true;
+        controls.terrain_lighting = controls
+            .terrain_lighting
+            .with_mode(TerrainRenderMode::Natural);
+        controls.sun_from_star = true;
+        controls.trails = false;
+        controls.guide_visible = false;
         let advance = motion.newtonian().map(FixedStepRunner::report);
-        let trails = TrailHistory::new(&system, scenario.trail_stride())?;
-        let enabled = match scenario {
-            GravityFixture::Hierarchy => vec![ids[1], ids[2]],
-            GravityFixture::Circular => vec![ids[1]],
-            GravityFixture::GameplaySolarSystem | GravityFixture::RealSolarSystem => system
-                .bodies()
-                .filter_map(|(id, body)| body.has_surface().then_some(id))
-                .collect(),
-        };
+        let trails = TrailHistory::new(&system, 64)?;
+        let pair = projection.coherent_view(&system)?;
+        let body = ids[selected];
+        let pose = FramePose::new(
+            FramePosition::new(
+                pair.projection().frames_for(body)?.body_fixed,
+                LocalPosition::try_metres(DVec3::from_array(camera_state.position_body_m))?,
+            ),
+            UnitRotation::try_from_quaternion(glam::DQuat::from_array(
+                camera_state.orientation_xyzw,
+            ))?,
+        );
+        let clearance = crate::terrain_inspection::clearance_at_body_position(
+            pair.system().body(body)?,
+            pose.position().local().metres(),
+            body,
+        )?
+        .context("canonical camera needs complete surface authority")?
+        .clearance_m;
+        anyhow::ensure!(
+            clearance >= 1.0,
+            "canonical camera requires at least 1 m clearance"
+        );
+        camera.developer_set_surface_pose(&pair, body, pose)?;
+        camera.target_clearance(&pair, clearance)?;
+        camera.enter_surface_inspection(&pair, body)?;
+        let enabled: Vec<_> = system
+            .bodies()
+            .filter_map(|(id, body)| body.has_surface().then_some(id))
+            .collect();
         let surfaces = enabled
             .into_iter()
             .map(|id| PlanetSurfaceSession::new(id, 2048))
@@ -640,16 +506,8 @@ impl GravityOrbitsDemo {
             #[cfg(feature = "developer-tools")]
             developer_snapshot: None,
             #[cfg(feature = "developer-tools")]
-            developer_offscreen: None,
             #[cfg(feature = "developer-tools")]
             developer_navigation: None,
-            #[cfg(feature = "developer-tools")]
-            resident_tile: resident_fixture::ResidentTileFixture::default(),
-            #[cfg(feature = "developer-tools")]
-            resident_hierarchy: hierarchy_fixture::ResidentHierarchyFixture::default(),
-            #[cfg(feature = "developer-tools")]
-            resident_regional: regional_fixture::RegionalFixture::default(),
-            sky_definition: crate::sky_definition::default_sky()?,
             navigation_snapshot_path: std::env::var_os("MUNDARIS_NAVIGATION_SNAPSHOT")
                 .map(std::path::PathBuf::from),
             navigation_wall_at: None,
@@ -659,19 +517,14 @@ impl GravityOrbitsDemo {
             profile_sampler: crate::performance_capture::ProfileSampler::default(),
             profile_snapshot: None,
             diagnostic_capture_request: None,
-            lab_benchmark: None,
             terrain_clearance: None,
             ready_mesh_probe: None,
             clearance_query_us: 0.0,
-            terrain: crate::terrain_population::TerrainPopulation::interactive()?,
-            planetary: planetary::PlanetaryTerrain::new(matches!(
-                scenario,
-                GravityFixture::GameplaySolarSystem | GravityFixture::RealSolarSystem
-            )),
-            scenario,
-            validation_route: None,
-            solar_validation: None,
-            analytic_validation: None,
+            terrain: crate::terrain_population::TerrainPopulation::new()?,
+            planetary: planetary::PlanetaryTerrain::new(true),
+            presentation,
+            scene_sha256,
+            camera_sha256,
             surfaces,
             surface_owners: Vec::new(),
             system,
@@ -680,8 +533,9 @@ impl GravityOrbitsDemo {
             camera,
             ids,
             selection,
-            system_namespace,
             tree_namespace,
+            #[cfg(feature = "developer-tools")]
+            system_namespace,
             overview_center_m: center,
             overview_extent_m: extent,
             trails,
@@ -1034,7 +888,6 @@ impl GravityOrbitsDemo {
             .selected()
             .ok_or_else(|| anyhow::anyhow!("no selected body"))?;
         match command {
-            Command::ValidationRoute => self.start_surface_validation()?,
             Command::LookBody(target) => self
                 .camera
                 .look_at_body(&self.projection.coherent_view(&self.system)?, target)?,
@@ -1158,23 +1011,7 @@ impl GravityOrbitsDemo {
                 self.seeking = false;
                 self.reseed_diagnostics()?;
             }
-            Command::Load(scenario) => {
-                let system_namespace = self
-                    .system_namespace
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("system namespace overflow"))?;
-                let tree_namespace = self
-                    .tree_namespace
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("tree namespace overflow"))?;
-                let replacement = Self::create(scenario, system_namespace, tree_namespace)?;
-                #[cfg(feature = "developer-tools")]
-                let replacement = Self {
-                    developer_session: self.developer_session.clone(),
-                    ..replacement
-                };
-                *self = replacement;
-            }
+
             Command::Select(body) => {
                 self.selection.select(&self.system, body)?;
                 self.controls.refresh_draft(self.system.body(body)?);
@@ -1327,7 +1164,7 @@ impl GravityOrbitsDemo {
             Command::Velocity(velocity) => {
                 anyhow::ensure!(
                     !self.motion.is_analytic(),
-                    "Velocity edits are unavailable in prescribed motion: velocity is the authored trajectory derivative. Load a Newtonian scenario to edit velocity."
+                    "Velocity edits are unavailable in prescribed motion: velocity is the authored trajectory derivative. "
                 );
                 let old = *self.system.body(id)?.state();
                 let state = BodyState::new(
@@ -1348,29 +1185,6 @@ impl GravityOrbitsDemo {
                 MotionSession::Analytic(a) => a.rename(&mut self.system, id, &name)?,
             },
             Command::TerrainPreview(enabled) => {
-                if enabled
-                    && !matches!(
-                        self.scenario,
-                        GravityFixture::GameplaySolarSystem | GravityFixture::RealSolarSystem
-                    )
-                {
-                    let id = self.ids[1];
-                    let body = self.system.body(id)?;
-                    if !body.has_surface() {
-                        let version =
-                            if std::env::var("MUNDARIS_PHASE55_AB").as_deref() == Ok("legacy") {
-                                mundaris_world::terrain::TerrainGeneratorVersion::V1
-                            } else {
-                                mundaris_world::terrain::TerrainGeneratorVersion::V2
-                            };
-                        let definition =
-                            crate::planet_terrain::checkpoint_terrain_definition_version(
-                                body.properties().reference_radius_m(),
-                                version,
-                            )?;
-                        self.system.edit_terrain(id, Some(definition))?;
-                    }
-                }
                 visual_controls::VisualCommand::Layer(visual_controls::Layer::Terrain, enabled)
                     .apply(&mut self.controls)?;
                 self.controls.surface_style.elevation_colors = enabled;
@@ -1438,9 +1252,6 @@ impl GravityOrbitsDemo {
                 self.developer_navigation = Some((Duration::ZERO, input));
             }
         }
-        analytic_validation::advance(self, elapsed);
-        self.advance_solar_validation(elapsed);
-        self.advance_surface_validation(elapsed);
         while let Some(command) = self.controls.pending.pop_front() {
             match self.command(command) {
                 Ok(()) => self.diagnostic = None,
@@ -1585,10 +1396,7 @@ impl GravityOrbitsDemo {
             }
             self.achieved_rate = self
                 .metrics
-                .measurement(
-                    self.scenario.fixed_step_s(),
-                    self.motion.rate().multiplier(),
-                )
+                .measurement(60.0, self.motion.rate().multiplier())
                 .map(|m| m.achieved_rate);
         }
         self.update_guides();
@@ -1692,165 +1500,7 @@ impl GravityOrbitsDemo {
     }
     // Opt-in native exercise of the ordinary Solar controls, not a second
     // renderer. Default launches remain unmodified; hidden/gap time is excluded.
-    fn advance_solar_validation(&mut self, elapsed: Duration) {
-        if self.hidden || elapsed > self.clock.threshold() {
-            return;
-        }
-        let Some((at, next)) = &mut self.solar_validation else {
-            return;
-        };
-        *at = at.saturating_add(elapsed);
-        let checkpoints = [2.0, 6.0, 12.0, 14.0, 18.0, 20.0, 24.0, 28.0];
-        if *next < checkpoints.len() && at.as_secs_f64() >= checkpoints[*next] {
-            tracing::info!(
-                step = *next,
-                elapsed_s = at.as_secs_f64(),
-                "Solar native validation route"
-            );
-            match *next {
-                0 => self.controls.pending.push_back(Command::Focus {
-                    fixed: false,
-                    fit: false,
-                }),
-                1 => self
-                    .controls
-                    .pending
-                    .push_back(Command::Clearance(10_000.0)),
-                2 => self.controls.pending.push_back(Command::SurfaceInspection),
-                3 => self.controls.pending.push_back(Command::SurfaceHorizon),
-                4 => {}
-                5 => self
-                    .controls
-                    .pending
-                    .push_back(Command::Navigation(NavigationInput::default())),
-                6 => self.controls.pending.push_back(Command::Focus {
-                    fixed: false,
-                    fit: true,
-                }),
-                7 => self.controls.pending.push_back(Command::Overview),
-                _ => unreachable!("fixed Solar validation route"),
-            }
-            *next += 1;
-        }
-        if (18.0..20.0).contains(&at.as_secs_f64()) {
-            self.controls
-                .pending
-                .push_back(Command::Navigation(NavigationInput {
-                    translation: DVec3::X,
-                    ..Default::default()
-                }));
-        }
-    }
 
-    fn advance_surface_validation(&mut self, elapsed: Duration) {
-        if self.hidden || elapsed > self.clock.threshold() {
-            return;
-        }
-        let Some(route) = &mut self.validation_route else {
-            return;
-        };
-        route.elapsed = route.elapsed.saturating_add(elapsed);
-        let actions = [
-            (2.0, "focus Aurelia", 0),
-            (4.0, "astronomical clearance", 1),
-            (6.0, "continuous approach", 2),
-            (37.0, "100 km", 3),
-            (40.0, "10 km", 4),
-            (43.0, "1 km", 5),
-            (46.0, "100 m", 6),
-            (49.0, "10 m", 7),
-            (52.0, "2 m", 8),
-            (55.0, "co-rotating inspection", 9),
-            (58.0, "local lateral movement", 10),
-            (60.0, "stop lateral movement", 11),
-            (61.0, "curved horizon", 12),
-            (64.0, "look toward Solace", 13),
-            (67.0, "twenty physical steps", 14),
-            (71.0, "look toward Luma", 15),
-            (74.0, "depart Body Orbit", 16),
-            (77.0, "whole system", 17),
-            (81.0, "repeat focus", 0),
-            (83.0, "repeat astronomical", 1),
-            (85.0, "repeat approach", 2),
-        ];
-        if route.next < actions.len() && route.elapsed.as_secs_f64() >= actions[route.next].0 {
-            let (_, label, action) = actions[route.next];
-            route.next += 1;
-            tracing::info!(
-                checkpoint = label,
-                world_revision = self.system.revision(),
-                sample_s = self.system.sample_time().seconds_since_epoch(),
-                "Phase 4 validation route"
-            );
-            let planet = self.ids[1];
-            match action {
-                0 => {
-                    self.controls.pending.push_back(Command::Select(planet));
-                    self.controls.pending.push_back(Command::Focus {
-                        fixed: false,
-                        fit: false,
-                    });
-                }
-                1 => self.controls.pending.push_back(Command::Clearance(1e11)),
-                2 => self.controls.pending.push_back(Command::Approach),
-                3..=8 => {
-                    self.controls.surface_style.borders = true;
-                    self.controls.pending.push_back(Command::Clearance(
-                        [1e5, 1e4, 1e3, 100.0, 10.0, 2.0][action - 3],
-                    ));
-                }
-                9 => {
-                    self.controls.surface_style.borders = false;
-                    self.controls.pending.push_back(Command::SurfaceInspection);
-                }
-                10 => self
-                    .controls
-                    .pending
-                    .push_back(Command::Navigation(NavigationInput {
-                        translation: DVec3::X,
-                        ..Default::default()
-                    })),
-                11 => self
-                    .controls
-                    .pending
-                    .push_back(Command::Navigation(NavigationInput::default())),
-                12 => self.controls.pending.push_back(Command::SurfaceHorizon),
-                13 => self
-                    .controls
-                    .pending
-                    .push_back(Command::LookBody(self.ids[0])),
-                14 => {}
-                15 => self
-                    .controls
-                    .pending
-                    .push_back(Command::LookBody(self.ids[2])),
-                16 => self.controls.pending.push_back(Command::Focus {
-                    fixed: false,
-                    fit: true,
-                }),
-                17 => self.controls.pending.push_back(Command::Overview),
-                _ => unreachable!("fixed validation route actions"),
-            }
-        }
-        // Distinct opportunities commit twenty real h60 steps. Twenty queued Single
-        // commands in one opportunity would only request the same next tick.
-        if (67.0..70.0).contains(&route.elapsed.as_secs_f64())
-            && self
-                .motion
-                .newtonian()
-                .is_some_and(|r| r.tick() < route.physical_target)
-        {
-            self.controls.pending.push_back(Command::Single(true));
-        }
-        if (58.0..60.0).contains(&route.elapsed.as_secs_f64()) {
-            self.controls
-                .pending
-                .push_back(Command::Navigation(NavigationInput {
-                    translation: DVec3::X,
-                    ..Default::default()
-                }));
-        }
-    }
     fn selected_index(&self) -> usize {
         self.ids
             .iter()
@@ -1939,6 +1589,12 @@ impl GravityOrbitsDemo {
         }
         self.set_lifecycle_drawable(true);
         self.developer_frame_number = self.developer_frame_number.saturating_add(1);
+        self.controls.cluster_report = renderer.cluster_report();
+        if self.controls.cluster_settings.mode == mundaris_renderer::ClusterMode::Reference {
+            self.controls.cluster_settings.freeze = false;
+        }
+        self.planetary.cluster_freeze = self.controls.cluster_settings.freeze;
+        renderer.set_cluster_settings(self.controls.cluster_settings);
         crate::engine_profile::set_enabled(self.controls.performance_lab.enabled);
         if crate::engine_profile::is_enabled() {
             renderer.request_profile_timing();
@@ -1950,6 +1606,7 @@ impl GravityOrbitsDemo {
             .last_wall
             .map_or(Duration::ZERO, |previous| now.duration_since(previous));
         self.last_wall = Some(now);
+        let native_interval_ms = elapsed.as_secs_f64() * 1000.0;
         let host_frame_started = Instant::now();
         let elapsed = fixed_elapsed.unwrap_or_else(|| match self.clock.classify(elapsed) {
             ClockInterval::Accepted(elapsed) => elapsed,
@@ -1992,12 +1649,7 @@ impl GravityOrbitsDemo {
         if self.viewport != new_viewport {
             let first = self.viewport.is_none();
             self.viewport = new_viewport;
-            #[cfg(feature = "developer-tools")]
-            let fixture_camera = self.resident_tile.enabled;
-            #[cfg(not(feature = "developer-tools"))]
-            let fixture_camera = false;
-            if !fixture_camera
-                && (first || self.camera.mode() == CameraMode::SystemOrbit)
+            if self.camera.mode() == CameraMode::SystemOrbit
                 && let Err(error) = self.refit(!first)
             {
                 self.diagnostic = Some(error.to_string());
@@ -2005,73 +1657,16 @@ impl GravityOrbitsDemo {
         }
         let started = Instant::now();
         let preparation_span = crate::engine_profile::span("Renderer preparation");
-        #[cfg(feature = "developer-tools")]
-        let visual_prep_context = if self.resident_tile.enabled {
-            "resident tile fixture failed during orbit visual preparation"
-        } else {
-            "orbit visual preparation failed"
-        };
-        #[cfg(not(feature = "developer-tools"))]
-        let visual_prep_context = "orbit visual preparation failed";
-        self.prepare_visuals().context(visual_prep_context)?;
-        #[cfg(feature = "developer-tools")]
-        if !self.resident_regional.enabled {
-            self.resident_regional.pump_shutdown();
-        }
+        self.prepare_visuals()
+            .context("orbit visual preparation failed")?;
         let selected_index = self.selected_index();
         let pair = self.projection.coherent_view(&self.system)?;
         self.camera
             .set_navigation_projection(self.content_projection(0.1)?, scale)?;
         self.controls.pixels_per_point = scale;
-        #[cfg(feature = "developer-tools")]
-        if self.resident_tile.enabled {
-            let was_stale = self.resident_tile.stale_reason.is_some();
-            let stale_reason = match (self.resident_tile.body, self.resident_tile.tile.as_ref()) {
-                (Some(body), Some(tile)) => match pair.system().body(body) {
-                    Ok(state)
-                        if state.surface_definition().is_some()
-                            && state.terrain_revision().value() == tile.key.surface_revision
-                            && state.properties().reference_radius_m().to_bits()
-                                == tile.key.radius_bits =>
-                    {
-                        None
-                    }
-                    Ok(_) => Some(
-                        "published_surface_or_radius_changed; issue_explicit_gpu_tile_rebuild"
-                            .into(),
-                    ),
-                    Err(error) => Some(format!("tile_body_unavailable:{error}")),
-                },
-                _ => Some("tile_publication_unavailable; issue_explicit_gpu_tile_rebuild".into()),
-            };
-            if stale_reason.is_some() {
-                self.resident_regional.disable();
-            }
-            if stale_reason.is_some() && !was_stale && self.resident_hierarchy.enabled {
-                self.resident_hierarchy.invalidate_parent_authority();
-            }
-            self.resident_tile.stale_reason = stale_reason;
-        }
-        #[cfg(feature = "developer-tools")]
-        if self.resident_hierarchy.enabled {
-            let previous_hierarchy_report = renderer.last_resident_hierarchy_report();
-            self.resident_hierarchy
-                .observe_uploads(Some(&previous_hierarchy_report));
-            self.resident_hierarchy.poll_and_advance(
-                elapsed,
-                Some(&previous_hierarchy_report),
-                renderer.deterministic(),
-            );
-        }
         self.terrain_clearance = self.camera.recorded_terrain_clearance();
         self.clearance_query_us = self.camera.navigation_diagnostics().terrain_query_us;
         self.ready_mesh_probe = None;
-        #[cfg(feature = "developer-tools")]
-        if self.resident_tile.enabled {
-            // The opt-in fixture owns one explicit prebuilt tile; ordinary
-            // fixture frames do not run the legacy adaptive terrain builder.
-            self.terrain_clearance = None;
-        }
         let view = PreparedView::new(
             &pair.evaluation(),
             self.camera.pose(),
@@ -2095,8 +1690,8 @@ impl GravityOrbitsDemo {
             self.requests.push(CelestialRenderBody {
                 body_fixed_frame: frames.body_fixed,
                 reference_radius_m: radius,
-                color: self.scenario.color(index),
-                unlit: index == 0,
+                color: self.presentation[index].color,
+                unlit: self.presentation[index].unlit,
                 selected: index == selected_index,
             });
         }
@@ -2109,11 +1704,7 @@ impl GravityOrbitsDemo {
         let population_near = near;
         self.surface_owners.clear();
         self.surface_owners.resize(self.requests.len(), false);
-        #[cfg(feature = "developer-tools")]
-        let resident_fixture_active = self.resident_tile.enabled;
-        #[cfg(not(feature = "developer-tools"))]
-        let resident_fixture_active = false;
-        let planetary_active = self.planetary.enabled && !resident_fixture_active;
+        let planetary_active = self.planetary.enabled;
         let mut planetary_candidate = if planetary_active && self.controls.terrain_preview {
             self.terrain.resident_candidate(
                 &pair,
@@ -2149,43 +1740,15 @@ impl GravityOrbitsDemo {
                 .ok_or_else(|| anyhow::anyhow!("resident body association missing"))?
                 as u64
                 + 1;
+            if self.planetary.body != Some(body) {
+                self.controls.cluster_settings.freeze = false;
+                self.planetary.cluster_freeze = false;
+                renderer.set_cluster_settings(self.controls.cluster_settings);
+            }
             planetary_binding_ready = self.planetary.bind(body, identity, &pair)?;
         }
         if planetary_active && planetary_candidate.is_none() {
             self.planetary.runtime.suspend();
-        }
-        if !resident_fixture_active && !planetary_active {
-            self.terrain.update(
-                &pair,
-                &view,
-                projection,
-                &self.requests,
-                &mut self.surfaces,
-                &mut self.surface_owners,
-                &self.sphere,
-                self.controls.terrain_preview,
-                Duration::from_millis(self.controls.terrain_morph_ms),
-                64,
-                if renderer.deterministic() {
-                    None
-                } else {
-                    Some(Duration::from_millis(2))
-                },
-                elapsed,
-            )?;
-        } else {
-            #[cfg(feature = "surface-profile")]
-            {
-                // Avoid carrying the previous legacy update's duration into a
-                // frame which deliberately skipped legacy terrain population.
-                self.terrain.profile = Default::default();
-            }
-            #[cfg(feature = "developer-tools")]
-            if let Some(body) = self.resident_tile.body
-                && let Some(index) = self.ids.iter().position(|&id| id == body)
-            {
-                self.surface_owners[index] = true;
-            }
         }
         if let Some(terrain) = self.terrain_clearance
             && self.terrain.active_body() == Some(terrain.body)
@@ -2222,26 +1785,6 @@ impl GravityOrbitsDemo {
             })?;
         }
         let mut lighting = self.controls.terrain_lighting;
-        let mut readability = None;
-        if let Some(active) = self.terrain.active_body()
-            && let Some(index) = self.ids.iter().position(|&id| id == active)
-            && matches!(
-                self.scenario,
-                GravityFixture::GameplaySolarSystem | GravityFixture::RealSolarSystem
-            )
-            && let Some(palette) = crate::solar_system::terrain_readability_config_with_sea_level(
-                crate::solar_system::SOLAR_SYSTEM_CONTENT[index].identity,
-                self.requests[index].reference_radius_m,
-                self.controls.reference_sea_level_m.unwrap_or(
-                    crate::solar_system::reference_sea_level_m(
-                        crate::solar_system::SOLAR_SYSTEM_CONTENT[index].identity,
-                    )
-                    .unwrap_or(0.0),
-                ),
-            )?
-        {
-            readability = Some(palette);
-        }
         if self.controls.sun_from_star
             && let Some(active) = if planetary_active {
                 self.planetary.body
@@ -2267,9 +1810,6 @@ impl GravityOrbitsDemo {
                 lighting.mode(),
             )?;
         }
-        if let Some(palette) = readability {
-            lighting = lighting.with_readability(palette);
-        }
         let mut frame = CelestialFrame::new(&view, &mut self.staging, projection, &self.sphere);
         frame.set_terrain_lighting(lighting);
         let mut planetary_submitted = false;
@@ -2284,6 +1824,12 @@ impl GravityOrbitsDemo {
                 body_frame,
                 projection,
                 lighting,
+                self.presentation[self
+                    .ids
+                    .iter()
+                    .position(|id| *id == body)
+                    .context("missing body presentation")?]
+                .appearance,
                 renderer.last_resident_regional_report(),
                 elapsed,
                 renderer.deterministic(),
@@ -2297,158 +1843,7 @@ impl GravityOrbitsDemo {
                 self.surface_owners[index] = true;
             }
         }
-        #[cfg(feature = "developer-tools")]
-        let mut resident_validation_draw = None;
-        #[cfg(feature = "developer-tools")]
-        let mut resident_hierarchy_validation_draw = None;
-        #[cfg(feature = "developer-tools")]
-        if self.resident_tile.enabled
-            && self.resident_tile.stale_reason.is_none()
-            && !self.resident_tile.reference_cpu
-        {
-            let body = self
-                .resident_tile
-                .body
-                .ok_or_else(|| anyhow::anyhow!("resident tile has no body"))?;
-            let body_frame = pair.projection().frames_for(body)?.body_fixed;
-            let draw = self.resident_tile.draw(&view, body_frame)?;
-            if self.resident_regional.enabled {
-                let source = view.prepare_source(body_frame)?;
-                let position = source.observer_in_source().metres();
-                let projection_scale_px =
-                    f64::from(size[1]) / (2.0 * (projection.vertical_fov_rad() * 0.5).tan());
-                self.resident_regional
-                    .observe(renderer.last_resident_regional_report());
-                self.resident_regional.advance(
-                    position,
-                    projection_scale_px,
-                    elapsed,
-                    renderer.deterministic(),
-                )?;
-                let regional_draw = self.resident_regional.draw(&draw)?;
-                frame.set_resident_regional(regional_draw)?;
-            } else if self.resident_hierarchy.enabled {
-                let report = renderer.last_resident_hierarchy_report();
-                let hierarchy_draw = self.resident_hierarchy.draw(draw, Some(&report))?;
-                frame.set_resident_hierarchy(hierarchy_draw.clone())?;
-                if let Some(patch_index) = self.resident_hierarchy.validation_pending
-                    && hierarchy_draw.draw_children
-                {
-                    resident_hierarchy_validation_draw = Some((hierarchy_draw, patch_index));
-                }
-            } else {
-                frame.set_resident_tile(draw.clone())?;
-                if self.resident_tile.validation_pending {
-                    resident_validation_draw = Some((draw, body_frame));
-                }
-            }
-        }
-        if let Some(active) = self.terrain.active_body()
-            && let Some(index) = self.ids.iter().position(|&id| id == active)
-            && matches!(
-                self.scenario,
-                GravityFixture::GameplaySolarSystem | GravityFixture::RealSolarSystem
-            )
-            && matches!(lighting.mode(), TerrainRenderMode::Natural)
-        {
-            let body = crate::solar_system::SOLAR_SYSTEM_CONTENT[index].identity;
-            if let Some(mut config) = crate::solar_system::planetary_config(
-                body,
-                self.requests[index].reference_radius_m,
-            )? {
-                config.ocean_enabled &= self.controls.planetary_ocean;
-                config.clouds_enabled &= self.controls.planetary_clouds;
-                config.atmosphere_enabled &= self.controls.planetary_atmosphere;
-                if body == crate::solar_system::SolarBody::Earth {
-                    config.sea_datum_m = self
-                        .controls
-                        .reference_sea_level_m
-                        .unwrap_or(config.sea_datum_m);
-                }
-                frame.set_planetary_environment(self.requests[index], config)?;
-            }
-        }
         let prepared = (|| -> Result<()> {
-            frame.set_distant_sky(
-                pair.projection().tree().root(),
-                std::sync::Arc::clone(&self.sky_definition),
-                self.controls.sky,
-            )?;
-            for session in &self.surfaces {
-                let index = self
-                    .ids
-                    .iter()
-                    .position(|&id| id == session.body())
-                    .expect("surface body");
-                #[cfg(feature = "developer-tools")]
-                let resident_fixture_owns_body =
-                    self.resident_tile.enabled && self.resident_tile.body == Some(session.body());
-                #[cfg(not(feature = "developer-tools"))]
-                let resident_fixture_owns_body = false;
-                let planetary_owns_body =
-                    planetary_active && self.planetary.body == Some(session.body());
-                if self.surface_owners[index] && planetary_owns_body {
-                    // Resident draw is already staged. No CPU mesh is packed.
-                } else if self.surface_owners[index] && resident_fixture_owns_body {
-                    #[cfg(feature = "developer-tools")]
-                    if self.resident_tile.stale_reason.is_none() && self.resident_tile.reference_cpu
-                    {
-                        let reference =
-                            self.resident_tile.cpu_reference.as_ref().ok_or_else(|| {
-                                anyhow::anyhow!("resident CPU reference is missing")
-                            })?;
-                        frame.append_generated_surface(
-                            self.requests[index],
-                            &[reference.patch],
-                            &[&reference.mesh],
-                            &reference.topology,
-                            self.controls.surface_style,
-                        )?;
-                    }
-                } else if self.surface_owners[index] {
-                    if self.terrain.active_body() == Some(session.body())
-                        && self.terrain.cover.ready()
-                    {
-                        let mut style = self.controls.surface_style;
-                        if matches!(
-                            self.scenario,
-                            GravityFixture::GameplaySolarSystem | GravityFixture::RealSolarSystem
-                        ) {
-                            style.elevation_colors &= crate::solar_system::SOLAR_SYSTEM_CONTENT
-                                [index]
-                                .terrain_elevation_diagnostic;
-                        }
-                        frame.append_stitched_surface(
-                            self.requests[index],
-                            self.terrain.cover.visible(),
-                            self.terrain
-                                .cover
-                                .surface()
-                                .ok_or_else(|| anyhow::anyhow!("missing stitched terrain"))?,
-                            self.terrain
-                                .cover
-                                .topology()
-                                .ok_or_else(|| anyhow::anyhow!("missing terrain topology"))?,
-                            style,
-                        )?;
-                        if let Some((mesh, fraction)) = self.terrain.cover.transition() {
-                            frame.append_surface_transition(
-                                self.requests[index],
-                                mesh,
-                                fraction,
-                                style,
-                            )?;
-                        }
-                    } else {
-                        frame.append_surface(
-                            self.requests[index],
-                            session.lod().active_visible(),
-                            session.lod().topology(),
-                            self.controls.surface_style,
-                        )?;
-                    }
-                }
-            }
             frame.append_body_observations(&self.requests, &self.surface_owners)?;
             if self.controls.surface_bounds {
                 for session in &self.surfaces {
@@ -2641,29 +2036,37 @@ impl GravityOrbitsDemo {
             rendering: RenderingSnapshot {
                 terrain_render_mode: render_mode_name(self.controls.terrain_lighting.mode()).into(),
                 terrain_enabled: self.controls.terrain_preview,
-                ocean_enabled: self.controls.planetary_ocean,
-                clouds_enabled: self.controls.planetary_clouds,
-                atmosphere_enabled: self.controls.planetary_atmosphere,
                 patch_borders_enabled: self.controls.surface_style.borders,
                 lod_colors_enabled: self.controls.surface_style.lod_colors,
                 navigation_markers_enabled: self.controls.markers,
                 ..Default::default()
-            }
-            .with_draw_report(report),
+            },
             performance,
         })?;
         snapshot.engine_profile = self.profile_snapshot.clone();
-        if let Some(sky) = report.sky {
-            snapshot.sky = Some(crate::developer_snapshot::SkySnapshot::collect(
-                &self.sky_definition,
-                self.controls.sky,
-                sky,
-                renderer.last_sky_resource_report(),
-                renderer.latest_gpu_profile(),
-                "latest_submitted (may be previous frame)",
-                "latest_completed (may be previous frame)",
-            ));
-        }
+        let cluster = renderer.cluster_report();
+        snapshot.rendering.clusters = Some(serde_json::json!({
+            "enabled":cluster.enabled,"mode":format!("{:?}",cluster.active_mode),"debug":format!("{:?}",self.controls.cluster_settings.debug),
+            "freeze_active":cluster.freeze_active,"resident_regions":cluster.resident_regions,"pending_regions":cluster.pending_regions,
+            "selected_clusters":cluster.selected_clusters,"selected_fine_clusters":cluster.selected_fine_clusters,"selected_coarse_clusters":cluster.selected_coarse_clusters,"selected_transition_clusters":cluster.selected_transition_clusters,"resident_clusters":cluster.resident_clusters,"submitted_triangles":cluster.submitted_triangles,"draw_commands":cluster.draw_commands,
+            "cpu_bytes":cluster.cpu_bytes,"gpu_bytes":cluster.gpu_bytes,"build_micros":cluster.build_micros,"selection_cpu_micros":cluster.selection_cpu_micros,
+            "all_build_micros":cluster.all_build_micros,"queue_wait_micros":cluster.queue_wait_micros,"max_queue_wait_micros":cluster.max_queue_wait_micros,
+            "completed_builds":cluster.completed_builds,"failed_builds":cluster.failed_builds,"evicted_before_selection":cluster.evicted_before_selection,"upload_bytes":cluster.upload_bytes,
+            "gpu_selection_ms":cluster.gpu_selection_ms,"gpu_render_ms":cluster.gpu_render_ms,"fallback_regions":cluster.fallback_regions,"rebuilds":cluster.rebuilds,"reason":cluster.reason,"counters_scope":cluster.counters_scope,
+            "triangle_edges":self.controls.cluster_settings.triangle_edges,"cluster_edges":self.controls.cluster_settings.cluster_edges,
+            "finite_mesh_error_px":mundaris_renderer::cluster::FINITE_MESH_ERROR_PX,"source_quality_accepted":false
+        }));
+        snapshot.shared_scene = Some(serde_json::json!({
+            "id": crate::shared_system::SCENE_NAME,
+            "scene_sha256": self.scene_sha256,
+            "camera_sha256": self.camera_sha256,
+            "bodies": self.presentation.iter().map(|body| serde_json::json!({
+                "id": body.semantic_id,
+                "identity": body.identity,
+                "definition_sha256": body.definition_sha256,
+                "definition_revision": body.definition_revision,
+            })).collect::<Vec<_>>(),
+        }));
         if planetary_active {
             self.planetary.annotate_previous(
                 &mut snapshot,
@@ -2743,240 +2146,22 @@ impl GravityOrbitsDemo {
         snapshot.performance.render_present_ms =
             Some(render_started.elapsed().as_secs_f64() * 1000.0);
         snapshot.performance.ui_build_cpu_ms = Some(ui_build_cpu_ms);
-        #[cfg(feature = "developer-tools")]
-        if let Some((draw, body_frame)) = resident_validation_draw {
-            // Validation follows the real frame submission so its setup cannot
-            // consume the cold publication before the captured production draw.
-            let vertices = renderer.validate_resident_tile(&draw)?;
-            let tile = self
-                .resident_tile
-                .tile
-                .as_ref()
-                .expect("prepared resident tile");
-            let anchor = tile.anchor_position_body()?;
-            let prepared_source = view.prepare_source(body_frame)?;
-            let root_frame = pair.projection().tree().root();
-            let body_origin_in_root_m = pair
-                .evaluation()
-                .convert_position(
-                    FramePosition::new(body_frame, LocalPosition::origin()),
-                    root_frame,
-                )?
-                .local()
-                .metres();
-            let observer_in_root_m = pair
-                .evaluation()
-                .convert_position(self.camera.pose().position(), root_frame)?
-                .local()
-                .metres();
-            let cells = tile.key.cells;
-            let mut max_local_error = 0.0f64;
-            let mut max_view_error = 0.0f64;
-            let mut max_normal_error = 0.0f64;
-            let mut max_material_error = 0.0f64;
-            let mut max_view_narrowing_error = 0.0f64;
-            let mut invalid_sample_count = 0usize;
-            for (index, gpu) in vertices.iter().enumerate() {
-                let x = index as u32 % (cells + 1);
-                let y = index as u32 / (cells + 1);
-                let st = [
-                    f64::from(x) / f64::from(cells),
-                    f64::from(y) / f64::from(cells),
-                ];
-                let local = tile.position_local(st)?;
-                let gpu_local = DVec3::from_array(gpu.position_local_m.map(f64::from));
-                max_local_error = max_local_error.max(local.distance(gpu_local));
-                let complete_body_point = anchor + local;
-                let expected_view_m = prepared_source
-                    .view_displacement(FramePosition::new(
-                        body_frame,
-                        LocalPosition::try_metres(complete_body_point)?,
-                    ))?
-                    .metres();
-                let gpu_view_m = DVec3::from_array(gpu.position_view_m.map(f64::from));
-                max_view_error = max_view_error.max(expected_view_m.distance(gpu_view_m));
-                let narrowed_anchor = draw.anchor_view_m.as_vec3().as_dvec3();
-                let rotated_local = (draw.body_to_view * local).as_vec3().as_dvec3();
-                max_view_narrowing_error = max_view_narrowing_error
-                    .max(expected_view_m.distance(narrowed_anchor + rotated_local));
-                let expected_normal = tile.normal_local([x, y])?;
-                let actual_normal = DVec3::from_array(gpu.normal_body.map(f64::from));
-                max_normal_error = max_normal_error.max(
-                    expected_normal
-                        .cross(actual_normal)
-                        .length()
-                        .atan2(expected_normal.dot(actual_normal)),
-                );
-                let expected_material = tile.material(st)?;
-                for (expected, actual) in expected_material.into_iter().zip(gpu.material) {
-                    max_material_error =
-                        max_material_error.max((f64::from(expected) - f64::from(actual)).abs());
-                }
-                let material_sum = gpu.material.iter().sum::<f32>();
-                let sample_valid = gpu.position_local_m.iter().all(|v| v.is_finite())
-                    && gpu.position_view_m.iter().all(|v| v.is_finite())
-                    && gpu.normal_body.iter().all(|v| v.is_finite())
-                    && gpu
-                        .material
-                        .iter()
-                        .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
-                    && (actual_normal.length() - 1.0).abs() <= 1.0e-4
-                    && (material_sum - 1.0).abs() <= 1.0e-4;
-                if !sample_valid {
-                    invalid_sample_count += 1;
-                }
-            }
-            let passed = vertices.len() == ((cells + 1) * (cells + 1)) as usize
-                && invalid_sample_count == 0
-                && max_local_error <= 0.001
-                && max_view_error <= 0.001
-                && max_normal_error <= 0.001
-                && max_material_error <= 1.0e-5;
-            self.resident_tile.gpu_validation = Some(serde_json::json!({
-                "sample_count": vertices.len(),
-                "max_local_position_error_m": max_local_error,
-                "max_view_position_error_m": max_view_error,
-                "max_prepared_view_to_narrowed_gpu_path_error_m": max_view_narrowing_error,
-                "anchor_view_m": draw.anchor_view_m.to_array(),
-                "body_to_view_columns": [
-                    draw.body_to_view.x_axis.to_array(),
-                    draw.body_to_view.y_axis.to_array(),
-                    draw.body_to_view.z_axis.to_array(),
-                ],
-                "body_origin_in_root_m": body_origin_in_root_m.to_array(),
-                "observer_in_root_m": observer_in_root_m.to_array(),
-                "common_parent_translation_m": body_origin_in_root_m.length(),
-                "validated_frame_number": self.developer_frame_number,
-                "view_mode": self.resident_tile.mode,
-                "sun_direction_body": self.resident_tile.sun_direction_body.to_array(),
-                "camera_offset_m": self.resident_tile.camera_offset_m,
-                "max_normal_error_radians": max_normal_error,
-                "max_material_component_error": max_material_error,
-                "invalid_sample_count": invalid_sample_count,
-                "all_positions_normals_materials_finite": invalid_sample_count == 0,
-                "normal_length_tolerance": 0.0001,
-                "material_weight_sum_tolerance": 0.0001,
-                "local_position_tolerance_m": 0.001,
-                "view_position_tolerance_m": 0.001,
-                "normal_tolerance_radians": 0.001,
-                "material_component_tolerance": 0.00001,
-                "passed": passed,
-                "readback_scope": "one_shot_fixture_validation_after_first_frame_submission",
-                "ordinary_frame_readbacks": 0,
-            }));
-            self.resident_tile.validation_pending = false;
-        }
-        #[cfg(feature = "developer-tools")]
-        if let Some((draw, patch_index)) = resident_hierarchy_validation_draw {
-            let vertices = renderer.validate_resident_hierarchy(&draw, patch_index)?;
-            let cells = draw.parent.tile.key.cells;
-            let mut max_local_error = 0.0f64;
-            let mut max_view_error = 0.0f64;
-            let mut max_normal_error = 0.0f64;
-            let mut max_material_error = 0.0f64;
-            let mut invalid_sample_count = 0usize;
-            for (index, gpu) in vertices.iter().enumerate() {
-                let grid = [index as u32 % (cells + 1), index as u32 / (cells + 1)];
-                let cpu = draw.reconstruct_patch(patch_index, grid)?;
-                let gpu_local = DVec3::from_array(gpu.position_local_m.map(f64::from));
-                let gpu_view = DVec3::from_array(gpu.position_view_m.map(f64::from));
-                max_local_error =
-                    max_local_error.max(cpu.position_parent_local_m.distance(gpu_local));
-                max_view_error = max_view_error.max(draw.position_view(&cpu).distance(gpu_view));
-                let gpu_normal = DVec3::from_array(gpu.normal_body.map(f64::from));
-                max_normal_error = max_normal_error.max(
-                    cpu.normal_body
-                        .cross(gpu_normal)
-                        .length()
-                        .atan2(cpu.normal_body.dot(gpu_normal)),
-                );
-                for (expected, actual) in cpu.material.into_iter().zip(gpu.material) {
-                    max_material_error =
-                        max_material_error.max((expected - f64::from(actual)).abs());
-                }
-                let normal_length = gpu_normal.length();
-                let material_sum = gpu.material.iter().sum::<f32>();
-                let valid = gpu.position_local_m.iter().all(|v| v.is_finite())
-                    && gpu.position_view_m.iter().all(|v| v.is_finite())
-                    && gpu.normal_body.iter().all(|v| v.is_finite())
-                    && (normal_length - 1.0).abs() <= 1.0e-4
-                    && gpu
-                        .material
-                        .iter()
-                        .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
-                    && (material_sum - 1.0).abs() <= 1.0e-4;
-                if !valid {
-                    invalid_sample_count += 1;
-                }
-            }
-            let passed = vertices.len() == ((cells + 1) * (cells + 1)) as usize
-                && invalid_sample_count == 0
-                && max_local_error <= 0.001
-                && max_view_error <= 0.001
-                && max_normal_error <= 0.001
-                && max_material_error <= 1.0e-5;
-            let validation = serde_json::json!({
-                "patch_index": patch_index,
-                "sample_count": vertices.len(),
-                "max_parent_anchor_local_error_m": max_local_error,
-                "max_view_position_error_m": max_view_error,
-                "max_normal_error_radians": max_normal_error,
-                "max_material_component_error": max_material_error,
-                "invalid_sample_count": invalid_sample_count,
-                "material_weight_sum_tolerance": 0.0001,
-                "normal_length_tolerance": 0.0001,
-                "position_tolerance_m": 0.001,
-                "normal_tolerance_radians": 0.001,
-                "material_component_tolerance": 0.00001,
-                "passed": passed,
-                "readback_scope": "explicit_hierarchy_diagnostic_validation_after_frame_submission",
-                "ordinary_frame_readbacks": 0,
-            });
-            self.resident_hierarchy.validation = Some(validation.clone());
-            self.resident_hierarchy.validation_history.push(validation);
-            self.resident_hierarchy.validation_pending =
-                (patch_index < 4).then_some(patch_index + 1);
-        }
-        #[cfg(feature = "developer-tools")]
-        let resident_report = self
-            .resident_tile
-            .enabled
-            .then(|| renderer.last_resident_tile_report());
-        #[cfg(feature = "developer-tools")]
-        let hierarchy_report = self
-            .resident_hierarchy
-            .enabled
-            .then(|| renderer.last_resident_hierarchy_report());
-        #[cfg(feature = "developer-tools")]
-        if let Some(report) = hierarchy_report.as_ref() {
-            self.resident_hierarchy.observe_uploads(Some(report));
-        }
-        #[cfg(feature = "developer-tools")]
-        {
-            snapshot.resident_tile = self
-                .resident_tile
-                .snapshot(resident_report.as_ref(), self.developer_frame_number);
-            snapshot.resident_hierarchy = self
-                .resident_hierarchy
-                .snapshot(hierarchy_report.as_ref(), self.developer_frame_number);
-            if self.resident_regional.enabled {
-                self.resident_regional
-                    .observe(renderer.last_resident_regional_report());
-                if !renderer.deterministic() {
-                    self.resident_regional
-                        .record_native_frame(&snapshot.performance, self.developer_frame_number);
-                }
-                snapshot.resident_regional = self.resident_regional.snapshot();
-            }
-            if let (Some(reason), Some(serde_json::Value::Object(hierarchy))) = (
-                self.resident_tile.stale_reason.as_ref(),
-                snapshot.resident_hierarchy.as_mut(),
-            ) {
-                hierarchy.insert("stale_reason".into(), serde_json::json!(reason));
-                hierarchy.insert("parent_drawable".into(), serde_json::json!(false));
-                hierarchy.insert("draw_children_gpu_ready".into(), serde_json::json!(false));
-            }
-        }
+        let native_cpu = renderer.native_render_timings();
+        snapshot.performance.native_render_cpu_ms = Some([
+            native_cpu.poll_ms,
+            native_cpu.acquire_ms,
+            native_cpu.ui_prepare_ms,
+            native_cpu.scene_encode_ms,
+            native_cpu.ui_encode_ms,
+            native_cpu.submit_ms,
+            native_cpu.present_ms,
+            native_cpu.total_ms,
+        ]);
+        snapshot.performance.native_submission_id = renderer.native_submission_id();
+        snapshot.performance.native_gpu_timestamp_sampling = renderer.native_timestamp_sampling();
+        snapshot.performance.native_presentation_mode = Some(renderer.presentation_mode_label());
+        snapshot.performance.native_redraw_uncapped = cfg!(feature = "developer-tools")
+            && std::env::var("MUNDARIS_UNCAPPED").is_ok_and(|value| value == "1");
         #[cfg(feature = "developer-tools")]
         if renderer.deterministic() {
             snapshot.performance = snapshot
@@ -2998,6 +2183,20 @@ impl GravityOrbitsDemo {
                 resident_report.validation_readback_bytes = 0;
             }
             let resident_prepare_ms = resident_report.preparation_micros as f64 / 1000.0;
+            snapshot.rendering.resident_submitted_patch_count = if planetary_submitted {
+                resident_report.prepare_patch_count
+            } else {
+                0
+            };
+            let cells = self
+                .planetary
+                .runtime
+                .template_tile()
+                .map_or(0, |tile| tile.key.cells as usize);
+            snapshot.rendering.resident_submitted_triangle_count = snapshot
+                .rendering
+                .resident_submitted_patch_count
+                .saturating_mul(cells * cells * 2);
             snapshot.performance.gpu_preparation_cpu_ms = Some(resident_prepare_ms);
             snapshot.performance.frame_cpu_ms = snapshot
                 .performance
@@ -3049,18 +2248,7 @@ impl GravityOrbitsDemo {
             }
         }
         snapshot.engine_profile = self.profile_snapshot.clone();
-        let capture_trace = if planetary_active {
-            self.planetary.runtime.trace()
-        } else {
-            #[cfg(feature = "developer-tools")]
-            {
-                self.resident_regional.trace()
-            }
-            #[cfg(not(feature = "developer-tools"))]
-            {
-                None
-            }
-        };
+        let capture_trace = self.planetary.runtime.trace();
         if let Some(name) = self
             .performance_capture
             .observe_with_trace(&snapshot, capture_trace)
@@ -3073,13 +2261,6 @@ impl GravityOrbitsDemo {
         if std::mem::take(&mut self.controls.performance_lab.capture_stop_requested) {
             self.performance_capture.stop();
         }
-        if let Some(route) = self.controls.performance_lab.benchmark_requested.take() {
-            self.start_lab_benchmark(route)?;
-        }
-        if std::mem::take(&mut self.controls.performance_lab.stop_requested) {
-            self.lab_benchmark = None;
-        }
-        self.advance_lab_benchmark()?;
         snapshot.performance.profiler_publication_ms =
             Some(profiler_started.elapsed().as_secs_f64() * 1000.0);
         snapshot.performance.host_frame_ms =
@@ -3089,9 +2270,11 @@ impl GravityOrbitsDemo {
             self.controls.performance_lab.ingest(&snapshot, None);
         }
         if planetary_active && planetary_candidate.is_some() {
-            self.planetary
-                .runtime
-                .record_native_frame(&snapshot.performance, self.developer_frame_number);
+            self.planetary.runtime.record_native_frame(
+                &snapshot.performance,
+                self.developer_frame_number,
+                native_interval_ms,
+            );
         }
         #[cfg(feature = "developer-tools")]
         if self.developer_session.is_some() || renderer.deterministic() {
@@ -3281,59 +2464,13 @@ impl GravityOrbitsDemo {
                     curve
                         .points
                         .push(FramePosition::new(source, LocalPosition::try_metres(p)?));
-                    let mut color = self.scenario.color(i);
+                    let mut color = self.presentation[i].color;
                     color[3] = if selected == Some(id) { 0.85 } else { 0.45 };
                     curve.colors.push(color);
                 }
             }
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod analytic_publication_tests {
-    use super::*;
-    #[test]
-    fn analytic_frame_failure_retains_sampled_authority_and_last_published_time() {
-        let mut demo = GravityOrbitsDemo::solar_system(false).unwrap();
-        if let MotionSession::Analytic(a) = &mut demo.motion {
-            a.seek_seconds(42.5, &mut demo.system).unwrap();
-        }
-        let before = demo
-            .system
-            .bodies()
-            .map(|(_, b)| b.clone())
-            .collect::<Vec<_>>();
-        let revision = demo.system.revision();
-        let other = GravityFixture::GameplaySolarSystem
-            .create(NonZeroU64::new(2).unwrap())
-            .unwrap();
-        demo.projection =
-            CelestialFrameProjection::build(&other, NonZeroU64::new(2).unwrap()).unwrap();
-        demo.publish();
-        assert!(!demo.coherent);
-        assert!(demo.motion.paused());
-        assert_eq!(demo.system.revision(), revision);
-        assert_eq!(demo.system.sample_time().seconds_since_epoch(), 42.5);
-        assert_eq!(
-            demo.system
-                .bodies()
-                .map(|(_, b)| b.clone())
-                .collect::<Vec<_>>(),
-            before
-        );
-        assert_eq!(demo.motion_snapshot().published_time_s, 0.0);
-        assert!(demo.motion_snapshot().latest_failure.is_some());
-        demo.update(Duration::from_millis(16));
-        assert!(!demo.coherent);
-        assert_eq!(demo.system.revision(), revision);
-        demo.command(Command::Rebuild).unwrap();
-        demo.publish();
-        assert!(demo.coherent);
-        assert_eq!(demo.motion_snapshot().published_time_s, 42.5);
-        assert!(demo.motion_snapshot().latest_failure.is_none());
-        assert!(demo.motion.paused());
     }
 }
 
@@ -3483,7 +2620,6 @@ fn draw_engineering_ui(
         }
         }
         if ui.button("Reset branch baseline (IDs / focus retained)").clicked() {controls.pending.push_back(Command::Reset);}
-        ui.horizontal_wrapped(|ui| {for (label,fixture) in [("Gameplay Solar System",GravityFixture::GameplaySolarSystem),("Real-scale Solar reference",GravityFixture::RealSolarSystem),("Load original hierarchy",GravityFixture::Hierarchy),("Load circular oracle",GravityFixture::Circular)] {if ui.button(label).clicked() {controls.pending.push_back(Command::Load(fixture));}}});
         ui.separator();
         if let (Some(advance), Some(diagnostics), Some(drift)) = (info.advance, info.diagnostics, info.drift) {
         ui.label(format!("{} bodies / {} pairs / {} new force passes this update",info.system.body_count(),pair_count(info.system.body_count()).expect("valid count"),advance.force_passes));
@@ -3519,7 +2655,7 @@ fn draw_engineering_ui(
             ui.text_edit_singleline(&mut controls.name);if ui.button("Apply name (retain history)").clicked() {controls.pending.push_back(Command::Rename(controls.name.clone()));}
             ui.text_edit_singleline(&mut controls.mass);if ui.button("Apply mass kg").clicked() {match controls.mass.parse() {Ok(value)=>controls.pending.push_back(Command::Mass(value)),Err(error)=>{ui.colored_label(egui::Color32::LIGHT_RED,format!("{error}"));}}}
             ui.text_edit_singleline(&mut controls.radius);if ui.button("Apply radius m (geometry only)").clicked() {match controls.radius.parse() {Ok(value)=>controls.pending.push_back(Command::Radius(value)),Err(error)=>{ui.colored_label(egui::Color32::LIGHT_RED,format!("{error}"));}}}
-            if info.motion.is_analytic() { ui.small("Velocity edits unavailable: prescribed trajectories determine velocity. Load a Newtonian scenario to edit it. Periods are independent of mass/radius edits."); }
+            if info.motion.is_analytic() { ui.small("Velocity edits unavailable: prescribed trajectories determine velocity.  Periods are independent of mass/radius edits."); }
             ui.add_enabled_ui(!info.motion.is_analytic(), |ui| {
             for value in &mut controls.velocity {ui.text_edit_singleline(value);}
             if ui.button("Apply system velocity m/s").clicked() {
@@ -3569,8 +2705,9 @@ fn draw_ui(
     } else {
         controls.performance_lab.draw(context, None, None);
     }
-    egui::SidePanel::right("planet surface / inspection").default_width(300.0).resizable(true).show(context,|ui| {
+    egui::SidePanel::right("planet surface / inspection").exact_width(300.0).resizable(false).show(context,|ui| {
             egui::ScrollArea::vertical().show(ui,|ui| {
+            crate::cluster_panel::show(ui, &mut controls.cluster_settings, &controls.cluster_report);
             developer_ui::right(ui, controls, info);
             ui.separator();
             ui.collapsing("Advanced terrain diagnostics", |ui| {
@@ -3579,7 +2716,6 @@ fn draw_ui(
             let pair=info.projection.coherent_view(info.system).expect("coherent UI");
             ui.collapsing("Camera precision / clearance / navigation", |ui| {
             ui.label(if controls.terrain_preview {"Procedural terrain checkpoint · adaptive ready cover"} else {"Smooth sphere · zero terrain height · one connected body"});
-            if info.ids.len()==3 && ui.button("Run legacy integrated validation route").clicked() {controls.pending.push_back(Command::ValidationRoute);}
             if let Some(c)=info.terrain_clearance {
                 ui.strong(format!("Terrain clearance: {:+.2} m",c.clearance_m));
                 if c.clearance_m<0.0 {ui.colored_label(egui::Color32::RED,"INSIDE TERRAIN (complete field)");}
@@ -3623,12 +2759,9 @@ fn draw_ui(
             visual_controls::checkbox(ui,controls,visual_controls::Layer::Borders,"Patch borders");visual_controls::checkbox(ui,controls,visual_controls::Layer::LodColors,"LOD colours");ui.checkbox(&mut controls.surface_style.face_colors,"Face IDs / colours");ui.checkbox(&mut controls.surface_style.underside,"No-cull underside diagnostic");
             ui.checkbox(&mut controls.surface_bounds,"Bounds / normal envelope axes (bounded)");
             let mut preview=controls.terrain_preview;
-            if ui.checkbox(&mut preview,"Adaptive terrain").changed() {controls.pending.push_back(Command::TerrainPreview(preview));}
+            if ui.checkbox(&mut preview,"Resident terrain").changed() {controls.pending.push_back(Command::TerrainPreview(preview));}
             if controls.terrain_preview {
-                ui.label("Natural planetary presentation (render-only layers)");
-                visual_controls::checkbox(ui,controls,visual_controls::Layer::Ocean,"Ocean layer (where defined)");
-                visual_controls::checkbox(ui,controls,visual_controls::Layer::Clouds,"Cloud layer (where defined)");
-                visual_controls::checkbox(ui,controls,visual_controls::Layer::Atmosphere,"Atmosphere layer (where defined)");
+                ui.label("Authored planetary material");
                 ui.checkbox(&mut controls.sun_from_star,"Use central star direction (disable for lighting presets)");
                 ui.add(egui::Slider::new(&mut controls.terrain_morph_ms,0..=1000).text("Morph ms (0: static)").clamping(egui::SliderClamping::Always));
                 ui.checkbox(&mut controls.surface_style.elevation_colors,"Derived terrain elevation colours");
@@ -3643,14 +2776,6 @@ fn draw_ui(
                         }
                     }
                 });
-                let mut override_sea=controls.reference_sea_level_m.is_some();
-                if ui.checkbox(&mut override_sea,"Override content reference sea level (display only)").changed() {
-                    controls.reference_sea_level_m=override_sea.then_some(crate::solar_system::GAMEPLAY_EARTH_SEA_LEVEL_M);
-                }
-                if let Some(sea)=&mut controls.reference_sea_level_m {
-                    ui.add(egui::DragValue::new(sea).speed(10.0).suffix(" m sea datum"));
-                }
-                ui.small("Blue = height below datum; no water geometry or biomes. Rock blends analytic slope 8–16°. Height and slope are independent.");
                 egui::ComboBox::from_label("Body-fixed sun preset").selected_text("Choose preset").show_ui(ui, |ui| {
                     for (label, preset) in [("Overhead", TerrainSunPreset::Overhead), ("Side", TerrainSunPreset::Side), ("Grazing", TerrainSunPreset::Grazing), ("Terminator", TerrainSunPreset::Terminator), ("Night", TerrainSunPreset::Night)] {
                         if ui.button(label).clicked() {
@@ -3917,510 +3042,84 @@ fn draw_ui(
 }
 
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn native_focus_resize_and_hidden_resume_cancel_navigation_without_replay() {
-        use super::*;
-        let mut demo = GravityOrbitsDemo::solar_system(false).unwrap();
-        demo.command(Command::Focus {
-            fixed: false,
-            fit: true,
-        })
-        .unwrap();
-        for _ in 0..60 {
-            demo.update(Duration::from_millis(20));
-        }
-        demo.command(Command::SurfaceInspection).unwrap();
-        demo.command(Command::Navigation(NavigationInput {
-            scroll_notches: 0.5,
-            translation: DVec3::X,
-            ..Default::default()
-        }))
-        .unwrap();
-        assert!(demo.camera.navigation_diagnostics().pending_forward_m > 0.0);
-        let pose = demo.camera.pose();
-        demo.on_window_event(&winit::event::WindowEvent::Focused(false));
-        assert_eq!(demo.controls.navigation.translation, DVec3::ZERO);
-        assert_eq!(demo.camera.navigation_diagnostics().pending_forward_m, 0.0);
-        demo.on_window_event(&winit::event::WindowEvent::Focused(true));
-        demo.update(Duration::ZERO);
-        assert_eq!(
-            demo.camera.pose().position().local(),
-            pose.position().local()
-        );
-        demo.command(Command::Navigation(NavigationInput {
-            translation: DVec3::Y,
-            ..Default::default()
-        }))
-        .unwrap();
-        demo.on_window_event(&winit::event::WindowEvent::Resized(
-            winit::dpi::PhysicalSize::new(1920, 1080),
-        ));
-        assert_eq!(demo.controls.navigation.translation, DVec3::ZERO);
-        demo.command(Command::Navigation(NavigationInput {
-            translation: DVec3::Y,
-            ..Default::default()
-        }))
-        .unwrap();
-        demo.set_lifecycle_drawable(false);
-        demo.set_lifecycle_drawable(true);
-        demo.update(Duration::ZERO);
-        assert_eq!(
-            demo.camera.pose().position().local(),
-            pose.position().local()
-        );
-        println!(
-            "native lifecycle hook: focus loss/gain, resize, hidden/resume: cancelled targets and held keys; position replay=0"
-        );
-    }
-    #[test]
-    fn solar_native_route_is_opt_in_uses_controls_and_excludes_hidden_time() {
-        use super::*;
-        let mut demo = GravityOrbitsDemo::solar_system(false).unwrap();
-        assert!(demo.solar_validation.is_none());
-        let revision = demo.system.revision();
-        let instant = demo.system.sample_time();
-        demo.solar_validation = Some((Duration::ZERO, 0));
-        demo.controls.pending.clear();
-        for _ in 0..20 {
-            demo.advance_solar_validation(Duration::from_millis(100));
-        }
-        assert!(matches!(
-            demo.controls.pending.front(),
-            Some(Command::Focus { .. })
-        ));
-        let before = demo.solar_validation;
-        demo.hidden = true;
-        demo.advance_solar_validation(Duration::from_millis(100));
-        assert_eq!(demo.solar_validation, before);
-        demo.hidden = false;
-        demo.advance_solar_validation(demo.clock.threshold() + Duration::from_secs(1));
-        assert_eq!(demo.solar_validation, before);
-        assert_eq!(demo.system.revision(), revision);
-        assert_eq!(demo.system.sample_time(), instant);
-    }
-
-    #[test]
-    fn solar_development_starts_paused_with_earth_selected_and_no_terrain_work() {
-        use super::*;
-        let demo = GravityOrbitsDemo::solar_system(false).unwrap();
-        assert_eq!(demo.system.body_count(), 10);
-        assert_eq!(
-            demo.system
-                .body(demo.selection.selected().unwrap())
-                .unwrap()
-                .name(),
-            "Earth"
-        );
-        assert_eq!(
-            demo.system
-                .body(demo.ids[3])
-                .unwrap()
-                .properties()
-                .reference_radius_m(),
-            400_000.0
-        );
-        assert_eq!(demo.surfaces.len(), 5);
-        assert!(demo.controls.terrain_preview);
-        assert!(demo.motion.paused());
-        assert_eq!(demo.camera.mode(), CameraMode::SystemOrbit);
-        assert_eq!(demo.terrain.active_body(), None);
-        assert_eq!(demo.terrain.cache.pending(), 0);
-    }
-    #[test]
-    fn terrain_runtime_options_select_deterministic_renderer_only_settings() {
-        use super::*;
-        assert_eq!(
-            terrain_lighting_configuration(None, None),
-            TerrainLighting::default()
-        );
-        assert_eq!(
-            terrain_lighting_configuration(Some("unknown"), Some("unknown")),
-            TerrainLighting::default()
-        );
-        for (name, mode) in [
-            ("elevation", TerrainRenderMode::Elevation),
-            ("lit", TerrainRenderMode::Lit),
-            ("normals", TerrainRenderMode::Normals),
-            ("diffuse", TerrainRenderMode::Diffuse),
-        ] {
-            let config = terrain_lighting_configuration(Some(name), Some("grazing"));
-            assert_eq!(config.mode(), mode);
-            assert_eq!(
-                config.sun_direction_body(),
-                TerrainSunPreset::Grazing.direction_body()
-            );
-        }
-    }
+mod analytic_publication_tests {
     use super::*;
     #[test]
-    fn integrated_surface_route_keeps_body_identity_and_commits_real_steps() {
-        let mut demo = GravityOrbitsDemo::new().unwrap();
-        let ids = demo.ids.clone();
-        let initial = *demo.system.body(ids[1]).unwrap().state();
-        demo.start_surface_validation().unwrap();
-        for _ in 0..3750 {
-            demo.update(Duration::from_millis(32));
-        }
-        assert_eq!(demo.ids, ids);
-        assert_eq!(demo.motion.newtonian().unwrap().tick(), 20);
-        assert_eq!(demo.system.sample_time().seconds_since_epoch(), 1200.0);
-        assert_ne!(*demo.system.body(ids[1]).unwrap().state(), initial);
-        assert_eq!(demo.camera.focused_body(), Some(ids[1]));
-        assert!(demo.camera.clearance_m() < 2.001);
-        assert!(demo.diagnostic.is_none(), "{:?}", demo.diagnostic);
-    }
-    #[test]
-    fn near_surface_stall_and_hidden_duration_preserve_inspection_and_resume_cleanly() {
-        let mut demo = GravityOrbitsDemo::new().unwrap();
-        demo.start_surface_validation().unwrap();
-        for _ in 0..1750 {
-            demo.update(Duration::from_millis(32));
-        }
-        assert_eq!(demo.camera.mode(), CameraMode::SurfaceInspection);
-        assert!(demo.camera.clearance_m() < 2.001);
-        demo.validation_route = None;
-        demo.command(Command::Rate(1e6)).unwrap();
-        demo.command(Command::Pause(false)).unwrap();
-        demo.update(Duration::from_millis(100));
-        assert!(demo.advance.unwrap().backlog_ticks > 0);
-        let revision = demo.system.revision();
-        let tick = demo.motion.newtonian().unwrap().tick();
-        let pose = demo.camera.pose();
-        let assert_inspection_pose = |actual: FramePose| {
-            assert_eq!(actual.position(), pose.position());
-            // Inspection reconstructs its normalized orientation even at zero
-            // navigation duration; compare within the existing basis envelope.
-            for (a, b) in actual
+    fn shared_camera_matches_authored_pose_and_survives_idle_motion() {
+        let loaded =
+            crate::shared_system::SharedTestSystem::load_canonical(NonZeroU64::new(71).unwrap())
+                .unwrap();
+        let mut demo = GravityOrbitsDemo::shared_test_system().unwrap();
+        let expected = DVec3::from_array(loaded.camera.position_body_m);
+        assert!((demo.camera.pose().position().local().metres() - expected).length() < 1e-8);
+        let orientation = glam::DQuat::from_array(loaded.camera.orientation_xyzw);
+        assert!(
+            demo.camera
+                .pose()
                 .orientation()
                 .quaternion()
-                .to_array()
-                .into_iter()
-                .zip(pose.orientation().quaternion().to_array())
-            {
-                assert!((a - b).abs() <= 1e-12);
-            }
-        };
-        demo.update(Duration::from_secs(36000));
-        assert_eq!(demo.system.revision(), revision);
-        assert_inspection_pose(demo.camera.pose());
-        assert_eq!(demo.motion.newtonian().unwrap().tick(), tick);
-        assert_eq!(demo.advance.unwrap().backlog_ticks, 0);
-        assert!(demo.motion.paused());
-        assert!(demo.gap_diagnostic.is_some());
-        demo.set_lifecycle_drawable(false);
-        demo.update(Duration::from_secs(36000));
-        demo.set_lifecycle_drawable(true);
-        demo.update(Duration::ZERO);
-        assert_inspection_pose(demo.camera.pose());
-        assert_eq!(demo.system.revision(), revision);
-        assert_eq!(demo.camera.mode(), CameraMode::SurfaceInspection);
-        demo.command(Command::Rate(1.0)).unwrap();
-        demo.command(Command::Pause(false)).unwrap();
-        demo.update(Duration::ZERO);
-        assert_eq!(demo.motion.newtonian().unwrap().tick(), tick);
-        demo.command(Command::Single(true)).unwrap();
-        demo.update(Duration::ZERO);
-        assert_eq!(demo.motion.newtonian().unwrap().tick(), tick + 1);
-        assert_inspection_pose(demo.camera.pose());
-        assert!(demo.projection.coherent_view(&demo.system).is_ok());
-        assert!(demo.diagnostic.is_none(), "{:?}", demo.diagnostic);
+                .dot(orientation)
+                .abs()
+                > 1.0 - 1e-14
+        );
+        let definition = demo
+            .system
+            .body(demo.ids[loaded.initial_body_index])
+            .unwrap()
+            .surface_definition()
+            .cloned();
+        demo.seek_seconds(15.0).unwrap();
+        demo.update(Duration::from_millis(16));
+        assert!((demo.camera.pose().position().local().metres() - expected).length() < 1e-8);
+        assert_eq!(
+            demo.system
+                .body(demo.ids[loaded.initial_body_index])
+                .unwrap()
+                .surface_definition()
+                .cloned(),
+            definition
+        );
     }
     #[test]
-    fn egui_wheel_and_keyboard_route_to_one_observer() {
-        let mut demo = GravityOrbitsDemo::new().unwrap();
-        let id = demo.ids[1];
-        demo.camera
-            .focus(
-                &demo.projection.coherent_view(&demo.system).unwrap(),
-                id,
-                false,
-                true,
-            )
-            .unwrap();
-        let before = demo.camera.clearance_m();
-        let context = egui::Context::default();
-        let raw = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(1280.0, 800.0),
-            )),
-            events: vec![
-                egui::Event::PointerMoved(egui::pos2(900.0, 500.0)),
-                egui::Event::MouseWheel {
-                    unit: egui::MouseWheelUnit::Line,
-                    delta: egui::vec2(0.0, 3.0),
-                    modifiers: egui::Modifiers::NONE,
-                },
-            ],
-            ..Default::default()
-        };
-        let (info, controls) = demo.ui_info(CelestialPreparationReport::default(), 0.1, 0.0);
-        let _ = context.run(raw, |ctx| draw_ui(ctx, controls, &info, &[]));
-        demo.update(Duration::from_millis(100));
-        assert!(demo.camera.clearance_m() < before);
-        assert_eq!(demo.camera.mode(), CameraMode::BodyOrbit);
-    }
-    #[test]
-    fn exact_requested_rate_matrix_sixty_accounted_seconds() {
-        for fixture in [GravityFixture::Hierarchy, GravityFixture::Circular] {
-            for rate in [1.0, 100.0, 1000.0, 10000.0, 100000.0, 1000000.0] {
-                let mut demo = GravityOrbitsDemo::create(fixture, 1, 1).unwrap();
-                demo.command(Command::Rate(rate)).unwrap();
-                demo.command(Command::Pause(false)).unwrap();
-                let started = Instant::now();
-                for _ in 0..3750 {
-                    demo.update(Duration::from_millis(16));
-                }
-                while demo.advance.unwrap().backlog_ticks > 0 {
-                    demo.update(Duration::ZERO);
-                }
-                let achieved = demo
-                    .metrics
-                    .measurement(fixture.fixed_step_s(), rate)
-                    .unwrap();
-                let authority = demo.system.sample_time().seconds_since_epoch();
-                let expected =
-                    (60.0 * rate / fixture.fixed_step_s()).floor() * fixture.fixed_step_s();
-                if rate * 0.016 / fixture.fixed_step_s() <= 512.0 {
-                    assert_eq!(authority, expected);
-                    assert_eq!(demo.advance.unwrap().rejected_simulation_seconds, 0.0);
-                } else {
-                    assert!(authority < expected);
-                    assert!(demo.advance.unwrap().rejected_simulation_seconds > 0.0);
-                }
-                assert_eq!(
-                    demo.motion.newtonian().unwrap().config().fixed_step_s(),
-                    fixture.fixed_step_s()
-                );
-                assert_eq!(demo.advance.unwrap().backlog_ticks, 0);
-                eprintln!(
-                    "exact fixture={fixture:?} requested={rate}x accounted_wall=60s achieved_window={}x window={}s authority={}s pending={} CPU_wall={}s",
-                    achieved.achieved_rate,
-                    achieved.window_s,
-                    authority,
-                    demo.advance.unwrap().backlog_ticks,
-                    started.elapsed().as_secs_f64()
-                );
-            }
+    fn analytic_frame_failure_retains_sampled_authority_and_last_published_time() {
+        let mut demo = GravityOrbitsDemo::shared_test_system().unwrap();
+        if let MotionSession::Analytic(a) = &mut demo.motion {
+            a.seek_seconds(42.5, &mut demo.system).unwrap();
         }
-    }
-    #[test]
-    fn long_gap_cancels_existing_debt_without_physical_or_camera_mutation() {
-        let mut demo = GravityOrbitsDemo::new().unwrap();
-        demo.command(Command::Pause(false)).unwrap();
-        demo.command(Command::Rate(1e6)).unwrap();
-        demo.update(Duration::from_millis(100));
-        assert!(demo.advance.unwrap().backlog_ticks > 0);
-        let states: Vec<_> = demo
+        let before = demo
             .system
             .bodies()
-            .map(|(id, b)| (id, b.clone()))
-            .collect();
+            .map(|(_, b)| b.clone())
+            .collect::<Vec<_>>();
         let revision = demo.system.revision();
-        let pose = demo.camera.pose();
-        demo.update(Duration::from_secs(36000));
+        let other =
+            crate::shared_system::SharedTestSystem::load_canonical(NonZeroU64::new(2).unwrap())
+                .unwrap()
+                .system;
+        demo.projection =
+            CelestialFrameProjection::build(&other, NonZeroU64::new(2).unwrap()).unwrap();
+        demo.publish();
+        assert!(!demo.coherent);
+        assert!(demo.motion.paused());
         assert_eq!(demo.system.revision(), revision);
+        assert_eq!(demo.system.sample_time().seconds_since_epoch(), 42.5);
         assert_eq!(
             demo.system
                 .bodies()
-                .map(|(id, b)| (id, b.clone()))
+                .map(|(_, b)| b.clone())
                 .collect::<Vec<_>>(),
-            states
+            before
         );
-        assert_eq!(demo.camera.pose(), pose);
-        assert!(demo.motion.paused());
-        assert_eq!(demo.advance.unwrap().backlog_ticks, 0);
-        assert!(demo.advance.unwrap().cancelled_simulation_seconds > 0.0);
-        assert!(demo.gap_diagnostic.is_some());
-        assert!(demo.metrics.measurement(60.0, 1e6).is_none());
-        demo.command(Command::Pause(false)).unwrap();
-        demo.update(Duration::ZERO);
-        assert_eq!(demo.system.revision(), revision);
-    }
-    #[test]
-    fn ordered_selection_focus_and_visual_history_preserve_identity_and_world() {
-        let mut demo = GravityOrbitsDemo::new().unwrap();
-        let id = demo.ids[2];
-        let revision = demo.system.revision();
-        demo.controls.pending.push_back(Command::Select(id));
-        demo.controls.pending.push_back(Command::Focus {
-            fixed: false,
-            fit: false,
-        });
-        demo.update(Duration::ZERO);
-        assert_eq!(demo.selection.selected(), Some(id));
-        assert_eq!(demo.camera.focused_body(), Some(id));
-        assert_eq!(demo.system.revision(), revision);
-        demo.prepare_visuals().unwrap();
-        assert_eq!(demo.trails.sample_count(), 1);
-        assert!(demo.curves[2].points.len() < 2);
-        assert!(demo.curves[5].points.len() >= 65);
-        assert_eq!(demo.system.revision(), revision);
-        demo.command(Command::Single(true)).unwrap();
-        demo.update(Duration::ZERO);
-        let ticks = demo.trails.retained_ticks();
-        demo.command(Command::TrailMode(true)).unwrap();
-        assert_eq!(demo.trails.retained_ticks(), ticks);
-        demo.prepare_visuals().unwrap();
-        assert_eq!(demo.system.revision(), revision + 1);
-    }
-    #[test]
-    fn commands_backlog_edits_seek_trails_focus_and_rebuild_are_coherent() {
-        let mut demo = GravityOrbitsDemo::new().unwrap();
-        let ids = demo.ids.clone();
-        demo.command(Command::Pause(false)).unwrap();
-        demo.command(Command::Rate(1000000.0)).unwrap();
-        demo.update(Duration::from_millis(100));
-        assert_eq!(demo.motion.newtonian().unwrap().tick(), 512);
-        assert!(demo.advance.unwrap().backlog_ticks > 0);
-        assert!(demo.projection.coherent_view(&demo.system).is_ok());
-        let state = *demo.system.body(ids[1]).unwrap().state();
-        let revision = demo.system.revision();
-        let history = demo.trails.retained_ticks();
-        assert!(demo.command(Command::Mass(f64::NAN)).is_err());
-        assert_eq!(demo.system.revision(), revision);
-        assert_eq!(demo.trails.retained_ticks(), history);
-        assert!(!demo.motion.paused());
-        demo.command(Command::Pause(true)).unwrap();
-        demo.command(Command::Focus {
-            fixed: false,
-            fit: true,
-        })
-        .unwrap();
-        assert_eq!(demo.system.revision(), revision);
-        demo.command(Command::Rebuild).unwrap();
-        assert_eq!(demo.ids, ids);
-        assert_eq!(demo.system.revision(), revision);
-        assert_eq!(demo.trails.retained_ticks(), history);
-        demo.command(Command::Mass(6e24)).unwrap();
-        assert!(demo.motion.paused());
-        assert_eq!(demo.motion.newtonian().unwrap().tick(), 0);
-        assert_eq!(*demo.system.body(ids[1]).unwrap().state(), state);
-        assert_eq!(demo.trails.sample_count(), 1);
-        demo.update(Duration::ZERO);
-        assert!(demo.projection.coherent_view(&demo.system).is_ok());
-        demo.command(Command::Seek(3000)).unwrap();
-        demo.update(Duration::ZERO);
-        assert!(demo.advance.unwrap().replay_remaining.is_some());
-        assert_eq!(demo.trails.sample_count(), 1);
-        demo.command(Command::CancelSeek).unwrap();
-        assert_eq!(demo.motion.newtonian().unwrap().tick(), 0);
-        demo.command(Command::Seek(3000)).unwrap();
-        while demo.seeking {
-            demo.update(Duration::ZERO);
-        }
-        assert_eq!(demo.motion.newtonian().unwrap().tick(), 3000);
-        assert_eq!(demo.trails.sample_count(), 1);
-        demo.command(Command::Reset).unwrap();
-        assert_eq!(demo.ids, ids);
-        assert_eq!(demo.motion.newtonian().unwrap().tick(), 0);
-        assert_eq!(*demo.system.body(ids[1]).unwrap().state(), state);
-        demo.command(Command::Load(GravityFixture::Circular))
-            .unwrap();
-        assert_ne!(demo.ids[0], ids[0]);
-        assert_eq!(demo.system.body_count(), 2);
-    }
-    #[test]
-    fn hidden_duration_and_numerical_error_record_no_fake_history() {
-        let mut demo = GravityOrbitsDemo::new().unwrap();
-        demo.command(Command::Pause(false)).unwrap();
-        demo.set_lifecycle_drawable(false);
-        demo.update(Duration::from_secs(1000000));
-        assert_eq!(demo.motion.newtonian().unwrap().tick(), 0);
-        demo.set_lifecycle_drawable(true);
-        demo.update(Duration::ZERO);
-        assert_eq!(demo.advance.unwrap().backlog_ticks, 0);
-        demo.command(Command::Load(GravityFixture::Circular))
-            .unwrap();
-        demo.command(Command::Velocity(-DVec3::X * 900000.0))
-            .unwrap();
-        demo.command(Command::Single(true)).unwrap();
-        demo.update(Duration::ZERO);
-        assert_eq!(demo.motion.newtonian().unwrap().tick(), 0);
-        assert_eq!(demo.trails.sample_count(), 1);
-        assert!(demo.diagnostic.is_some());
-        assert!(demo.projection.coherent_view(&demo.system).is_ok());
-    }
-    #[test]
-    fn repeated_single_steps_preserve_committed_trail_cadence() {
-        let mut demo = GravityOrbitsDemo::new().unwrap();
-        demo.command(Command::Load(GravityFixture::Circular))
-            .unwrap();
-        for _ in 0..16 {
-            demo.command(Command::Single(true)).unwrap();
-            demo.update(Duration::ZERO);
-        }
-        assert_eq!(demo.trails.retained_ticks(), [0, 8, 16]);
-        demo.command(Command::Single(false)).unwrap();
-        demo.update(Duration::ZERO);
-        assert_eq!(demo.trails.retained_ticks(), [15]);
-        demo.command(Command::Single(false)).unwrap();
-        demo.update(Duration::ZERO);
-        assert_eq!(demo.trails.retained_ticks(), [15]);
-    }
-    #[test]
-    fn seek_invalidates_trails_before_private_replay_and_cancel_retains_world() {
-        let mut demo = GravityOrbitsDemo::new().unwrap();
-        demo.command(Command::Load(GravityFixture::Circular))
-            .unwrap();
-        for _ in 0..16 {
-            demo.command(Command::Single(true)).unwrap();
-            demo.update(Duration::ZERO);
-        }
-        assert_eq!(demo.trails.sample_count(), 3);
-        let time = demo.system.sample_time();
-        let revision = demo.system.revision();
-        demo.command(Command::Seek(10000)).unwrap();
-        assert_eq!(demo.trails.retained_ticks(), [16]);
-        demo.command(Command::CancelSeek).unwrap();
-        assert_eq!(demo.system.sample_time(), time);
-        assert_eq!(demo.system.revision(), revision);
-    }
-    #[test]
-    fn radius_edit_updates_only_geometry_and_camera_navigation_envelope() {
-        let mut demo = GravityOrbitsDemo::new().unwrap();
-        demo.camera
-            .focus(
-                &demo.projection.coherent_view(&demo.system).unwrap(),
-                demo.ids[1],
-                false,
-                true,
-            )
-            .unwrap();
-        let state = *demo.system.body(demo.ids[1]).unwrap().state();
-        demo.command(Command::Radius(6.371e8)).unwrap();
-        demo.update(Duration::ZERO);
-        assert_eq!(*demo.system.body(demo.ids[1]).unwrap().state(), state);
-        assert!(demo.camera.distance_m() > 6.371e8);
-        assert!(
-            demo.diagnostic
-                .as_deref()
-                .unwrap()
-                .contains("only the observer")
-        );
-        assert!(demo.projection.coherent_view(&demo.system).is_ok());
-    }
-    #[test]
-    fn projection_failure_suppresses_drawing_and_reports_actual_paused_clock() {
-        let mut demo = GravityOrbitsDemo::new().unwrap();
-        let wrong = CelestialSystem::new(NonZeroU64::new(99).unwrap(), SimulationInstant::ZERO);
-        demo.projection =
-            CelestialFrameProjection::build(&wrong, NonZeroU64::new(99).unwrap()).unwrap();
-        demo.command(Command::Pause(false)).unwrap();
-        demo.update(Duration::from_millis(100));
+        assert_eq!(demo.motion_snapshot().published_time_s, 0.0);
+        assert!(demo.motion_snapshot().latest_failure.is_some());
+        demo.update(Duration::from_millis(16));
         assert!(!demo.coherent);
-        assert!(demo.motion.paused());
-        assert!(demo.advance.unwrap().forward_steps > 0);
-        assert_eq!(demo.advance.unwrap().status, PlaybackStatus::Paused);
-        assert_eq!(
-            demo.advance.unwrap().requested_time,
-            demo.system.sample_time()
-        );
-        let revision = demo.system.revision();
-        demo.command(Command::Rebuild).unwrap();
-        demo.update(Duration::ZERO);
-        assert!(demo.coherent);
         assert_eq!(demo.system.revision(), revision);
+        demo.command(Command::Rebuild).unwrap();
+        demo.publish();
+        assert!(demo.coherent);
+        assert_eq!(demo.motion_snapshot().published_time_s, 42.5);
+        assert!(demo.motion_snapshot().latest_failure.is_none());
+        assert!(demo.motion.paused());
     }
 }

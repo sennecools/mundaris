@@ -183,7 +183,15 @@ fn translating_orbit_queries_fixed_direction_and_guard_preserves_orientation() {
             < 1e-5
     );
     camera.enter_surface_inspection(&pair, body).unwrap();
+    camera.target_clearance(&pair, 100.0).unwrap();
+    let recorded = camera.recorded_terrain_clearance().unwrap();
+    let direct = terrain_clearance(&pair, camera.pose(), body)
+        .unwrap()
+        .unwrap();
+    assert!((recorded.clearance_m - 100.0).abs() < 1e-6);
+    assert!((recorded.clearance_m - direct.clearance_m).abs() < 1e-6);
     camera.target_clearance(&pair, 2.0).unwrap();
+    assert!((camera.recorded_terrain_clearance().unwrap().clearance_m - 2.0).abs() < 1e-6);
     camera.set_terrain_clearance_guard(Some(10.0)).unwrap();
     camera
         .update_navigation(

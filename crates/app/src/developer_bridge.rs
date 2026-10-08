@@ -280,7 +280,6 @@ fn parse_cli(args: &[String]) -> Result<Value> {
     let command = args[0].as_str();
     let mut registry = registry_default();
     let mut session_id = None;
-    let mut offscreen = false;
     let mut wait_timeout_s = 30.0;
     let mut wait_predicate = None;
     let mut positional = Vec::new();
@@ -302,7 +301,11 @@ fn parse_cli(args: &[String]) -> Result<Value> {
                         .clone(),
                 );
             }
-            "--offscreen" => offscreen = true,
+            "--offscreen" => {
+                bail!(
+                    "offscreen scenario rendering is disabled; use the shared native test solar system"
+                )
+            }
             "--timeout" => {
                 i += 1;
                 wait_timeout_s = args
@@ -326,15 +329,20 @@ fn parse_cli(args: &[String]) -> Result<Value> {
         return Ok(json!({"status":"ok","sessions":live}));
     }
     if command == "launch" {
-        let preset = positional
-            .first()
-            .ok_or_else(|| anyhow!("launch needs a preset"))?;
         let output = PathBuf::from(
             positional
-                .get(1)
+                .first()
                 .ok_or_else(|| anyhow!("launch needs an output directory"))?,
         );
-        let session = crate::developer_scenarios::launch_owned(preset, &registry, &output)?;
+        ensure!(
+            positional.len() == 1,
+            "launch accepts only an output directory"
+        );
+        let session = crate::developer_scenarios::launch_owned(
+            crate::developer_scenarios::SHARED_TEST_SYSTEM_PRESET,
+            &registry,
+            &output,
+        )?;
         return Ok(json!({"status":"ok","session":session}));
     }
     if command == "scenario" || command == "rebuild-replay" {
@@ -346,12 +354,8 @@ fn parse_cli(args: &[String]) -> Result<Value> {
             .map(PathBuf::from)
             .unwrap_or_else(|| fresh_output("target/developer-scenarios"));
         let result = if command == "scenario" {
-            if offscreen {
-                crate::developer_scenarios::run_offscreen(&scenario, &output)?
-            } else {
-                let session = select_session(&registry, session_id.as_deref())?;
-                crate::developer_scenarios::run_native(&session, &scenario, &output)?
-            }
+            let session = select_session(&registry, session_id.as_deref())?;
+            crate::developer_scenarios::run_native(&session, &scenario, &output)?
         } else {
             let session = select_session(&registry, session_id.as_deref())?;
             crate::developer_scenarios::rebuild_and_replay(&session, &scenario, &registry, &output)?
@@ -449,7 +453,7 @@ sessions | inspect | control acquire [OWNER] | control renew LEASE | control rel
 capabilities | diagnostics [terrain|performance|errors]\n\
 request [JSON|-|@FILE]\n\
 action LEASE [JSON|-] | receipt COMMAND_ID | events [AFTER_SEQUENCE] | capture LEASE NAME\n\
-wait [COMMAND_ID] [--predicate JSON] [--timeout SECONDS] | cancel LEASE | launch PRESET OUTPUT_DIR | stop | scenario [--offscreen] [JSON|-|@FILE] [OUTPUT_DIR]\n\
+wait [COMMAND_ID] [--predicate JSON] [--timeout SECONDS] | cancel LEASE | launch OUTPUT_DIR | stop | scenario [JSON|-|@FILE] [OUTPUT_DIR]\n\
 rebuild-replay [JSON|-|@FILE] [OUTPUT_DIR] | mcp\n\
 JSON action payloads use the tagged DevCommand schema; '-' reads stdin and @FILE reads a file.";
 
@@ -744,33 +748,31 @@ fn mcp_tools() -> Value {
             {"type":"object","properties":{"action":{"const":"navigation_mode"},"mode":{"enum":["system_orbit","overview","body_orbit","surface_horizon","surface_inspection","free_flight"]}},"required":["action","mode"],"additionalProperties":false},
             {"type":"object","properties":{"action":{"const":"navigation"},"drag":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"scroll_notches":{"type":"number"},"translation":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"speed_multiplier":{"type":"number","exclusiveMinimum":0},"boost_multiplier":{"type":"number","exclusiveMinimum":0},"duration_s":{"type":"number","minimum":0}},"required":["action"],"additionalProperties":false},
             {"type":"object","properties":{"action":{"const":"clearance"},"meters":{"type":"number","exclusiveMinimum":0}},"required":["action","meters"],"additionalProperties":false},
+            {"type":"object","properties":{"action":{"const":"surface_pose"},"body":{"type":"string","description":body_handle_description},"position_body_m":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"orientation_xyzw":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4}},"required":["action","body","position_body_m","orientation_xyzw"],"additionalProperties":false},
             {"type":"object","properties":{"action":{"const":"pause"},"paused":{"type":"boolean"}},"required":["action","paused"],"additionalProperties":false},
             {"type":"object","properties":{"action":{"const":"rate"},"multiplier":{"type":"number"}},"required":["action","multiplier"],"additionalProperties":false},
             {"type":"object","properties":{"action":{"const":"seek"},"seconds":{"type":"number"}},"required":["action","seconds"],"additionalProperties":false},
             {"type":"object","properties":{"action":{"const":"single_step"},"forward":{"type":"boolean"}},"required":["action"],"additionalProperties":false},
             {"type":"object","properties":{"action":{"const":"reset"}},"required":["action"],"additionalProperties":false},
+            {"type":"object","properties":{"action":{"const":"resident_cover_hold"},"enabled":{"type":"boolean"}},"required":["action","enabled"],"additionalProperties":false},
+            {"type":"object","properties":{"action":{"const":"cluster_rendering"},"mode":{"enum":["reference","culling","lod"]},"debug":{"enum":["lit","clusters","lod","residency"]},"triangle_edges":{"type":"boolean"},"cluster_edges":{"type":"boolean"},"freeze":{"type":"boolean"}},"required":["action","mode"],"additionalProperties":false},
             {"type":"object","properties":{"action":{"const":"render_mode"},"mode":{"type":"string"}},"required":["action","mode"],"additionalProperties":false},
-            {"type":"object","properties":{"action":{"const":"layer"},"layer":{"enum":["terrain","ocean","clouds","atmosphere","sky","markers","labels","trails","guides","patch_borders","lod_colors"]},"enabled":{"type":"boolean"}},"required":["action","layer","enabled"],"additionalProperties":false},
-            {"type":"object","properties":{"action":{"const":"sky_setting"},"setting":{"enum":["intensity","star_intensity","background_intensity","halo_strength","galactic_yaw_rad","galactic_roll_rad"]},"value":{"type":"number"}},"required":["action","setting","value"],"additionalProperties":false},
-            {"type":"object","properties":{"action":{"const":"gpu_tile"},"enabled":{"type":"boolean"},"family":{"enum":["rocky_v5","icy_v3","volcanic_v3"]},"seed":{"type":"integer","minimum":0},"radius_m":{"type":"number","exclusiveMinimum":0},"face":{"enum":["positive_x","negative_x","positive_y","negative_y","positive_z","negative_z"]},"level":{"type":"integer","minimum":0,"maximum":30},"x":{"type":"integer","minimum":0},"y":{"type":"integer","minimum":0},"cells":{"type":"integer","minimum":1,"maximum":128},"revision":{"type":"integer","minimum":0}},"required":["action","enabled"],"additionalProperties":false},
-            {"type":"object","properties":{"action":{"const":"gpu_tile_view"},"mode":{"type":"integer","minimum":0,"maximum":10},"camera_offset_m":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"sun_direction_body":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"reference_cpu":{"type":"boolean"}},"required":["action"],"additionalProperties":false},
-            {"type":"object","properties":{"action":{"const":"gpu_hierarchy"},"enabled":{"type":"boolean"},"refine":{"type":"boolean"},"morph_duration_ms":{"type":"integer","minimum":0,"maximum":10000},"child_delays_ms":{"type":"array","items":{"type":"integer","minimum":0,"maximum":5000},"minItems":4,"maxItems":4},"request_mask":{"type":"integer","minimum":0,"maximum":15},"cancel_pending":{"type":"boolean"},"diagnostic_validate":{"type":"boolean"}},"required":["action","enabled"],"additionalProperties":false},
-            {"type":"object","properties":{"action":{"const":"gpu_regional"},"enabled":{"type":"boolean"},"max_depth":{"type":"integer","minimum":1,"maximum":4},"gpu_slots":{"type":"integer","minimum":5,"maximum":512},"cpu_tiles":{"type":"integer","minimum":5,"maximum":1024},"worker_count":{"type":"integer","minimum":1,"maximum":8},"worker_delay_ms":{"type":"integer","minimum":0,"maximum":5000},"upload_tiles_per_frame":{"type":"integer","minimum":1,"maximum":16},"upload_bytes_per_frame":{"type":"integer","minimum":1,"maximum":67108864},"publication_groups_per_frame":{"type":"integer","minimum":1,"maximum":8},"transition_limit":{"type":"integer","minimum":1,"maximum":16},"morph_duration_ms":{"type":"integer","minimum":0,"maximum":10000},"split_error_px":{"type":"number","exclusiveMinimum":0},"merge_error_px":{"type":"number","exclusiveMinimum":0}},"required":["action","enabled"],"additionalProperties":false}
+            {"type":"object","properties":{"action":{"const":"layer"},"layer":{"enum":["terrain","markers","labels","trails","guides","patch_borders","lod_colors"]},"enabled":{"type":"boolean"}},"required":["action","layer","enabled"],"additionalProperties":false}
         ]
     });
     let mut tools = json!([
       {"name":"mundaris_sessions","description":"List live Mundaris development sessions.","inputSchema":{"type":"object","properties":{"registry":{"type":"string"}},"additionalProperties":false}},
       {"name":"mundaris_capabilities","description":"Read protocol and action capabilities for a live session.","inputSchema":{"type":"object","properties":{"session":{"type":"string"}},"additionalProperties":false}},
       {"name":"mundaris_inspect","description":"Read the current coherent developer snapshot.","inputSchema":{"type":"object","properties":{"session":{"type":"string"}},"additionalProperties":false}},
-      {"name":"mundaris_diagnostics","description":"Read bounded terrain, performance, or error diagnostics.","inputSchema":{"type":"object","properties":{"session":{"type":"string"},"scope":{"enum":["terrain","performance","errors"]}},"additionalProperties":false}},
+      {"name":"mundaris_diagnostics","description":"Read bounded terrain, performance, errors, or explicitly run an expensive submitted-mesh accuracy pass.","inputSchema":{"type":"object","properties":{"session":{"type":"string"},"scope":{"enum":["terrain","performance","errors","accuracy"]}},"additionalProperties":false}},
       {"name":"mundaris_control","description":"Acquire, renew, release, or cancel the session control lease. A lease lasts 30 seconds; renew it before expiry to keep control.","inputSchema":{"type":"object","oneOf":[{"properties":{"session":{"type":"string"},"operation":{"const":"acquire"},"owner":{"type":"string"}},"required":["operation"],"additionalProperties":false},{"properties":{"session":{"type":"string"},"operation":{"enum":["renew","release","cancel"]},"lease":{"type":"string"}},"required":["operation","lease"],"additionalProperties":false}]}},
       {"name":"mundaris_action","description":"Submit one typed engine action under a control lease.","inputSchema":{"type":"object","properties":{"session":{"type":"string"},"lease":{"type":"string"},"command":action_schema},"required":["lease","command"],"additionalProperties":false}},
       {"name":"mundaris_receipt","description":"Read one command receipt by its command id.","inputSchema":{"type":"object","properties":{"session":{"type":"string"},"command_id":{"type":"string"}},"required":["command_id"],"additionalProperties":false}},
       {"name":"mundaris_capture","description":"Request a paired native capture and return its image and evidence paths.","inputSchema":{"type":"object","properties":{"session":{"type":"string"},"lease":{"type":"string"},"name":{"type":"string"}},"required":["lease","name"],"additionalProperties":false}},
       {"name":"mundaris_wait","description":"Wait up to 30 seconds for a command receipt and/or snapshot predicate.","inputSchema":{"type":"object","properties":{"session":{"type":"string"},"command_id":{"type":"string"},"timeout_s":{"type":"number","minimum":0,"maximum":30,"description":"Maximum wait duration in seconds (0 to 30)."},"predicate":{"type":"object","description":"Snapshot condition. Example: {\"path\":\"general.frame_number\",\"at_least\":3}.","properties":{"path":{"type":"string","description":"Nonempty dotted snapshot path, such as general.frame_number."},"equals":{},"not_equals":{},"at_least":{"type":"number"},"at_most":{"type":"number"}},"required":["path"],"additionalProperties":false}},"anyOf":[{"required":["command_id"]},{"required":["predicate"]}],"additionalProperties":false}},
       {"name":"mundaris_events","description":"Read bounded recent command and diagnostic events.","inputSchema":{"type":"object","properties":{"session":{"type":"string"},"after":{"type":"integer","minimum":0}},"additionalProperties":false}},
-      {"name":"mundaris_scenarios","description":"Run a serialized scenario natively or offscreen, or rebuild and replay it.","inputSchema":{"type":"object","properties":{"session":{"type":"string"},"scenario":{"type":"object"},"output_directory":{"type":"string"},"rebuild_replay":{"type":"boolean"},"offscreen":{"type":"boolean"}},"required":["scenario"],"additionalProperties":false}},
-      {"name":"mundaris_ownedlifecycle","description":"Launch an owned native session or stop a selected owned session.","inputSchema":{"type":"object","properties":{"operation":{"enum":["launch","stop"]},"session":{"type":"string"},"preset":{"enum":["solar-system","real-solar-system","gravity-orbits"]},"output_directory":{"type":"string"},"registry":{"type":"string"}},"required":["operation"],"additionalProperties":false}}
+      {"name":"mundaris_scenarios","description":"Run a serialized scenario against the shared native test solar system or rebuild and replay it.","inputSchema":{"type":"object","properties":{"session":{"type":"string"},"scenario":{"type":"object"},"output_directory":{"type":"string"},"rebuild_replay":{"type":"boolean"}},"required":["scenario"],"additionalProperties":false}},
+      {"name":"mundaris_ownedlifecycle","description":"Launch the shared native test solar system or stop a selected owned session.","inputSchema":{"type":"object","properties":{"operation":{"enum":["launch","stop"]},"session":{"type":"string"},"output_directory":{"type":"string"},"registry":{"type":"string"}},"required":["operation"],"additionalProperties":false}}
     ]);
     for tool in tools.as_array_mut().expect("tool list") {
         let schema = &mut tool["inputSchema"];
@@ -818,9 +820,7 @@ fn mcp_tool_call(
             .unwrap_or_else(|| fresh_output("target/developer-owned"));
         let result = if operation == "launch" {
             crate::developer_scenarios::launch_owned_cancellable(
-                args.get("preset")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow!("missing preset"))?,
+                crate::developer_scenarios::SHARED_TEST_SYSTEM_PRESET,
                 &registry,
                 &output,
                 cancelled,
@@ -846,19 +846,6 @@ fn mcp_tool_call(
             .map(PathBuf::from)
             .unwrap_or_else(|| fresh_output("target/developer-scenarios"));
         let result = if args
-            .get("offscreen")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            ensure!(
-                !args
-                    .get("rebuild_replay")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                "offscreen and rebuild_replay cannot be combined"
-            );
-            crate::developer_scenarios::run_offscreen_cancellable(&scenario, &output, cancelled)?
-        } else if args
             .get("rebuild_replay")
             .and_then(Value::as_bool)
             .unwrap_or(false)

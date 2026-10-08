@@ -1,0 +1,114 @@
+{
+  "schema": 1,
+  "id": "test-solar-system",
+  "initial_body": "moon",
+  "camera_state": "camera.json",
+  "bodies": [
+    {
+      "id": "sol",
+      "name": "Sol",
+      "identity": 1,
+      "mass_kg": 1.98847e+26,
+      "radius_m": 800000.0,
+      "color": [
+        1.0,
+        0.83,
+        0.48,
+        1.0
+      ],
+      "unlit": true,
+      "translation": {
+        "kind": "Stationary",
+        "position_m": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "spin_axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "spin_orientation_xyzw": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "spin_radians_per_second": 0.0,
+      "terrain": null
+    },
+    {
+      "id": "moon",
+      "name": "Moon",
+      "identity": 2,
+      "mass_kg": 7.342e+20,
+      "radius_m": 109081.77680113012,
+      "color": [
+        0.52,
+        0.52,
+        0.52,
+        1.0
+      ],
+      "unlit": false,
+      "translation": {
+        "kind": "Elliptic",
+        "reference": "sol",
+        "semi_major_axis_m": 24000000.0,
+        "eccentricity": 0.0,
+        "period_s": 120000.0,
+        "inclination_radians": 0.089,
+        "phase_radians": 1.2
+      },
+      "spin_axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "spin_orientation_xyzw": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "spin_radians_per_second": 0.0002,
+      "terrain": "terrain/moon.json"
+    },
+    {
+      "id": "rust",
+      "name": "Rust",
+      "identity": 3,
+      "mass_kg": 8e+20,
+      "radius_m": 140000.0,
+      "color": [
+        0.6,
+        0.3,
+        0.16,
+        1.0
+      ],
+      "unlit": false,
+      "translation": {
+        "kind": "Stationary",
+        "position_m": [
+          50000000.0,
+          12000000.0,
+          0.0
+        ]
+      },
+      "spin_axis": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "spin_orientation_xyzw": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "spin_radians_per_second": -0.00015,
+      "terrain": "terrain/rust.json"
+    }
+  ]
+}

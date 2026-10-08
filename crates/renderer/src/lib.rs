@@ -8,12 +8,16 @@
 mod celestial;
 mod celestial_lines;
 mod celestial_view;
+pub mod cluster;
+mod cluster_gpu;
+pub mod cluster_region;
+mod cluster_runtime;
 mod debug;
+pub mod field_compute;
 mod gpu_profile;
 #[cfg(feature = "developer-tools")]
 pub mod native_capture;
 pub mod planet_surface;
-mod planetary;
 pub mod regional_edges;
 pub mod regional_resident;
 pub mod resident_hierarchy;
@@ -25,14 +29,17 @@ mod view;
 pub use celestial::*;
 pub use celestial_lines::{CelestialLineStyle, CelestialPolyline, PolylinePreparationReport};
 pub use celestial_view::*;
+pub use cluster::{ClusterDebug, ClusterMode, ClusterReport, ClusterSettings};
 pub use debug::{DebugFrame, DebugLine, DebugProjection, DebugStaging};
-pub use gpu_profile::{CpuUploadProfile, GpuProfile, TimestampAvailability};
-pub use planetary::{PlanetLandProfile, PlanetaryConfig};
+pub use gpu_profile::{
+    CpuUploadProfile, GpuProfile, TimestampAvailability, TimestampProfilingMetrics,
+};
 pub use regional_resident::*;
 pub use resident_hierarchy::{HierarchyVertex, ResidentHierarchyDraw, ResidentHierarchyReport};
 pub use resident_tile::{
-    ReconstructedTileVertex, ResidentTileReport, TILE_FILTER_VERSION, TILE_FORMAT_VERSION,
-    TileData, TileDraw, TileGeometryError, TileKey, TilePublicationToken, TileSlotState, TileTexel,
+    ReconstructedTileVertex, ResidentMaterialAppearance, ResidentTileReport, TILE_FILTER_VERSION,
+    TILE_FORMAT_VERSION, TileData, TileDraw, TileGeometryError, TileKey, TilePublicationToken,
+    TileSlotState, TileTexel,
 };
 pub use view::*;
 
@@ -100,8 +107,24 @@ impl Default for RenderOutcome {
     }
 }
 
+/// Nonoverlapping CPU wall scopes for native rendering; scene encoding includes
+/// resident preparation. Submission IDs associate these scopes with GPU samples.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct NativeRenderTimings {
+    pub poll_ms: f64,
+    pub acquire_ms: f64,
+    pub ui_prepare_ms: f64,
+    /// Includes resident preparation and native scene command encoding.
+    pub scene_encode_ms: f64,
+    pub ui_encode_ms: f64,
+    pub submit_ms: f64,
+    pub present_ms: f64,
+    pub total_ms: f64,
+}
+
 /// Owns the native presentation surface, GPU device, and minimal egui integration.
 pub struct Renderer {
+    cluster_settings: ClusterSettings,
     _instance: wgpu::Instance,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -118,6 +141,7 @@ pub struct Renderer {
     timestamp_slot: Option<gpu_profile::AsyncTimestampSlot>,
     last_render_outcome: RenderOutcome,
     submission_id: u64,
+    native_render_timings: NativeRenderTimings,
     #[cfg(feature = "developer-tools")]
     surface_copy_src_supported: bool,
     #[cfg(feature = "developer-tools")]
@@ -127,6 +151,16 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    /// CPU wall scopes for the latest submitted native frame; GPU times are separate.
+    pub fn native_render_timings(&self) -> NativeRenderTimings {
+        self.native_render_timings
+    }
+
+    /// Effective surface configuration, including developer measurement overrides.
+    pub fn presentation_mode(&self) -> wgpu::PresentMode {
+        self.surface_config.present_mode
+    }
+
     pub fn pixels_per_point(&self) -> f32 {
         self.egui_context.pixels_per_point()
     }
@@ -156,6 +190,14 @@ impl Renderer {
             .and_then(gpu_profile::AsyncTimestampSlot::latest_submission_id)
     }
 
+    /// Low-cost accounting for explicit requests, query reservations, readback,
+    /// and their source submission IDs.
+    pub fn timestamp_profiling_metrics(&self) -> TimestampProfilingMetrics {
+        self.timestamp_slot
+            .as_ref()
+            .map_or_else(Default::default, gpu_profile::AsyncTimestampSlot::metrics)
+    }
+
     /// Suppress automatic new timestamp queries while developer diagnostics are idle.
     /// Any query already in flight continues to be polled without waiting.
     #[cfg(feature = "developer-tools")]
@@ -171,6 +213,9 @@ impl Renderer {
             return false;
         }
         self.developer_timestamp_gate.request();
+        if let Some(slot) = &mut self.timestamp_slot {
+            slot.record_explicit_request();
+        }
         true
     }
 
@@ -203,6 +248,22 @@ impl Renderer {
         self.celestial
             .as_ref()
             .map_or_else(Default::default, |r| r.last_resident_regional_report())
+    }
+    pub fn set_cluster_settings(&mut self, settings: ClusterSettings) {
+        self.cluster_settings = settings;
+    }
+    pub fn cluster_report(&self) -> ClusterReport {
+        self.celestial
+            .as_ref()
+            .map_or_else(Default::default, |r| r.cluster_report())
+    }
+    /// Lazily clone the actually submitted retained terrain for an explicit accuracy pass.
+    #[cfg(feature = "developer-tools")]
+    pub fn last_submitted_regional_draw(&self) -> Option<(RegionalResidentDraw, Vec<usize>, bool)> {
+        if !matches!(self.last_render_outcome(), RenderOutcome::Submitted { .. }) {
+            return None;
+        }
+        self.celestial.as_ref()?.last_submitted_regional_draw()
     }
     /// Explicit diagnostic readback for one regional patch.
     pub fn validate_resident_regional(
@@ -318,6 +379,11 @@ impl Renderer {
             .first()
             .copied()
             .ok_or(RendererError::NoSurfaceAlphaModes)?;
+        let uncapped = cfg!(feature = "developer-tools")
+            && std::env::var("MUNDARIS_UNCAPPED").is_ok_and(|value| value == "1");
+        let present_mode =
+            gpu_profile::select_present_mode(&surface_capabilities.present_modes, uncapped);
+        let desired_maximum_frame_latency = 2;
         let window_size = window.inner_size();
         let suspended = window_size.width == 0 || window_size.height == 0;
         let surface_config = wgpu::SurfaceConfiguration {
@@ -325,8 +391,8 @@ impl Renderer {
             format,
             width: window_size.width.max(1),
             height: window_size.height.max(1),
-            present_mode: wgpu::PresentMode::Fifo,
-            desired_maximum_frame_latency: 2,
+            present_mode,
+            desired_maximum_frame_latency,
             alpha_mode,
             view_formats: vec![],
         };
@@ -349,7 +415,10 @@ impl Renderer {
         info!(
             adapter = %adapter_info.name,
             backend = ?adapter_info.backend,
-            "GPU adapter initialized"
+            supported_present_modes = ?surface_capabilities.present_modes,
+            selected_present_mode = ?present_mode,
+            desired_maximum_frame_latency,
+            "GPU adapter and presentation initialized"
         );
 
         let timestamp_slot = gpu_profile::AsyncTimestampSlot::new(&device);
@@ -366,10 +435,12 @@ impl Renderer {
             suspended,
             debug: None,
             celestial: None,
+            cluster_settings: ClusterSettings::default(),
             timestamp_availability,
             timestamp_slot,
             last_render_outcome: RenderOutcome::default(),
             submission_id: 0,
+            native_render_timings: NativeRenderTimings::default(),
             #[cfg(feature = "developer-tools")]
             surface_copy_src_supported,
             #[cfg(feature = "developer-tools")]
@@ -485,6 +556,8 @@ impl Renderer {
         celestial_frame: Option<&CelestialFrame<'_, '_, '_>>,
         ui: impl FnMut(&egui::Context),
     ) -> Result<(), RendererError> {
+        let render_clock = std::time::Instant::now();
+        self.native_render_timings = NativeRenderTimings::default();
         self.last_render_outcome = RenderOutcome::Skipped(RenderSkipReason::PreparationFailed);
         if self.suspended {
             self.last_render_outcome = RenderOutcome::Skipped(RenderSkipReason::Suspended);
@@ -507,12 +580,29 @@ impl Renderer {
                 .as_mut()
                 .is_some_and(|slot| slot.available());
         #[cfg(feature = "developer-tools")]
+        let timestamp_wanted = self
+            .developer_timestamp_gate
+            .wants_sample(celestial_frame.is_some());
+        #[cfg(feature = "developer-tools")]
         let timestamp_active = self
             .developer_timestamp_gate
             .begin_if_idle(celestial_frame.is_some(), timestamp_slot_idle);
         #[cfg(not(feature = "developer-tools"))]
-        let timestamp_active = celestial_frame.is_some() && timestamp_slot_idle;
+        let timestamp_wanted = celestial_frame.is_some();
+        #[cfg(not(feature = "developer-tools"))]
+        let timestamp_active = timestamp_wanted && timestamp_slot_idle;
 
+        if timestamp_wanted && let Some(slot) = &mut self.timestamp_slot {
+            slot.record_eligible_frame();
+            if timestamp_slot_idle {
+                slot.record_accepted_reservation();
+            } else {
+                slot.record_busy_skip(self.submission_id.checked_add(1));
+            }
+        }
+
+        self.native_render_timings.poll_ms = render_clock.elapsed().as_secs_f64() * 1000.0;
+        let acquire_clock = std::time::Instant::now();
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
             Err(SurfaceError::Lost) => {
@@ -541,6 +631,9 @@ impl Renderer {
                 return Ok(());
             }
         };
+
+        self.native_render_timings.acquire_ms = acquire_clock.elapsed().as_secs_f64() * 1000.0;
+        let ui_clock = std::time::Instant::now();
 
         let Some(submission_id) = self.submission_id.checked_add(1) else {
             self.last_render_outcome =
@@ -602,6 +695,8 @@ impl Renderer {
             None
         };
 
+        self.native_render_timings.ui_prepare_ms = ui_clock.elapsed().as_secs_f64() * 1000.0;
+        let scene_clock = std::time::Instant::now();
         if let Some(frame) = debug_frame {
             let debug = self.debug.get_or_insert_with(|| {
                 debug::DebugRenderer::new(
@@ -628,6 +723,7 @@ impl Renderer {
                     self.surface_config.height,
                 )
             });
+            celestial.set_cluster_settings(self.cluster_settings);
             let draw_result = celestial.draw(
                 &self.device,
                 &self.queue,
@@ -648,6 +744,8 @@ impl Renderer {
             }
         }
 
+        self.native_render_timings.scene_encode_ms = scene_clock.elapsed().as_secs_f64() * 1000.0;
+        let ui_encode_clock = std::time::Instant::now();
         {
             let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Mundaris frame clear and editor UI"),
@@ -701,6 +799,8 @@ impl Renderer {
         if timestamp_active && let Some(slot) = &self.timestamp_slot {
             slot.resolve(&mut encoder);
         }
+        self.native_render_timings.ui_encode_ms = ui_encode_clock.elapsed().as_secs_f64() * 1000.0;
+        let submit_clock = std::time::Instant::now();
         self.queue.submit(
             frame_start
                 .into_iter()
@@ -718,9 +818,13 @@ impl Renderer {
             #[cfg(feature = "developer-tools")]
             self.developer_timestamp_gate.submitted();
         }
+        self.native_render_timings.submit_ms = submit_clock.elapsed().as_secs_f64() * 1000.0;
+        let present_clock = std::time::Instant::now();
         // Wayland uses this notification to coordinate compositor frame callbacks.
         self.window.pre_present_notify();
         frame.present();
+        self.native_render_timings.present_ms = present_clock.elapsed().as_secs_f64() * 1000.0;
+        self.native_render_timings.total_ms = render_clock.elapsed().as_secs_f64() * 1000.0;
         self.last_render_outcome = RenderOutcome::Submitted {
             submission_id,
             presentation_requested: true,

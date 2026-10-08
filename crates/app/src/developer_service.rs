@@ -543,7 +543,7 @@ impl DeveloperService {
         let (status, data) = match &request.operation {
             DevOperation::Capabilities => (
                 "ok",
-                json!({"protocol_version":PROTOCOL_VERSION,"queue_capacity":REQUEST_CAPACITY,"applications_per_turn":COMMANDS_PER_TURN,"history_capacity":HISTORY_CAPACITY,"lease_seconds":LEASE_SECONDS,"native_capture":"on_demand_surface_copy","presets":["solar-system","real-solar-system","gravity-orbits"],"actions":["select","focus","overview","look_at","navigation_mode","navigation","clearance","pause","rate","seek","single_step","reset","render_mode","layer","sky_setting","gpu_tile","gpu_tile_view","gpu_hierarchy"]}),
+                json!({"protocol_version":PROTOCOL_VERSION,"queue_capacity":REQUEST_CAPACITY,"applications_per_turn":COMMANDS_PER_TURN,"history_capacity":HISTORY_CAPACITY,"lease_seconds":LEASE_SECONDS,"native_capture":"on_demand_surface_copy","presets":["test-solar-system"],"actions":["profiler","select","focus","overview","look_at","navigation_mode","navigation","clearance","surface_pose","pause","rate","seek","single_step","reset","render_mode","layer","resident_cover_hold","cluster_rendering"]}),
             ),
             DevOperation::Inspect => {
                 let mut snapshot = self.current_observation(drawable, demo.world().revision());
@@ -559,6 +559,13 @@ impl DeveloperService {
                 let observed = self.current_observation(drawable, demo.world().revision());
                 let s = observed.as_ref();
                 match scope.as_str() {
+                    "accuracy" => match demo.developer_accuracy(renderer) {
+                        Ok(accuracy) => (
+                            "ok",
+                            json!({"accuracy":accuracy,"timing_scope":"explicit_accuracy_pass_excluded_from_clean_replays"}),
+                        ),
+                        Err(error) => ("failed", json!({"error":error.to_string()})),
+                    },
                     "terrain" => (
                         "ok",
                         json!({"terrain":s.map(|s|&s.terrain),"resident_tile":s.and_then(|s|s.resident_tile.as_ref()),"resident_hierarchy":s.and_then(|s|s.resident_hierarchy.as_ref()),"work":s.map(|s|&s.work),"memory":s.map(|s|&s.memory),"freshness":s.and_then(|s|s.development.as_ref())}),

@@ -92,6 +92,7 @@ fn regional_shader_matches_cpu_and_keeps_adjacent_edges_watertight() {
             body_to_view: DMat3::IDENTITY,
             mode: 2,
             sun_body: DVec3::Z,
+            appearance: Default::default(),
         })
         .collect();
 
@@ -218,6 +219,7 @@ fn regional_shader_matches_cpu_and_keeps_adjacent_edges_watertight() {
         body_to_view,
         mode: 2,
         sun_body: DVec3::Z,
+        appearance: Default::default(),
     };
     let child_draw = TileDraw {
         tile: Arc::clone(&selected_child),
@@ -232,6 +234,7 @@ fn regional_shader_matches_cpu_and_keeps_adjacent_edges_watertight() {
         body_to_view,
         mode: 2,
         sun_body: DVec3::Z,
+        appearance: Default::default(),
     };
     let child_coarse_boundary = mundaris_renderer::regional_edges::subdivided_parent_boundary(
         &parent_tile,

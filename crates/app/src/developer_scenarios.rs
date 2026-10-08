@@ -25,9 +25,8 @@ const MAX_WAIT_SECONDS: f64 = 300.0;
 const MAX_ACTION_SECONDS: f64 = 60.0;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_BUILD_DURATION: Duration = Duration::from_secs(30 * 60);
-const DEFAULT_WIDTH: u32 = 960;
-const DEFAULT_HEIGHT: u32 = 640;
 const OUTPUT_CLAIM_FILE: &str = ".mundaris-scenario-claim";
+pub const SHARED_TEST_SYSTEM_PRESET: &str = "test-solar-system";
 
 static OWNED_CHILDREN: OnceLock<Mutex<HashMap<u32, Child>>> = OnceLock::new();
 
@@ -121,11 +120,8 @@ impl Scenario {
             self.schema
         );
         ensure!(
-            matches!(
-                self.preset.as_str(),
-                "solar-system" | "real-solar-system" | "gravity-orbits" | "gravity-hierarchy"
-            ),
-            "unsupported preset {:?}",
+            self.preset == SHARED_TEST_SYSTEM_PRESET,
+            "unsupported preset {:?}; only {SHARED_TEST_SYSTEM_PRESET:?} is available",
             self.preset
         );
         ensure!(!self.steps.is_empty(), "scenario has no steps");
@@ -305,11 +301,8 @@ pub fn launch_owned_cancellable(
 ) -> Result<SessionDescriptor> {
     check_cancelled(cancelled)?;
     ensure!(
-        matches!(
-            preset,
-            "solar-system" | "real-solar-system" | "gravity-orbits" | "gravity-hierarchy"
-        ),
-        "unsupported preset {preset:?}"
+        preset == SHARED_TEST_SYSTEM_PRESET,
+        "unsupported preset {preset:?}; only {SHARED_TEST_SYSTEM_PRESET:?} is available"
     );
     let registry = absolute_from_cwd(registry)?;
     let output = absolute_from_cwd(output)?;
@@ -387,15 +380,9 @@ pub fn launch_owned_cancellable(
     build_manifest["immutable_executable"] = json!(immutable_exe.display().to_string());
     let build_manifest_path = output.join("build-manifest.json");
     write_json(build_manifest_path.clone(), &build_manifest)?;
-    let command_arg = match preset {
-        "gravity-hierarchy" | "gravity-orbits" => "--gravity-orbits",
-        "real-solar-system" => "--real-solar-system",
-        _ => "--solar-system",
-    };
     let mut command = Command::new(&immutable_exe);
     command
         .current_dir(&repo)
-        .arg(command_arg)
         .arg("--dev-interface")
         .env("MUNDARIS_DEV_REGISTRY", &registry)
         .env("MUNDARIS_DEV_OUTPUT", &output)
@@ -564,7 +551,7 @@ pub fn run_native_cancellable(
     check_cancelled(cancelled)?;
     scenario.validate()?;
     ensure!(
-        normalize_preset(&session.preset) == normalize_preset(&scenario.preset),
+        session.preset == scenario.preset,
         "scenario preset does not match owned session"
     );
     let output = absolute_from_cwd(output)?;
@@ -583,16 +570,8 @@ pub fn run_offscreen_cancellable(
     cancelled: Option<&AtomicBool>,
 ) -> Result<Value> {
     check_cancelled(cancelled)?;
-    scenario.validate()?;
-    ensure!(
-        scenario.deterministic,
-        "offscreen repeat requires a scenario declared deterministic"
-    );
-    let output = absolute_from_cwd(output)?;
-    create_fresh_dir(&output)?;
-    check_cancelled(cancelled)?;
-    let mut host = OffscreenHost::new(&scenario.preset)?;
-    execute_scenario(&mut host, scenario, &output, cancelled)
+    let _ = (scenario, output);
+    bail!("offscreen scenario rendering is disabled; run the shared native test-solar-system scene")
 }
 
 trait ScenarioHost {
@@ -908,123 +887,6 @@ fn fresh_at(snapshot: &Value, minimum_sequence: u64) -> bool {
             .is_some_and(|sequence| sequence >= minimum_sequence)
 }
 
-struct OffscreenHost {
-    demo: crate::GravityOrbitsDemo,
-    latest: crate::developer_capture::DeveloperCapture,
-    handles: HashMap<String, String>,
-    session_id: String,
-    elapsed_frames: u64,
-}
-
-impl OffscreenHost {
-    fn new(preset: &str) -> Result<Self> {
-        let mut demo = make_demo(preset)?;
-        let session_id = format!("offscreen-{}-{}", std::process::id(), timestamp_nonce());
-        demo.developer_set_session(&session_id);
-        let inventory = demo.developer_inventory(&session_id)?;
-        let latest =
-            demo.developer_offscreen_frame(Duration::ZERO, DEFAULT_WIDTH, DEFAULT_HEIGHT)?;
-        Ok(Self {
-            demo,
-            latest,
-            handles: body_handles(&inventory)?,
-            session_id,
-            elapsed_frames: 0,
-        })
-    }
-
-    fn advance(&mut self, frames: u64, cancelled: Option<&AtomicBool>) -> Result<()> {
-        for _ in 0..frames {
-            check_cancelled(cancelled)?;
-            self.latest = self.demo.developer_offscreen_frame(
-                Duration::from_nanos(16_666_667),
-                DEFAULT_WIDTH,
-                DEFAULT_HEIGHT,
-            )?;
-            self.elapsed_frames += 1;
-        }
-        Ok(())
-    }
-}
-
-impl ScenarioHost for OffscreenHost {
-    fn resolve_command(&self, command: DevCommand) -> Result<DevCommand> {
-        resolve_command(command, &self.handles)
-    }
-
-    fn action(
-        &mut self,
-        command: DevCommand,
-        duration_s: f64,
-        cancelled: Option<&AtomicBool>,
-    ) -> Result<Value> {
-        check_cancelled(cancelled)?;
-        self.demo.developer_apply_command(&command)?;
-        let frames = ((duration_s * 60.0).ceil() as u64).max(1);
-        self.advance(frames, cancelled)?;
-        Ok(
-            json!({"command":command,"fixed_steps":frames,"fixed_step_elapsed_s":self.elapsed_frames as f64 / 60.0}),
-        )
-    }
-
-    fn observe(
-        &mut self,
-        predicate: &Predicate,
-        timeout_s: f64,
-        cancelled: Option<&AtomicBool>,
-    ) -> Result<Value> {
-        let deadline = (timeout_s * 60.0).ceil() as u64;
-        for checked in 0..=deadline {
-            check_cancelled(cancelled)?;
-            let snapshot = serde_json::to_value(&self.latest.snapshot)?;
-            if predicate_matches(&snapshot, predicate)? {
-                return Ok(snapshot);
-            }
-            if checked < deadline {
-                self.advance(1, cancelled)?;
-            }
-        }
-        bail!("offscreen wait predicate timed out: {}", predicate.path)
-    }
-
-    fn capture(
-        &mut self,
-        name: &str,
-        output: &Path,
-        cancelled: Option<&AtomicBool>,
-    ) -> Result<Value> {
-        check_cancelled(cancelled)?;
-        let metadata = self
-            .latest
-            .snapshot
-            .capture
-            .as_mut()
-            .context("offscreen frame lacks capture metadata")?;
-        metadata.scene = name.to_owned();
-        metadata.image = format!("{name}.png");
-        crate::developer_capture::write_pair(output, &self.latest)?;
-        check_cancelled(cancelled)?;
-        self.latest =
-            self.demo
-                .developer_offscreen_frame(Duration::ZERO, DEFAULT_WIDTH, DEFAULT_HEIGHT)?;
-        Ok(
-            json!({"image":format!("{name}.png"),"fixed_step_elapsed_s":self.elapsed_frames as f64 / 60.0}),
-        )
-    }
-
-    fn elapsed_metadata(&self) -> Value {
-        json!({"fixed_step_elapsed_s":self.elapsed_frames as f64 / 60.0})
-    }
-
-    fn result_metadata(&self) -> Value {
-        json!({"mode":"offscreen","clock_mode":"fixed-step","deterministic":true,"fixed_step_hz":60,"fixed_step_elapsed_s":self.elapsed_frames as f64 / 60.0,"session_id":self.session_id})
-    }
-
-    fn finish(&mut self) -> Result<()> {
-        Ok(())
-    }
-}
-
 pub fn rebuild_and_replay(
     session: &SessionDescriptor,
     scenario: &Scenario,
@@ -1322,7 +1184,8 @@ fn resolve_command(
     match &mut command {
         DevCommand::Select { body }
         | DevCommand::Focus { body, .. }
-        | DevCommand::LookAt { body } => resolve(body)?,
+        | DevCommand::LookAt { body }
+        | DevCommand::SurfacePose { body, .. } => resolve(body)?,
         _ => {}
     }
     Ok(command)
@@ -1457,14 +1320,6 @@ fn executable_path(root: &Path) -> PathBuf {
     root.join("target").join("release").join(executable_name())
 }
 
-fn normalize_preset(preset: &str) -> &str {
-    if preset == "gravity-hierarchy" {
-        "gravity-orbits"
-    } else {
-        preset
-    }
-}
-
 fn wait_for_session(
     registry: &Path,
     child: &mut Child,
@@ -1478,9 +1333,7 @@ fn wait_for_session(
         check_cancelled(cancelled)?;
         if let Some(found) = crate::developer_bridge::discover(registry)?
             .into_iter()
-            .find(|s| {
-                s.pid == child.id() && normalize_preset(&s.preset) == normalize_preset(preset)
-            })
+            .find(|s| s.pid == child.id() && s.preset == preset)
         {
             ensure!(
                 found.binary_sha256 == hash,
@@ -1547,13 +1400,6 @@ fn terminate_owned_child(child: &mut Child) -> Result<()> {
     }
     child.wait().context("reaping failed owned launch")?;
     Ok(())
-}
-
-fn timestamp_nonce() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
 }
 
 #[cfg(windows)]
@@ -1637,21 +1483,6 @@ fn source_attribution(root: &Path) -> Result<Value> {
     }))
 }
 
-#[cfg(feature = "terrain-capture")]
-fn make_demo(preset: &str) -> Result<crate::GravityOrbitsDemo> {
-    match preset {
-        "solar-system" => crate::GravityOrbitsDemo::solar_system(false),
-        "real-solar-system" => crate::GravityOrbitsDemo::solar_system(true),
-        "gravity-orbits" | "gravity-hierarchy" => crate::GravityOrbitsDemo::new(),
-        _ => bail!("unsupported preset {preset:?}"),
-    }
-}
-
-#[cfg(not(feature = "terrain-capture"))]
-fn make_demo(_preset: &str) -> Result<crate::GravityOrbitsDemo> {
-    bail!("offscreen scenario execution requires terrain-capture")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1660,7 +1491,7 @@ mod tests {
     fn scenarios_reject_invalid_schema_steps_and_timeouts() {
         let invalid = Scenario {
             schema: 2,
-            preset: "solar-system".into(),
+            preset: SHARED_TEST_SYSTEM_PRESET.into(),
             initial_settings: Vec::new(),
             deterministic: false,
             steps: vec![ScenarioStep {
@@ -1675,7 +1506,7 @@ mod tests {
         assert!(invalid.validate().is_err());
         let reserved_checkpoint = Scenario {
             schema: 1,
-            preset: "solar-system".into(),
+            preset: SHARED_TEST_SYSTEM_PRESET.into(),
             initial_settings: Vec::new(),
             deterministic: false,
             steps: vec![ScenarioStep {
@@ -1701,7 +1532,7 @@ mod tests {
         assert!(reserved_checkpoint.validate().is_err());
         let invalid = Scenario {
             schema: 1,
-            preset: "solar-system".into(),
+            preset: SHARED_TEST_SYSTEM_PRESET.into(),
             initial_settings: Vec::new(),
             deterministic: false,
             steps: vec![ScenarioStep {
@@ -1733,6 +1564,38 @@ mod tests {
             at_most: Some(1.0),
         };
         assert!(inverted_range.validate(0).is_err());
+    }
+
+    #[test]
+    fn scenario_parser_accepts_only_the_shared_test_system() {
+        let scenario_for = |preset: &str| Scenario {
+            schema: 1,
+            preset: preset.into(),
+            initial_settings: Vec::new(),
+            deterministic: false,
+            steps: vec![ScenarioStep {
+                name: None,
+                action: None,
+                wait: None,
+                capture: Some(CaptureStep {
+                    name: "view".into(),
+                }),
+                checkpoint: None,
+                duration_s: 0.0,
+            }],
+        };
+        assert!(scenario_for(SHARED_TEST_SYSTEM_PRESET).validate().is_ok());
+        for retired in [
+            "solar-system",
+            "real-solar-system",
+            "gravity-orbits",
+            "gravity-hierarchy",
+        ] {
+            assert!(
+                scenario_for(retired).validate().is_err(),
+                "accepted {retired}"
+            );
+        }
     }
 
     #[test]
@@ -1785,7 +1648,7 @@ mod tests {
     fn cancelled_offscreen_run_stops_before_creating_artifacts_or_engine() {
         let scenario = Scenario {
             schema: 1,
-            preset: "solar-system".into(),
+            preset: SHARED_TEST_SYSTEM_PRESET.into(),
             initial_settings: Vec::new(),
             deterministic: true,
             steps: Vec::new(),

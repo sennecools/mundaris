@@ -1,4 +1,7 @@
 //! Opt-in regional residency and local publication over the complete world field.
+#[path = "boundary_profile.rs"]
+mod boundary_profile;
+use boundary_profile::BoundarySchedulingMetrics;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     sync::{
@@ -32,25 +35,37 @@ use mundaris_renderer::{
 };
 use mundaris_world::terrain::SurfaceGenerator;
 
-const PLANETARY_GPU_SLOTS: usize = 32768;
+// Reserve >=64 MiB within the prior slot envelope for the bounded prototype.
+// Every backend in the comparison uses this same reservation.
+const PLANETARY_GPU_SLOTS: usize = 32768 - 1024;
+// 64 MiB products/jobs +72 MiB compiler reservation +8 MiB GPU pack +1 MiB bookkeeping.
+const CLUSTER_CPU_RESERVE: usize = 145 * 1024 * 1024;
 const PLANETARY_CPU_TILES: usize = 49152;
 const PLANETARY_MAX_DESIRED_PATCHES: usize = 16384;
 
 #[derive(Clone, Copy)]
 #[cfg_attr(not(any(feature = "developer-tools", test)), allow(dead_code))]
 pub(super) struct RegionalSettings {
+    #[cfg(test)]
     pub enabled: bool,
+    #[cfg(test)]
     pub max_depth: u8,
     pub gpu_slots: usize,
+    #[cfg(test)]
     pub cpu_tiles: usize,
     pub worker_count: usize,
+    #[cfg(test)]
     pub worker_delay_ms: u64,
+    #[cfg(test)]
     pub upload_tiles_per_frame: usize,
+    #[cfg(test)]
     pub upload_bytes_per_frame: u64,
     pub publication_groups_per_frame: usize,
     pub transition_limit: usize,
     pub morph_duration_ms: u64,
+    #[cfg(test)]
     pub split_error_px: f64,
+    #[cfg(test)]
     pub merge_error_px: f64,
 }
 
@@ -129,6 +144,7 @@ mod lifecycle_tests {
             fixture.record_native_frame(
                 &crate::developer_snapshot::PerformanceSnapshot::default(),
                 1_000 + frame,
+                7.0 + frame as f64 / 1_000.0,
             );
         }
         let summary = fixture.snapshot_frame().unwrap();
@@ -145,6 +161,10 @@ mod lifecycle_tests {
         );
         assert_eq!(exported["native_frame_samples"][0]["frame"], 1_044);
         assert_eq!(exported["native_frame_samples"][255]["frame"], 1_299);
+        // Held preparation can leave the advance ledger stale; native intervals
+        // must come from the submitted host frame instead.
+        assert_eq!(exported["native_frame_samples"][0]["interval_ms"], 7.044);
+        assert_eq!(exported["native_frame_samples"][255]["interval_ms"], 7.299);
         assert_eq!(exported["frame_intervals_ms"][0], 44.0);
         assert_eq!(exported["frame_intervals_ms"][255], 299.0);
         let decoded: ResidentDiagnosticSnapshot = serde_json::from_value(exported).unwrap();
@@ -703,13 +723,13 @@ mod lifecycle_tests {
         assert_eq!(core.config().cpu_tile_cap, PLANETARY_CPU_TILES);
         assert_eq!(
             core.config().cpu_byte_cap,
-            PLANETARY_CPU_TILES * 35 * 35 * 32
+            PLANETARY_CPU_TILES * 35 * 35 * 32 - CLUSTER_CPU_RESERVE
         );
         assert_eq!(
             fixture.settings.as_ref().unwrap().gpu_slots,
             PLANETARY_GPU_SLOTS
         );
-        assert_eq!(core.config().worker_count, 4);
+        assert_eq!(core.config().worker_count, 3);
         assert_eq!(core.config().upload_tile_cap, 4);
         assert_eq!(core.config().upload_byte_cap, 8 * 1024 * 1024);
         assert!(fixture.template_tile().is_none());
@@ -765,6 +785,7 @@ mod lifecycle_tests {
                     body_to_view: DMat3::IDENTITY,
                     mode: 0,
                     sun_body: DVec3::Z,
+                    appearance: Default::default(),
                 };
                 let draw = fixture.draw(&root_draw).unwrap();
                 saw_upload_only |= draw.patches.is_empty() && !draw.uploads.is_empty();
@@ -1075,7 +1096,7 @@ mod lifecycle_tests {
 }
 
 impl RegionalSettings {
-    #[cfg_attr(not(any(feature = "developer-tools", test)), allow(dead_code))]
+    #[cfg(test)]
     pub fn validate(self) -> Result<()> {
         ensure!(
             (1..=4).contains(&self.max_depth),
@@ -1217,17 +1238,20 @@ struct PendingPublication {
     expected: Arc<BTreeMap<CubePatchAddress, TileBoundary>>,
     keys: BTreeMap<CubePatchAddress, TileKey>,
     ready_at: std::time::Instant,
+    prepared_at: std::time::Instant,
 }
 
 struct PublicationCompletion {
     token: PublicationToken,
     prepared: Result<PreparedPublication, String>,
     elapsed: Duration,
+    prepared_at: std::time::Instant,
 }
 
 struct PublicationJob {
     work: PublicationWork,
     token: PublicationToken,
+    profile_identity: Option<engine_profile::ProfileJobIdentity>,
 }
 
 struct PublicationInFlight {
@@ -1533,6 +1557,7 @@ fn prepare_publication_batch(
     // At most two endpoint tasks borrow one immutable canonical target. The
     // coordinator alone owns cache mutation and deterministic result assembly.
     let chunk_size = work.transitions.len().div_ceil(2).max(1);
+    let profile_identity = engine_profile::current_job_identity();
     let transitions = thread::scope(|scope| {
         let mut handles = Vec::new();
         for (index, chunk) in work.transitions.chunks(chunk_size).enumerate() {
@@ -1547,6 +1572,7 @@ fn prepare_publication_batch(
                         } else {
                             "Boundary Worker 1"
                         });
+                        let _job = profile_identity.map(engine_profile::job_scope);
                         let _span = engine_profile::span("Endpoint preparation");
                         chunk
                             .iter()
@@ -1684,11 +1710,22 @@ impl PublicationWorker {
                 let mut retained_snapshots = Vec::new();
                 let mut boundary_cache =
                     mundaris_renderer::regional_edges::RegionalBoundaryCache::default();
-                while let Ok(job) = jobs.recv() {
-                    let _span = engine_profile::span("Boundary preparation");
+                while let Ok(job) = {
+                    let _wait = engine_profile::wait_span(
+                        "Boundary worker queue wait",
+                        engine_profile::ProfileWaitReason::BoundaryPreparationQueue,
+                    );
+                    jobs.recv()
+                } {
                     worker_active.store(1, Ordering::Release);
                     let started = std::time::Instant::now();
-                    let PublicationJob { work, token } = job;
+                    let PublicationJob {
+                        work,
+                        token,
+                        profile_identity,
+                    } = job;
+                    let _job = profile_identity.map(engine_profile::job_scope);
+                    let _span = engine_profile::span("Boundary preparation");
                     if let Some(trace) = &token.trace {
                         for key in token.keys.values() {
                             trace.event_key(key, Stage::BoundaryStarted);
@@ -1784,6 +1821,7 @@ impl PublicationWorker {
                         token,
                         prepared,
                         elapsed: started.elapsed(),
+                        prepared_at: std::time::Instant::now(),
                     };
                     worker_active.store(0, Ordering::Release);
                     worker_completion_ready.store(1, Ordering::Release);
@@ -1821,7 +1859,25 @@ impl PublicationWorker {
                 trace.event_key(key, Stage::BoundaryQueued);
             }
         }
-        match self.sender.try_send(PublicationJob { work, token }) {
+        let profile_identity = engine_profile::is_enabled().then(|| {
+            let dispatch_frame_id = engine_profile::current_frame_id();
+            let upstream_job_ids = token.trace.as_ref().map_or_else(Vec::new, |trace| {
+                trace.latest_profile_job_ids(token.keys.values())
+            });
+            engine_profile::ProfileJobIdentity::boundary_batch(
+                engine_profile::next_job_id(),
+                dispatch_frame_id,
+                dispatch_frame_id,
+                token.revision,
+                token.keys.len().min(u32::MAX as usize) as u32,
+                upstream_job_ids,
+            )
+        });
+        match self.sender.try_send(PublicationJob {
+            work,
+            token,
+            profile_identity,
+        }) {
             Ok(()) => {
                 self.in_flight = Some(in_flight);
                 Ok(true)
@@ -1847,6 +1903,11 @@ impl PublicationWorker {
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub(crate) struct NativeFrameSample {
+    native_gpu_timestamp_sampling: Option<crate::developer_snapshot::TimestampSamplingSnapshot>,
+    gpu_preparation_cache_hit: bool,
+    native_render_cpu_ms: Option<[f64; 8]>,
+    native_submission_id: Option<u64>,
+    gpu_frame_ms: Option<f64>,
     #[serde(flatten)]
     publication_stages: PublicationStages,
     frame: u64,
@@ -2075,6 +2136,7 @@ pub(super) struct RegionalFixture {
     slot_scan_cursor: usize,
     publication_worker: Option<PublicationWorker>,
     publication_stages: PublicationStages,
+    boundary_scheduling: BoundarySchedulingMetrics,
     prepared_publications: VecDeque<PendingPublication>,
     boundary_overlays: BTreeMap<CubePatchAddress, Option<TileBoundary>>,
     boundary_completed: u64,
@@ -2216,12 +2278,14 @@ impl RegionalFixture {
             max_level: 24,
             cells,
             cpu_tile_cap: PLANETARY_CPU_TILES,
-            cpu_byte_cap: PLANETARY_CPU_TILES.saturating_mul(
-                (cells as usize + 3)
-                    .saturating_mul(cells as usize + 3)
-                    .saturating_mul(32),
-            ),
-            worker_count: 4,
+            cpu_byte_cap: PLANETARY_CPU_TILES
+                .saturating_mul(
+                    (cells as usize + 3)
+                        .saturating_mul(cells as usize + 3)
+                        .saturating_mul(32),
+                )
+                .saturating_sub(if cells == 32 { CLUSTER_CPU_RESERVE } else { 0 }),
+            worker_count: 3,
             worker_delay: Duration::ZERO,
             queue_cap: 32,
             completion_cap: 8,
@@ -2248,18 +2312,26 @@ impl RegionalFixture {
             enabled: true,
             core: Some(core),
             settings: Some(RegionalSettings {
+                #[cfg(test)]
                 enabled: true,
+                #[cfg(test)]
                 max_depth: 24,
                 gpu_slots: PLANETARY_GPU_SLOTS,
+                #[cfg(test)]
                 cpu_tiles: PLANETARY_CPU_TILES,
-                worker_count: 4,
+                worker_count: 3,
+                #[cfg(test)]
                 worker_delay_ms: 0,
+                #[cfg(test)]
                 upload_tiles_per_frame: 4,
+                #[cfg(test)]
                 upload_bytes_per_frame: 8 * 1024 * 1024,
                 publication_groups_per_frame: 8,
                 transition_limit: 16,
                 morph_duration_ms: 150,
+                #[cfg(test)]
                 split_error_px: 0.15,
+                #[cfg(test)]
                 merge_error_px: 0.075,
             }),
             publication_worker: self.publication_worker.take(),
@@ -2341,7 +2413,7 @@ impl RegionalFixture {
         (level(core.desired()), level(core.drawable()))
     }
 
-    #[cfg_attr(not(any(feature = "developer-tools", test)), allow(dead_code))]
+    #[cfg(test)]
     pub fn configure(
         &mut self,
         settings: RegionalSettings,
@@ -2446,6 +2518,7 @@ impl RegionalFixture {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn disable(&mut self) {
         self.enabled = false;
         self.suspend();
@@ -2459,7 +2532,7 @@ impl RegionalFixture {
         }
     }
 
-    #[cfg_attr(not(any(feature = "developer-tools", test)), allow(dead_code))]
+    #[cfg(test)]
     pub fn pump_shutdown(&mut self) {
         if let Some(core) = &mut self.core {
             core.drain_cancelled();
@@ -2850,6 +2923,14 @@ impl RegionalFixture {
                     self.schedule_transition()?;
                 }
             }
+        } else {
+            let counters = self.boundary_scheduling.counters();
+            counters.completion_tick_dispatch_skips =
+                counters.completion_tick_dispatch_skips.saturating_add(1);
+            // This branch intentionally does not discover/validate another batch.
+            // Candidate presence alone cannot establish useful eligible work.
+            counters.eligibility_unknown_ticks =
+                counters.eligibility_unknown_ticks.saturating_add(1);
         }
         let gpu_admission_started = std::time::Instant::now();
         self.update_gpu_admission()?;
@@ -2870,11 +2951,11 @@ impl RegionalFixture {
         &mut self,
         performance: &crate::developer_snapshot::PerformanceSnapshot,
         submitted_frame: u64,
+        interval_ms: f64,
     ) {
         if self.native_frame_samples.len() == 8192 {
             self.native_frame_samples.pop_front();
         }
-        let interval_ms = self.frame_intervals_ms.back().copied().unwrap_or(0.0);
         let previous = self.native_frame_samples.back();
         let upload_byte_delta = previous.map_or(0, |sample| {
             self.last_report
@@ -2903,6 +2984,11 @@ impl RegionalFixture {
         });
         let backlog_age_ms = self.publication_backlog_age_ms();
         self.native_frame_samples.push_back(NativeFrameSample {
+            native_gpu_timestamp_sampling: performance.native_gpu_timestamp_sampling,
+            gpu_preparation_cache_hit: self.last_report.preparation_cache_hit,
+            native_render_cpu_ms: performance.native_render_cpu_ms,
+            native_submission_id: performance.native_submission_id,
+            gpu_frame_ms: performance.gpu_frame_ms,
             publication_stages: self.publication_stages.clone(),
             frame: submitted_frame,
             interval_ms,
@@ -3118,6 +3204,7 @@ impl RegionalFixture {
             + self.publication_stages.publication_candidate_discovery_ms
             + self.publication_stages.publication_dependency_checks_ms;
         let result = self.schedule_publication_batch_inner(started);
+        self.boundary_scheduling.close(std::time::Instant::now());
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         let stages_after = self.publication_stages.publication_candidate_zone_ms
             + self.publication_stages.publication_payload_collection_ms
@@ -3134,6 +3221,20 @@ impl RegionalFixture {
 
     fn schedule_publication_batch_inner(&mut self, started: std::time::Instant) -> Result<()> {
         const PREPARED_CAPACITY: usize = 8;
+        let counters = self.boundary_scheduling.counters();
+        counters.dispatch_checks = counters.dispatch_checks.saturating_add(1);
+        counters.admission_budget_checks = counters
+            .admission_budget_checks
+            .saturating_add(u64::from(self.publication_admission_ms >= 1.5));
+        counters.prepared_capacity_checks = counters.prepared_capacity_checks.saturating_add(
+            u64::from(self.prepared_publications.len() >= PREPARED_CAPACITY),
+        );
+        counters.worker_unavailable_checks =
+            counters.worker_unavailable_checks.saturating_add(u64::from(
+                self.publication_worker
+                    .as_ref()
+                    .is_none_or(|worker| worker.in_flight.is_some()),
+            ));
         if self.publication_admission_ms >= 1.5
             || self.prepared_publications.len() == PREPARED_CAPACITY
             || self
@@ -3152,6 +3253,9 @@ impl RegionalFixture {
                     .saturating_sub(self.groups.len() + self.prepared_publications.len()),
             );
         if capacity == 0 {
+            let counters = self.boundary_scheduling.counters();
+            counters.transition_capacity_checks =
+                counters.transition_capacity_checks.saturating_add(1);
             return Ok(());
         }
         let discovery_started = std::time::Instant::now();
@@ -3265,6 +3369,17 @@ impl RegionalFixture {
                 self.blocked_by_dependency += 1;
                 continue;
             };
+            if engine_profile::is_enabled() {
+                self.boundary_scheduling.observe_eligible_idle(
+                    std::time::Instant::now(),
+                    self.publication_worker
+                        .as_ref()
+                        .is_some_and(|worker| worker.in_flight.is_none()),
+                    transitions.len() < capacity
+                        && self.publication_admission_ms + started.elapsed().as_secs_f64() * 1000.0
+                            < 1.5,
+                );
+            }
             for tile in std::iter::once(&parent_tile).chain(child_tiles.values()) {
                 keys.insert(tile.key.address, tile.key.clone());
                 dependencies.insert(tile.key.address);
@@ -3286,6 +3401,8 @@ impl RegionalFixture {
                 payload_started.elapsed().as_secs_f64() * 1000.0;
         }
         if transitions.is_empty() {
+            let counters = self.boundary_scheduling.counters();
+            counters.no_eligible_work_checks = counters.no_eligible_work_checks.saturating_add(1);
             return Ok(());
         }
         let dispatch_started = std::time::Instant::now();
@@ -3318,6 +3435,7 @@ impl RegionalFixture {
             transitions,
             keep_alive,
         }));
+        self.boundary_scheduling.close(std::time::Instant::now());
         if self
             .publication_worker
             .as_mut()
@@ -3325,6 +3443,8 @@ impl RegionalFixture {
             .submit(work, token)?
         {
             self.publication_builds += count;
+            let counters = self.boundary_scheduling.counters();
+            counters.eligible_dispatches = counters.eligible_dispatches.saturating_add(1);
             self.publication_last_state = "batch_preparing";
         }
         self.publication_stages.publication_dispatch_ms +=
@@ -3657,6 +3777,8 @@ impl RegionalFixture {
                 return Ok(true);
             }
         };
+        self.boundary_scheduling
+            .consume_prepared(completion.prepared_at, std::time::Instant::now());
         match (completion.token.kind, prepared) {
             (
                 PublicationKind::Batch { overlays },
@@ -3692,6 +3814,7 @@ impl RegionalFixture {
                         expected: Arc::clone(&base),
                         keys,
                         ready_at,
+                        prepared_at: completion.prepared_at,
                     });
                 }
                 self.publication_last_state = "batch_prepared";
@@ -4013,6 +4136,7 @@ impl RegionalFixture {
             body_to_view: root_draw.body_to_view,
             mode: root_draw.mode,
             sun_body: root_draw.sun_body,
+            appearance: root_draw.appearance,
         })
     }
 
@@ -4179,7 +4303,9 @@ impl RegionalFixture {
         self.publication_stages.resident_slot_allocation_ms =
             draw_started.elapsed().as_secs_f64() * 1000.0;
         let mut desired_ancestors = HashSet::new();
-        if let Some(core) = &self.core {
+        if let Some(core) = &self.core
+            && core.desired() != core.drawable()
+        {
             for desired in core.desired() {
                 let mut ancestor = desired.parent();
                 while let Some(address) = ancestor {
@@ -4207,12 +4333,20 @@ impl RegionalFixture {
                 .group
                 .and_then(|id| self.groups.iter().find(|g| g.id == id).map(|g| g.fraction))
                 .unwrap_or(1.0);
+            let own = self.tile_draw(*address, root_draw)?;
+            let parent = if *address == patch.parent {
+                // Stable interiors use the same immutable tile and transform.
+                // Clone its shared references rather than reconstructing it twice.
+                own.clone()
+            } else {
+                self.tile_draw(patch.parent, root_draw)?
+            };
             patches.push(RegionalPatchDraw {
                 quality_fallback: desired_ancestors.contains(address),
                 own_slot,
                 parent_slot,
-                own: self.tile_draw(*address, root_draw)?,
-                parent: self.tile_draw(patch.parent, root_draw)?,
+                own,
+                parent,
                 morph_fraction: if patch.quadrant.is_some() {
                     if patch.merging { 1.0 - t } else { t }
                 } else {
@@ -4246,7 +4380,7 @@ impl RegionalFixture {
         self.core.as_ref().map(RegionalTerrain::trace)
     }
 
-    #[cfg(any(test, feature = "developer-tools"))]
+    #[cfg(test)]
     pub fn snapshot(&self) -> Option<serde_json::Value> {
         self.snapshot_impl(true)
             .and_then(|snapshot| serde_json::to_value(snapshot).ok())
@@ -4262,7 +4396,16 @@ impl RegionalFixture {
         }
         let core = self.core.as_ref()?;
         let _span = engine_profile::span("Terrain diagnostic snapshot");
-        let drawable_addresses: HashSet<_> = core.drawable().iter().copied().collect();
+        // Equal complete covers cannot contain an ancestor fallback. Avoid
+        // reconstructing every desired ancestry chain in the settled frame.
+        // Exact cover equality is checked afresh; motion/publication restore
+        // the original ancestry calculation immediately when they diverge.
+        let covers_match = core.desired() == core.drawable();
+        let drawable_addresses: HashSet<_> = if covers_match {
+            HashSet::new()
+        } else {
+            core.drawable().iter().copied().collect()
+        };
         let core_snapshot = if self.planetary {
             core.snapshot_summary()
         } else {
@@ -4309,6 +4452,7 @@ impl RegionalFixture {
             terrain_trace = cache.value.clone();
         }
         object.insert("gpu_preparation_stages".into(), serde_json::json!({
+            "preparation_cache_hit": self.last_report.preparation_cache_hit,
             "cached_endpoint_validation_ms": self.last_report.cached_endpoint_validation_micros.map(|v| v as f64 / 1000.0),
             "proposed_slot_state_ms": self.last_report.proposed_slot_state_micros.map(|v| v as f64 / 1000.0),
             "slot_dependency_check_ms": self.last_report.slot_dependency_check_micros.map(|v| v as f64 / 1000.0),
@@ -4352,6 +4496,11 @@ impl RegionalFixture {
             HashSet::new()
         };
         object.insert("publication_pipeline".into(), serde_json::json!({
+            "scheduling_observations": self.boundary_scheduling.snapshot(std::time::Instant::now()),
+            "scheduling_observation_scope": "dispatch checks and exact eligible-to-dispatch host preparation; completion-only ticks have unknown eligibility; no inferred whole-frame idle or pure worker starvation",
+            "oldest_fully_prepared_age_ms": self.prepared_publications.iter()
+                .map(|pending| pending.prepared_at.elapsed().as_secs_f64() * 1000.0)
+                .fold(0.0, f64::max),
             "frontier_discovery_ms": core.frontier_discovery_time_micros() as f64 / 1000.0,
             "maximum_candidate_age_ticks": core.publication_local_candidates().iter()
                 .map(|candidate| core.publication_candidate_age_ticks(candidate)).max().unwrap_or(0),
@@ -4519,6 +4668,7 @@ impl RegionalFixture {
             serde_json::json!(
                 core.desired()
                     .iter()
+                    .filter(|_| !covers_match)
                     .filter(|desired| {
                         let mut ancestor = desired.parent();
                         while let Some(address) = ancestor {

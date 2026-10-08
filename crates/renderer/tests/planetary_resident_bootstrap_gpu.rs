@@ -106,6 +106,7 @@ fn planetary_six_root_bootstrap_uploads_without_draw_then_warms_stably() {
             body_to_view,
             mode: 0,
             sun_body: DVec3::Z,
+            appearance: Default::default(),
         })
         .collect();
 

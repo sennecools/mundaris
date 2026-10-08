@@ -344,7 +344,7 @@ impl HierarchicalField {
             local_context,
             &directed,
             &mut band_work[2],
-            context.as_deref_mut(),
+            context,
         )?;
         let total = Differential::new(inherited.height_m, inherited.gradient_m)
             + contributions[0]

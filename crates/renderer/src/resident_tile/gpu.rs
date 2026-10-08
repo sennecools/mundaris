@@ -13,8 +13,8 @@ use std::sync::{
 };
 use wgpu::util::DeviceExt;
 
-const PARAM_BYTES: u64 = 384;
-const PARAM_STRIDE: u64 = 512;
+const PARAM_BYTES: u64 = 560;
+const PARAM_STRIDE: u64 = 768;
 const SLOT_COUNT: usize = 5;
 const REGIONAL_SLOT_BASE: usize = SLOT_COUNT;
 const VALIDATION_VERTEX_BYTES: u64 = 64;
@@ -26,6 +26,7 @@ enum PrepareKind {
 }
 
 pub(crate) struct ResidentTileRenderer {
+    cluster: crate::cluster_runtime::ClusterRuntime,
     pipeline: wgpu::RenderPipeline,
     validation_pipeline: wgpu::ComputePipeline,
     tile_layout: wgpu::BindGroupLayout,
@@ -46,9 +47,13 @@ pub(crate) struct ResidentTileRenderer {
     regional_report: RegionalResidentReport,
     regional_endpoint_validation: RegionalEndpointValidationCache,
     regional_draw: Option<RegionalResidentDraw>,
+    last_submitted_regional_epoch: Option<u64>,
     completed_submission: Arc<AtomicU64>,
     submission_serial: u64,
     prepared_draw_slots: BTreeSet<usize>,
+    prepared_submission_pending: bool,
+    renderer_state_epoch: u64,
+    regional_draw_epoch: Option<u64>,
     regional_active_patches: Vec<usize>,
     regional_cells: u32,
     allocation_count: u32,
@@ -313,10 +318,15 @@ impl ResidentTileRenderer {
             regional_report: RegionalResidentReport::default(),
             regional_endpoint_validation: RegionalEndpointValidationCache::default(),
             regional_draw: None,
+            last_submitted_regional_epoch: None,
             completed_submission: Arc::new(AtomicU64::new(0)),
             submission_serial: 0,
             prepared_draw_slots: BTreeSet::new(),
+            prepared_submission_pending: false,
+            renderer_state_epoch: 0,
+            regional_draw_epoch: None,
             regional_active_patches: Vec::new(),
+            cluster: crate::cluster_runtime::ClusterRuntime::new(device, format, projection_layout),
             regional_cells: 0,
             allocation_count: (SLOT_COUNT * 2 + 2) as u32,
         }
@@ -328,8 +338,11 @@ impl ResidentTileRenderer {
         queue: &wgpu::Queue,
         draw: &TileDraw,
     ) -> Result<(), RenderPreparationError> {
+        self.bump_renderer_state_epoch();
         self.regional_draw = None;
         self.regional_active_patches.clear();
+        self.prepared_draw_slots.clear();
+        self.prepared_submission_pending = false;
         let slot = self.preflight_slot(device, 0, draw)?;
         self.preflight_grid(device, draw.tile.key.cells)?;
         self.clear_frame();
@@ -353,6 +366,7 @@ impl ResidentTileRenderer {
         self.write_params(queue, 0, &params, PrepareKind::Render);
         self.prepared_draw_slots.clear();
         self.prepared_draw_slots.insert(0);
+        self.prepared_submission_pending = true;
         self.finish_report();
         Ok(())
     }
@@ -373,12 +387,21 @@ impl ResidentTileRenderer {
         draw: &ResidentHierarchyDraw,
         kind: PrepareKind,
     ) -> Result<(), RenderPreparationError> {
+        self.bump_renderer_state_epoch();
         if matches!(kind, PrepareKind::Render) {
             self.regional_draw = None;
             self.regional_active_patches.clear();
         }
         draw.validate()
             .map_err(|_| RenderPreparationError::InvalidResidentTile)?;
+        if draw
+            .children
+            .iter()
+            .flatten()
+            .any(|child| child.appearance != draw.parent.appearance)
+        {
+            return Err(RenderPreparationError::InvalidResidentTile);
+        }
         let mut slot_preflights: [Option<SlotPreflight>; SLOT_COUNT] =
             std::array::from_fn(|_| None);
         slot_preflights[0] = Some(self.preflight_slot(device, 0, &draw.parent)?);
@@ -460,6 +483,7 @@ impl ResidentTileRenderer {
             if draw.draw_children {
                 self.prepared_draw_slots.extend(1..SLOT_COUNT);
             }
+            self.prepared_submission_pending = true;
         }
         self.finish_report();
         Ok(())
@@ -474,6 +498,47 @@ impl ResidentTileRenderer {
         draw: &RegionalResidentDraw,
     ) -> Result<(), RenderPreparationError> {
         let prepare_started = std::time::Instant::now();
+        if draw.uploads.is_empty()
+            && self.regional_draw_epoch == Some(self.renderer_state_epoch)
+            && self
+                .regional_draw
+                .as_ref()
+                .is_some_and(|previous| previous.same_render_inputs(draw))
+        {
+            self.clear_for_kind(PrepareKind::Render);
+            self.prepared_submission_pending = !self.prepared_draw_slots.is_empty();
+            let total_micros = elapsed_micros(prepare_started);
+            let report = &mut self.regional_report;
+            report.preparation_micros = total_micros;
+            report.validation_dependency_micros = Some(0);
+            report.resource_allocation_micros = Some(0);
+            report.gpu_upload_preparation_micros = Some(0);
+            report.cached_endpoint_validation_micros = Some(0);
+            report.proposed_slot_state_micros = Some(0);
+            report.slot_dependency_check_micros = Some(0);
+            report.metadata_pack_queue_write_micros = Some(0);
+            report.draw_retention_micros = Some(0);
+            report.report_assembly_micros = Some(0);
+            report.endpoint_validation_cache_hits = 0;
+            report.endpoint_validation_cache_misses = 0;
+            report.prepare_patch_count = draw.patches.len();
+            report.prepare_upload_count = 0;
+            report.prepare_distinct_slot_count = self.prepared_draw_slots.len();
+            report.tile_upload_bytes = 0;
+            report.boundary_upload_bytes = 0;
+            report.metadata_upload_bytes = 0;
+            report.tile_upload_count = 0;
+            report.boundary_upload_count = 0;
+            report.deferred_upload_count = 0;
+            report.transfer_staging_bytes = 0;
+            report.validation_readback_bytes = 0;
+            report.drawable_metadata_micros = Some(total_micros);
+            report.preparation_cache_hit = true;
+            return Ok(());
+        }
+
+        self.bump_renderer_state_epoch();
+        self.regional_report.preparation_cache_hit = false;
         let mut timings = RegionalPreparationTimings {
             prepare_patch_count: draw.patches.len(),
             prepare_upload_count: draw.uploads.len(),
@@ -510,6 +575,15 @@ impl ResidentTileRenderer {
         self.regional_report.drawable_metadata_micros = result
             .is_ok()
             .then_some(total_micros.saturating_sub(measured_micros));
+        if result.is_ok()
+            && !self.regional_report.fallback_active
+            && draw.uploads.is_empty()
+            && self.regional_active_patches.len() == draw.patches.len()
+        {
+            self.regional_draw_epoch = Some(self.renderer_state_epoch);
+        } else {
+            self.regional_draw_epoch = None;
+        }
         result
     }
 
@@ -642,9 +716,10 @@ impl ResidentTileRenderer {
                     .get(REGIONAL_SLOT_BASE + slot_index)
                     .is_some_and(|slot| slot.last_use_submission > completed);
                 if slot_in_flight
-                    || self
-                        .prepared_draw_slots
-                        .contains(&(REGIONAL_SLOT_BASE + slot_index))
+                    || (self.prepared_submission_pending
+                        && self
+                            .prepared_draw_slots
+                            .contains(&(REGIONAL_SLOT_BASE + slot_index)))
                 {
                     blocked_dependencies = true;
                 }
@@ -662,6 +737,7 @@ impl ResidentTileRenderer {
             report.boundary_upload_count = 0;
             report.deferred_upload_count = draw.uploads.len() as u64;
             report.transfer_staging_bytes = 0;
+            report.preparation_cache_hit = false;
             let diagnostic_mode = draw
                 .patches
                 .iter()
@@ -737,6 +813,18 @@ impl ResidentTileRenderer {
             } else {
                 timings.draw_retention_micros = Some(elapsed_micros(retention_started));
             }
+            self.prepared_draw_slots.clear();
+            if let Some(previous) = self.regional_draw.as_ref() {
+                for &patch_index in &self.regional_active_patches {
+                    if let Some(patch) = previous.patches.get(patch_index) {
+                        self.prepared_draw_slots
+                            .insert(REGIONAL_SLOT_BASE + patch.own_slot);
+                        self.prepared_draw_slots
+                            .insert(REGIONAL_SLOT_BASE + patch.parent_slot);
+                    }
+                }
+            }
+            self.prepared_submission_pending = !self.prepared_draw_slots.is_empty();
             let report_started = std::time::Instant::now();
             report.slots = (0..draw.capacity)
                 .map(|index| {
@@ -877,7 +965,8 @@ impl ResidentTileRenderer {
             let physical_slot = REGIONAL_SLOT_BASE + upload.slot;
             let slot = &self.tile_slots[physical_slot];
             let needs_content = upload_bytes[&upload.slot].is_some();
-            let safe = !self.prepared_draw_slots.contains(&physical_slot)
+            let safe = (!self.prepared_submission_pending
+                || !self.prepared_draw_slots.contains(&physical_slot))
                 && slot.last_use_submission <= completed;
             if needs_content && !safe {
                 report.deferred_upload_count += 1;
@@ -891,6 +980,7 @@ impl ResidentTileRenderer {
                 let upload_started = std::time::Instant::now();
                 let bytes = pack_tile(&upload.tile.tile);
                 queue.write_buffer(&self.tile_slots[physical_slot].buffer, 0, &bytes);
+                self.bump_renderer_state_epoch();
                 add_elapsed_nanos(&mut timings.gpu_upload_preparation_nanos, upload_started);
                 let slot = &mut self.tile_slots[physical_slot];
                 slot.publication_state = proposed_states
@@ -916,7 +1006,7 @@ impl ResidentTileRenderer {
         }
         for (slot_index, state) in proposed_states {
             if let Some(slot) = self.tile_slots.get_mut(REGIONAL_SLOT_BASE + slot_index)
-                && slot.resident_key.as_ref() == state.requested_key.as_ref()
+                && slot.resident_key.as_ref() == state.requested_key.as_deref()
             {
                 slot.publication_state = state;
             }
@@ -955,6 +1045,7 @@ impl ResidentTileRenderer {
                 let upload_started = std::time::Instant::now();
                 let packed = pack_own_boundaries(&patch.boundary_endpoints, draw.cells);
                 queue.write_buffer(&self.tile_slots[own_physical_slot].edge_buffer, 0, &packed);
+                self.bump_renderer_state_epoch();
                 add_elapsed_nanos(&mut timings.gpu_upload_preparation_nanos, upload_started);
                 self.tile_slots[own_physical_slot].own_edge_version =
                     Some(patch.boundary_endpoints.version);
@@ -982,6 +1073,7 @@ impl ResidentTileRenderer {
                     edge_layer_offset(draw.cells, 2)?,
                     &packed,
                 );
+                self.bump_renderer_state_epoch();
                 add_elapsed_nanos(&mut timings.gpu_upload_preparation_nanos, upload_started);
                 self.tile_slots[parent_physical_slot].parent_boundary =
                     Some(patch.boundary_endpoints.parent.clone());
@@ -1044,6 +1136,7 @@ impl ResidentTileRenderer {
         }
         let retention_started = std::time::Instant::now();
         self.prepared_draw_slots = used_slots.clone();
+        self.prepared_submission_pending = !used_slots.is_empty();
         self.regional_active_patches = next_active;
         self.regional_draw = Some(draw.clone());
         self.tile_groups.retain(|(own, parent), _| {
@@ -1155,6 +1248,9 @@ impl ResidentTileRenderer {
         let active_draw = self.regional_draw.as_ref().unwrap_or(draw);
         for &patch_index in &self.regional_active_patches {
             if let Some(patch) = active_draw.patches.get(patch_index) {
+                if self.cluster.draw(pass, projection, patch_index) {
+                    continue;
+                }
                 self.draw_patch(
                     pass,
                     projection,
@@ -1166,6 +1262,53 @@ impl ResidentTileRenderer {
         }
     }
 
+    pub(crate) fn prepare_clusters(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        projection: crate::CelestialProjection,
+        settings: crate::ClusterSettings,
+    ) {
+        if let Some(draw) = &self.regional_draw {
+            self.cluster.prepare(
+                device,
+                queue,
+                encoder,
+                projection,
+                draw,
+                &self.regional_active_patches,
+                settings,
+            );
+            let updates: Vec<_> = self
+                .regional_active_patches
+                .iter()
+                .filter_map(|index| {
+                    let patch = draw.patches.get(*index)?;
+                    let mut bytes = self
+                        .params_cache
+                        .get(*index)
+                        .and_then(Option::as_ref)
+                        .copied()?;
+                    let mode = if settings.mode != crate::ClusterMode::Reference
+                        && settings.debug == crate::ClusterDebug::Residency
+                    {
+                        self.cluster.fallback_mode(patch)
+                    } else {
+                        patch.own.mode
+                    };
+                    bytes[124..128].copy_from_slice(&(mode as f32).to_le_bytes());
+                    Some((*index, bytes))
+                })
+                .collect();
+            for (index, bytes) in updates {
+                self.write_params(queue, index, &bytes, PrepareKind::Render);
+            }
+        }
+    }
+    pub(crate) fn cluster_report(&self) -> crate::ClusterReport {
+        self.cluster.report()
+    }
     pub(crate) fn regional_report(&self) -> RegionalResidentReport {
         let mut report = self.regional_report.clone();
         let completed = self.completed_submission.load(Ordering::Acquire);
@@ -1183,7 +1326,13 @@ impl ResidentTileRenderer {
     /// Associate slots read by the just-submitted frame with a nonblocking
     /// queue-completion callback. No device polling or wait occurs here.
     pub(crate) fn on_submitted(&mut self, queue: &wgpu::Queue) {
-        if self.prepared_draw_slots.is_empty() {
+        self.cluster.on_submitted(queue);
+        self.last_submitted_regional_epoch = (self.prepared_submission_pending
+            && !self.prepared_draw_slots.is_empty()
+            && self.regional_draw.is_some()
+            && !self.regional_active_patches.is_empty())
+        .then_some(self.renderer_state_epoch);
+        if !self.prepared_submission_pending || self.prepared_draw_slots.is_empty() {
             return;
         }
         self.submission_serial = self.submission_serial.saturating_add(1);
@@ -1193,11 +1342,29 @@ impl ResidentTileRenderer {
                 slot.last_use_submission = serial;
             }
         }
-        self.prepared_draw_slots.clear();
+        self.prepared_submission_pending = false;
         let completed = Arc::clone(&self.completed_submission);
         queue.on_submitted_work_done(move || {
             completed.fetch_max(serial, Ordering::Release);
         });
+    }
+
+    /// Lazily clone the exact draw used by the latest submitted frame. Call this
+    /// immediately after submission, before another prepare mutates renderer state.
+    #[cfg(feature = "developer-tools")]
+    pub(crate) fn last_submitted_regional_draw(
+        &self,
+    ) -> Option<(RegionalResidentDraw, Vec<usize>, bool)> {
+        if self.cluster.has_cluster_draw()
+            || self.last_submitted_regional_epoch != Some(self.renderer_state_epoch)
+        {
+            return None;
+        }
+        Some((
+            self.regional_draw.as_ref()?.clone(),
+            self.regional_active_patches.clone(),
+            self.regional_report.fallback_active,
+        ))
     }
 
     fn ensure_regional_resources(
@@ -1208,6 +1375,7 @@ impl ResidentTileRenderer {
         params_bytes: u64,
         edge_bytes: u64,
     ) -> Result<(), RenderPreparationError> {
+        let mut resources_changed = false;
         let required_slot_count = REGIONAL_SLOT_BASE
             .checked_add(capacity)
             .ok_or(RenderPreparationError::InvalidResidentTile)?;
@@ -1221,6 +1389,7 @@ impl ResidentTileRenderer {
             self.allocation_count = self
                 .allocation_count
                 .saturating_add((required_slot_count - old_len) as u32);
+            resources_changed = true;
         }
         if self.params_buffer.size() < params_bytes {
             self.params_cache.clear();
@@ -1237,6 +1406,7 @@ impl ResidentTileRenderer {
                 &self.validation_buffer,
             );
             self.allocation_count = self.allocation_count.saturating_add(1);
+            resources_changed = true;
         }
         let mut edge_changed = false;
         for slot in self.tile_slots.iter_mut().skip(REGIONAL_SLOT_BASE) {
@@ -1259,6 +1429,9 @@ impl ResidentTileRenderer {
             self.rebuild_tile_groups(device);
         }
         self.ensure_grid(device, cells)?;
+        if resources_changed || edge_changed {
+            self.bump_renderer_state_epoch();
+        }
         Ok(())
     }
 
@@ -1283,6 +1456,9 @@ impl ResidentTileRenderer {
         index: usize,
         draw: &TileDraw,
     ) -> Result<SlotPreflight, RenderPreparationError> {
+        draw.appearance
+            .validate()
+            .map_err(|_| RenderPreparationError::InvalidResidentTile)?;
         let slot = self
             .tile_slots
             .get(index)
@@ -1329,6 +1505,7 @@ impl ResidentTileRenderer {
         kind: PrepareKind,
     ) -> Result<(), RenderPreparationError> {
         if self.tile_slots[index].resident_key.as_ref() == Some(&draw.tile.key) {
+            self.bump_renderer_state_epoch();
             self.tile_slots[index].publication_state = preflight.publication_state;
             return Ok(());
         }
@@ -1341,6 +1518,7 @@ impl ResidentTileRenderer {
         let pack_duration = pack_start.elapsed();
         let upload_start = std::time::Instant::now();
         queue.write_buffer(&self.tile_slots[index].buffer, 0, &packed);
+        self.bump_renderer_state_epoch();
         let upload_api_duration = upload_start.elapsed();
         {
             let slot = &mut self.tile_slots[index];
@@ -1475,6 +1653,7 @@ impl ResidentTileRenderer {
         if self.params_cache.get(slot).and_then(Option::as_ref) == Some(params) {
             return false;
         }
+        self.bump_renderer_state_epoch();
         if self.params_cache.len() <= slot {
             self.params_cache.resize(slot + 1, None);
         }
@@ -1564,7 +1743,9 @@ impl ResidentTileRenderer {
     }
 
     pub(crate) fn clear_frame(&mut self) {
+        self.bump_renderer_state_epoch();
         self.prepared_draw_slots.clear();
+        self.prepared_submission_pending = false;
         self.regional_active_patches.clear();
         self.regional_draw = None;
         self.clear_for_kind(PrepareKind::Render);
@@ -1572,6 +1753,10 @@ impl ResidentTileRenderer {
         self.hierarchy_report.draw_children = false;
         self.hierarchy_report.morph_fraction = 0.0;
         self.finish_report();
+    }
+
+    fn bump_renderer_state_epoch(&mut self) {
+        self.renderer_state_epoch = self.renderer_state_epoch.wrapping_add(1);
     }
 
     fn clear_for_kind(&mut self, kind: PrepareKind) {
@@ -1652,6 +1837,7 @@ impl ResidentTileRenderer {
         projection_group: &wgpu::BindGroup,
         draw: &TileDraw,
     ) -> Result<Vec<ReconstructedTileVertex>, RenderPreparationError> {
+        self.bump_renderer_state_epoch();
         let preflight = self.preflight_slot(device, 0, draw)?;
         self.preflight_grid(device, draw.tile.key.cells)?;
         self.clear_for_kind(PrepareKind::Validation);
@@ -1715,6 +1901,8 @@ impl ResidentTileRenderer {
         draw: &RegionalResidentDraw,
         patch_index: usize,
     ) -> Result<Vec<ReconstructedTileVertex>, RenderPreparationError> {
+        self.bump_renderer_state_epoch();
+        self.regional_report.validation_readback_bytes = 0;
         let patch = draw
             .patches
             .get(patch_index)
@@ -1731,14 +1919,17 @@ impl ResidentTileRenderer {
             REGIONAL_SLOT_BASE + patch.parent_slot,
             patch_index,
             draw.cells,
-        )?;
-        self.regional_report.validation_readback_bytes =
-            u64::from(draw.cells + 1).pow(2) * VALIDATION_VERTEX_BYTES;
+        );
         // The diagnostic waits for its readback, so it can release its own
         // slot use immediately without depending on an ordinary-frame callback.
         self.prepared_draw_slots.clear();
+        self.prepared_submission_pending = false;
         self.completed_submission
             .fetch_max(self.submission_serial, Ordering::Release);
+        self.bump_renderer_state_epoch();
+        let output = output?;
+        self.regional_report.validation_readback_bytes =
+            u64::from(draw.cells + 1).pow(2) * VALIDATION_VERTEX_BYTES;
         Ok(output)
     }
 
@@ -1960,7 +2151,7 @@ fn pack_params(
     parent_slot: usize,
     fallback_kind: f32,
 ) -> [u8; PARAM_BYTES as usize] {
-    let mut values = [0.0_f32; 96];
+    let mut values = [0.0_f32; 140];
     values[..44].copy_from_slice(&pack_tile_params(draw));
     values[44..88].copy_from_slice(&pack_tile_params(parent));
     values[42] = f32::from(draw.tile.key.address.level());
@@ -1983,6 +2174,23 @@ fn pack_params(
         } else {
             0.0
         },
+    ]);
+    let mut cursor = 96;
+    for color in draw
+        .appearance
+        .material_colors
+        .into_iter()
+        .chain(draw.appearance.natural_colors)
+        .chain([draw.appearance.base_color, draw.appearance.dark_color])
+    {
+        values[cursor..cursor + 4].copy_from_slice(&[color[0], color[1], color[2], 0.0]);
+        cursor += 4;
+    }
+    values[cursor..cursor + 4].copy_from_slice(&[
+        draw.appearance.ambient,
+        draw.appearance.diffuse,
+        draw.appearance.curvature_darkening,
+        draw.appearance.curvature_lightening,
     ]);
     let mut bytes = [0_u8; PARAM_BYTES as usize];
     for (value, output) in values.into_iter().zip(bytes.as_chunks_mut::<4>().0) {
@@ -2182,6 +2390,7 @@ mod regional_pressure_tests {
             body_to_view,
             mode: 10,
             sun_body,
+            appearance: Default::default(),
         }
     }
 
@@ -2301,8 +2510,12 @@ mod regional_pressure_tests {
                 .unwrap();
 
             assert!(renderer.regional_report.fallback_active);
+            assert!(!renderer.regional_report.preparation_cache_hit);
             assert_eq!(renderer.regional_report.deferred_upload_count, 1);
             assert_eq!(renderer.regional_active_patches, [0]);
+            assert_eq!(renderer.regional_draw_epoch, None);
+            assert!(renderer.prepared_submission_pending);
+            assert!(renderer.prepared_draw_slots.contains(&REGIONAL_SLOT_BASE));
             assert_eq!(
                 renderer.tile_slots[REGIONAL_SLOT_BASE]
                     .resident_key

@@ -86,6 +86,8 @@ pub struct RegionalResidentReport {
     pub prepare_patch_count: usize,
     pub prepare_upload_count: usize,
     pub prepare_distinct_slot_count: usize,
+    /// The latest preparation reused an exactly matching, previously validated cover.
+    pub preparation_cache_hit: bool,
     /// Endpoint references reused from or newly validated in the exact cache.
     pub endpoint_validation_cache_hits: u64,
     pub endpoint_validation_cache_misses: u64,
@@ -141,6 +143,33 @@ pub struct RegionalSlotReport {
 }
 
 impl RegionalResidentDraw {
+    /// Whether two draws have identical immutable content and presentation inputs.
+    /// This is deliberately exact: cached validation is valid only while every
+    /// value that can affect validation or packed GPU parameters is unchanged.
+    pub(crate) fn same_render_inputs(&self, other: &Self) -> bool {
+        self.planetary == other.planetary
+            && self.capacity == other.capacity
+            && self.cells == other.cells
+            && self.uploads.len() == other.uploads.len()
+            && self
+                .uploads
+                .iter()
+                .zip(&other.uploads)
+                .all(|(a, b)| a.slot == b.slot && same_tile_draw(&a.tile, &b.tile))
+            && self.patches.len() == other.patches.len()
+            && self.patches.iter().zip(&other.patches).all(|(a, b)| {
+                a.own_slot == b.own_slot
+                    && a.parent_slot == b.parent_slot
+                    && same_tile_draw(&a.own, &b.own)
+                    && same_tile_draw(&a.parent, &b.parent)
+                    && a.morph_fraction.to_bits() == b.morph_fraction.to_bits()
+                    && a.boundary_fraction.to_bits() == b.boundary_fraction.to_bits()
+                    && a.quadrant == b.quadrant
+                    && a.quality_fallback == b.quality_fallback
+                    && Arc::ptr_eq(&a.boundary_endpoints, &b.boundary_endpoints)
+            })
+    }
+
     pub fn precision_budget(&self, tile: &crate::TileDraw) -> crate::RenderPrecisionBudget {
         if self.planetary {
             tile.planetary_precision_budget()
@@ -192,6 +221,7 @@ impl RegionalResidentDraw {
         let mut expected_uploads = BTreeMap::<usize, &TileKey>::new();
         let mut parent_keys = BTreeMap::<usize, &TileKey>::new();
         let mut parent_boundaries = BTreeMap::<usize, (&TileKey, &TileBoundary)>::new();
+        let mut cover_appearance = None;
         for patch in &self.patches {
             if patch.own_slot >= self.capacity
                 || patch.parent_slot >= self.capacity
@@ -206,6 +236,8 @@ impl RegionalResidentDraw {
                 || !(0.0..=1.0).contains(&patch.boundary_fraction)
                 || patch.own.mode != patch.parent.mode
                 || patch.own.sun_body != patch.parent.sun_body
+                || patch.own.appearance != patch.parent.appearance
+                || cover_appearance.is_some_and(|appearance| appearance != patch.own.appearance)
                 || patch
                     .own
                     .body_to_view
@@ -216,6 +248,7 @@ impl RegionalResidentDraw {
             {
                 return Err(TileGeometryError::InvalidTile);
             }
+            cover_appearance = Some(patch.own.appearance);
             patch.own.tile.validate_layout()?;
             patch.parent.tile.validate_layout()?;
             patch
@@ -299,6 +332,20 @@ impl RegionalResidentDraw {
         }
         Ok(())
     }
+}
+
+fn same_tile_draw(a: &TileDraw, b: &TileDraw) -> bool {
+    Arc::ptr_eq(&a.tile, &b.tile)
+        && a.tile.key == b.tile.key
+        && a.publication.key() == b.publication.key()
+        && a.publication.generation() == b.publication.generation()
+        && a.anchor_view_m.to_array().map(f64::to_bits)
+            == b.anchor_view_m.to_array().map(f64::to_bits)
+        && a.body_to_view.to_cols_array().map(f64::to_bits)
+            == b.body_to_view.to_cols_array().map(f64::to_bits)
+        && a.mode == b.mode
+        && a.sun_body.to_array().map(f64::to_bits) == b.sun_body.to_array().map(f64::to_bits)
+        && a.appearance == b.appearance
 }
 
 /// CPU reconstruction matching the shader's actual parent triangles and edge
@@ -531,6 +578,7 @@ mod endpoint_cache_tests {
             body_to_view: DMat3::IDENTITY,
             mode: 0,
             sun_body: DVec3::Z,
+            appearance: Default::default(),
         };
         RegionalResidentDraw {
             planetary: true,
@@ -594,5 +642,97 @@ mod endpoint_cache_tests {
         empty.patches.clear();
         empty.validate_cached(&mut cache).unwrap();
         assert!(cache.endpoints.is_empty());
+    }
+
+    #[test]
+    fn cached_draw_inputs_require_exact_content_slots_and_presentation() {
+        let original = draw();
+        assert!(original.same_render_inputs(&original.clone()));
+
+        let mut changed = original.clone();
+        changed.capacity += 1;
+        assert!(!original.same_render_inputs(&changed));
+
+        changed = original.clone();
+        changed.planetary = false;
+        assert!(!original.same_render_inputs(&changed));
+
+        changed = original.clone();
+        changed.uploads.push(RegionalTileUpload {
+            slot: 0,
+            tile: changed.patches[0].own.clone(),
+        });
+        assert!(!original.same_render_inputs(&changed));
+
+        changed = original.clone();
+        changed.patches[0].own_slot = 1;
+        assert!(!original.same_render_inputs(&changed));
+
+        changed = original.clone();
+        changed.patches[0].parent_slot = 1;
+        assert!(!original.same_render_inputs(&changed));
+
+        changed = original.clone();
+        let tile = Arc::clone(&changed.patches[0].own.tile);
+        changed.patches[0].own.tile = Arc::new((*tile).clone());
+        assert!(!original.same_render_inputs(&changed));
+
+        changed = original.clone();
+        changed.patches[0].own.anchor_view_m.x = -0.0;
+        assert!(!original.same_render_inputs(&changed));
+
+        changed = original.clone();
+        changed.patches[0].own.body_to_view.x_axis.x = -0.0;
+        assert!(!original.same_render_inputs(&changed));
+
+        changed = original.clone();
+        changed.patches[0].own.mode = 1;
+        assert!(!original.same_render_inputs(&changed));
+
+        changed = original.clone();
+        changed.patches[0].own.appearance.material_colors[0][0] += 0.01;
+        assert!(!original.same_render_inputs(&changed));
+
+        changed = original.clone();
+        changed.patches[0].own.sun_body.x = -0.0;
+        assert!(!original.same_render_inputs(&changed));
+
+        changed = original.clone();
+        changed.patches[0].morph_fraction = f32::from_bits(1.0f32.to_bits() + 1);
+        assert!(!original.same_render_inputs(&changed));
+
+        changed = original.clone();
+        changed.patches[0].boundary_fraction = f32::from_bits(1.0f32.to_bits() - 1);
+        assert!(!original.same_render_inputs(&changed));
+
+        changed = original.clone();
+        changed.patches[0].quadrant = Some([0, 0]);
+        assert!(!original.same_render_inputs(&changed));
+
+        changed = original.clone();
+        changed.patches[0].quality_fallback = true;
+        assert!(!original.same_render_inputs(&changed));
+
+        changed = original.clone();
+        let endpoints = Arc::clone(&changed.patches[0].boundary_endpoints);
+        changed.patches[0].boundary_endpoints = Arc::new((*endpoints).clone());
+        assert!(!original.same_render_inputs(&changed));
+
+        changed = original.clone();
+        let mut state = TileSlotState::default();
+        let other_key = {
+            let mut key = changed.patches[0].own.tile.key.clone();
+            key.definition_words.push(9);
+            key
+        };
+        state.request(&changed.patches[0].own.tile.key).unwrap();
+        state.request(&other_key).unwrap();
+        changed.patches[0].own.publication =
+            state.request(&changed.patches[0].own.tile.key).unwrap();
+        assert!(!original.same_render_inputs(&changed));
+
+        changed = original.clone();
+        changed.patches.clear();
+        assert!(!original.same_render_inputs(&changed));
     }
 }

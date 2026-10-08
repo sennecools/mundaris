@@ -80,6 +80,7 @@ fn hierarchy_draw(
         body_to_view,
         mode: 2,
         sun_body: DVec3::Z,
+        appearance: Default::default(),
     });
     ResidentHierarchyDraw {
         parent: draws[0].clone(),
@@ -186,6 +187,7 @@ fn invalid_late_child_does_not_publish_any_slot_or_invalidate_previous_tokens() 
         body_to_view: DMat3::IDENTITY,
         mode: 2,
         sun_body: DVec3::Z,
+        appearance: Default::default(),
     };
     let mut frame = CelestialFrame::new(&view, staging, projection, &sphere);
     frame.set_resident_tile(invalid_single).unwrap();

@@ -96,60 +96,6 @@ mod tests {
     use super::*;
     use mundaris_math::*;
     #[test]
-    fn planetary_layers_keep_sun_coherent_and_all_diagnostics_disable_them() {
-        use crate::planet_surface::{TerrainLighting, TerrainRenderMode};
-        let tree = FrameTree::new(std::num::NonZeroU64::new(5130).unwrap());
-        let view = PreparedView::new(
-            &tree.evaluate(),
-            FramePose::new(
-                FramePosition::new(
-                    tree.root(),
-                    LocalPosition::try_metres(DVec3::Z * 800_000.0).unwrap(),
-                ),
-                UnitRotation::identity(),
-            ),
-            crate::RenderPrecisionBudget::near_debug(),
-        )
-        .unwrap();
-        let body = CelestialRenderBody {
-            body_fixed_frame: tree.root(),
-            reference_radius_m: 400_000.0,
-            color: [1.0; 4],
-            unlit: false,
-            selected: false,
-        };
-        let sphere = Icosphere::new();
-        let mut staging = CelestialStaging::default();
-        let mut frame = CelestialFrame::new(
-            &view,
-            &mut staging,
-            CelestialProjection::try_new(640, 480, 1.0, 0.1).unwrap(),
-            &sphere,
-        );
-        let lighting = TerrainLighting::default().with_mode(TerrainRenderMode::Natural);
-        for mode in TerrainRenderMode::ALL {
-            frame.set_terrain_lighting(lighting);
-            frame
-                .set_planetary_environment(body, crate::PlanetaryConfig::default())
-                .unwrap();
-            assert_eq!(frame.report().planetary_ocean_draws, 1);
-            let new_light =
-                TerrainLighting::try_new(DVec3::X, 0.06, 0.94, TerrainRenderMode::Natural).unwrap();
-            frame.set_terrain_lighting(new_light);
-            assert_eq!(frame.staging.planetary[0].sun_body, [1.0, 0.0, 0.0]);
-            frame.set_terrain_lighting(new_light.with_mode(mode));
-            if mode != TerrainRenderMode::Natural {
-                frame
-                    .set_planetary_environment(body, crate::PlanetaryConfig::default())
-                    .unwrap();
-                assert_eq!(frame.report().planetary_ocean_draws, 0);
-                assert_eq!(frame.report().planetary_cloud_draws, 0);
-                assert_eq!(frame.report().planetary_atmosphere_draws, 0);
-            }
-            frame.validate().unwrap();
-        }
-    }
-    #[test]
     fn vertex_uniform_layout_is_explicit_and_complete() {
         let tree = FrameTree::new(std::num::NonZeroU64::new(1).unwrap());
         let observer = FramePose::new(
@@ -314,20 +260,9 @@ pub struct CelestialStaging {
     draws: Vec<u32>,
     markers: Vec<CelestialMarker>,
     centers: Vec<(DVec3, f64)>,
-    planetary: Vec<PlanetaryDraw>,
     resident_tile: Option<crate::TileDraw>,
     resident_hierarchy: Option<crate::ResidentHierarchyDraw>,
     resident_regional: Option<crate::RegionalResidentDraw>,
-}
-#[derive(Clone, Copy)]
-pub(crate) struct PlanetaryDraw {
-    pub body_frame: FrameId,
-    pub radius_m: f32,
-    pub observer_body_radius: [f32; 3],
-    pub sun_body: [f32; 3],
-    pub body_axes_view: [[f32; 3]; 3],
-    pub config: crate::PlanetaryConfig,
-    pub sphere_constants: [f32; 4],
 }
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CelestialPreparationReport {
@@ -342,9 +277,6 @@ pub struct CelestialPreparationReport {
     pub precision_fallbacks: usize,
     pub max_narrowing_error_m: f64,
     pub max_projected_error_pixels: f64,
-    pub planetary_ocean_draws: usize,
-    pub planetary_cloud_draws: usize,
-    pub planetary_atmosphere_draws: usize,
 }
 pub struct CelestialFrame<'view, 'tree, 'storage> {
     view: &'view PreparedView<'tree>,
@@ -370,7 +302,6 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
         staging.markers.clear();
         staging.centers.clear();
         staging.surface.clear();
-        staging.planetary.clear();
         staging.resident_tile = None;
         staging.resident_hierarchy = None;
         staging.resident_regional = None;
@@ -481,120 +412,7 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
     /// Sets renderer-only terrain shading for this frame. Directions and terrain
     /// normals use body-fixed axes; this does not change reusable geometry.
     pub fn set_terrain_lighting(&mut self, lighting: crate::planet_surface::TerrainLighting) {
-        let mode = lighting.mode();
-        if mode != crate::planet_surface::TerrainRenderMode::Natural {
-            self.staging.planetary.clear();
-            self.staging.surface.lighting = lighting;
-            return;
-        }
-        for draw in &mut self.staging.planetary {
-            draw.sun_body = lighting.sun_direction_body().as_vec3().to_array();
-        }
-        self.staging.surface.lighting = self.staging.planetary.first().map_or(lighting, |draw| {
-            lighting.with_planet_profile(draw.config.land)
-        });
-    }
-
-    /// Adds bounded natural material layers for a body in this frame.
-    pub fn set_planetary_environment(
-        &mut self,
-        body: CelestialRenderBody,
-        config: crate::PlanetaryConfig,
-    ) -> Result<(), RenderPreparationError> {
-        let result = (|| {
-            let config = config.try_validate()?;
-            let lighting_mode = self.staging.surface.lighting.mode();
-            if lighting_mode != crate::planet_surface::TerrainRenderMode::Natural {
-                return Ok(());
-            }
-            if !body.reference_radius_m.is_finite()
-                || body.reference_radius_m <= 0.0
-                || body.reference_radius_m + config.sea_datum_m <= 0.0
-                || body.reference_radius_m + config.atmosphere_height_m > f64::from(f32::MAX)
-                || (self
-                    .staging
-                    .planetary
-                    .first()
-                    .is_some_and(|prior| prior.body_frame != body.body_fixed_frame))
-            {
-                return Err(RenderPreparationError::InvalidBudget);
-            }
-            let source = self.view.prepare_source(body.body_fixed_frame)?;
-            let radius = body.reference_radius_m;
-            let observer_body = source.observer_in_source().metres();
-            let observer_body_radius = observer_body / radius;
-            // Factoring before narrowing avoids subtracting two nearly equal
-            // planetary-radius squares in WGSL at close water/cloud clearances.
-            let observer_radius_m = observer_body.length();
-            let sphere_constants = [
-                config.sea_datum_m,
-                config.cloud_altitude_m,
-                config.atmosphere_height_m,
-                0.0,
-            ]
-            .map(|altitude| crate::planetary::shell_constant(observer_radius_m, radius, altitude));
-            let body_axes = [
-                mundaris_math::Direction3::try_new(DVec3::X)?,
-                mundaris_math::Direction3::try_new(DVec3::Y)?,
-                mundaris_math::Direction3::try_new(DVec3::Z)?,
-            ];
-            let body_axes_view = [
-                source
-                    .view_direction(body_axes[0])?
-                    .unit()
-                    .as_vec3()
-                    .to_array(),
-                source
-                    .view_direction(body_axes[1])?
-                    .unit()
-                    .as_vec3()
-                    .to_array(),
-                source
-                    .view_direction(body_axes[2])?
-                    .unit()
-                    .as_vec3()
-                    .to_array(),
-            ];
-            let sun_body = self
-                .staging
-                .surface
-                .lighting
-                .sun_direction_body()
-                .as_vec3()
-                .to_array();
-            let observer_body_radius = observer_body_radius.as_vec3().to_array();
-            if !observer_body_radius
-                .iter()
-                .chain(&sun_body)
-                .chain(body_axes_view.iter().flatten())
-                .chain(&sphere_constants)
-                .all(|v| v.is_finite())
-                || radius > f64::from(f32::MAX)
-                || observer_body_radius.iter().any(|v| v.abs() > 1.0e20)
-            {
-                return Err(RenderPreparationError::InvalidDebugGeometry);
-            }
-            self.staging.surface.lighting = self
-                .staging
-                .surface
-                .lighting
-                .with_planet_profile(config.land);
-            self.staging.planetary.clear();
-            self.staging.planetary.push(PlanetaryDraw {
-                body_frame: body.body_fixed_frame,
-                radius_m: radius as f32,
-                observer_body_radius,
-                sun_body,
-                body_axes_view,
-                config,
-                sphere_constants,
-            });
-            Ok(())
-        })();
-        if result.is_err() {
-            self.failed = true;
-        }
-        result
+        self.staging.surface.lighting = lighting;
     }
 
     /// Content projection used for this frame, including viewport and origin.
@@ -628,30 +446,9 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
         self.projection
     }
     pub fn report(&self) -> CelestialPreparationReport {
-        let planetary_ocean_draws = self
-            .staging
-            .planetary
-            .iter()
-            .filter(|d| d.config.ocean_enabled)
-            .count();
-        let planetary_cloud_draws = self
-            .staging
-            .planetary
-            .iter()
-            .filter(|d| d.config.clouds_enabled)
-            .count();
-        let planetary_atmosphere_draws = self
-            .staging
-            .planetary
-            .iter()
-            .filter(|d| d.config.atmosphere_enabled)
-            .count();
         CelestialPreparationReport {
             sky: self.staging.sky.as_ref().map(|s| s.report()),
             surface: self.staging.surface.report,
-            planetary_ocean_draws,
-            planetary_cloud_draws,
-            planetary_atmosphere_draws,
             ..self.report
         }
     }
@@ -1008,20 +805,7 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
         Ok(())
     }
     pub fn validate(&self) -> Result<(), RenderPreparationError> {
-        if self.failed
-            || self.staging.planetary.iter().any(|draw| {
-                !draw
-                    .observer_body_radius
-                    .iter()
-                    .chain(&draw.sun_body)
-                    .chain(draw.body_axes_view.iter().flatten())
-                    .chain(&draw.sphere_constants)
-                    .all(|value| value.is_finite())
-                    || !draw.radius_m.is_finite()
-                    || draw.radius_m <= 0.0
-                    || draw.config.try_validate().is_err()
-            })
-        {
+        if self.failed {
             Err(RenderPreparationError::FailedDebugFrame)
         } else if (self.staging.resident_tile.is_some()
             || self.staging.resident_hierarchy.is_some()
@@ -1051,6 +835,7 @@ fn pack(position: [f32; 3], normal: [f32; 3], bytes: &mut Vec<u8>, normal_w: f32
 }
 
 pub(crate) struct CelestialRenderer {
+    cluster_settings: crate::ClusterSettings,
     sky: crate::sky::SkyRenderer,
     surface: crate::planet_surface::PlanetSurfaceRenderer,
     sphere_pipeline: wgpu::RenderPipeline,
@@ -1071,13 +856,19 @@ pub(crate) struct CelestialRenderer {
     polylines: wgpu::Buffer,
     polyline_capacity: u64,
     indices: wgpu::Buffer,
-    planetary: crate::planetary::PlanetaryRenderer,
-    planetary_depth: wgpu::BindGroup,
     resident_tile: Option<crate::resident_tile::ResidentTileRenderer>,
     _depth_texture: wgpu::Texture,
     depth: wgpu::TextureView,
 }
 impl CelestialRenderer {
+    pub(crate) fn set_cluster_settings(&mut self, settings: crate::ClusterSettings) {
+        self.cluster_settings = settings;
+    }
+    pub(crate) fn cluster_report(&self) -> crate::ClusterReport {
+        self.resident_tile
+            .as_ref()
+            .map_or_else(Default::default, |r| r.cluster_report())
+    }
     pub(crate) fn last_sky_resource_report(&self) -> crate::sky::SkyResourceReport {
         self.sky.report()
     }
@@ -1098,6 +889,12 @@ impl CelestialRenderer {
         self.resident_tile
             .as_ref()
             .map_or_else(Default::default, |r| r.regional_report())
+    }
+    #[cfg(feature = "developer-tools")]
+    pub(crate) fn last_submitted_regional_draw(
+        &self,
+    ) -> Option<(crate::RegionalResidentDraw, Vec<usize>, bool)> {
+        self.resident_tile.as_ref()?.last_submitted_regional_draw()
     }
     pub(crate) fn resident_on_submitted(&mut self, queue: &wgpu::Queue) {
         if let Some(r) = &mut self.resident_tile {
@@ -1242,8 +1039,6 @@ impl CelestialRenderer {
         }
         queue.write_buffer(&indices, 0, &bytes);
         let (depth_texture, depth) = depth(device, width, height);
-        let planetary = crate::planetary::PlanetaryRenderer::new(device, format);
-        let planetary_depth = planetary.atmosphere_group(device, &depth);
         Self {
             sky: crate::sky::SkyRenderer::new(device, format),
             surface: crate::planet_surface::PlanetSurfaceRenderer::new(
@@ -1275,9 +1070,8 @@ impl CelestialRenderer {
             ),
             polyline_capacity: 32,
             indices,
-            planetary,
-            planetary_depth,
             resident_tile: None,
+            cluster_settings: crate::ClusterSettings::default(),
             _depth_texture: depth_texture,
             depth,
         }
@@ -1286,7 +1080,6 @@ impl CelestialRenderer {
         let (texture, view) = depth(device, width, height);
         self._depth_texture = texture;
         self.depth = view;
-        self.planetary_depth = self.planetary.atmosphere_group(device, &self.depth);
     }
     pub(crate) fn draw(
         &mut self,
@@ -1337,8 +1130,15 @@ impl CelestialRenderer {
         } else if let Some(resident_tile) = &mut self.resident_tile {
             resident_tile.clear_frame();
         }
-        self.planetary
-            .upload(queue, &storage.planetary, frame.projection);
+        if let Some(resident) = &mut self.resident_tile {
+            resident.prepare_clusters(
+                device,
+                queue,
+                encoder,
+                frame.projection,
+                self.cluster_settings,
+            );
+        }
         grow(
             device,
             &mut self.vertices,
@@ -1466,39 +1266,7 @@ impl CelestialRenderer {
                 queries.end_scope(&mut pass, 3);
             }
         }
-        self.planetary
-            .draw_shells(&mut pass, &storage.planetary, timestamps);
         drop(pass);
-        if storage
-            .planetary
-            .iter()
-            .any(|draw| draw.config.atmosphere_enabled)
-        {
-            let mut atmosphere = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Planetary atmosphere scattering"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: timestamps.map(|queries| queries.pass_writes(1)),
-                occlusion_query_set: None,
-            });
-            let [x, y] = frame.projection.origin();
-            let [w, h] = frame.projection.viewport();
-            atmosphere.set_viewport(x as f32, y as f32, w as f32, h as f32, 0.0, 1.0);
-            atmosphere.set_scissor_rect(x, y, w, h);
-            self.planetary.draw_atmosphere(
-                &mut atmosphere,
-                &storage.planetary,
-                &self.planetary_depth,
-            );
-        }
         if !storage.lines.is_empty() || !storage.polylines.is_empty() {
             let mut overlays = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Celestial guides and overlays"),
@@ -1536,13 +1304,6 @@ impl CelestialRenderer {
             }
         }
         let mut scope_mask = 1;
-        if storage
-            .planetary
-            .iter()
-            .any(|draw| draw.config.atmosphere_enabled)
-        {
-            scope_mask |= 1 << 1;
-        }
         if !storage.lines.is_empty() || !storage.polylines.is_empty() {
             scope_mask |= 1 << 2;
         }
@@ -1564,12 +1325,6 @@ impl CelestialRenderer {
             if !storage.surface.fallback.is_empty() {
                 scope_mask |= 1 << 4;
             }
-            if storage.planetary.len() == 1 && storage.planetary[0].config.ocean_enabled {
-                scope_mask |= 1 << 5;
-            }
-            if storage.planetary.len() == 1 && storage.planetary[0].config.clouds_enabled {
-                scope_mask |= 1 << 6;
-            }
             if !storage.draws.is_empty() {
                 scope_mask |= 1 << 7;
             }
@@ -1579,7 +1334,7 @@ impl CelestialRenderer {
     }
 
     // Each section owns its complete draw state. In particular, a new pass has
-    // no bindings, and planetary group 0 is not the celestial projection group.
+    // no bindings.
     fn bind_sphere_state(&self, pass: &mut wgpu::RenderPass<'_>, draw: u32, start: u32) {
         pass.set_pipeline(&self.sphere_pipeline);
         pass.set_bind_group(0, &self.projection_group, &[]);

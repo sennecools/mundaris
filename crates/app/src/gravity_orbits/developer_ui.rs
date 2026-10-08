@@ -400,7 +400,6 @@ pub(super) fn right(ui: &mut egui::Ui, controls: &mut Controls, info: &UiInfo<'_
     ui.add_space(8.0);
     ui.separator();
     ui.heading("Rendering");
-    ui.strong("Planetary layers");
     let mut natural = controls.terrain_lighting.mode() == TerrainRenderMode::Natural;
     if ui
         .checkbox(&mut natural, "Natural terrain")
@@ -418,23 +417,6 @@ pub(super) fn right(ui: &mut egui::Ui, controls: &mut Controls, info: &UiInfo<'_
                     TerrainRenderMode::Lit
                 },
             )));
-    }
-    visual_controls::checkbox(ui, controls, visual_controls::Layer::Ocean, "Ocean");
-    visual_controls::checkbox(ui, controls, visual_controls::Layer::Clouds, "Clouds");
-    visual_controls::checkbox(
-        ui,
-        controls,
-        visual_controls::Layer::Atmosphere,
-        "Atmosphere",
-    );
-    ui.small("Layers render only where defined, in Natural mode.");
-    if let Some(s) = info.snapshot {
-        ui.small(format!(
-            "This frame: ocean {} · clouds {} · atmosphere {}",
-            on_off(s.rendering.ocean_drawn),
-            on_off(s.rendering.clouds_drawn),
-            on_off(s.rendering.atmosphere_drawn)
-        ));
     }
     ui.collapsing("Diagnostic rendering", |ui| {
         visual_controls::checkbox(
@@ -470,58 +452,9 @@ pub(super) fn right(ui: &mut egui::Ui, controls: &mut Controls, info: &UiInfo<'_
                 }
             });
     });
-    let mut sky_settings = controls.sky;
-    ui.collapsing("Distant sky", |ui| {
-        ui.small("Fictional decorative content · not travel destinations");
-        ui.checkbox(&mut sky_settings.enabled, "Enabled");
-        ui.add(egui::Slider::new(&mut sky_settings.intensity, 0.0..=3.0).text("Intensity"));
-        ui.add(
-            egui::Slider::new(
-                &mut sky_settings.galactic_yaw_rad,
-                -std::f64::consts::PI..=std::f64::consts::PI,
-            )
-            .text("Galactic yaw"),
-        );
-        ui.add(
-            egui::Slider::new(
-                &mut sky_settings.galactic_roll_rad,
-                -std::f64::consts::PI..=std::f64::consts::PI,
-            )
-            .text("Galactic roll"),
-        );
-        ui.add(egui::Slider::new(&mut sky_settings.star_intensity, 0.0..=3.0).text("Stars"));
-        ui.add(
-            egui::Slider::new(&mut sky_settings.background_intensity, 0.0..=3.0)
-                .text("Galactic band"),
-        );
-        ui.add(
-            egui::Slider::new(&mut sky_settings.halo_strength, 0.0..=0.5).text("Bright-star halos"),
-        );
-        if let Some(sky) = info.snapshot.and_then(|s| s.sky.as_ref()) {
-            ui.small(format!(
-                "{} v{} · {} finite stars",
-                sky.preset, sky.version, sky.star_count
-            ));
-            if sky.outside_envelope {
-                ui.colored_label(
-                    egui::Color32::YELLOW,
-                    "Sky unavailable outside supported observer envelope",
-                );
-            }
-        }
-    });
-    if sky_settings != controls.sky {
-        controls
-            .pending
-            .push_back(Command::Visual(visual_controls::VisualCommand::Sky(
-                sky_settings,
-            )));
-    }
     ui.add_space(8.0);
     ui.separator();
     ui.heading("Terrain");
-    let mut enabled = controls.terrain_preview;
-    if ui.checkbox(&mut enabled, "Procedural terrain").on_hover_text("Use existing observer-local terrain admission; disabling requests the smooth/far path.").changed() { controls.pending.push_back(Command::TerrainPreview(enabled)); }
     if let Some(s) = info.snapshot {
         ui.strong(&s.terrain.backend);
         if let Some(r) = &s.resident_planetary {
@@ -675,8 +608,4 @@ pub(super) fn right(ui: &mut egui::Ui, controls: &mut Controls, info: &UiInfo<'_
             }
         });
     }
-}
-
-fn on_off(value: bool) -> &'static str {
-    if value { "On" } else { "Off" }
 }

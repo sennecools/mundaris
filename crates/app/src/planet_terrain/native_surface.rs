@@ -6,6 +6,7 @@ const REPRESENTATION_SAMPLE_SPACING_PIXELS: f64 = 1.0;
 
 /// Exact world definition used by a disposable native terrain representation.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)] // Preserve the existing immutable authority value adapter.
 pub enum NativeTerrainDefinition {
     Legacy(TerrainDefinition),
     Surface(SurfaceDefinition),

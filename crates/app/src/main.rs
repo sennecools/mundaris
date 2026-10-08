@@ -1,8 +1,6 @@
 #![forbid(unsafe_code)]
 
-mod celestial_model;
 mod redraw;
-mod reference_frames;
 
 use std::{sync::Arc, time::Instant};
 
@@ -31,18 +29,11 @@ struct MundarisApp {
     application_error: Option<anyhow::Error>,
     occluded: bool,
     redraw_schedule: redraw::RedrawSchedule,
-    demo: Option<reference_frames::ReferenceFrameDemo>,
-    celestial_demo: Option<celestial_model::CelestialModelDemo>,
-    gravity_demo: Option<mundaris_app::GravityOrbitsDemo>,
+    gravity_demo: mundaris_app::GravityOrbitsDemo,
 }
 
 impl MundarisApp {
-    fn new(
-        reference_frames: bool,
-        celestial_model: bool,
-        gravity_orbits: bool,
-        solar_scale: Option<bool>,
-    ) -> Result<Self> {
+    fn new() -> Result<Self> {
         Ok(Self {
             #[cfg(feature = "developer-tools")]
             developer: None,
@@ -51,23 +42,7 @@ impl MundarisApp {
             application_error: None,
             occluded: false,
             redraw_schedule: redraw::RedrawSchedule::default(),
-            demo: if reference_frames {
-                Some(reference_frames::ReferenceFrameDemo::new()?)
-            } else {
-                None
-            },
-            celestial_demo: if celestial_model {
-                Some(celestial_model::CelestialModelDemo::new()?)
-            } else {
-                None
-            },
-            gravity_demo: if let Some(real_scale) = solar_scale {
-                Some(mundaris_app::GravityOrbitsDemo::solar_system(real_scale)?)
-            } else if gravity_orbits {
-                Some(mundaris_app::GravityOrbitsDemo::new()?)
-            } else {
-                None
-            },
+            gravity_demo: mundaris_app::GravityOrbitsDemo::shared_test_system()?,
         })
     }
 
@@ -102,6 +77,8 @@ impl ApplicationHandler<AppEvent> for MundarisApp {
         let attributes = Window::default_attributes()
             .with_title("Mundaris")
             .with_inner_size(PhysicalSize::new(1280, 800));
+        #[cfg(feature = "developer-tools")]
+        let attributes = attributes.with_active(self.developer.is_none());
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(error) => {
@@ -132,27 +109,11 @@ impl ApplicationHandler<AppEvent> for MundarisApp {
         info!("native window and renderer initialized");
         self.window = Some(window);
         self.renderer = Some(renderer);
-        if let Some(demo) = &mut self.demo {
-            demo.reset_wall_tick();
-        }
-        if let Some(demo) = &mut self.celestial_demo {
-            demo.reset_wall_tick();
-        }
-        if let Some(demo) = &mut self.gravity_demo {
-            demo.reset_wall_capture();
-        }
+        self.gravity_demo.reset_wall_capture();
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(demo) = &mut self.demo {
-            demo.set_lifecycle_drawable(false);
-        }
-        if let Some(demo) = &mut self.celestial_demo {
-            demo.set_lifecycle_drawable(false);
-        }
-        if let Some(demo) = &mut self.gravity_demo {
-            demo.set_lifecycle_drawable(false);
-        }
+        self.gravity_demo.set_lifecycle_drawable(false);
         // Release presentation resources before the native window on suspension.
         self.renderer = None;
         self.window = None;
@@ -186,8 +147,9 @@ impl ApplicationHandler<AppEvent> for MundarisApp {
                 ..
             } | WindowEvent::MouseInput { .. }
                 | WindowEvent::MouseWheel { .. }
-        ) && let (Some(service), Some(demo)) = (&mut self.developer, &mut self.gravity_demo)
+        ) && let Some(service) = &mut self.developer
         {
+            let demo = &mut self.gravity_demo;
             let input_kind = match &event {
                 WindowEvent::KeyboardInput { .. } => "keyboard",
                 WindowEvent::MouseInput { .. } => "mouse_button",
@@ -195,13 +157,20 @@ impl ApplicationHandler<AppEvent> for MundarisApp {
                 _ => unreachable!(),
             };
             info!(input_kind, "developer session received human input");
-            service.interrupt(demo, renderer, "human_input");
+            let reason = match &event {
+                WindowEvent::KeyboardInput { event, .. }
+                    if event.state == winit::event::ElementState::Pressed =>
+                {
+                    "human_input_keyboard_pressed"
+                }
+                WindowEvent::KeyboardInput { .. } => "human_input_keyboard_released",
+                WindowEvent::MouseInput { .. } => "human_input_mouse_button",
+                _ => "human_input_mouse_wheel",
+            };
+            service.interrupt(demo, renderer, reason);
         }
 
-        let scene_consumed = self
-            .gravity_demo
-            .as_mut()
-            .is_some_and(|demo| demo.on_window_event(&event));
+        let scene_consumed = self.gravity_demo.on_window_event(&event);
         let repaint = if scene_consumed {
             true
         } else {
@@ -220,22 +189,14 @@ impl ApplicationHandler<AppEvent> for MundarisApp {
                 // Resized. Projection and the acquired target must agree even
                 // when RedrawRequested arrives first.
                 renderer.resize(size.width, size.height);
-                let result = if let Some(demo) = &mut self.demo {
-                    demo.render(renderer, size.width, size.height)
-                } else if let Some(demo) = &mut self.celestial_demo {
-                    demo.render(renderer, size.width, size.height)
-                } else if let Some(demo) = &mut self.gravity_demo {
-                    demo.render(renderer, size.width, size.height)
-                } else {
-                    renderer.render(bootstrap_ui).map_err(anyhow::Error::new)
-                };
+                let result = self.gravity_demo.render(renderer, size.width, size.height);
                 if let Err(error) = result {
                     self.fail(event_loop, error.context("rendering a frame"));
                     return;
                 }
                 #[cfg(feature = "developer-tools")]
-                if let (Some(service), Some(demo)) = (&mut self.developer, &self.gravity_demo) {
-                    service.observe(demo, renderer, true);
+                if let Some(service) = &mut self.developer {
+                    service.observe(&self.gravity_demo, renderer, true);
                 }
             }
             _ => {}
@@ -245,30 +206,14 @@ impl ApplicationHandler<AppEvent> for MundarisApp {
             window.request_redraw();
         }
         let drawable = self.drawable();
-        if let Some(demo) = &mut self.gravity_demo {
-            demo.set_lifecycle_drawable(drawable);
-        }
-        if let Some(demo) = &mut self.demo {
-            demo.set_lifecycle_drawable(drawable);
-        }
-        if let Some(demo) = &mut self.celestial_demo {
-            demo.set_lifecycle_drawable(drawable);
-        }
+        self.gravity_demo.set_lifecycle_drawable(drawable);
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         #[cfg(feature = "developer-tools")]
         self.developer_turn(event_loop);
         let drawable = self.drawable();
-        if let Some(demo) = &mut self.demo {
-            demo.set_lifecycle_drawable(drawable);
-        }
-        if let Some(demo) = &mut self.celestial_demo {
-            demo.set_lifecycle_drawable(drawable);
-        }
-        if let Some(demo) = &mut self.gravity_demo {
-            demo.set_lifecycle_drawable(drawable);
-        }
+        self.gravity_demo.set_lifecycle_drawable(drawable);
         let (control_flow, request_redraw) =
             self.redraw_schedule.update(Instant::now(), self.drawable());
         event_loop.set_control_flow(control_flow);
@@ -282,27 +227,13 @@ impl ApplicationHandler<AppEvent> for MundarisApp {
 impl MundarisApp {
     fn developer_turn(&mut self, event_loop: &ActiveEventLoop) {
         let drawable = self.drawable();
-        if let (Some(service), Some(demo), Some(renderer)) = (
-            &mut self.developer,
-            &mut self.gravity_demo,
-            &mut self.renderer,
-        ) {
-            service.turn(demo, renderer, drawable);
+        if let (Some(service), Some(renderer)) = (&mut self.developer, &mut self.renderer) {
+            service.turn(&mut self.gravity_demo, renderer, drawable);
             if service.shutdown_requested {
                 event_loop.exit();
             }
         }
     }
-}
-
-fn bootstrap_ui(context: &egui::Context) {
-    egui::Window::new("Mundaris")
-        .collapsible(false)
-        .resizable(false)
-        .show(context, |ui| {
-            ui.label("Bootstrap environment");
-            ui.label("Renderer initialized");
-        });
 }
 
 fn main() -> Result<()> {
@@ -315,74 +246,47 @@ fn main() -> Result<()> {
         .try_init()
         .map_err(|error| anyhow!("initializing structured logging: {error}"))?;
 
-    let event_loop = EventLoop::<AppEvent>::with_user_event()
-        .build()
-        .context("creating the native event loop")?;
-    let mut arguments: Vec<_> = std::env::args().skip(1).collect();
-    let dev_interface = arguments.iter().any(|a| a == "--dev-interface")
+    let arguments: Vec<_> = std::env::args().skip(1).collect();
+    if arguments
+        .iter()
+        .any(|argument| argument == "--help" || argument == "-h")
+    {
+        println!("usage: mundaris_app [--dev-interface]");
+        return Ok(());
+    }
+    let mut dev_interface = false;
+    for argument in &arguments {
+        match argument.as_str() {
+            "--dev-interface" if !dev_interface => dev_interface = true,
+            "--dev-interface" => anyhow::bail!("duplicate --dev-interface"),
+            other => {
+                anyhow::bail!("unknown argument: {other}; usage: mundaris_app [--dev-interface]")
+            }
+        }
+    }
+    let dev_interface = dev_interface
         || cfg!(feature = "developer-tools")
             && (std::env::var("MUNDARIS_PERFORMANCE_LAB").is_ok_and(|value| value == "1")
                 || std::env::var_os("MUNDARIS_CAPTURE_DIR").is_some());
-    anyhow::ensure!(
-        arguments
-            .iter()
-            .filter(|a| a.as_str() == "--dev-interface")
-            .count()
-            <= 1,
-        "duplicate --dev-interface"
-    );
-    arguments.retain(|a| a != "--dev-interface");
     #[cfg(not(feature = "developer-tools"))]
     anyhow::ensure!(
         !dev_interface,
         "--dev-interface requires the developer-tools build feature"
     );
-    let legacy_terrain = arguments.iter().any(|a| a == "--legacy-terrain");
-    arguments.retain(|a| a != "--legacy-terrain");
-    let usage = "usage: mundaris_app [--solar-system | --real-solar-system | --reference-frames | --celestial-model | --gravity-orbits] [--legacy-terrain]";
-    anyhow::ensure!(
-        arguments.len() <= 1,
-        "conflicting or duplicate arguments; {usage}"
-    );
-    let (reference_frames, celestial_model, gravity_orbits, solar_scale) =
-        match arguments.first().map(String::as_str) {
-            None | Some("--solar-system") => (false, false, false, Some(false)),
-            Some("--real-solar-system") => (false, false, false, Some(true)),
-            Some("--reference-frames") => (true, false, false, None),
-            Some("--celestial-model") => (false, true, false, None),
-            Some("--gravity-orbits") => (false, false, true, None),
-            Some(argument) => anyhow::bail!("unknown argument: {argument}; {usage}"),
-        };
-    let mut app = MundarisApp::new(
-        reference_frames,
-        celestial_model,
-        gravity_orbits,
-        solar_scale,
-    )?;
-    if legacy_terrain && let Some(demo) = &mut app.gravity_demo {
-        demo.use_legacy_terrain();
-    }
+    let event_loop = EventLoop::<AppEvent>::with_user_event()
+        .build()
+        .context("creating the native event loop")?;
+    let mut app = MundarisApp::new()?;
     #[cfg(feature = "developer-tools")]
     if dev_interface {
-        anyhow::ensure!(
-            app.gravity_demo.is_some(),
-            "development interface does not support reference-frame or celestial-model demos"
-        );
-        let preset = if gravity_orbits {
-            "gravity-orbits"
-        } else if solar_scale == Some(true) {
-            "real-solar-system"
-        } else {
-            "solar-system"
-        };
+        let preset = "test-solar-system";
         let proxy = event_loop.create_proxy();
         let service =
             mundaris_app::developer_service::DeveloperService::start(preset, move || {
                 let _ = proxy.send_event(AppEvent::DeveloperWake);
             })?;
-        if let Some(demo) = &mut app.gravity_demo {
-            demo.developer_set_session(&service.descriptor.session_id);
-        }
+        app.gravity_demo
+            .developer_set_session(&service.descriptor.session_id);
         app.developer = Some(service);
     }
     event_loop

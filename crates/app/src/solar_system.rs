@@ -184,6 +184,8 @@ pub const SOLAR_SYSTEM_CONTENT: [SolarBodyContent; 10] = [
     ),
 ];
 
+const MOON_FIELDS_EXPERIMENT_SEED: u64 = 2;
+
 #[allow(clippy::too_many_arguments)]
 const fn entry(
     identity: SolarBody,
@@ -264,7 +266,44 @@ impl SolarSystemPreset {
         self,
         namespace: NonZeroU64,
     ) -> anyhow::Result<(CelestialSystem, CelestialMotionDefinition)> {
-        let system = self.create(namespace)?;
+        self.create_analytic_with_moon_fields_cpu(namespace, false)
+    }
+
+    /// Create the ordinary analytic preset with an optional developer Moon source.
+    /// The experiment changes only the Moon's source version and seed.
+    pub(crate) fn create_analytic_with_moon_fields_cpu(
+        self,
+        namespace: NonZeroU64,
+        moon_fields_cpu: bool,
+    ) -> anyhow::Result<(CelestialSystem, CelestialMotionDefinition)> {
+        self.create_analytic_with_moon_profile(namespace, moon_fields_cpu, None)
+    }
+
+    pub(crate) fn create_analytic_with_moon_profile(
+        self,
+        namespace: NonZeroU64,
+        moon_fields_cpu: bool,
+        profile: Option<TerrainHeightProfile>,
+    ) -> anyhow::Result<(CelestialSystem, CelestialMotionDefinition)> {
+        anyhow::ensure!(
+            profile.is_none() || moon_fields_cpu,
+            "height profile requires the Moon field experiment"
+        );
+        let mut system = self.create_with_moon_fields_cpu(namespace, moon_fields_cpu)?;
+        if let Some(profile) = profile {
+            let moon_id = system
+                .bodies()
+                .find(|(_, body)| body.name() == "Moon")
+                .map(|(id, _)| id)
+                .ok_or_else(|| anyhow::anyhow!("Moon is missing"))?;
+            let definition = SurfaceDefinition::generated(
+                TerrainIdentity(0x4d4f_4f4e),
+                TerrainSeed(MOON_FIELDS_EXPERIMENT_SEED),
+                SurfaceAlgorithm::MoonProfileV1,
+            )
+            .with_height_profile(profile)?;
+            system.edit_surface_definition(moon_id, Some(definition))?;
+        }
         let mut definitions = Vec::with_capacity(system.body_count());
         for (i, (id, body)) in system.bodies().enumerate() {
             let content = &SOLAR_SYSTEM_CONTENT[i];
@@ -312,6 +351,14 @@ impl SolarSystemPreset {
     }
 
     pub fn create(self, namespace: NonZeroU64) -> anyhow::Result<CelestialSystem> {
+        self.create_with_moon_fields_cpu(namespace, false)
+    }
+
+    fn create_with_moon_fields_cpu(
+        self,
+        namespace: NonZeroU64,
+        moon_fields_cpu: bool,
+    ) -> anyhow::Result<CelestialSystem> {
         anyhow::ensure!(
             self.body_radius_scale.is_finite()
                 && self.body_radius_scale > 0.0
@@ -438,8 +485,16 @@ impl SolarSystemPreset {
                         id,
                         Some(SurfaceDefinition::generated(
                             TerrainIdentity(seed),
-                            TerrainSeed(seed),
-                            SurfaceAlgorithm::RockyV5,
+                            if moon_fields_cpu {
+                                TerrainSeed(MOON_FIELDS_EXPERIMENT_SEED)
+                            } else {
+                                TerrainSeed(seed)
+                            },
+                            if moon_fields_cpu {
+                                SurfaceAlgorithm::MoonFieldsV1
+                            } else {
+                                SurfaceAlgorithm::RockyV5
+                            },
                         )),
                     )?;
                 } else {
@@ -480,112 +535,6 @@ pub fn body_color(body: SolarBody) -> [f32; 4] {
 
 /// Natural material defaults for catalogue bodies; all dimensions are authored
 /// relative to the supplied (possibly gameplay-scaled) reference radius.
-pub fn planetary_config(
-    body: SolarBody,
-    radius_m: f64,
-) -> anyhow::Result<Option<mundaris_renderer::PlanetaryConfig>> {
-    if !radius_m.is_finite() || radius_m <= 0.0 {
-        anyhow::bail!("planetary radius must be finite and positive");
-    }
-    use mundaris_renderer::{PlanetLandProfile as Land, PlanetaryConfig};
-    let mut config = match body {
-        SolarBody::Sun
-        | SolarBody::Jupiter
-        | SolarBody::Saturn
-        | SolarBody::Uranus
-        | SolarBody::Neptune => return Ok(None),
-        SolarBody::Earth => PlanetaryConfig {
-            land: Land::Earth,
-            sea_datum_m: GAMEPLAY_EARTH_SEA_LEVEL_M,
-            ..Default::default()
-        },
-        SolarBody::Mars => PlanetaryConfig {
-            land: Land::Mars,
-            ocean_enabled: false,
-            clouds_enabled: false,
-            atmosphere_enabled: false,
-            ..Default::default()
-        },
-        SolarBody::Moon | SolarBody::Mercury | SolarBody::Venus => PlanetaryConfig {
-            land: Land::Rock,
-            ocean_enabled: false,
-            clouds_enabled: false,
-            atmosphere_enabled: false,
-            ..Default::default()
-        },
-    };
-    if body == SolarBody::Earth {
-        config.cloud_altitude_m = (0.012 * radius_m).min(12_000.0);
-        config.atmosphere_height_m = (0.025 * radius_m).min(100_000.0);
-    }
-    Ok(Some(config.try_validate()?))
-}
-
-/// Reference datum for diagnostic basin colouring and the render-only ocean.
-/// Kept outside terrain definitions so display changes never invalidate raw terrain.
-pub const GAMEPLAY_EARTH_SEA_LEVEL_M: f64 = 350.0;
-
-/// Only Earth uses the tuned diagnostic ocean level; airless bodies use zero.
-pub fn reference_sea_level_m(body: SolarBody) -> Option<f64> {
-    content(body).rocky_terrain_seed.map(|_| {
-        if body == SolarBody::Earth {
-            GAMEPLAY_EARTH_SEA_LEVEL_M
-        } else {
-            0.0
-        }
-    })
-}
-
-/// Content-authored readability thresholds scaled to each rocky preset's relief.
-/// Blue on airless bodies means below the reference datum, not liquid water.
-pub fn terrain_readability_config(
-    body: SolarBody,
-    radius_m: f64,
-) -> anyhow::Result<Option<mundaris_renderer::planet_surface::TerrainReadability>> {
-    terrain_readability_config_with_sea_level(
-        body,
-        radius_m,
-        reference_sea_level_m(body).unwrap_or(0.0),
-    )
-}
-
-/// Debug/content override of the datum without modifying procedural geometry.
-pub fn terrain_readability_config_with_sea_level(
-    body: SolarBody,
-    radius_m: f64,
-    sea_level_m: f64,
-) -> anyhow::Result<Option<mundaris_renderer::planet_surface::TerrainReadability>> {
-    if content(body).rocky_terrain_seed.is_none() {
-        return Ok(None);
-    }
-    anyhow::ensure!(
-        radius_m.is_finite() && radius_m > 0.0,
-        "invalid palette radius"
-    );
-    let relief = match body {
-        SolarBody::Mercury => 0.35,
-        SolarBody::Venus => 0.22,
-        SolarBody::Earth => 1.0,
-        SolarBody::Moon => 0.42,
-        SolarBody::Mars => 0.76,
-        _ => 0.5,
-    };
-    let scale = relief * (radius_m / 400_000.0).min(1.0);
-    Ok(Some(
-        mundaris_renderer::planet_surface::TerrainReadability::try_new(
-            sea_level_m,
-            sea_level_m + 60.0 * scale,
-            sea_level_m + 250.0 * scale,
-            sea_level_m + 350.0 * scale,
-            sea_level_m + 650.0 * scale,
-            8.0,
-            16.0,
-        )?,
-    ))
-}
-
-/// Build rocky V2 definitions. Macro relief wavelengths scale with the body;
-/// regional and local wavelengths remain physical, and heights shrink for small worlds.
 pub fn terrain_definition(
     body: SolarBody,
     radius_m: f64,
@@ -725,4 +674,112 @@ pub fn cratered_terrain_definition(
         TerrainDefinition::new(identity, seed, TerrainGeneratorVersion::CrateredV1, config);
     definition.validate_radius(radius_m)?;
     Ok(definition)
+}
+
+#[cfg(test)]
+mod moon_fields_selection_tests {
+    use super::*;
+
+    fn assert_moon_fields_selection(preset: SolarSystemPreset, expected_radius_m: f64) {
+        let namespace = NonZeroU64::new(91).unwrap();
+        let (default_system, _) = preset.create_analytic(namespace).unwrap();
+        let (fields_system, _) = preset
+            .create_analytic_with_moon_fields_cpu(namespace, true)
+            .unwrap();
+        let (default_id, default_moon) = default_system
+            .bodies()
+            .find(|(_, body)| body.name() == "Moon")
+            .unwrap();
+        let (fields_id, fields_moon) = fields_system
+            .bodies()
+            .find(|(_, body)| body.name() == "Moon")
+            .unwrap();
+        let default_surface = default_moon.surface_definition().unwrap();
+        let fields_surface = fields_moon.surface_definition().unwrap();
+
+        assert_eq!(default_id, fields_id);
+        assert_eq!(default_surface.identity(), TerrainIdentity(0x4d4f_4f4e));
+        assert_eq!(fields_surface.identity(), default_surface.identity());
+        assert_eq!(default_surface.seed(), TerrainSeed(0x4d4f_4f4e));
+        assert_eq!(
+            fields_surface.seed(),
+            TerrainSeed(MOON_FIELDS_EXPERIMENT_SEED)
+        );
+        assert_eq!(
+            default_surface.terrain().algorithm(),
+            SurfaceAlgorithm::RockyV5
+        );
+        assert_eq!(
+            fields_surface.terrain().algorithm(),
+            SurfaceAlgorithm::MoonFieldsV1
+        );
+        assert_eq!(
+            default_moon.properties().reference_radius_m(),
+            expected_radius_m
+        );
+        assert_eq!(
+            fields_moon.properties().reference_radius_m(),
+            expected_radius_m
+        );
+    }
+
+    #[test]
+    fn developer_moon_fields_selection_preserves_body_identity_and_scale() {
+        let gameplay = SolarSystemPreset::gameplay();
+        assert_moon_fields_selection(
+            gameplay,
+            SOLAR_SYSTEM_CONTENT[index(SolarBody::Moon)].real_mean_radius_m
+                * gameplay.body_radius_scale,
+        );
+        assert_moon_fields_selection(
+            SolarSystemPreset::real_scale(),
+            SOLAR_SYSTEM_CONTENT[index(SolarBody::Moon)].real_mean_radius_m,
+        );
+    }
+
+    #[test]
+    fn profile_selection_changes_only_moon_source_and_retains_body_ids() {
+        let bytes: Vec<_> = (0..16u16)
+            .flat_map(|value| (value * 4000).to_le_bytes())
+            .collect();
+        let profile = TerrainHeightProfile::from_u16_le(4, 4, &bytes).unwrap();
+        for preset in [
+            SolarSystemPreset::gameplay(),
+            SolarSystemPreset::real_scale(),
+        ] {
+            let namespace = NonZeroU64::new(97).unwrap();
+            let (default, _) = preset.create_analytic(namespace).unwrap();
+            let (experiment, _) = preset
+                .create_analytic_with_moon_profile(namespace, true, Some(profile.clone()))
+                .unwrap();
+            for ((default_id, default_body), (experiment_id, experiment_body)) in
+                default.bodies().zip(experiment.bodies())
+            {
+                assert_eq!(default_id, experiment_id);
+                assert_eq!(default_body.properties(), experiment_body.properties());
+                if default_body.name() == "Moon" {
+                    let definition = experiment_body.surface_definition().unwrap();
+                    assert_eq!(
+                        definition.terrain().algorithm(),
+                        SurfaceAlgorithm::MoonProfileV1
+                    );
+                    assert_eq!(definition.height_profile(), Some(&profile));
+                    assert_eq!(
+                        definition.identity(),
+                        default_body.surface_definition().unwrap().identity()
+                    );
+                    SurfaceGenerator::new(
+                        definition,
+                        experiment_body.properties().reference_radius_m(),
+                    )
+                    .unwrap();
+                } else {
+                    assert_eq!(
+                        default_body.surface_definition(),
+                        experiment_body.surface_definition()
+                    );
+                }
+            }
+        }
+    }
 }

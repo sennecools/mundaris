@@ -1,0 +1,130 @@
+{
+  "schema": 1,
+  "id": "eroded-profile-test",
+  "revision": 1,
+  "identity": 1297043278,
+  "seed": 2,
+  "algorithm": "MoonProfileV1",
+  "geology": {
+    "version": 1,
+    "age": {
+      "start": 0.12,
+      "span": 0.86
+    },
+    "activity_factor": {
+      "start": 0.55,
+      "span": 0.45
+    },
+    "resurfacing": {
+      "base": 0.0,
+      "age": 0.0,
+      "activity": 0.0,
+      "random": 0.0,
+      "age_complement": false
+    },
+    "impact_retention": {
+      "base": 1.0,
+      "age": 0.0,
+      "activity": 0.0,
+      "random": 0.0,
+      "age_complement": false
+    },
+    "relief_fraction": {
+      "base": 0.00685,
+      "age": 0.0,
+      "activity": 0.0,
+      "random": 0.0,
+      "age_complement": false
+    },
+    "feature_scale_fraction": {
+      "start": 0.2,
+      "span": 0.16
+    },
+    "orientation_turns": {
+      "start": 0.0,
+      "span": 1.0
+    }
+  },
+  "procedural": null,
+  "profile": {
+    "asset": "test-inputs/mountain-eroded.r16",
+    "sha256": "43129546fd677d48a8ea3844475ab9aa258c6215929d5bda004ec218bb3cc89e",
+    "provenance": "temporary-reference-input",
+    "width": 2048,
+    "height": 2048,
+    "kernel": "bspline",
+    "footprint_m": 4000.0,
+    "amplitude_m": 600.0,
+    "detail_layers": [
+      {
+        "footprint_m": 64.0,
+        "amplitude_m": 1.5
+      }
+    ]
+  },
+  "material_composition": [
+    0.0,
+    1.0
+  ],
+  "material_contrast": 0.4,
+  "appearance": {
+    "material_colors": [
+      [
+        0.72,
+        0.54,
+        0.3
+      ],
+      [
+        0.34,
+        0.38,
+        0.42
+      ],
+      [
+        0.45,
+        0.3,
+        0.22
+      ],
+      [
+        0.78,
+        0.73,
+        0.64
+      ]
+    ],
+    "natural_colors": [
+      [
+        0.42,
+        0.42,
+        0.42
+      ],
+      [
+        0.3,
+        0.3,
+        0.3
+      ],
+      [
+        0.12,
+        0.12,
+        0.12
+      ],
+      [
+        0.62,
+        0.62,
+        0.62
+      ]
+    ],
+    "base_color": [
+      0.35,
+      0.38,
+      0.34
+    ],
+    "dark_color": [
+      0.08,
+      0.08,
+      0.08
+    ],
+    "ambient": 0.2,
+    "diffuse": 0.8,
+    "curvature_darkening": 0.0,
+    "curvature_lightening": 0.0
+  }
+}

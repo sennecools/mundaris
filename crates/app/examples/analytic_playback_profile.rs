@@ -14,9 +14,9 @@ fn main() -> Result<()> {
         .context("provide a fresh output JSON path")?;
     ensure!(!output.exists(), "refusing to replace existing evidence");
     let mut fixtures = Vec::new();
-    for real_scale in [false, true] {
+    for scene in [mundaris_app::shared_system::SCENE_NAME] {
         for time_s in [0.0, 31_557_600_000.0, -31_557_600_000.0] {
-            let mut app = GravityOrbitsDemo::solar_system(real_scale)?;
+            let mut app = GravityOrbitsDemo::shared_test_system()?;
             app.seek_seconds(time_s)?;
             app.set_playback_rate(1.0)?;
             app.set_paused(false)?;
@@ -40,7 +40,7 @@ fn main() -> Result<()> {
                     "app_update_us":update_us, "body_count":motion.analytic_body_count,
                     "solver_iterations":motion.solver_iterations}));
             }
-            fixtures.push(json!({"real_scale":real_scale,"start_time_s":time_s,"warmup_count":5,"sample_count":30,"samples":samples}));
+            fixtures.push(json!({"scene":scene,"start_time_s":time_s,"warmup_count":5,"sample_count":30,"samples":samples}));
         }
     }
     let result = json!({"profile":if cfg!(debug_assertions){"debug"}else{"release"},

@@ -53,7 +53,11 @@ fn ready(
         }
         assert!(
             Instant::now() < deadline,
-            "worker patch did not publish before deadline"
+            "worker patch did not publish before deadline: body={:?} level={} pending={} report={:?}",
+            id.body,
+            a.level(),
+            cache.pending(),
+            cache.report()
         );
         thread::sleep(Duration::from_millis(1));
     }
@@ -128,7 +132,11 @@ fn workers_match_serial_patch_bits_across_bodies_and_scales() {
 #[test]
 fn worker_cancellation_revision_switch_and_aggregate_reservations_stay_bounded() {
     let (mut world, identities) = fixture();
-    let cap = 4 * 1024 * 1024;
+    // Modern surface jobs reserve the supported profile working-set bound even
+    // for procedural fixtures. Charge that bound plus workers and patch storage.
+    let cap = mundaris_world::terrain::SurfaceGenerator::working_heap_bound_bytes()
+        + size_of::<mundaris_world::terrain::SurfaceGenerator>()
+        + 16 * 1024 * 1024;
     let mut cache = TerrainPatchCache::new_with_workers(cap, 64, 4).unwrap();
     let old = &identities[0];
     for level in 0..12 {

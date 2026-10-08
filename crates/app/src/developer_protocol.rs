@@ -53,6 +53,28 @@ pub enum DevOperation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DevCommand {
+    /// Diagnostic-only profiler controls. Freeze retains the displayed data while
+    /// the simulation continues. Export queues a bounded background write.
+    Profiler {
+        #[serde(default)]
+        enabled: Option<bool>,
+        #[serde(default)]
+        freeze: Option<bool>,
+        #[serde(default)]
+        view: Option<String>,
+        #[serde(default)]
+        frame: Option<u64>,
+        #[serde(default)]
+        event: Option<u64>,
+        #[serde(default)]
+        export: bool,
+        #[serde(default)]
+        zoom: Option<f64>,
+        #[serde(default)]
+        pan: Option<f64>,
+        #[serde(default)]
+        fill_window: Option<bool>,
+    },
     Select {
         body: String,
     },
@@ -84,6 +106,28 @@ pub enum DevCommand {
     },
     Clearance {
         meters: f64,
+    },
+    /// Attribution control: stop preparation/publication while drawing the retained cover.
+    ResidentCoverHold {
+        enabled: bool,
+    },
+    ClusterRendering {
+        mode: String,
+        #[serde(default = "cluster_lit")]
+        debug: String,
+        #[serde(default)]
+        triangle_edges: bool,
+        #[serde(default)]
+        cluster_edges: bool,
+        #[serde(default)]
+        freeze: bool,
+    },
+    /// Reproducible developer capture pose in the selected body's f64 fixed frame.
+    /// The ordinary surface controller and complete-source clearance remain active.
+    SurfacePose {
+        body: String,
+        position_body_m: [f64; 3],
+        orientation_xyzw: [f64; 4],
     },
     Pause {
         paused: bool,
@@ -257,6 +301,9 @@ fn default_regional_merge_error_px() -> f64 {
 }
 fn one() -> f64 {
     1.0
+}
+fn cluster_lit() -> String {
+    "lit".into()
 }
 fn yes() -> bool {
     true

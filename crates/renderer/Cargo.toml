@@ -11,8 +11,10 @@ surface-profile = ["dep:cpu-time"]
 terrain-capture = []
 
 [dependencies]
+meshopt = "=0.6.2"
 cpu-time = { version = "1.0.0", optional = true }
 mundaris_math = { path = "../math" }
+naga.workspace = true
 glam.workspace = true
 egui.workspace = true
 egui-wgpu.workspace = true
@@ -25,7 +27,6 @@ winit.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
-naga.workspace = true
 
 [[bench]]
 name = "view_preparation"

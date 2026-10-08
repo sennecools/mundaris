@@ -5,7 +5,7 @@ use mundaris_app::{
 };
 #[test]
 fn handles_are_session_scoped_and_inventory_is_observational() {
-    let mut demo = GravityOrbitsDemo::solar_system(false).unwrap();
+    let mut demo = GravityOrbitsDemo::shared_test_system().unwrap();
     demo.developer_set_session("first");
     let revision = demo.world().revision();
     let a = demo.developer_inventory("first").unwrap();
@@ -27,7 +27,7 @@ fn handles_are_session_scoped_and_inventory_is_observational() {
 }
 #[test]
 fn malformed_nonfinite_and_unknown_operations_do_not_mutate_authority() {
-    let mut demo = GravityOrbitsDemo::solar_system(false).unwrap();
+    let mut demo = GravityOrbitsDemo::shared_test_system().unwrap();
     let revision = demo.world().revision();
     for command in [
         DevCommand::Seek { seconds: f64::NAN },

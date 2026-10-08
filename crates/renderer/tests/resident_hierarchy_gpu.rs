@@ -158,6 +158,7 @@ fn hierarchy_gpu_matches_f64_and_preserves_borders_under_common_offsets() {
                 body_to_view,
                 mode: 2,
                 sun_body: DVec3::new(0.3, -0.4, 0.8).normalize(),
+                appearance: Default::default(),
             });
             let mut hierarchy = ResidentHierarchyDraw {
                 parent: draws[0].clone(),

@@ -37,6 +37,7 @@ fn draw(level: u8, anchor_view_m: DVec3) -> TileDraw {
         body_to_view: DMat3::IDENTITY,
         mode: 0,
         sun_body: DVec3::Z,
+        appearance: Default::default(),
     }
 }
 

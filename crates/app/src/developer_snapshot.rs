@@ -3,9 +3,7 @@
 
 use anyhow::{Result, ensure};
 use mundaris_math::FramePose;
-use mundaris_renderer::{
-    CelestialPreparationReport, CelestialProjection, GpuProfile, planet_surface::TerrainRenderMode,
-};
+use mundaris_renderer::{CelestialProjection, GpuProfile, planet_surface::TerrainRenderMode};
 use mundaris_world::{BodyId, CoherentCelestialView};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeMap};
 use serde_json::Value;
@@ -292,33 +290,87 @@ impl MemorySnapshot {
     }
 }
 
-/// Enable flags are developer settings; draw flags identify layers in this frame.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RenderingSnapshot {
+    #[serde(default)]
+    pub clusters: Option<serde_json::Value>,
+    #[serde(default)]
+    pub resident_cover_held: bool,
+    #[serde(default)]
+    pub resident_submitted_patch_count: usize,
+    /// Indexed triangles submitted before rasterization; not visible pixel coverage.
+    #[serde(default)]
+    pub resident_submitted_triangle_count: usize,
     pub terrain_render_mode: String,
     pub terrain_enabled: bool,
-    pub ocean_enabled: bool,
-    pub clouds_enabled: bool,
-    pub atmosphere_enabled: bool,
     pub patch_borders_enabled: bool,
     pub lod_colors_enabled: bool,
     pub navigation_markers_enabled: bool,
-    pub ocean_drawn: bool,
-    pub clouds_drawn: bool,
-    pub atmosphere_drawn: bool,
 }
-impl RenderingSnapshot {
-    pub fn with_draw_report(mut self, report: CelestialPreparationReport) -> Self {
-        self.ocean_drawn = report.planetary_ocean_draws > 0;
-        self.clouds_drawn = report.planetary_cloud_draws > 0;
-        self.atmosphere_drawn = report.planetary_atmosphere_draws > 0;
-        self
+
+/// Native asynchronous sampling counts; reservations can abort before submission.
+/// A busy skip identifies query availability, not expensive skipped work.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimestampSamplingSnapshot {
+    pub explicit_requests: u64,
+    pub eligible_frames: u64,
+    pub accepted_reservations: u64,
+    pub actual_submissions: u64,
+    pub valid_completions: u64,
+    pub busy_skips: u64,
+    pub map_failures: u64,
+    pub decode_failures: u64,
+    pub invalid_samples: u64,
+    pub last_busy_skip_candidate_submission_id: Option<u64>,
+    pub last_busy_skip_source_submission_id: Option<u64>,
+    pub last_submitted_source_submission_id: Option<u64>,
+    pub last_completed_source_submission_id: Option<u64>,
+    pub last_map_failure_source_submission_id: Option<u64>,
+    pub last_decode_failure_source_submission_id: Option<u64>,
+    pub last_invalid_sample_source_submission_id: Option<u64>,
+}
+
+impl From<mundaris_renderer::TimestampProfilingMetrics> for TimestampSamplingSnapshot {
+    fn from(metrics: mundaris_renderer::TimestampProfilingMetrics) -> Self {
+        Self {
+            explicit_requests: metrics.explicit_requests,
+            eligible_frames: metrics.eligible_frames,
+            accepted_reservations: metrics.accepted_reservations,
+            actual_submissions: metrics.actual_submissions,
+            valid_completions: metrics.valid_completions,
+            busy_skips: metrics.busy_skips,
+            map_failures: metrics.map_failures,
+            decode_failures: metrics.decode_failures,
+            invalid_samples: metrics.invalid_samples,
+            last_busy_skip_candidate_submission_id: metrics.last_busy_skip_candidate_submission_id,
+            last_busy_skip_source_submission_id: metrics.last_busy_skip_source_submission_id,
+            last_submitted_source_submission_id: metrics.last_submitted_source_submission_id,
+            last_completed_source_submission_id: metrics.last_completed_source_submission_id,
+            last_map_failure_source_submission_id: metrics.last_map_failure_source_submission_id,
+            last_decode_failure_source_submission_id: metrics
+                .last_decode_failure_source_submission_id,
+            last_invalid_sample_source_submission_id: metrics
+                .last_invalid_sample_source_submission_id,
+        }
     }
 }
 
 /// CPU stages are host elapsed times. GPU regular terrain and fallback are separate.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PerformanceSnapshot {
+    /// Renderer CPU scopes ordered poll, acquire, UI prepare, scene encode,
+    /// UI encode, submit, present, total. Scene encode includes resident preparation.
+    #[serde(default)]
+    pub native_render_cpu_ms: Option<[f64; 8]>,
+    #[serde(default)]
+    pub native_submission_id: Option<u64>,
+    /// Cumulative nonblocking native timestamp sampling counters, with source IDs.
+    #[serde(default)]
+    pub native_gpu_timestamp_sampling: Option<TimestampSamplingSnapshot>,
+    #[serde(default)]
+    pub native_presentation_mode: Option<String>,
+    #[serde(default)]
+    pub native_redraw_uncapped: bool,
     /// Host cost of bounded profiler publication/capture bookkeeping.
     #[serde(default)]
     pub profiler_publication_ms: Option<f64>,
@@ -346,10 +398,6 @@ pub struct PerformanceSnapshot {
     #[serde(default)]
     pub gpu_frame_ms: Option<f64>,
     #[serde(default)]
-    pub gpu_clouds_ms: Option<f64>,
-    #[serde(default)]
-    pub gpu_atmosphere_ms: Option<f64>,
-    #[serde(default)]
     pub gpu_main_pass_ms: Option<f64>,
     #[serde(default)]
     pub gpu_overlay_ms: Option<f64>,
@@ -362,11 +410,9 @@ pub struct PerformanceSnapshot {
     pub upload_bytes: Option<u64>,
 }
 impl PerformanceSnapshot {
-    /// Native uses `latest_completed`; blocking offscreen readback uses `same_frame`.
+    /// Native uses `latest_completed`.
     pub fn with_gpu(mut self, profile: GpuProfile, scope: &str) -> Self {
         self.gpu_frame_ms = profile.frame.map(|d| d.as_secs_f64() * 1000.0);
-        self.gpu_clouds_ms = profile.clouds.map(|d| d.as_secs_f64() * 1000.0);
-        self.gpu_atmosphere_ms = profile.atmosphere.map(|d| d.as_secs_f64() * 1000.0);
         self.gpu_main_pass_ms = profile.celestial_pass.map(|d| d.as_secs_f64() * 1000.0);
         self.gpu_overlay_ms = profile.overlay_pass.map(|d| d.as_secs_f64() * 1000.0);
         self.gpu_terrain_ms = profile.terrain.map(|d| d.as_secs_f64() * 1000.0);
@@ -392,110 +438,6 @@ pub struct CaptureMetadata {
     pub backend: String,
 }
 
-/// Decorative sky inputs and measured renderer observations, separate from bodies.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SkySnapshot {
-    pub preset: String,
-    pub version: u32,
-    pub seed: u64,
-    pub classification: String,
-    pub anchor_frame: String,
-    pub anchor_m: [f64; 3],
-    pub galactic_to_system_xyzw: [f64; 4],
-    pub finite_star_distance_range_m: [f64; 2],
-    pub supported_observer_radius_m: f64,
-    pub enabled: bool,
-    pub stars_drawn: bool,
-    pub background_drawn: bool,
-    pub outside_envelope: bool,
-    pub intensity: f32,
-    pub star_intensity: f32,
-    pub background_intensity: f32,
-    pub halo_strength: f32,
-    pub galactic_yaw_rad: f64,
-    pub galactic_roll_rad: f64,
-    pub star_count: usize,
-    #[serde(default)]
-    pub background_size_pixels: Option<[u32; 2]>,
-    #[serde(default)]
-    pub focal_chart_count: Option<usize>,
-    #[serde(default)]
-    pub focal_chart_size_pixels: Option<u32>,
-    #[serde(default)]
-    pub transient_generation_payload_bound_bytes: Option<u64>,
-    pub cpu_preparation_ms: f64,
-    pub generation_ms: Option<f64>,
-    pub upload_api_ms: Option<f64>,
-    pub gpu_sky_ms: Option<f64>,
-    pub cpu_capacity_bytes: Option<u64>,
-    pub gpu_capacity_bytes: Option<u64>,
-    pub static_upload_bytes: Option<u64>,
-    pub frame_upload_bytes: Option<u64>,
-    pub resource_growth_events: Option<u64>,
-    pub catalogue_upload_count: Option<u64>,
-    pub background_upload_count: Option<u64>,
-    pub resource_timing_scope: String,
-    pub gpu_timing_scope: String,
-}
-impl SkySnapshot {
-    pub fn collect(
-        definition: &mundaris_renderer::sky::SkyDefinition,
-        settings: mundaris_renderer::sky::SkySettings,
-        report: mundaris_renderer::sky::SkyPreparationReport,
-        resources: Option<mundaris_renderer::sky::SkyResourceReport>,
-        gpu: GpuProfile,
-        resource_scope: &str,
-        gpu_scope: &str,
-    ) -> Self {
-        Self {
-            preset: definition.identity().preset.into(),
-            version: definition.identity().version,
-            seed: definition.identity().seed,
-            classification: crate::sky_definition::CLASSIFICATION.into(),
-            anchor_frame: "system_inertial".into(),
-            anchor_m: definition.anchor_m().to_array(),
-            galactic_to_system_xyzw: definition.galactic_to_system().to_array(),
-            finite_star_distance_range_m: [
-                crate::sky_definition::FINITE_STAR_MIN_DISTANCE_M,
-                crate::sky_definition::FINITE_STAR_MAX_DISTANCE_M,
-            ],
-            supported_observer_radius_m: crate::sky_definition::SUPPORTED_OBSERVER_RADIUS_M,
-            enabled: report.enabled,
-            stars_drawn: report.stars_drawn,
-            background_drawn: report.background_drawn,
-            outside_envelope: report.outside_envelope,
-            intensity: settings.intensity,
-            star_intensity: settings.star_intensity,
-            background_intensity: settings.background_intensity,
-            halo_strength: settings.halo_strength,
-            galactic_yaw_rad: settings.galactic_yaw_rad,
-            galactic_roll_rad: settings.galactic_roll_rad,
-            star_count: report.star_count,
-            background_size_pixels: Some([
-                definition.background().width,
-                definition.background().height,
-            ]),
-            focal_chart_count: Some(definition.morphology().map_or(0, |m| m.complexes.len())),
-            focal_chart_size_pixels: definition.morphology().map(|m| m.detail_size),
-            transient_generation_payload_bound_bytes: resources
-                .and_then(|r| r.transient_generation_payload_bound_bytes),
-            cpu_preparation_ms: report.cpu_preparation_ms,
-            generation_ms: resources.and_then(|r| r.generation_ms),
-            upload_api_ms: resources.map(|r| r.upload_api_ms),
-            gpu_sky_ms: gpu.sky.map(|d| d.as_secs_f64() * 1000.0),
-            cpu_capacity_bytes: resources.map(|r| r.cpu_capacity_bytes),
-            gpu_capacity_bytes: resources.map(|r| r.gpu_capacity_bytes),
-            static_upload_bytes: resources.map(|r| r.static_upload_bytes),
-            frame_upload_bytes: resources.map(|r| r.frame_upload_bytes),
-            resource_growth_events: resources.map(|r| r.resource_growth_events),
-            catalogue_upload_count: resources.map(|r| r.catalogue_upload_count),
-            background_upload_count: resources.map(|r| r.background_upload_count),
-            resource_timing_scope: resource_scope.into(),
-            gpu_timing_scope: gpu_scope.into(),
-        }
-    }
-}
-
 /// One developer-visible interpretation of a coherent prepared engine frame.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeveloperSnapshot {
@@ -509,10 +451,11 @@ pub struct DeveloperSnapshot {
     pub performance: PerformanceSnapshot,
     pub warnings: Vec<String>,
     pub capture: Option<CaptureMetadata>,
+    /// Loaded authored scene/camera/terrain bytes shared by user and replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_scene: Option<Value>,
     #[serde(default)]
     pub motion: Option<MotionSnapshot>,
-    #[serde(default)]
-    pub sky: Option<SkySnapshot>,
     #[serde(default)]
     pub development: Option<DevelopmentSnapshot>,
     /// Opt-in Slice 2A fixture telemetry from the same resident-tile submission.
@@ -762,13 +705,13 @@ impl DeveloperSnapshot {
             warnings: Vec::new(),
             capture: None,
             motion: input.motion,
-            sky: None,
             development: None,
             resident_tile: None,
             resident_hierarchy: None,
             resident_regional: None,
             resident_planetary: None,
             engine_profile: None,
+            shared_scene: None,
         };
         snapshot.refresh_warnings();
         Ok(snapshot)

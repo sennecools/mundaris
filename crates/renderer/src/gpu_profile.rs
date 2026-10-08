@@ -30,23 +30,137 @@ pub struct GpuProfile {
     pub frame: Option<std::time::Duration>,
     /// Complete main celestial render pass.
     pub celestial_pass: Option<std::time::Duration>,
-    /// Complete atmosphere render pass.
-    pub atmosphere_pass: Option<std::time::Duration>,
     /// Complete guides/overlay render pass.
     pub overlay_pass: Option<std::time::Duration>,
     /// Mesh and resident surface draws, including the regional Moon terrain path.
     pub terrain: Option<std::time::Duration>,
     /// Transition fallback surface draws inside the celestial scene pass.
     pub transition_fallback: Option<std::time::Duration>,
-    /// Planetary ocean shell draws inside the celestial scene pass.
-    pub ocean: Option<std::time::Duration>,
-    /// Planetary cloud shell draws inside the celestial scene pass.
-    pub clouds: Option<std::time::Duration>,
-    /// Same measurement as `atmosphere_pass`, also available under the layer name.
-    pub atmosphere: Option<std::time::Duration>,
     pub remaining_celestial: Option<std::time::Duration>,
     /// Distant background and finite-star draws only, excluding upload/readback.
     pub sky: Option<std::time::Duration>,
+}
+
+/// Low-cost counters describing timestamp query requests and asynchronous
+/// readback. Submission IDs identify actual query sources; a busy skip records
+/// the candidate frame ID and the still-pending source without attributing any
+/// application work to that skipped frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TimestampProfilingMetrics {
+    pub explicit_requests: u64,
+    pub eligible_frames: u64,
+    pub accepted_reservations: u64,
+    pub actual_submissions: u64,
+    pub valid_completions: u64,
+    pub busy_skips: u64,
+    pub map_failures: u64,
+    pub decode_failures: u64,
+    pub invalid_samples: u64,
+    pub last_busy_skip_candidate_submission_id: Option<u64>,
+    pub last_busy_skip_source_submission_id: Option<u64>,
+    pub last_submitted_source_submission_id: Option<u64>,
+    pub last_completed_source_submission_id: Option<u64>,
+    pub last_map_failure_source_submission_id: Option<u64>,
+    pub last_decode_failure_source_submission_id: Option<u64>,
+    pub last_invalid_sample_source_submission_id: Option<u64>,
+}
+
+impl TimestampProfilingMetrics {
+    #[cfg(any(feature = "developer-tools", test))]
+    fn explicit_request(&mut self) {
+        self.explicit_requests = self.explicit_requests.saturating_add(1);
+    }
+
+    fn eligible_frame(&mut self) {
+        self.eligible_frames = self.eligible_frames.saturating_add(1);
+    }
+
+    fn accepted_reservation(&mut self) {
+        self.accepted_reservations = self.accepted_reservations.saturating_add(1);
+    }
+
+    fn busy_skip(&mut self, candidate: Option<u64>, source: Option<u64>) {
+        self.busy_skips = self.busy_skips.saturating_add(1);
+        self.last_busy_skip_candidate_submission_id = candidate;
+        self.last_busy_skip_source_submission_id = source;
+    }
+
+    fn submitted(&mut self, source: u64) {
+        self.actual_submissions = self.actual_submissions.saturating_add(1);
+        self.last_submitted_source_submission_id = Some(source);
+    }
+
+    fn mapped(&mut self, source: u64, has_valid_scope: bool, has_invalid_scope: bool) {
+        self.last_completed_source_submission_id = Some(source);
+        if has_valid_scope && !has_invalid_scope {
+            self.valid_completions = self.valid_completions.saturating_add(1);
+        }
+        if has_invalid_scope {
+            self.invalid_samples = self.invalid_samples.saturating_add(1);
+            self.last_invalid_sample_source_submission_id = Some(source);
+        }
+        if !has_valid_scope || has_invalid_scope {
+            self.decode_failures = self.decode_failures.saturating_add(1);
+            self.last_decode_failure_source_submission_id = Some(source);
+        }
+    }
+
+    fn map_failed(&mut self, source: Option<u64>) {
+        self.map_failures = self.map_failures.saturating_add(1);
+        self.invalid_samples = self.invalid_samples.saturating_add(1);
+        self.last_map_failure_source_submission_id = source;
+        self.last_invalid_sample_source_submission_id = source;
+    }
+}
+
+fn scope_decode_status(ticks: &[u64], period_nanoseconds: f32, scope_mask: u16) -> (bool, bool) {
+    let mut has_valid_scope = false;
+    let mut has_invalid_scope = false;
+    for pair in 0..10 {
+        if scope_mask & (1 << pair) == 0 {
+            continue;
+        }
+        let Some(start) = ticks.get(pair * 2).copied() else {
+            has_invalid_scope = true;
+            continue;
+        };
+        let Some(end) = ticks.get(pair * 2 + 1).copied() else {
+            has_invalid_scope = true;
+            continue;
+        };
+        let Some(elapsed) = end.checked_sub(start) else {
+            has_invalid_scope = true;
+            continue;
+        };
+        let elapsed_ns = elapsed as f64 * f64::from(period_nanoseconds);
+        if !elapsed_ns.is_finite() || elapsed_ns < 0.0 {
+            has_invalid_scope = true;
+        } else if pair == 8 && elapsed_ns == 0.0 {
+            // Zero sky time is the existing cold-query sentinel, not a bad sample.
+        } else {
+            has_valid_scope = true;
+        }
+    }
+    (has_valid_scope, has_invalid_scope)
+}
+
+/// Selects the fastest explicitly advertised mode for uncapped measurement.
+/// The normal presentation path remains FIFO.
+pub(crate) fn select_present_mode(
+    supported: &[wgpu::PresentMode],
+    uncapped: bool,
+) -> wgpu::PresentMode {
+    if !uncapped {
+        return wgpu::PresentMode::Fifo;
+    }
+    [
+        wgpu::PresentMode::Immediate,
+        wgpu::PresentMode::Mailbox,
+        wgpu::PresentMode::Fifo,
+    ]
+    .into_iter()
+    .find(|mode| supported.contains(mode))
+    .unwrap_or(wgpu::PresentMode::Fifo)
 }
 
 pub(crate) fn decode(ticks: &[u64], period_nanoseconds: f32, scope_mask: u16) -> GpuProfile {
@@ -65,13 +179,9 @@ pub(crate) fn decode(ticks: &[u64], period_nanoseconds: f32, scope_mask: u16) ->
     GpuProfile {
         frame: scoped(9, 9),
         celestial_pass: scoped(0, 0),
-        atmosphere_pass: scoped(1, 1),
         overlay_pass: scoped(2, 2),
         terrain: scoped(3, 3),
         transition_fallback: scoped(4, 4),
-        ocean: scoped(5, 5),
-        clouds: scoped(6, 6),
-        atmosphere: scoped(1, 1),
         remaining_celestial: scoped(7, 7),
         // A zero elapsed interval cannot establish sky work on the cold query;
         // retain unavailable semantics rather than publishing a fabricated win.
@@ -189,9 +299,13 @@ impl DeveloperTimestampGate {
         self.requested = true;
     }
 
+    pub fn wants_sample(&self, has_celestial_frame: bool) -> bool {
+        has_celestial_frame && (!self.observation_mode || self.requested)
+    }
+
     /// True only when a celestial frame can start in an idle query slot.
     pub fn begin_if_idle(&self, has_celestial_frame: bool, slot_idle: bool) -> bool {
-        has_celestial_frame && slot_idle && (!self.observation_mode || self.requested)
+        self.wants_sample(has_celestial_frame) && slot_idle
     }
 
     /// Retain the request through skips and preparation errors; consume it only
@@ -213,6 +327,7 @@ pub(crate) struct AsyncTimestampSlot {
     pending_submission_id: Option<u64>,
     period_nanoseconds: f32,
     scope_mask: u16,
+    metrics: TimestampProfilingMetrics,
 }
 
 impl AsyncTimestampSlot {
@@ -239,6 +354,7 @@ impl AsyncTimestampSlot {
             pending_submission_id: None,
             period_nanoseconds: 1.0,
             scope_mask: 0,
+            metrics: TimestampProfilingMetrics::default(),
         })
     }
 
@@ -254,17 +370,34 @@ impl AsyncTimestampSlot {
                         .map(|chunk| u64::from_le_bytes(*chunk))
                         .collect();
                     self.latest = decode(&ticks, self.period_nanoseconds, self.scope_mask);
-                    self.latest_submission_id = self.pending_submission_id.take();
+                    let (has_valid_scope, has_invalid_scope) =
+                        scope_decode_status(&ticks, self.period_nanoseconds, self.scope_mask);
+                    let source_submission_id = self.pending_submission_id.take();
+                    self.latest_submission_id = source_submission_id;
+                    if let Some(source_submission_id) = source_submission_id {
+                        self.metrics.mapped(
+                            source_submission_id,
+                            has_valid_scope,
+                            has_invalid_scope,
+                        );
+                    } else {
+                        self.metrics.decode_failures =
+                            self.metrics.decode_failures.saturating_add(1);
+                        self.metrics.invalid_samples =
+                            self.metrics.invalid_samples.saturating_add(1);
+                    }
                     drop(mapped);
                     self.readback.unmap();
                     self.receiver = None;
                 }
                 Ok(Err(_)) => {
+                    self.metrics.map_failed(self.pending_submission_id);
                     self.pending_submission_id = None;
                     self.receiver = None;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => return false,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.metrics.map_failed(self.pending_submission_id);
                     self.pending_submission_id = None;
                     self.receiver = None;
                 }
@@ -288,6 +421,7 @@ impl AsyncTimestampSlot {
         self.period_nanoseconds = period_nanoseconds;
         self.scope_mask = scope_mask;
         self.pending_submission_id = Some(submission_id);
+        self.metrics.submitted(submission_id);
         let (sender, receiver) = std::sync::mpsc::channel();
         self.readback
             .map_async(wgpu::MapMode::Read, .., move |result| {
@@ -299,6 +433,28 @@ impl AsyncTimestampSlot {
     pub fn latest_submission_id(&self) -> Option<u64> {
         self.latest_submission_id
     }
+
+    pub fn metrics(&self) -> TimestampProfilingMetrics {
+        self.metrics
+    }
+
+    #[cfg(feature = "developer-tools")]
+    pub fn record_explicit_request(&mut self) {
+        self.metrics.explicit_request();
+    }
+
+    pub fn record_eligible_frame(&mut self) {
+        self.metrics.eligible_frame();
+    }
+
+    pub fn record_accepted_reservation(&mut self) {
+        self.metrics.accepted_reservation();
+    }
+
+    pub fn record_busy_skip(&mut self, candidate: Option<u64>) {
+        self.metrics
+            .busy_skip(candidate, self.pending_submission_id);
+    }
 }
 
 #[cfg(test)]
@@ -306,15 +462,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn profile_exposes_available_pass_and_inside_pass_scopes() {
+    fn profile_exposes_available_celestial_and_inside_pass_scopes() {
         let profile = decode(&(0..20).collect::<Vec<u64>>(), 2.0, 0b11_1111_1111);
         let two_ns = Some(std::time::Duration::from_nanos(2));
         assert_eq!(profile.frame, two_ns);
         assert_eq!(profile.celestial_pass, two_ns);
-        assert_eq!(profile.atmosphere_pass, two_ns);
         assert_eq!(profile.terrain, two_ns);
-        assert_eq!(profile.ocean, two_ns);
-        assert_eq!(profile.clouds, two_ns);
         assert_eq!(profile.sky, two_ns);
     }
 
@@ -325,7 +478,6 @@ mod tests {
             profile.celestial_pass,
             Some(std::time::Duration::from_nanos(1))
         );
-        assert_eq!(profile.atmosphere_pass, None);
         assert_eq!(profile.terrain, None);
         assert_eq!(profile.transition_fallback, None);
         assert_eq!(profile.sky, None);
@@ -361,6 +513,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn uncapped_presentation_uses_supported_modes_in_priority_order() {
+        use wgpu::PresentMode::{Fifo, Immediate, Mailbox};
+
+        assert_eq!(
+            select_present_mode(&[Fifo, Mailbox, Immediate], true),
+            Immediate
+        );
+        assert_eq!(select_present_mode(&[Fifo, Mailbox], true), Mailbox);
+        assert_eq!(select_present_mode(&[Fifo], true), Fifo);
+        assert_eq!(select_present_mode(&[Immediate, Mailbox], false), Fifo);
+        assert_eq!(select_present_mode(&[], true), Fifo);
+    }
+
+    #[test]
+    fn profiling_metrics_keep_requests_reservations_and_submissions_distinct() {
+        let mut metrics = TimestampProfilingMetrics::default();
+        metrics.explicit_request();
+        metrics.eligible_frame();
+        metrics.accepted_reservation();
+        metrics.busy_skip(Some(13), Some(12));
+        metrics.submitted(13);
+
+        assert_eq!(metrics.explicit_requests, 1);
+        assert_eq!(metrics.eligible_frames, 1);
+        assert_eq!(metrics.accepted_reservations, 1);
+        assert_eq!(metrics.actual_submissions, 1);
+        assert_eq!(metrics.busy_skips, 1);
+        assert_eq!(metrics.last_busy_skip_candidate_submission_id, Some(13));
+        assert_eq!(metrics.last_busy_skip_source_submission_id, Some(12));
+        assert_eq!(metrics.last_submitted_source_submission_id, Some(13));
+    }
+
+    #[test]
+    fn partially_invalid_active_scopes_do_not_count_as_valid_completion() {
+        let mut ticks = (0..QUERY_COUNT as u64).collect::<Vec<_>>();
+        ticks[3] = ticks[2] - 1;
+        let (has_valid_scope, has_invalid_scope) = scope_decode_status(&ticks, 1.0, 0b11);
+        assert!(has_valid_scope);
+        assert!(has_invalid_scope);
+
+        let mut metrics = TimestampProfilingMetrics::default();
+        metrics.mapped(24, has_valid_scope, has_invalid_scope);
+        assert_eq!(metrics.valid_completions, 0);
+        assert_eq!(metrics.decode_failures, 1);
+        assert_eq!(metrics.invalid_samples, 1);
+        assert_eq!(metrics.last_decode_failure_source_submission_id, Some(24));
+        assert_eq!(metrics.last_invalid_sample_source_submission_id, Some(24));
+    }
+
+    #[test]
+    fn zero_timestamp_values_are_valid_except_for_sky_scope() {
+        let zero_ticks = [0; QUERY_COUNT as usize];
+        let frame = decode(&zero_ticks, 1.0, FRAME_SCOPE_BIT);
+        assert_eq!(frame.frame, Some(std::time::Duration::ZERO));
+        assert_eq!(
+            scope_decode_status(&zero_ticks, 1.0, FRAME_SCOPE_BIT),
+            (true, false)
+        );
+
+        let sky = decode(&zero_ticks, 1.0, 1 << 8);
+        assert_eq!(sky.sky, None);
+        assert_eq!(
+            scope_decode_status(&zero_ticks, 1.0, 1 << 8),
+            (false, false)
+        );
+
+        let mut reversed_ticks = zero_ticks;
+        reversed_ticks[0] = 1;
+        assert_eq!(scope_decode_status(&reversed_ticks, 1.0, 1), (false, true));
+    }
+
     #[cfg(feature = "developer-tools")]
     #[test]
     fn observation_gate_waits_for_celestial_idle_slot_and_submitted_sample() {
@@ -368,8 +592,11 @@ mod tests {
         assert!(gate.begin_if_idle(true, true));
 
         gate.set_observation_mode(true);
+        assert!(!gate.wants_sample(true));
+        assert!(!gate.wants_sample(false));
         assert!(!gate.begin_if_idle(true, true));
         gate.request();
+        assert!(gate.wants_sample(true));
         assert!(!gate.begin_if_idle(false, true));
         assert!(!gate.begin_if_idle(true, false));
         assert!(gate.begin_if_idle(true, true));

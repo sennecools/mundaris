@@ -31,6 +31,7 @@ fn draw(tile: Arc<mundaris_app::resident_terrain::TileData>, anchor_view_m: DVec
         body_to_view: DMat3::IDENTITY,
         mode: 0,
         sun_body: DVec3::Z,
+        appearance: Default::default(),
     }
 }
 

@@ -159,6 +159,14 @@ pub struct TerrainTraceJob {
     pub format_version: u32,
     pub filter_version: u32,
     pub cells: u32,
+    /// First profiled request frame for the current generation cycle.
+    pub origin_frame_id: Option<u64>,
+    /// Bounded exact-key links to individual worker admissions/retries.
+    pub profile_jobs: Vec<ProfileJobLink>,
+    pub profile_jobs_omitted: u64,
+    pub blocker_intervals: Vec<TraceBlockInterval>,
+    pub blocker_intervals_omitted: u64,
+    pub prepared_to_drawable_us: Option<u64>,
     pub requested_us: Option<u64>,
     pub milestones: Vec<TerrainTraceMilestone>,
     pub blocked_by: Vec<BlockReason>,
@@ -185,6 +193,23 @@ pub struct TerrainTraceJob {
     pub parent: Option<TraceAddress>,
     pub children: Vec<TraceAddress>,
     pub neighbors: Vec<TraceAddress>,
+}
+
+/// Per-exact-key recorded blockers, bounded independently of the recent event ring.
+#[derive(Debug, Clone, Serialize)]
+pub struct TraceBlockInterval {
+    pub reason: BlockReason,
+    pub start_us: u64,
+    pub end_us: u64,
+    pub open: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ProfileJobLink {
+    pub job_id: u64,
+    pub capture_id: u64,
+    pub origin_frame_id: u64,
+    pub dispatch_frame_id: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -261,6 +286,8 @@ pub struct TerrainTraceSnapshot {
     pub snapshot_frame_id: u64,
     pub jobs: Vec<TerrainTraceJob>,
     pub events: Vec<TerrainTraceEvent>,
+    pub snapshot_jobs_omitted: usize,
+    pub snapshot_events_omitted: usize,
     pub tracked_jobs: usize,
     pub requested: usize,
     pub generation_queued: usize,
@@ -371,6 +398,8 @@ struct Job {
     generation_cancelled_queue: Option<TerrainTraceQueue>,
     superseded_queue: Option<TerrainTraceQueue>,
     total_block_time_us: u64,
+    blocker_intervals: VecDeque<TraceBlockInterval>,
+    blocker_intervals_omitted: u64,
 }
 
 #[derive(Default)]
@@ -383,6 +412,9 @@ struct ReasonTotals {
 
 struct Inner {
     jobs: HashMap<TileKey, Job>,
+    profile_origins: HashMap<TileKey, u64>,
+    profile_jobs: HashMap<TileKey, VecDeque<ProfileJobLink>>,
+    profile_jobs_omitted: HashMap<TileKey, u64>,
     order: VecDeque<TileKey>,
     current_by_address: HashMap<CubePatchAddress, TileKey>,
     generation_candidates: HashMap<CubePatchAddress, (TileKey, u64)>,
@@ -415,6 +447,9 @@ impl TerrainTrace {
             origin: Instant::now(),
             inner: Mutex::new(Inner {
                 jobs: HashMap::new(),
+                profile_origins: HashMap::new(),
+                profile_jobs: HashMap::new(),
+                profile_jobs_omitted: HashMap::new(),
                 order: VecDeque::new(),
                 current_by_address: HashMap::new(),
                 generation_candidates: HashMap::new(),
@@ -436,14 +471,15 @@ impl TerrainTrace {
     }
 
     /// Begin tracking the exact immutable tile key before queue admission.
-    pub fn admit(&self, key: &TileKey) {
+    pub fn admit(&self, key: &TileKey) -> Option<u64> {
         if !crate::engine_profile::is_enabled() {
-            return;
+            return None;
         }
         let now = self.now_us();
+        let current_frame = crate::engine_profile::current_frame_id();
         let mut inner = self.lock();
         if inner.jobs.contains_key(key) {
-            let (first_request, completed_blocks) = {
+            let (first_request, completed_blocks, origin_reset) = {
                 let existing = inner.jobs.get_mut(key).expect("job checked above");
                 let generation_finished = existing.milestones[Stage::GenerationCompleted.index()]
                     .or(existing.milestones[Stage::GenerationCancelled.index()])
@@ -462,8 +498,15 @@ impl TerrainTrace {
                     *requested = Some(now);
                     existing.requested_us = Some(now);
                 }
-                (first_request, completed_blocks)
+                (
+                    first_request,
+                    completed_blocks,
+                    generation_finished || first_request,
+                )
             };
+            if origin_reset {
+                inner.profile_origins.insert(key.clone(), current_frame);
+            }
             for (reason, started) in completed_blocks {
                 Self::record_unblocked_for_job(&mut inner, key, now, reason, started);
             }
@@ -480,7 +523,7 @@ impl TerrainTrace {
                     },
                 );
             }
-            return;
+            return inner.profile_origins.get(key).copied();
         }
         while inner.jobs.len() >= MAX_JOBS {
             if !evict_oldest_job(&mut inner, now) {
@@ -491,6 +534,7 @@ impl TerrainTrace {
         milestones[Stage::Requested.index()] = Some(now);
         inner.order.push_back(key.clone());
         inner.current_by_address.insert(key.address, key.clone());
+        inner.profile_origins.insert(key.clone(), current_frame);
         inner.jobs.insert(
             key.clone(),
             Job {
@@ -506,6 +550,8 @@ impl TerrainTrace {
                 generation_cancelled_queue: None,
                 superseded_queue: None,
                 total_block_time_us: 0,
+                blocker_intervals: VecDeque::new(),
+                blocker_intervals_omitted: 0,
             },
         );
         Self::push_event(
@@ -518,6 +564,58 @@ impl TerrainTrace {
                 unblocked: false,
             },
         );
+        Some(current_frame)
+    }
+
+    pub fn profile_job_dispatched(
+        &self,
+        key: &TileKey,
+        job_id: u64,
+        origin_frame_id: u64,
+        dispatch_frame_id: u64,
+    ) {
+        if !crate::engine_profile::is_enabled() {
+            return;
+        }
+        let mut inner = self.lock();
+        if inner.jobs.contains_key(key) {
+            let omitted = {
+                let links = inner.profile_jobs.entry(key.clone()).or_default();
+                if links.iter().any(|link| link.job_id == job_id) {
+                    return;
+                }
+                let omitted = links.len() == 8;
+                if omitted {
+                    links.pop_front();
+                }
+                links.push_back(ProfileJobLink {
+                    job_id,
+                    capture_id: crate::engine_profile::capture_id(),
+                    origin_frame_id,
+                    dispatch_frame_id,
+                });
+                omitted
+            };
+            if omitted {
+                let count = inner.profile_jobs_omitted.entry(key.clone()).or_default();
+                *count = count.saturating_add(1);
+            }
+        }
+    }
+
+    pub fn latest_profile_job_ids<'a>(
+        &self,
+        keys: impl IntoIterator<Item = &'a TileKey>,
+    ) -> Vec<u64> {
+        if !crate::engine_profile::is_enabled() {
+            return Vec::new();
+        }
+        let inner = self.lock();
+        keys.into_iter()
+            .filter_map(|key| inner.profile_jobs.get(key)?.back())
+            .filter(|link| link.capture_id == crate::engine_profile::capture_id())
+            .map(|link| link.job_id)
+            .collect()
     }
 
     /// Synchronize the exact keys still eligible for CPU generation admission.
@@ -772,6 +870,10 @@ impl TerrainTrace {
     }
 
     pub fn snapshot(&self) -> TerrainTraceSnapshot {
+        self.snapshot_for_profile_jobs(&[])
+    }
+
+    pub fn snapshot_for_profile_jobs(&self, preferred_job_ids: &[u64]) -> TerrainTraceSnapshot {
         if !crate::engine_profile::is_enabled() {
             return TerrainTraceSnapshot {
                 schema_version: 1,
@@ -843,10 +945,47 @@ impl TerrainTrace {
                 })
                 .count() as u64;
             let completed_rate_window_complete = rate_window_complete(&inner, now);
-            let selected_keys = snapshot_job_keys(&inner.order, &inner.jobs);
+            let mut selected_keys = Vec::with_capacity(SNAPSHOT_JOBS);
+            let preferred = preferred_job_ids
+                .iter()
+                .take(64)
+                .copied()
+                .collect::<HashSet<_>>();
+            for (key, links) in &inner.profile_jobs {
+                if selected_keys.len() == SNAPSHOT_JOBS {
+                    break;
+                }
+                if links.iter().any(|link| {
+                    preferred.contains(&link.job_id)
+                        && link.capture_id == crate::engine_profile::capture_id()
+                }) && inner.jobs.contains_key(key)
+                {
+                    selected_keys.push(key.clone());
+                }
+            }
+            let mut selected_set = selected_keys.iter().cloned().collect::<HashSet<_>>();
+            for key in snapshot_job_keys(&inner.order, &inner.jobs) {
+                if selected_keys.len() == SNAPSHOT_JOBS {
+                    break;
+                }
+                if selected_set.insert(key.clone()) {
+                    selected_keys.push(key);
+                }
+            }
             let row_jobs = selected_keys
                 .iter()
-                .filter_map(|key| inner.jobs.get(key).cloned())
+                .filter_map(|key| {
+                    Some((
+                        inner.jobs.get(key)?.clone(),
+                        inner.profile_origins.get(key).copied(),
+                        inner
+                            .profile_jobs
+                            .get(key)
+                            .map(|links| links.iter().copied().collect::<Vec<_>>())
+                            .unwrap_or_default(),
+                        inner.profile_jobs_omitted.get(key).copied().unwrap_or(0),
+                    ))
+                })
                 .collect::<Vec<_>>();
             let events = inner
                 .events
@@ -882,13 +1021,23 @@ impl TerrainTrace {
         let queues =
             finish_queue_snapshots(queue_accumulators, now, completed_rate_window_complete);
         let block_reasons = finish_block_snapshots(block_accumulators);
-        let jobs = row_jobs.iter().map(|job| snapshot_job(job, now)).collect();
-        let span_us = now.min(RATE_WINDOW_US).max(1);
+        let jobs = row_jobs
+            .iter()
+            .map(|(job, origin, profile_jobs, omitted)| {
+                snapshot_job_with_profile(job, now, *origin, profile_jobs, *omitted)
+            })
+            .collect();
+        let span_us = now.clamp(1, RATE_WINDOW_US);
         TerrainTraceSnapshot {
             schema_version: 1,
             enabled: true,
             generated_at_us: now,
             snapshot_frame_id,
+            snapshot_jobs_omitted: tracked_jobs.saturating_sub(row_jobs.len()),
+            snapshot_events_omitted: {
+                let inner = self.lock();
+                inner.events.len().saturating_sub(SNAPSHOT_EVENTS)
+            },
             jobs,
             events,
             tracked_jobs,
@@ -1006,6 +1155,16 @@ impl TerrainTrace {
         let elapsed = now.saturating_sub(started);
         if let Some(job) = inner.jobs.get_mut(key) {
             job.total_block_time_us = job.total_block_time_us.saturating_add(elapsed);
+            if job.blocker_intervals.len() == 32 {
+                job.blocker_intervals.pop_front();
+                job.blocker_intervals_omitted = job.blocker_intervals_omitted.saturating_add(1);
+            }
+            job.blocker_intervals.push_back(TraceBlockInterval {
+                reason,
+                start_us: started,
+                end_us: now,
+                open: false,
+            });
         }
         Self::record_unblocked(inner, key.address, now, reason, started);
     }
@@ -1032,6 +1191,8 @@ impl TerrainTrace {
                 generation_cancelled_queue: None,
                 superseded_queue: None,
                 total_block_time_us: 0,
+                blocker_intervals: VecDeque::new(),
+                blocker_intervals_omitted: 0,
             },
         );
     }
@@ -1066,6 +1227,9 @@ fn evict_oldest_job(inner: &mut Inner, now: u64) -> bool {
         return false;
     };
     if let Some(job) = inner.jobs.remove(&oldest) {
+        inner.profile_origins.remove(&oldest);
+        inner.profile_jobs.remove(&oldest);
+        inner.profile_jobs_omitted.remove(&oldest);
         let queue =
             queue_for_job(&job).map_or(TerrainTraceQueue::Unattributed, |(queue, _, _)| queue);
         inner.dropped_jobs_by_queue[queue.index()] =
@@ -1302,7 +1466,7 @@ fn finish_queue_snapshots(
     now: u64,
     rate_window_complete: bool,
 ) -> Vec<TerrainTraceQueueSnapshot> {
-    let rate_window = now.min(RATE_WINDOW_US).max(1) as f64;
+    let rate_window = now.clamp(1, RATE_WINDOW_US) as f64;
     TerrainTraceQueue::ALL
         .into_iter()
         .map(|queue| {
@@ -1494,7 +1658,18 @@ fn is_upload_blocker(reason: BlockReason) -> bool {
     )
 }
 
+#[cfg(test)]
 fn snapshot_job(job: &Job, now: u64) -> TerrainTraceJob {
+    snapshot_job_with_profile(job, now, None, &[], 0)
+}
+
+fn snapshot_job_with_profile(
+    job: &Job,
+    now: u64,
+    origin_frame_id: Option<u64>,
+    profile_jobs: &[ProfileJobLink],
+    profile_jobs_omitted: u64,
+) -> TerrainTraceJob {
     let get = |stage: Stage| job.milestones[stage.index()];
     let latest = job
         .milestones
@@ -1589,6 +1764,28 @@ fn snapshot_job(job: &Job, now: u64) -> TerrainTraceJob {
         format_version: job.key.format_version,
         filter_version: job.key.filter_version,
         cells: job.key.cells,
+        origin_frame_id,
+        profile_jobs: profile_jobs.to_vec(),
+        profile_jobs_omitted,
+        blocker_intervals: job
+            .blocker_intervals
+            .iter()
+            .cloned()
+            .chain(
+                job.blocked_since
+                    .iter()
+                    .map(|(reason, start_us)| TraceBlockInterval {
+                        reason: *reason,
+                        start_us: *start_us,
+                        end_us: now,
+                        open: true,
+                    }),
+            )
+            .collect(),
+        blocker_intervals_omitted: job.blocker_intervals_omitted,
+        prepared_to_drawable_us: get(Stage::FullyPrepared)
+            .zip(get(Stage::Drawable))
+            .and_then(|(start, end)| end.checked_sub(start)),
         requested_us: job.requested_us,
         milestones: job
             .milestones
@@ -1743,9 +1940,9 @@ fn snapshot_job_keys(order: &VecDeque<TileKey>, jobs: &HashMap<TileKey, Job>) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockReason, Inner, Job, Stage, TerrainTrace, TerrainTraceJobState, TerrainTraceQueue,
-        evict_oldest_job, queue_accumulators, rate_window_complete, reset_boundary_cycle,
-        reset_generation_cycle, snapshot_job,
+        BlockReason, Inner, Job, ProfileJobLink, Stage, TerrainTrace, TerrainTraceJobState,
+        TerrainTraceQueue, evict_oldest_job, queue_accumulators, rate_window_complete,
+        reset_boundary_cycle, reset_generation_cycle, snapshot_job,
     };
     use crate::resident_terrain::TileKey;
     use mundaris_math::surface::{CubeFace, CubePatchAddress};
@@ -1754,7 +1951,7 @@ mod tests {
     fn test_key(identity: u32) -> TileKey {
         TileKey {
             body_identity: 1,
-            definition_words: vec![identity],
+            definition_words: vec![u64::from(identity)],
             radius_bits: 1,
             surface_revision: 1,
             material_revision: 1,
@@ -1789,6 +1986,8 @@ mod tests {
             generation_cancelled_queue: None,
             superseded_queue: None,
             total_block_time_us: 0,
+            blocker_intervals: VecDeque::new(),
+            blocker_intervals_omitted: 0,
         }
     }
 
@@ -1801,6 +2000,9 @@ mod tests {
         }
         Inner {
             jobs: inner_jobs,
+            profile_origins: HashMap::new(),
+            profile_jobs: HashMap::new(),
+            profile_jobs_omitted: HashMap::new(),
             order,
             current_by_address: HashMap::new(),
             generation_candidates: HashMap::new(),
@@ -1823,6 +2025,83 @@ mod tests {
         }
         assert_eq!(Stage::COUNT, Stage::ALL.len());
         assert_eq!(Stage::Evicted.index() + 1, Stage::COUNT);
+    }
+
+    #[test]
+    fn exact_job_blocker_intervals_are_bounded_and_preserve_open_reasons() {
+        let key = test_key(1);
+        let mut inner = test_inner(vec![test_job(key.clone(), true, false, false)]);
+        for index in 0..40 {
+            TerrainTrace::record_unblocked_for_job(
+                &mut inner,
+                &key,
+                index * 10 + 5,
+                BlockReason::WorkerQueueFull,
+                index * 10,
+            );
+        }
+        inner
+            .jobs
+            .get_mut(&key)
+            .unwrap()
+            .blocked_since
+            .push((BlockReason::CpuCapacity, 395));
+        let snapshot = snapshot_job(&inner.jobs[&key], 400);
+        assert_eq!(snapshot.blocker_intervals.len(), 33);
+        assert_eq!(snapshot.blocker_intervals_omitted, 8);
+        assert_eq!(snapshot.blocker_intervals[0].start_us, 80);
+        assert!(snapshot.blocker_intervals.last().unwrap().open);
+        assert_eq!(snapshot.blocker_intervals.last().unwrap().end_us, 400);
+    }
+
+    #[test]
+    fn preferred_completed_job_retains_exact_identity_outside_pending_snapshot_frontier() {
+        use std::{sync::Mutex, time::Instant};
+        let previous = crate::engine_profile::is_enabled();
+        crate::engine_profile::set_enabled(true);
+        let keys = (1..=150).map(test_key).collect::<Vec<_>>();
+        let mut inner = test_inner(
+            keys.iter()
+                .cloned()
+                .map(|key| test_job(key, true, false, false))
+                .collect(),
+        );
+        let selected = keys[74].clone();
+        let completed = inner.jobs.get_mut(&selected).unwrap();
+        completed.milestones[Stage::GenerationQueued.index()] = None;
+        completed.milestones[Stage::GenerationStarted.index()] = Some(3);
+        completed.milestones[Stage::GenerationCompleted.index()] = Some(7);
+        inner.profile_jobs.insert(
+            selected.clone(),
+            VecDeque::from([ProfileJobLink {
+                job_id: 999,
+                capture_id: crate::engine_profile::capture_id(),
+                origin_frame_id: 7,
+                dispatch_frame_id: 8,
+            }]),
+        );
+        let trace = TerrainTrace {
+            origin: Instant::now(),
+            inner: Mutex::new(inner),
+        };
+        assert!(
+            !trace
+                .snapshot()
+                .jobs
+                .iter()
+                .any(|job| job.definition_words == selected.definition_words)
+        );
+        let snapshot = trace.snapshot_for_profile_jobs(&[999]);
+        let matched = snapshot
+            .jobs
+            .iter()
+            .find(|job| job.profile_jobs.iter().any(|link| link.job_id == 999))
+            .unwrap();
+        assert_eq!(matched.definition_words, selected.definition_words);
+        assert_eq!(matched.body_identity, selected.body_identity);
+        assert_eq!(snapshot.jobs.len(), 128);
+        assert_eq!(snapshot.snapshot_jobs_omitted, 22);
+        crate::engine_profile::set_enabled(previous);
     }
 
     #[test]
@@ -1968,6 +2247,8 @@ mod tests {
             generation_cancelled_queue: None,
             superseded_queue: None,
             total_block_time_us: 0,
+            blocker_intervals: VecDeque::new(),
+            blocker_intervals_omitted: 0,
         };
 
         reset_boundary_cycle(&mut job);
@@ -2016,6 +2297,8 @@ mod tests {
             generation_cancelled_queue: None,
             superseded_queue: None,
             total_block_time_us: 0,
+            blocker_intervals: VecDeque::new(),
+            blocker_intervals_omitted: 0,
         };
 
         assert!(matches!(
@@ -2075,6 +2358,8 @@ mod tests {
             generation_cancelled_queue: None,
             superseded_queue: None,
             total_block_time_us: 40,
+            blocker_intervals: VecDeque::new(),
+            blocker_intervals_omitted: 0,
         };
 
         let row = snapshot_job(&job, 310);
@@ -2119,6 +2404,8 @@ mod tests {
             generation_cancelled_queue: None,
             superseded_queue: None,
             total_block_time_us: 0,
+            blocker_intervals: VecDeque::new(),
+            blocker_intervals_omitted: 0,
         };
 
         assert!(matches!(
@@ -2158,6 +2445,8 @@ mod tests {
             generation_cancelled_queue: None,
             superseded_queue: None,
             total_block_time_us: 0,
+            blocker_intervals: VecDeque::new(),
+            blocker_intervals_omitted: 0,
         };
 
         reset_generation_cycle(&mut job, 12);
@@ -2196,6 +2485,8 @@ mod tests {
             generation_cancelled_queue: None,
             superseded_queue: None,
             total_block_time_us: 0,
+            blocker_intervals: VecDeque::new(),
+            blocker_intervals_omitted: 0,
         };
 
         assert!(super::queue_for_job(&job).is_none());
@@ -2236,9 +2527,14 @@ mod tests {
             generation_cancelled_queue: None,
             superseded_queue: None,
             total_block_time_us: 0,
+            blocker_intervals: VecDeque::new(),
+            blocker_intervals_omitted: 0,
         };
         let mut inner = Inner {
             jobs: HashMap::from([(key.clone(), job)]),
+            profile_origins: HashMap::new(),
+            profile_jobs: HashMap::new(),
+            profile_jobs_omitted: HashMap::new(),
             order: VecDeque::from([key.clone()]),
             current_by_address: HashMap::from([(key.address, key.clone())]),
             generation_candidates: HashMap::new(),
@@ -2294,6 +2590,8 @@ mod tests {
             generation_cancelled_queue: None,
             superseded_queue: None,
             total_block_time_us: 0,
+            blocker_intervals: VecDeque::new(),
+            blocker_intervals_omitted: 0,
         };
 
         assert!(matches!(
@@ -2335,6 +2633,8 @@ mod tests {
             generation_cancelled_queue: None,
             superseded_queue: None,
             total_block_time_us: 0,
+            blocker_intervals: VecDeque::new(),
+            blocker_intervals_omitted: 0,
         };
 
         assert!(matches!(
@@ -2515,6 +2815,8 @@ mod tests {
             generation_cancelled_queue: None,
             superseded_queue: None,
             total_block_time_us: 0,
+            blocker_intervals: VecDeque::new(),
+            blocker_intervals_omitted: 0,
         };
 
         assert!(matches!(
@@ -2555,6 +2857,8 @@ mod tests {
             generation_cancelled_queue: None,
             superseded_queue: None,
             total_block_time_us: 0,
+            blocker_intervals: VecDeque::new(),
+            blocker_intervals_omitted: 0,
         };
 
         assert!(super::queue_for_job(&job).is_none());
@@ -2592,6 +2896,8 @@ mod tests {
             generation_cancelled_queue: None,
             superseded_queue: None,
             total_block_time_us: 0,
+            blocker_intervals: VecDeque::new(),
+            blocker_intervals_omitted: 0,
         };
 
         assert!(super::queue_for_job(&job).is_none());

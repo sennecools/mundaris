@@ -8,6 +8,8 @@ publish = false
 mundaris_math = { path = "../math" }
 thiserror.workspace = true
 glam.workspace = true
+sha2 = "=0.10.9"
+serde.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

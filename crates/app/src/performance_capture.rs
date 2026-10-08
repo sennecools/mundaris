@@ -24,6 +24,7 @@ use std::io::Read;
 
 /// One outstanding sampled timeline export. Sorting and JSON construction stay
 /// on the diagnostic worker; the frame owner never waits for its result.
+#[derive(Default)]
 pub struct ProfileSampler {
     sender: Option<SyncSender<()>>,
     receiver: Option<mpsc::Receiver<ProfileSample>>,
@@ -37,15 +38,6 @@ enum ProfileSample {
     WorkerUnavailable,
 }
 
-impl Default for ProfileSampler {
-    fn default() -> Self {
-        Self {
-            sender: None,
-            receiver: None,
-            outstanding: false,
-        }
-    }
-}
 impl ProfileSampler {
     pub fn poll_value(&mut self) -> Option<Value> {
         match self.poll()? {
@@ -66,23 +58,25 @@ impl ProfileSampler {
                 .name("profile-export".into())
                 .spawn(move || {
                     while rx.recv().is_ok() {
+                        let _lane = crate::engine_profile::worker_scope_named("Profile snapshot");
+                        let _span = crate::engine_profile::span("Profile snapshot serialization");
                         let mut snapshot = crate::engine_profile::snapshot();
-                        let cutoff = snapshot.generated_at_ns.saturating_sub(3_000_000_000);
-                        snapshot.since_ns = Some(cutoff);
-                        for lane in &mut snapshot.lanes {
-                            lane.events.retain(|event| event.end_ns >= cutoff);
-                            let capacity = if matches!(
-                                lane.worker,
-                                crate::engine_profile::WorkerIdentity::Main
-                            ) {
-                                8_192
-                            } else {
-                                512
-                            };
-                            if lane.events.len() > capacity {
-                                lane.events.drain(..lane.events.len() - capacity);
+                        // Bound transport payload separately from the underlying event rings.
+                        let mut retained = snapshot
+                            .lanes
+                            .iter()
+                            .flat_map(|lane| lane.events.iter())
+                            .map(|event| (event.end_ns, event.event_id))
+                            .collect::<Vec<_>>();
+                        retained.sort_unstable();
+                        let omitted = retained.len().saturating_sub(4096);
+                        if let Some(cutoff) = retained.get(omitted).copied() {
+                            for lane in &mut snapshot.lanes {
+                                lane.events
+                                    .retain(|event| (event.end_ns, event.event_id) >= cutoff);
                             }
                         }
+                        snapshot.snapshot_events_omitted = omitted;
                         let result = match serde_json::to_value(snapshot) {
                             Ok(value) => ProfileSample::Ready(value),
                             Err(error) => ProfileSample::SerializationFailed(error.to_string()),
@@ -177,18 +171,10 @@ fn env_threshold(name: &str, default: f64, maximum: f64) -> f64 {
 
 /// At most one deep terrain snapshot is requested or returned at a time.
 /// Snapshot construction, sorting, and JSON conversion all run on this worker.
+#[derive(Default)]
 pub struct TerrainTraceSampler {
     request: Option<SyncSender<Arc<TerrainTrace>>>,
     result: Option<Receiver<Result<Value, String>>>,
-}
-
-impl Default for TerrainTraceSampler {
-    fn default() -> Self {
-        Self {
-            request: None,
-            result: None,
-        }
-    }
 }
 
 impl TerrainTraceSampler {
@@ -202,8 +188,11 @@ impl TerrainTraceSampler {
             .name("terrain-trace-snapshot".into())
             .spawn(move || {
                 while let Ok(trace) = request_rx.recv() {
-                    let result =
-                        serde_json::to_value(trace.snapshot()).map_err(|error| error.to_string());
+                    let _lane = crate::engine_profile::worker_scope_named("Terrain snapshot");
+                    let _span = crate::engine_profile::span("Terrain snapshot serialization");
+                    let preferred = crate::engine_profile::recent_job_ids();
+                    let result = serde_json::to_value(trace.snapshot_for_profile_jobs(&preferred))
+                        .map_err(|error| error.to_string());
                     if result_tx.send(result).is_err() {
                         break;
                     }
@@ -316,9 +305,7 @@ impl ConvergenceWatch {
 
         if progress || self.last_progress.is_none() {
             self.last_progress = Some(now);
-            self.best_visible_ratio = if target_changed {
-                frame.visible_convergence
-            } else if ratio_progress {
+            self.best_visible_ratio = if target_changed || ratio_progress {
                 frame.visible_convergence
             } else {
                 self.best_visible_ratio.or(frame.visible_convergence)
@@ -449,17 +436,16 @@ impl PerformanceCapture {
                 .and_then(Value::as_f64)
         };
         self.poll_trace_result();
-        if let Some(bundle) = &mut self.pending {
-            if bundle.terrain_trace_status == "pending"
-                && bundle
-                    .terrain_trace_requested_at
-                    .is_some_and(|at| at.elapsed() >= PROFILE_RESULT_TIMEOUT)
-            {
-                bundle.terrain_trace_status = "timeout";
-                bundle.terrain_trace_error =
-                    Some("terrain trace snapshot exceeded the bounded wait".into());
-                self.trace_sampler = None;
-            }
+        if let Some(bundle) = &mut self.pending
+            && bundle.terrain_trace_status == "pending"
+            && bundle
+                .terrain_trace_requested_at
+                .is_some_and(|at| at.elapsed() >= PROFILE_RESULT_TIMEOUT)
+        {
+            bundle.terrain_trace_status = "timeout";
+            bundle.terrain_trace_error =
+                Some("terrain trace snapshot exceeded the bounded wait".into());
+            self.trace_sampler = None;
         }
         let frame = Frame {
             frame: snapshot.general.frame_number,
@@ -483,11 +469,11 @@ impl PerformanceCapture {
         let convergence_stalled =
             self.convergence
                 .stalled(&frame, now, self.thresholds.convergence_stall);
-        if let Some(bundle) = &mut self.pending {
-            if bundle.post_remaining > 0 {
-                bundle.frames.push(frame.clone());
-                bundle.post_remaining -= 1;
-            }
+        if let Some(bundle) = &mut self.pending
+            && bundle.post_remaining > 0
+        {
+            bundle.frames.push(frame.clone());
+            bundle.post_remaining -= 1;
         }
         self.finish_pending_if_ready();
         if self.history.len() == PRE_FRAMES {
@@ -833,7 +819,8 @@ fn write_bundle(root: &std::path::Path, bundle: Bundle) -> std::io::Result<()> {
         }
     }
     events.flush()?;
-    write_json(output.join("spans.json"), &bundle.profile)
+    write_json(output.join("spans.json"), &bundle.profile)?;
+    crate::profile_export::write_profile_trace(&output.join("timeline.json"), &bundle.profile, None)
 }
 
 fn collect_identity() -> Value {

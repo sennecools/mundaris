@@ -35,6 +35,80 @@ pub struct TileTexel {
     pub material: [f32; 4],
 }
 
+/// Authored renderer material data applied to resident surface samples.
+/// These values change shading only; they never alter tile displacement or
+/// the material weights produced by the surface definition.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ResidentMaterialAppearance {
+    /// Four semantic-material colors used by diagnostic material mode 3.
+    pub material_colors: [[f32; 3]; 4],
+    /// Four semantic-material colors used by natural mode 11.
+    pub natural_colors: [[f32; 3]; 4],
+    /// Curvature lightening target.
+    pub base_color: [f32; 3],
+    /// Curvature darkening target.
+    pub dark_color: [f32; 3],
+    pub ambient: f32,
+    pub diffuse: f32,
+    pub curvature_darkening: f32,
+    pub curvature_lightening: f32,
+}
+
+impl Default for ResidentMaterialAppearance {
+    fn default() -> Self {
+        Self {
+            material_colors: [
+                [0.72, 0.54, 0.30],
+                [0.34, 0.38, 0.42],
+                [0.45, 0.30, 0.22],
+                [0.78, 0.73, 0.64],
+            ],
+            natural_colors: [[0.42; 3], [0.30; 3], [0.12; 3], [0.62; 3]],
+            base_color: [0.47, 0.48, 0.50],
+            dark_color: [0.16, 0.14, 0.12],
+            ambient: 0.20,
+            diffuse: 0.80,
+            curvature_darkening: 0.0,
+            curvature_lightening: 0.0,
+        }
+    }
+}
+
+impl ResidentMaterialAppearance {
+    /// Validates authored colors and shading coefficients before renderer use.
+    pub fn validate(self) -> Result<Self, TileGeometryError> {
+        let valid_color = |color: &[f32; 3]| {
+            color
+                .iter()
+                .all(|channel| channel.is_finite() && (0.0..=1.0).contains(channel))
+        };
+        if self
+            .material_colors
+            .iter()
+            .chain(&self.natural_colors)
+            .chain([&self.base_color, &self.dark_color])
+            .any(|color| !valid_color(color))
+            || !self.ambient.is_finite()
+            || !(0.0..=1.0).contains(&self.ambient)
+            || !self.diffuse.is_finite()
+            || !(0.0..=1.0).contains(&self.diffuse)
+            || self.ambient + self.diffuse > 1.0
+            || !self.curvature_darkening.is_finite()
+            || !(0.0..=1.0).contains(&self.curvature_darkening)
+            || !self.curvature_lightening.is_finite()
+            || !(0.0..=1.0).contains(&self.curvature_lightening)
+        {
+            return Err(TileGeometryError::InvalidTile);
+        }
+        Ok(self)
+    }
+
+    /// Constructs validated material data for content loaders.
+    pub fn try_new(value: Self) -> Result<Self, TileGeometryError> {
+        value.validate()
+    }
+}
+
 /// CPU payload for one cube-chart tile. Texels are row-major and include a one
 /// sample halo: the dimensions are `(cells + 3) × (cells + 3)`.
 #[derive(Debug, Clone, PartialEq)]
@@ -259,9 +333,12 @@ pub struct TileDraw {
     pub anchor_view_m: DVec3,
     /// Body-fixed axes expressed in view coordinates.
     pub body_to_view: DMat3,
-    /// 0 lit, 1 height, 2 normal, 3 material, 4 UV, 5 grid.
+    /// 0 lit geometry, 1 height, 2 normal, 3 material, 4 UV, 5 grid;
+    /// 6..10 runtime diagnostics, 11 neutral rocky natural materials.
     pub mode: u32,
     pub sun_body: DVec3,
+    /// Authored colors and shading, independent of tile geometry and texels.
+    pub appearance: ResidentMaterialAppearance,
 }
 
 impl TileDraw {
@@ -297,6 +374,9 @@ impl TileDraw {
         &self,
         budget: crate::RenderPrecisionBudget,
     ) -> Result<(), crate::RenderPreparationError> {
+        self.appearance
+            .validate()
+            .map_err(|_| crate::RenderPreparationError::InvalidResidentTile)?;
         budget.try_view_relative_position(self.anchor_view_m)?;
         let columns = self.body_to_view.to_cols_array();
         let rotation = self.body_to_view;
@@ -381,7 +461,7 @@ pub struct ReconstructedTileVertex {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TilePublicationToken {
     generation: u64,
-    key: TileKey,
+    key: Arc<TileKey>,
 }
 impl TilePublicationToken {
     pub fn generation(&self) -> u64 {
@@ -396,35 +476,39 @@ impl TilePublicationToken {
 #[derive(Debug, Default, Clone)]
 pub struct TileSlotState {
     generation: u64,
-    requested_key: Option<TileKey>,
+    requested_key: Option<Arc<TileKey>>,
 }
 impl TileSlotState {
     /// Select the desired content key. Repeating the same key keeps its token.
     pub fn request(&mut self, key: &TileKey) -> Result<TilePublicationToken, TileGeometryError> {
-        if self.requested_key.as_ref() != Some(key) {
+        if self.requested_key.as_deref() != Some(key) {
             self.generation = self
                 .generation
                 .checked_add(1)
                 .ok_or(TileGeometryError::InvalidTile)?;
-            self.requested_key = Some(key.clone());
+            self.requested_key = Some(Arc::new(key.clone()));
         }
         Ok(TilePublicationToken {
             generation: self.generation,
-            key: key.clone(),
+            key: Arc::clone(
+                self.requested_key
+                    .as_ref()
+                    .expect("request establishes a key"),
+            ),
         })
     }
 
     /// Accept only the latest matching request. This guard runs before a GPU
     /// slot upload, so delayed CPU completions cannot replace newer content.
     pub fn accept_publication(&mut self, token: &TilePublicationToken, key: &TileKey) -> bool {
-        if token.key != *key || token.generation < self.generation {
+        if token.key.as_ref() != key || token.generation < self.generation {
             return false;
         }
         if token.generation == self.generation {
-            return self.requested_key.as_ref() == Some(key);
+            return self.requested_key.as_deref() == Some(key);
         }
         self.generation = token.generation;
-        self.requested_key = Some(key.clone());
+        self.requested_key = Some(Arc::clone(&token.key));
         true
     }
 
