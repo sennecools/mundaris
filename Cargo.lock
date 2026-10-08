@@ -1309,6 +1309,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mundaris_terrain_bake"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "png",
+ "pollster",
+ "serde",
+ "serde_json",
+ "sha2",
+ "wgpu",
+]
+
+[[package]]
 name = "mundaris_world"
 version = "0.0.1"
 dependencies = [

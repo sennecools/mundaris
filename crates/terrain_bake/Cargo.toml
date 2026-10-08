@@ -1,0 +1,22 @@
+[package]
+name = "mundaris_terrain_bake"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Offline recipe-driven GPU bake of periodic terrain library bundles"
+
+[[bin]]
+name = "terrain_bake"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+png.workspace = true
+pollster.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "=0.10.9"
+wgpu.workspace = true
+
+[lints]
+workspace = true
