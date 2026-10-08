@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Terrain Field Author</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand-mark" aria-hidden="true">T</div>
+    <div class="brand-copy"><strong>Terrain Field Author</strong><span>Procedural data workbench</span></div>
+    <div class="topbar-divider"></div>
+    <label class="template-control" for="template-select">Recipe
+      <select id="template-select" aria-label="Recipe template"></select>
+    </label>
+    <button id="apply-template" class="button button-subtle">Load template</button>
+    <div class="topbar-spacer"></div>
+    <button id="undo-button" class="button button-icon" aria-label="Undo" title="Undo (Ctrl+Z)">↶</button>
+    <button id="redo-button" class="button button-icon" aria-label="Redo" title="Redo (Ctrl+Y)">↷</button>
+    <button id="save-button" class="button button-subtle">Save JSON</button>
+    <button id="load-button" class="button button-subtle">Load JSON</button>
+    <input id="load-file" type="file" accept="application/json,.json" hidden>
+    <button id="export-button" class="button button-primary">Export fields</button>
+  </header>
+
+  <main class="workspace">
+    <section class="graph-panel panel" aria-label="Recipe graph editor">
+      <div class="panel-heading graph-heading">
+        <div><span class="eyebrow">AUTHORING</span><h1>Recipe graph</h1></div>
+        <div class="graph-actions">
+          <label class="compact-control">Add node
+            <select id="add-node-kind" aria-label="Node kind to add"></select>
+          </label>
+          <button id="add-node-button" class="button button-small">＋ Add</button>
+        </div>
+      </div>
+      <div class="graph-help">Drag nodes to arrange. Connect each input with its source selector. Wires show the saved graph dependencies.</div>
+      <div id="graph-viewport" class="graph-viewport" tabindex="0" aria-label="Terrain recipe node canvas">
+        <div id="graph-canvas" class="graph-canvas">
+          <svg id="wire-layer" class="wire-layer" aria-hidden="true"></svg>
+          <div id="node-layer" class="node-layer"></div>
+        </div>
+        <div id="graph-empty" class="empty-overlay" hidden>Load a recipe template to begin.</div>
+      </div>
+      <div class="graph-footer"><span id="node-count">0 nodes</span><span>Recipe schema v2</span></div>
+    </section>
+
+    <section class="preview-panel panel" aria-label="Field preview">
+      <div class="panel-heading preview-heading">
+        <div><span class="eyebrow">LIVE FIELDS</span><h1>Field inspection</h1></div>
+        <span id="preview-state" class="status-pill status-working"><i></i>Connecting</span>
+      </div>
+      <div class="preview-toolbar">
+        <label class="compact-control">Field
+          <select id="map-select" aria-label="Field map">
+            <option value="height">Height · m</option>
+            <option value="humidity">Humidity · 0–1</option>
+            <option value="temperature">Temperature · K</option>
+            <option value="material">Material colors</option>
+            <option value="support">Feature support · 0–1</option>
+          </select>
+        </label>
+        <label class="compact-control">Cube face
+          <select id="face-select" aria-label="Cube face">
+            <option value="0">+X · 0</option><option value="1">−X · 1</option>
+            <option value="2">+Y · 2</option><option value="3">−Y · 3</option>
+            <option value="4">+Z · 4</option><option value="5">−Z · 5</option>
+          </select>
+        </label>
+        <label class="compact-control resolution-control">Samples
+          <select id="resolution-select" aria-label="Preview resolution">
+            <option value="32">32 × 32</option><option value="64">64 × 64</option>
+          </select>
+        </label>
+        <button id="refresh-preview" class="button button-small">Refresh</button>
+      </div>
+      <div class="map-frame">
+        <canvas id="map-canvas" width="320" height="320" aria-label="Returned terrain field map"></canvas>
+        <div id="map-empty" class="map-empty"><div class="map-empty-icon">◌</div><strong>Waiting for field data</strong><span>The map appears after the Rust evaluator returns samples.</span></div>
+      </div>
+      <div class="map-legend"><span id="map-field-name">Height field</span><span id="map-range">No returned range</span></div>
+      <div id="error-banner" class="error-banner" role="alert" hidden></div>
+      <div class="identity-strip">
+        <div><span>GEOMETRY</span><code id="identity-geometry">—</code></div>
+        <div><span>CLIMATE</span><code id="identity-climate">—</code></div>
+        <div><span>PALETTE</span><code id="identity-palette">—</code></div>
+      </div>
+      <div class="stats-grid">
+        <div><span>Height range</span><strong id="stat-height">—</strong></div>
+        <div><span>Humidity range</span><strong id="stat-humidity">—</strong></div>
+        <div><span>Temperature</span><strong id="stat-temperature">—</strong></div>
+        <div><span>Map size</span><strong id="stat-size">—</strong></div>
+      </div>
+    </section>
+
+    <aside class="side-column">
+      <section class="inspector-panel panel" aria-label="Node inspector">
+        <div class="panel-heading inspector-heading"><div><span class="eyebrow">SELECTION</span><h2>Node inspector</h2></div><button id="delete-node" class="button button-danger button-small" disabled>Delete</button></div>
+        <div id="inspector-empty" class="inspector-empty">Select a node to edit its parameters and incoming connections.</div>
+        <div id="inspector-content" hidden>
+          <div class="selected-node-title"><span id="selected-node-kind" class="node-type-tag">NODE</span><strong id="selected-node-label"></strong></div>
+          <label class="field-label" for="node-label">Node label</label><input id="node-label" class="text-input" type="text" maxlength="64">
+          <div id="input-fields" class="inspector-section"></div>
+          <div id="parameter-fields" class="inspector-section"></div>
+        </div>
+      </section>
+
+      <section class="seed-panel panel" aria-label="Seed controls">
+        <div class="panel-heading compact-heading"><div><span class="eyebrow">DETERMINISM</span><h2>Seed streams</h2></div></div>
+        <div class="seed-grid">
+          <label>Geometry<input id="seed-geometry" class="number-input" type="number" min="0" max="9007199254740991" step="1"></label>
+          <label>Climate<input id="seed-climate" class="number-input" type="number" min="0" max="9007199254740991" step="1"></label>
+          <label>Material<input id="seed-material" class="number-input" type="number" min="0" max="9007199254740991" step="1"></label>
+        </div>
+        <div class="seed-note">Material seed affects layer weights and material response. Lock shape and climate to explore appearance variation.</div>
+      </section>
+
+      <section class="variation-panel panel" aria-label="Seed variation gallery">
+        <div class="panel-heading compact-heading"><div><span class="eyebrow">CONSTRAINED VARIATION</span><h2>Seed gallery</h2></div><button id="generate-gallery" class="button button-small">Generate 4</button></div>
+        <div class="lock-row">
+          <label><input id="lock-geometry" type="checkbox"> Lock shape</label>
+          <label><input id="lock-climate" type="checkbox"> Lock climate</label>
+          <label><input id="lock-palette" type="checkbox"> Lock palette</label>
+        </div>
+        <div id="gallery-status" class="gallery-status">Variations run one at a time through the Rust evaluator.</div>
+        <div id="gallery-grid" class="gallery-grid"></div>
+      </section>
+
+      <section class="export-result panel" id="export-result" hidden aria-live="polite">
+        <div class="eyebrow">PUBLISHED BUNDLE</div><strong id="export-path"></strong><code id="export-hash"></code><span id="export-files"></span>
+      </section>
+    </aside>
+  </main>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+</body>
+</html>
