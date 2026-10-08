@@ -269,6 +269,11 @@ impl GravityOrbitsDemo {
                 )))
             }
             DevCommand::ResidentCoverHold { enabled } => {
+                if self.atlas.enabled {
+                    // Atlas terrain: freeze request generation (draws continue).
+                    self.atlas.hold = *enabled;
+                    return Ok(());
+                }
                 ensure!(
                     !*enabled || self.planetary.runtime.has_coverage(),
                     "hold requires resident coverage"

@@ -3024,6 +3024,7 @@ mod timeline_tests {
             resident_hierarchy: None,
             resident_regional: None,
             resident_planetary: None,
+            terrain_atlas: None,
             engine_profile: Some(Arc::new(json!({"generated_at_ns":1,"lanes":[]}))),
         };
         let mut lab = PerformanceLab::default();

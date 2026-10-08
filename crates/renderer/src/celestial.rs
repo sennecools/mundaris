@@ -263,6 +263,7 @@ pub struct CelestialStaging {
     resident_tile: Option<crate::TileDraw>,
     resident_hierarchy: Option<crate::ResidentHierarchyDraw>,
     resident_regional: Option<crate::RegionalResidentDraw>,
+    terrain_atlas: Option<crate::TerrainAtlasFrame>,
 }
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CelestialPreparationReport {
@@ -305,6 +306,7 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
         staging.resident_tile = None;
         staging.resident_hierarchy = None;
         staging.resident_regional = None;
+        staging.terrain_atlas = None;
         staging.sky = None;
         Self {
             view,
@@ -407,6 +409,11 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
         }
         self.staging.resident_regional = Some(draw);
         Ok(())
+    }
+
+    /// Stages atlas producer jobs and instanced terrain draws (ADR 0016).
+    pub fn set_terrain_atlas(&mut self, atlas: crate::TerrainAtlasFrame) {
+        self.staging.terrain_atlas = Some(atlas);
     }
 
     /// Sets renderer-only terrain shading for this frame. Directions and terrain
@@ -857,6 +864,7 @@ pub(crate) struct CelestialRenderer {
     polyline_capacity: u64,
     indices: wgpu::Buffer,
     resident_tile: Option<crate::resident_tile::ResidentTileRenderer>,
+    terrain_atlas: Option<crate::terrain_atlas::TerrainAtlasRenderer>,
     _depth_texture: wgpu::Texture,
     depth: wgpu::TextureView,
 }
@@ -900,6 +908,19 @@ impl CelestialRenderer {
         if let Some(r) = &mut self.resident_tile {
             r.on_submitted(queue);
         }
+        if let Some(atlas) = &mut self.terrain_atlas {
+            atlas.on_submitted();
+        }
+    }
+    pub(crate) fn take_atlas_bounds(&mut self) -> Vec<crate::AtlasBounds> {
+        self.terrain_atlas
+            .as_mut()
+            .map_or_else(Vec::new, |atlas| atlas.take_bounds())
+    }
+    pub(crate) fn atlas_report(&self) -> crate::TerrainAtlasReport {
+        self.terrain_atlas
+            .as_ref()
+            .map_or_else(Default::default, |atlas| atlas.report())
     }
     pub(crate) fn validate_resident_regional(
         &mut self,
@@ -1071,6 +1092,7 @@ impl CelestialRenderer {
             polyline_capacity: 32,
             indices,
             resident_tile: None,
+            terrain_atlas: None,
             cluster_settings: crate::ClusterSettings::default(),
             _depth_texture: depth_texture,
             depth,
@@ -1129,6 +1151,30 @@ impl CelestialRenderer {
             }
         } else if let Some(resident_tile) = &mut self.resident_tile {
             resident_tile.clear_frame();
+        }
+        if let Some(atlas_frame) = &storage.terrain_atlas
+            && let Some(config) = atlas_frame.config
+        {
+            if self
+                .terrain_atlas
+                .as_ref()
+                .is_none_or(|atlas| atlas.config() != config)
+            {
+                self.terrain_atlas = Some(
+                    crate::terrain_atlas::TerrainAtlasRenderer::new(
+                        device,
+                        self.target_format,
+                        &self.projection_layout,
+                        config,
+                    )
+                    .map_err(RenderPreparationError::TerrainAtlas)?,
+                );
+            }
+            if let Some(atlas) = &mut self.terrain_atlas {
+                atlas
+                    .prepare(device, queue, encoder, atlas_frame)
+                    .map_err(RenderPreparationError::TerrainAtlas)?;
+            }
         }
         if let Some(resident) = &mut self.resident_tile {
             resident.prepare_clusters(
@@ -1262,6 +1308,17 @@ impl CelestialRenderer {
             } else {
                 resident_tile.draw(&mut pass, &self.projection_group);
             }
+            if let Some(queries) = timestamps.filter(|q| q.inside_passes()) {
+                queries.end_scope(&mut pass, 3);
+            }
+        }
+        if storage.terrain_atlas.is_some()
+            && let Some(atlas) = &self.terrain_atlas
+        {
+            if let Some(queries) = timestamps.filter(|q| q.inside_passes()) {
+                queries.write_scope(&mut pass, 3);
+            }
+            atlas.draw(&mut pass, &self.projection_group);
             if let Some(queries) = timestamps.filter(|q| q.inside_passes()) {
                 queries.end_scope(&mut pass, 3);
             }

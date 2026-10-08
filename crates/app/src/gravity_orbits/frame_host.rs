@@ -4,6 +4,21 @@ pub(super) enum FrameHost<'a> {
     Native(&'a mut Renderer),
 }
 impl FrameHost<'_> {
+    pub fn take_terrain_atlas_bounds(&mut self) -> Vec<mundaris_renderer::AtlasBounds> {
+        match self {
+            Self::Native(r) => r.take_terrain_atlas_bounds(),
+        }
+    }
+    pub fn terrain_atlas_report(&self) -> mundaris_renderer::TerrainAtlasReport {
+        match self {
+            Self::Native(r) => r.terrain_atlas_report(),
+        }
+    }
+    pub fn terrain_atlas_layer_limit(&self) -> u32 {
+        match self {
+            Self::Native(r) => r.terrain_atlas_layer_limit(),
+        }
+    }
     pub fn set_cluster_settings(&mut self, settings: mundaris_renderer::ClusterSettings) {
         match self {
             Self::Native(r) => r.set_cluster_settings(settings),

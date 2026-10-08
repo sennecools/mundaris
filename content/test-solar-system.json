@@ -3,6 +3,22 @@
   "id": "test-solar-system",
   "initial_body": "moon",
   "camera_state": "camera.json",
+  "lod": {
+    "schema": 1,
+    "tile_cells": 128,
+    "draw_cells": 32,
+    "atlas_layers": 512,
+    "normal_scale": 2,
+    "pixel_error": 4.0,
+    "min_range_factor": 3.0,
+    "morph_fraction": 0.3,
+    "base_resident_level": 1,
+    "max_level": 22,
+    "jobs_per_frame": 24,
+    "arrival_seconds": 0.25,
+    "skirt_cells": 2.0,
+    "min_body_pixels": 6.0
+  },
   "bodies": [
     {
       "id": "sol",

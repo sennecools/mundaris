@@ -24,6 +24,7 @@ pub mod motion_session;
 pub mod orbit_guides;
 pub mod performance_capture;
 pub mod performance_lab;
+pub mod planet_lod;
 pub mod planet_surface;
 pub mod planet_terrain;
 pub mod playback_metrics;

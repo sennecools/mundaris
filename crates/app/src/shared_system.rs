@@ -25,6 +25,8 @@ struct SystemContent {
     id: String,
     initial_body: String,
     camera_state: String,
+    /// Atlas terrain LOD policy (ADR 0016).
+    lod: crate::planet_lod::LodPolicy,
     bodies: Vec<BodyContent>,
 }
 
@@ -196,6 +198,7 @@ pub struct BodyPresentation {
 }
 pub struct SharedTestSystem {
     pub system: CelestialSystem,
+    pub lod: crate::planet_lod::LodPolicy,
     pub motion: CelestialMotionDefinition,
     pub presentation: Vec<BodyPresentation>,
     pub initial_body_index: usize,
@@ -364,6 +367,7 @@ impl SharedTestSystem {
             content.schema == 1 && content.id == SCENE_NAME,
             "only the shared test solar system is supported"
         );
+        content.lod.validate().context("invalid lod policy")?;
         ensure!(
             (3..=32).contains(&content.bodies.len()),
             "test system must have 3..=32 bodies"
@@ -490,6 +494,7 @@ impl SharedTestSystem {
         );
         Ok(Self {
             system,
+            lod: content.lod,
             motion,
             presentation,
             initial_body_index,

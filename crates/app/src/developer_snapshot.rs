@@ -470,6 +470,9 @@ pub struct DeveloperSnapshot {
     /// Ordinary planetary resident runtime; distinct from finite fixtures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resident_planetary: Option<ResidentDiagnosticSnapshot>,
+    /// Atlas terrain runtime (ADR 0016).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terrain_atlas: Option<Value>,
     /// Bounded sampled CPU timeline; timestamps use its own monotonic epoch.
     #[serde(
         default,
@@ -710,6 +713,7 @@ impl DeveloperSnapshot {
             resident_hierarchy: None,
             resident_regional: None,
             resident_planetary: None,
+            terrain_atlas: None,
             engine_profile: None,
             shared_scene: None,
         };

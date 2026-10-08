@@ -18,6 +18,7 @@ mod geology;
 mod hierarchy;
 mod moon_fields;
 mod moon_profile;
+pub mod producer;
 mod provinces;
 mod query_context;
 pub use hierarchy::SurfaceDetailDiagnostics;

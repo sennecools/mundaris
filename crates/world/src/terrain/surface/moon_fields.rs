@@ -13,11 +13,11 @@ use super::{
 use glam::{DMat3, DVec3};
 use std::ops::{Add, Mul, Neg, Sub};
 
-const BASIN_COUNT: usize = 8;
-const LAYOUTS: usize = 2;
-const JITTER: f64 = 0.16;
-const SHELL: f64 = 0.30;
-const SUPPORT: f64 = 0.52;
+pub(super) const BASIN_COUNT: usize = 8;
+pub(super) const LAYOUTS: usize = 2;
+pub(super) const JITTER: f64 = 0.16;
+pub(super) const SHELL: f64 = 0.30;
+pub(super) const SUPPORT: f64 = 0.52;
 pub const MOON_CRATER_BAND_BUDGETS_M: [f64; 3] = [
     MoonFieldDefinition::default_v1().bands[0].height_budget_m,
     MoonFieldDefinition::default_v1().bands[1].height_budget_m,
@@ -350,14 +350,14 @@ fn uncache_recipe(
 
 #[derive(Debug, Clone)]
 pub(super) struct MoonFieldsV1 {
-    radius_m: f64,
-    seed: u64,
-    parameters: GeologicalParameters,
-    axes: [DVec3; 4],
-    basins: [DVec3; BASIN_COUNT],
-    rotation: DMat3,
+    pub(super) radius_m: f64,
+    pub(super) seed: u64,
+    pub(super) parameters: GeologicalParameters,
+    pub(super) axes: [DVec3; 4],
+    pub(super) basins: [DVec3; BASIN_COUNT],
+    pub(super) rotation: DMat3,
     bound_m: f64,
-    definition: MoonFieldDefinition,
+    pub(super) definition: MoonFieldDefinition,
 }
 
 impl MoonFieldsV1 {
@@ -483,7 +483,19 @@ impl MoonFieldsV1 {
     pub(super) fn evaluate(
         &self,
         n: DVec3,
+        context: Option<&mut SurfaceQueryContext<'_>>,
+    ) -> Result<(f64, DVec3, [f64; 4], SurfaceQueryWork), TerrainError> {
+        self.evaluate_weighted(n, context, None)
+    }
+
+    /// Band-limited derived evaluation. Each crater band contribution is scaled
+    /// by its footprint weight and skipped when that weight is zero. `None`
+    /// is the complete authoritative evaluation.
+    pub(super) fn evaluate_weighted(
+        &self,
+        n: DVec3,
         mut context: Option<&mut SurfaceQueryContext<'_>>,
+        band_weights: Option<[f64; 3]>,
     ) -> Result<(f64, DVec3, [f64; 4], SurfaceQueryWork), TerrainError> {
         let n = self.rotation.transpose() * n;
         let global = self.global(n);
@@ -491,8 +503,15 @@ impl MoonFieldsV1 {
         let mut impact_weight = 0.0;
         let mut work = SurfaceQueryWork::default();
         for (band, band_definition) in self.definition.bands.iter().enumerate() {
-            let contribution =
+            let weight = band_weights.map_or(1.0, |weights| weights[band]);
+            if weight <= 0.0 {
+                continue;
+            }
+            let mut contribution =
                 self.evaluate_band(n, band, global.regional, &mut work, context.as_deref_mut())?;
+            if band_weights.is_some() {
+                contribution = contribution * weight;
+            }
             total = total + contribution;
             impact_weight += contribution.value.abs() / (band_definition.height_budget_m + 1.0);
         }
@@ -507,6 +526,25 @@ impl MoonFieldsV1 {
             normalize_weights([regolith, substrate, basalt, ejecta]),
             work,
         ))
+    }
+
+    /// Per-basin `[scale, bowl depth]` exactly as sampled by `global`.
+    pub(super) fn basin_parameters(&self) -> [[f64; 2]; BASIN_COUNT] {
+        std::array::from_fn(|index| {
+            [
+                self.definition
+                    .basin_scale
+                    .sample(unit(self.seed ^ index as u64 ^ 0x4241_5349_4e53)),
+                self.definition
+                    .basin_bowl_depth
+                    .sample(unit(self.seed ^ index as u64)),
+            ]
+        })
+    }
+
+    /// The 64-bit hash salt of one crater band/layout lattice.
+    pub(super) fn lattice_salt(&self, band: usize, layout: usize) -> u64 {
+        self.seed ^ (band as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ layout as u64
     }
 
     fn global(&self, n: DVec3) -> GlobalSample {

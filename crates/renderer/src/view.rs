@@ -102,6 +102,8 @@ pub enum RenderPreparationError {
     InvalidResidentTile,
     #[error("GPU progress during bounded resource growth: {0}")]
     GpuProgress(String),
+    #[error("terrain atlas: {0}")]
+    TerrainAtlas(String),
 }
 
 /// Observer-centred view with camera-local axes (+X right, +Y up, -Z forward).

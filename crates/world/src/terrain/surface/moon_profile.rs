@@ -7,7 +7,7 @@ use std::{sync::Arc, time::Instant};
 
 const MAX_PROFILE_DIMENSION: u32 = 2048;
 const MAX_DETAIL_LAYER_COUNT: usize = 2;
-const PROFILE_BANDS: [(f64, f64); 3] = [(2.0, 0.012), (8.0, 0.0015), (32.0, 0.0002)];
+pub(super) const PROFILE_BANDS: [(f64, f64); 3] = [(2.0, 0.012), (8.0, 0.0015), (32.0, 0.0002)];
 
 /// Opt-in service and source-work measurements for one complete MoonProfile point.
 /// Durations are nanoseconds from this process; source counters describe actual
@@ -121,7 +121,7 @@ pub(super) const MAX_PROFILE_WORKING_HEAP_BYTES: usize =
     24 * 1024 * 1024 + MAX_DETAIL_LAYER_COUNT * std::mem::size_of::<TerrainHeightDetailLayer>();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProfileKernel {
+pub(super) enum ProfileKernel {
     Smoothstep,
     CubicBSpline,
 }
@@ -381,8 +381,8 @@ pub(super) struct MoonProfileSample {
 
 #[derive(Debug, Clone)]
 pub(super) struct MoonProfileField {
-    profile: TerrainHeightProfile,
-    radius_m: f64,
+    pub(super) profile: TerrainHeightProfile,
+    pub(super) radius_m: f64,
     bound_m: f64,
 }
 
@@ -456,7 +456,8 @@ impl MoonProfileField {
         if let Some((footprint_m, amplitude_m)) = self.profile.terrain_scale {
             let frequency = 2.0 * self.radius_m / footprint_m;
             let (sampled, sampled_gradient) = sample_triplanar(
-                &self.profile,
+                self.profile.grid(),
+                self.profile.kernel,
                 n,
                 weights,
                 weight_gradients,
@@ -472,7 +473,8 @@ impl MoonProfileField {
         } else {
             for (band_index, (frequency, amplitude)) in PROFILE_BANDS.iter().copied().enumerate() {
                 let (sampled, sampled_gradient) = sample_triplanar(
-                    &self.profile,
+                    self.profile.grid(),
+                    self.profile.kernel,
                     n,
                     weights,
                     weight_gradients,
@@ -497,7 +499,8 @@ impl MoonProfileField {
             observer.record_detail_layer();
             let frequency = 2.0 * self.radius_m / layer.footprint_m;
             let (sampled, sampled_gradient) = sample_triplanar(
-                &layer.profile,
+                layer.profile.grid(),
+                layer.profile.kernel,
                 n,
                 weights,
                 weight_gradients,
@@ -544,12 +547,12 @@ impl MoonProfileField {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ProfileValue {
-    value: f64,
-    gradient_uv: [f64; 2],
+pub(super) struct ProfileValue {
+    pub(super) value: f64,
+    pub(super) gradient_uv: [f64; 2],
 }
 
-fn projection(n: DVec3, axis: usize) -> (f64, f64) {
+pub(super) fn projection(n: DVec3, axis: usize) -> (f64, f64) {
     match axis {
         0 => (n.y, n.z),
         1 => (n.x, n.z),
@@ -557,8 +560,9 @@ fn projection(n: DVec3, axis: usize) -> (f64, f64) {
     }
 }
 
-fn sample_triplanar<O: ProfileObserver>(
-    profile: &TerrainHeightProfile,
+pub(super) fn sample_triplanar<O: ProfileObserver>(
+    grid: ProfileGrid<'_>,
+    kernel: ProfileKernel,
     n: DVec3,
     weights: [f64; 3],
     weight_gradients: [DVec3; 3],
@@ -570,7 +574,7 @@ fn sample_triplanar<O: ProfileObserver>(
     let mut sampled_gradient = DVec3::ZERO;
     for axis in 0..3 {
         let (a, b) = projection(n, axis);
-        let s = profile.sample_periodic_observed(a, b, frequency, observer);
+        let s = grid.sample(kernel, a, b, frequency, observer);
         sampled += weights[axis] * s.value;
         let chart_gradient = match axis {
             0 => DVec3::new(0.0, s.gradient_uv[0], s.gradient_uv[1]),
@@ -583,7 +587,7 @@ fn sample_triplanar<O: ProfileObserver>(
     (sampled, sampled_gradient)
 }
 
-fn triplanar_weights(n: DVec3) -> Result<([f64; 3], [DVec3; 3]), TerrainError> {
+pub(super) fn triplanar_weights(n: DVec3) -> Result<([f64; 3], [DVec3; 3]), TerrainError> {
     let raw = [n.x.powi(4), n.y.powi(4), n.z.powi(4)];
     let total = raw.iter().sum::<f64>();
     if !total.is_finite() || total <= 0.0 {
@@ -608,8 +612,54 @@ impl TerrainHeightProfile {
         self.sample_periodic_observed(u, v, frequency, &mut NoopProfileObserver)
     }
 
+    #[cfg(test)]
     fn sample_periodic_observed<O: ProfileObserver>(
         &self,
+        u: f64,
+        v: f64,
+        frequency: f64,
+        observer: &mut O,
+    ) -> ProfileValue {
+        self.grid().sample(self.kernel, u, v, frequency, observer)
+    }
+
+    pub(super) fn grid(&self) -> ProfileGrid<'_> {
+        ProfileGrid {
+            width: self.width,
+            height: self.height,
+            values: &self.values,
+            sample_range: self.sample_range,
+        }
+    }
+
+    #[cfg(test)]
+    fn value(&self, x: u32, y: u32) -> f64 {
+        self.grid().value(x, y)
+    }
+
+    pub(super) fn shared_values(&self) -> &Arc<[u16]> {
+        &self.values
+    }
+
+    pub(super) fn is_cubic_bspline(&self) -> bool {
+        self.kernel == ProfileKernel::CubicBSpline
+    }
+}
+
+/// Borrowed periodic u16 sample grid. The complete profile and its derived
+/// pre-filtered mip levels share this exact reconstruction arithmetic.
+#[derive(Clone, Copy)]
+pub(super) struct ProfileGrid<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub values: &'a [u16],
+    pub sample_range: [u16; 2],
+}
+
+impl ProfileGrid<'_> {
+    pub(super) fn sample<O: ProfileObserver>(
+        self,
+        kernel: ProfileKernel,
         u: f64,
         v: f64,
         frequency: f64,
@@ -621,7 +671,7 @@ impl TerrainHeightProfile {
                 gradient_uv: [0.0, 0.0],
             };
         }
-        if self.kernel == ProfileKernel::CubicBSpline {
+        if kernel == ProfileKernel::CubicBSpline {
             return self.sample_periodic_cubic_bspline(u, v, frequency, observer);
         }
         observer.record_profile_taps(4, 4);
@@ -656,7 +706,7 @@ impl TerrainHeightProfile {
     }
 
     fn sample_periodic_cubic_bspline<O: ProfileObserver>(
-        &self,
+        self,
         u: f64,
         v: f64,
         frequency: f64,
@@ -695,7 +745,7 @@ impl TerrainHeightProfile {
         }
     }
 
-    fn value(&self, x: u32, y: u32) -> f64 {
+    fn value(self, x: u32, y: u32) -> f64 {
         let [low, high] = self.sample_range;
         if low == high {
             return 0.5;

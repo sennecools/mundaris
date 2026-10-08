@@ -23,6 +23,7 @@ pub mod regional_resident;
 pub mod resident_hierarchy;
 pub mod resident_tile;
 pub mod sky;
+pub mod terrain_atlas;
 #[cfg(feature = "terrain-capture")]
 pub mod terrain_capture;
 mod view;
@@ -40,6 +41,12 @@ pub use resident_tile::{
     ReconstructedTileVertex, ResidentMaterialAppearance, ResidentTileReport, TILE_FILTER_VERSION,
     TILE_FORMAT_VERSION, TileData, TileDraw, TileGeometryError, TileKey, TilePublicationToken,
     TileSlotState, TileTexel,
+};
+pub use terrain_atlas::{
+    ATLAS_BOUNDS_GRID, AtlasBounds, AtlasChart, AtlasFieldsConstants, AtlasImageLevel,
+    AtlasInstance, AtlasProduceJob, AtlasProfileLayer, AtlasSampleSource, AtlasSource,
+    AtlasTileKind, MAX_ATLAS_JOBS_PER_FRAME, ProducedTileReadback, TerrainAtlasConfig,
+    TerrainAtlasFrame, TerrainAtlasReport, produce_for_validation,
 };
 pub use view::*;
 
@@ -249,6 +256,21 @@ impl Renderer {
             .as_ref()
             .map_or_else(Default::default, |r| r.last_resident_regional_report())
     }
+    /// Produced atlas height bounds delivered since the last call.
+    pub fn take_terrain_atlas_bounds(&mut self) -> Vec<AtlasBounds> {
+        self.celestial
+            .as_mut()
+            .map_or_else(Vec::new, |c| c.take_atlas_bounds())
+    }
+    pub fn terrain_atlas_report(&self) -> TerrainAtlasReport {
+        self.celestial
+            .as_ref()
+            .map_or_else(Default::default, |c| c.atlas_report())
+    }
+    /// Device limit on atlas texture-array layers.
+    pub fn terrain_atlas_layer_limit(&self) -> u32 {
+        self.device.limits().max_texture_array_layers
+    }
     pub fn set_cluster_settings(&mut self, settings: ClusterSettings) {
         self.cluster_settings = settings;
     }
@@ -356,7 +378,12 @@ impl Renderer {
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("Mundaris device"),
                 required_features: requested_features,
-                required_limits: wgpu::Limits::default(),
+                // The terrain atlas needs more texture-array layers than the
+                // portable default; request what the adapter offers, capped.
+                required_limits: wgpu::Limits {
+                    max_texture_array_layers: adapter.limits().max_texture_array_layers.min(2048),
+                    ..wgpu::Limits::default()
+                },
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 memory_hints: wgpu::MemoryHints::default(),
                 trace: wgpu::Trace::Off,

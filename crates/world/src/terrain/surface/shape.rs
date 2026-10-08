@@ -39,6 +39,11 @@ enum ShapeKind {
 impl ShapeDefinition {
     /// Constructs the unit-sphere shape, where the reference radius is the
     /// physical radius in every direction.
+    /// Whether this is the reference sphere (zero shape height everywhere).
+    pub fn is_sphere(&self) -> bool {
+        matches!(self.kind, ShapeKind::Sphere)
+    }
+
     pub fn sphere() -> Self {
         Self {
             kind: ShapeKind::Sphere,

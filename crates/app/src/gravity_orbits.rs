@@ -227,6 +227,7 @@ pub struct GravityOrbitsDemo {
     clearance_query_us: f64,
     terrain: crate::terrain_population::TerrainPopulation,
     planetary: planetary::PlanetaryTerrain,
+    atlas: crate::planet_lod::PlanetLod,
     presentation: Vec<crate::shared_system::BodyPresentation>,
     scene_sha256: String,
     camera_sha256: String,
@@ -417,6 +418,7 @@ impl GravityOrbitsDemo {
         )?;
         let crate::shared_system::SharedTestSystem {
             mut system,
+            lod,
             motion: definition,
             presentation,
             initial_body_index: selected,
@@ -522,6 +524,12 @@ impl GravityOrbitsDemo {
             clearance_query_us: 0.0,
             terrain: crate::terrain_population::TerrainPopulation::new()?,
             planetary: planetary::PlanetaryTerrain::new(true),
+            // Temporary developer toggle back to the resident path; removal
+            // condition: atlas Phase 3 native acceptance (ADR 0016).
+            atlas: crate::planet_lod::PlanetLod::new(
+                (std::env::var("MUNDARIS_TERRAIN_BACKEND").as_deref() != Ok("resident"))
+                    .then_some(lod),
+            ),
             presentation,
             scene_sha256,
             camera_sha256,
@@ -1704,7 +1712,11 @@ impl GravityOrbitsDemo {
         let population_near = near;
         self.surface_owners.clear();
         self.surface_owners.resize(self.requests.len(), false);
-        let planetary_active = self.planetary.enabled;
+        let atlas_active = self.atlas.enabled;
+        let planetary_active = self.planetary.enabled && !atlas_active;
+        if atlas_active {
+            self.planetary.runtime.suspend();
+        }
         let mut planetary_candidate = if planetary_active && self.controls.terrain_preview {
             self.terrain.resident_candidate(
                 &pair,
@@ -1812,6 +1824,54 @@ impl GravityOrbitsDemo {
         }
         let mut frame = CelestialFrame::new(&view, &mut self.staging, projection, &self.sphere);
         frame.set_terrain_lighting(lighting);
+        if atlas_active {
+            let _span = crate::engine_profile::span("Atlas terrain preparation");
+            self.atlas
+                .receive_bounds(renderer.take_terrain_atlas_bounds());
+            let star = pair.system().body(self.ids[0])?;
+            let mut inputs = Vec::new();
+            for &id in &self.ids {
+                let body = pair.system().body(id)?;
+                let Some(definition) = body.surface_definition() else {
+                    continue;
+                };
+                let sun_body = body
+                    .state()
+                    .body_to_system()
+                    .inverse()
+                    .rotate_direction(Direction3::try_new(
+                        star.state().center_in_system().metres()
+                            - body.state().center_in_system().metres(),
+                    )?)?
+                    .unit();
+                inputs.push(crate::planet_lod::AtlasBodyInput {
+                    body: id,
+                    body_fixed_frame: pair.projection().frames_for(id)?.body_fixed,
+                    definition,
+                    radius_m: body.properties().reference_radius_m(),
+                    revision: body.terrain_revision().value(),
+                    sun_body,
+                });
+            }
+            let mode = match lighting.mode() {
+                TerrainRenderMode::Normals => 2,
+                TerrainRenderMode::Elevation => 1,
+                _ => 0,
+            };
+            let atlas_frame = self.atlas.prepare(
+                &view,
+                projection,
+                &inputs,
+                mode,
+                renderer.terrain_atlas_layer_limit(),
+            )?;
+            for body in self.atlas.drawn_bodies() {
+                if let Some(index) = self.ids.iter().position(|id| id == body) {
+                    self.surface_owners[index] = true;
+                }
+            }
+            frame.set_terrain_atlas(atlas_frame);
+        }
         let mut planetary_submitted = false;
         if planetary_active
             && planetary_binding_ready
@@ -2074,6 +2134,9 @@ impl GravityOrbitsDemo {
                 &self.system,
                 planetary_binding_ready,
             )?;
+        } else if atlas_active {
+            self.atlas
+                .annotate_terrain(&mut snapshot.terrain, &self.ids, &self.system);
         }
         // Opt-in native evidence scratch export of this exact prepared state.
         // Disabled for ordinary launches; collection remains observational.
@@ -2229,8 +2292,28 @@ impl GravityOrbitsDemo {
             snapshot.performance.host_frame_ms =
                 Some(host_frame_started.elapsed().as_secs_f64() * 1000.0);
         }
+        if atlas_active {
+            snapshot.terrain.backend = "ATLAS CDLOD".into();
+            let ids = &self.ids;
+            let system = &self.system;
+            snapshot.terrain_atlas = Some(self.atlas.snapshot(|body| {
+                let index = ids.iter().position(|id| *id == body);
+                index
+                    .and_then(|index| self.presentation.get(index))
+                    .map(|p| p.semantic_id.clone())
+                    .or_else(|| system.body(body).ok().map(|b| b.name().to_string()))
+                    .unwrap_or_default()
+            }));
+        }
         snapshot.performance.host_frame_ms =
             Some(host_frame_started.elapsed().as_secs_f64() * 1000.0);
+        if atlas_active {
+            self.atlas.record_frame(
+                native_interval_ms,
+                snapshot.performance.host_frame_ms,
+                renderer.terrain_atlas_report().jobs as usize,
+            );
+        }
         drop(frame_span);
         let profiler_started = Instant::now();
         if let Some(profile) = self.profile_sampler.poll_value() {
