@@ -119,7 +119,7 @@ impl SkyRenderer {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
         let view = texture.create_view(&Default::default());
@@ -169,15 +169,15 @@ impl SkyRenderer {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Distant sky pipeline layout"),
-            bind_group_layouts: &[&layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
         });
         let attributes = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4];
-        let star_layout = [wgpu::VertexBufferLayout {
+        let star_layout = [Some(wgpu::VertexBufferLayout {
             array_stride: 32,
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &attributes,
-        }];
+        })];
         let make_pipeline = |label: &'static str, entry: &'static str, star: bool| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
@@ -220,13 +220,13 @@ impl SkyRenderer {
                 primitive: wgpu::PrimitiveState::default(),
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: false,
-                    depth_compare: wgpu::CompareFunction::Always,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::Always),
                     stencil: Default::default(),
                     bias: Default::default(),
                 }),
                 multisample: Default::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             })
         };

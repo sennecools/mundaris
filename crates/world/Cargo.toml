@@ -6,8 +6,12 @@ publish = false
 
 [dependencies]
 mundaris_math = { path = "../math" }
+mundaris_terrain_fields = { path = "../terrain_fields" }
 thiserror.workspace = true
 glam.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
 
 [dev-dependencies]
 criterion.workspace = true

@@ -8,7 +8,7 @@ gates or interpret screenshots. Requested allocations are not measured VRAM.
 #>
 [CmdletBinding()]
 param(
-    [string] $EvidenceRoot = 'target/terrain-redesign/slice2a',
+    [string] $EvidenceRoot = '../target/terrain-redesign/slice2a',
     [string] $Label = 'final'
 )
 $ErrorActionPreference = 'Stop'
@@ -35,7 +35,7 @@ try {
         }
     })
     $binaries = @()
-    foreach ($releaseRoot in @('target/release','target/slice2a-validation/release')) {
+    foreach ($releaseRoot in @('../target/release','../target/slice2a-validation/release')) {
         $binaries += @(Get-ChildItem -LiteralPath $releaseRoot -Filter '*.exe' -File -ErrorAction SilentlyContinue |
             Where-Object Name -In @('mundaris_app.exe','mundaris_dev.exe') | ForEach-Object {
                 [pscustomobject]@{ path=$_.FullName; sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }

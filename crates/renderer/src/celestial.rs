@@ -1129,7 +1129,7 @@ impl CelestialRenderer {
         queue: &wgpu::Queue,
         draw: &crate::TileDraw,
     ) -> Result<Vec<crate::ReconstructedTileVertex>, RenderPreparationError> {
-        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         if self.resident_tile.is_none() {
             self.resident_tile = Some(crate::resident_tile::ResidentTileRenderer::new(
                 device,
@@ -1144,7 +1144,7 @@ impl CelestialRenderer {
             .and_then(|resident| {
                 resident.validate_gpu(device, queue, &self.projection_group, draw)
             });
-        if let Some(error) = pollster::block_on(device.pop_error_scope()) {
+        if let Some(error) = pollster::block_on(error_scope.pop()) {
             return Err(RenderPreparationError::GpuProgress(error.to_string()));
         }
         result
@@ -1156,7 +1156,7 @@ impl CelestialRenderer {
         draw: &crate::ResidentHierarchyDraw,
         patch_index: usize,
     ) -> Result<Vec<crate::ReconstructedTileVertex>, RenderPreparationError> {
-        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         if self.resident_tile.is_none() {
             self.resident_tile = Some(crate::resident_tile::ResidentTileRenderer::new(
                 device,
@@ -1177,7 +1177,7 @@ impl CelestialRenderer {
                     patch_index,
                 )
             });
-        if let Some(error) = pollster::block_on(device.pop_error_scope()) {
+        if let Some(error) = pollster::block_on(error_scope.pop()) {
             return Err(RenderPreparationError::GpuProgress(error.to_string()));
         }
         result
@@ -1310,6 +1310,7 @@ impl CelestialRenderer {
                 ));
             }
             if let Some(resident) = &mut self.resident_tile {
+                resident.set_material_palette(storage.surface.lighting);
                 resident.prepare_regional(device, queue, draw)?;
             }
         } else if let Some(draw) = &storage.resident_hierarchy {
@@ -1321,6 +1322,7 @@ impl CelestialRenderer {
                 ));
             }
             if let Some(resident_tile) = &mut self.resident_tile {
+                resident_tile.set_material_palette(storage.surface.lighting);
                 resident_tile.prepare_hierarchy(device, queue, draw)?;
             }
         } else if let Some(draw) = &storage.resident_tile {
@@ -1332,6 +1334,7 @@ impl CelestialRenderer {
                 ));
             }
             if let Some(resident_tile) = &mut self.resident_tile {
+                resident_tile.set_material_palette(storage.surface.lighting);
                 resident_tile.prepare(device, queue, draw)?;
             }
         } else if let Some(resident_tile) = &mut self.resident_tile {
@@ -1408,6 +1411,8 @@ impl CelestialRenderer {
             }),
             timestamp_writes: timestamps.map(|queries| queries.pass_writes(0)),
             occlusion_query_set: None,
+
+            multiview_mask: None,
         });
         let [x, y] = frame.projection.origin();
         let [w, h] = frame.projection.viewport();
@@ -1488,6 +1493,8 @@ impl CelestialRenderer {
                 depth_stencil_attachment: None,
                 timestamp_writes: timestamps.map(|queries| queries.pass_writes(1)),
                 occlusion_query_set: None,
+
+                multiview_mask: None,
             });
             let [x, y] = frame.projection.origin();
             let [w, h] = frame.projection.viewport();
@@ -1521,6 +1528,8 @@ impl CelestialRenderer {
                 }),
                 timestamp_writes: timestamps.map(|queries| queries.pass_writes(2)),
                 occlusion_query_set: None,
+
+                multiview_mask: None,
             });
             let [x, y] = frame.projection.origin();
             let [w, h] = frame.projection.viewport();
@@ -1701,8 +1710,8 @@ fn pipeline(
 ) -> wgpu::RenderPipeline {
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("Celestial debug pipeline layout"),
-        bind_group_layouts: layouts,
-        push_constant_ranges: &[],
+        bind_group_layouts: &layouts.iter().copied().map(Some).collect::<Vec<_>>(),
+        immediate_size: 0,
     });
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("Observer-relative celestial shader"),
@@ -1715,11 +1724,11 @@ fn pipeline(
             module: &shader,
             entry_point: Some("vs_main"),
             compilation_options: Default::default(),
-            buffers: &[wgpu::VertexBufferLayout {
+            buffers: &[Some(wgpu::VertexBufferLayout {
                 array_stride: 32,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &wgpu::vertex_attr_array![0=>Float32x4,1=>Float32x4],
-            }],
+            })],
         },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
@@ -1746,13 +1755,13 @@ fn pipeline(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: !lines,
-            depth_compare: wgpu::CompareFunction::GreaterEqual,
+            depth_write_enabled: Some(!lines),
+            depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
             stencil: Default::default(),
             bias: Default::default(),
         }),
         multisample: Default::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     })
 }

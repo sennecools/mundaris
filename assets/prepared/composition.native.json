@@ -1,0 +1,84 @@
+{
+  "schema_version": 2,
+  "algorithm": "mundaris.prepared-composition/2",
+  "body_identity": "original-prepared-profile-reference",
+  "revision": 2,
+  "control": {
+    "path": "composition-assets/global-v1",
+    "content_sha256": "8aecbdaf2df4750250853421c4ef7cd9bc6ad4db8f4f71d5037ce78a55e64d0e",
+    "metadata_sha256": "5861ab07c89dd93e93aff3502d4aa3f1b4b5351c370899e9b3841c5b1eddfaf3"
+  },
+  "profiles": [
+    {
+      "path": "bundles/flat-v1",
+      "content_sha256": "43b7939149276745604e350b6990a747da7750519ac0f86f9bfce82b706f5881",
+      "metadata_sha256": "119e7beefeb8f1ca4f686d024ed89bde15c8d1a15eca0af7d9131c1eb371f413"
+    },
+    {
+      "path": "bundles/crater-v1",
+      "content_sha256": "1f1da1b29383a8ed8bd0a89fd35f14fb5b1cd4550396c92794cfd5800fe245ec",
+      "metadata_sha256": "f327f654b59c107a539d52f8883a8acbcbb4e749aa4b6b805ce685066f50399b"
+    }
+  ],
+  "placements": [
+    {
+      "identity": "crater-A",
+      "selector": 1,
+      "center": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "tangent_x": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "horizontal_scale": 2.0,
+      "height_scale": 5.0,
+      "amplitude": 1.0
+    },
+    {
+      "identity": "crater-B",
+      "selector": 1,
+      "center": [
+        0.005940462355393619,
+        0.0,
+        0.9999823552978343
+      ],
+      "tangent_x": [
+        0.9999823552978343,
+        0.0,
+        -0.005940462355393619
+      ],
+      "horizontal_scale": 0.75,
+      "height_scale": 2.0,
+      "amplitude": 1.0
+    }
+  ],
+  "material_binding": [
+    "substrate",
+    "rim_rock",
+    "ejecta_deposit"
+  ],
+  "material_mapping": [
+    [
+      1.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ]
+}

@@ -37,6 +37,17 @@ impl PlanetaryTerrain {
         }
     }
 
+    /// Read-only publication signature for native authoring evidence and tests.
+    pub(super) fn binding_signature(&self) -> Option<(&SurfaceDefinition, u64, u64)> {
+        self.binding
+            .as_ref()
+            .map(|(definition, radius_bits, revision)| (definition, *radius_bits, *revision))
+    }
+
+    pub(super) fn binding_ready(&self) -> bool {
+        self.binding_ready
+    }
+
     /// Configure from immutable world authority. A busy old pool drains before
     /// replacement; rapid body changes cannot accumulate detached worker pools.
     pub fn bind(
@@ -133,6 +144,9 @@ impl PlanetaryTerrain {
             mode: match lighting.mode() {
                 mundaris_renderer::planet_surface::TerrainRenderMode::Normals => 2,
                 mundaris_renderer::planet_surface::TerrainRenderMode::Elevation => 1,
+                // Uniform albedo preserves geometry lighting while excluding
+                // material weights and per-tile height normalization.
+                mundaris_renderer::planet_surface::TerrainRenderMode::Diffuse => 11,
                 _ => 0,
             },
             sun_body: lighting.sun_direction_body(),

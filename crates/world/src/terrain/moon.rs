@@ -1,6 +1,7 @@
 //! Independent moon-like body-fixed terrain algorithms. Version codes use a
 //! separate namespace from the legacy terrain generators.
 use super::{TerrainError, TerrainIdentity, TerrainSample, TerrainSeed};
+use crate::terrain::SurfaceQueryContext;
 use glam::{DMat3, DVec3};
 use mundaris_math::{Direction3, noise::gradient_noise, surface::SurfaceLocation};
 mod ancient;
@@ -269,6 +270,25 @@ impl MoonTerrainGenerator {
     ) -> Result<MoonSurfaceSample, TerrainError> {
         let value = match &self.ancient {
             Some(field) => field.evaluate(location)?,
+            None => self.evaluate_with_cell_halo(location, 1)?,
+        };
+        if !value.height_m.is_finite() || !value.gradient.is_finite() {
+            return Err(TerrainError::NonFiniteResult);
+        }
+        let material = material_sample(value, self.radius_m);
+        Ok(MoonSurfaceSample {
+            terrain: TerrainSample::from_parts(value.height_m, value.gradient),
+            material,
+        })
+    }
+
+    pub(super) fn evaluate_point_with_context(
+        &self,
+        location: SurfaceLocation,
+        context: &mut SurfaceQueryContext<'_>,
+    ) -> Result<MoonSurfaceSample, TerrainError> {
+        let value = match &self.ancient {
+            Some(field) => field.evaluate_with_context(location, context)?,
             None => self.evaluate_with_cell_halo(location, 1)?,
         };
         if !value.height_m.is_finite() || !value.gradient.is_finite() {

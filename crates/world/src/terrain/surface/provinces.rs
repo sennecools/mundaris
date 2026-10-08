@@ -7,12 +7,13 @@ use super::{
     TerrainIdentity, TerrainSeed,
     director::{DirectedSample, DirectorField},
     mix,
-    query_context::{CachedFeature, PROVINCE_FEATURE_FAMILY, SurfaceQueryContext},
+    query_context::{CachedFeature, CellKey, PROVINCE_FEATURE_FAMILY, SurfaceQueryContext},
     unit,
 };
 use glam::{DMat3, DVec3};
 use mundaris_math::{Direction3, noise::gradient_noise, surface::SurfaceLocation};
 use std::ops::{Add, Div, Mul, Neg, Sub};
+use std::time::Instant;
 
 const JITTER: f64 = 0.16;
 const SHELL: f64 = 0.30;
@@ -372,6 +373,13 @@ impl ProvinceField {
         direction: DVec3,
         mut context: Option<&mut SurfaceQueryContext<'_>>,
     ) -> Result<(ProvinceSample, ProvinceParentContext), TerrainError> {
+        let profile_enabled = context
+            .as_deref()
+            .is_some_and(SurfaceQueryContext::profiling);
+        let profile_started = profile_enabled.then(Instant::now);
+        let legacy_before = context
+            .as_deref()
+            .map_or(0, SurfaceQueryContext::legacy_history_elapsed_ns);
         if !direction.is_finite() || direction.length_squared() <= f64::MIN_POSITIVE {
             return Err(TerrainError::InvalidConfig);
         }
@@ -392,9 +400,14 @@ impl ProvinceField {
                     .rocky_history
                     .as_ref()
                     .ok_or(TerrainError::InvalidConfig)?;
-                let sample = history.evaluate_point(SurfaceLocation::new(
+                let location = SurfaceLocation::new(
                     Direction3::try_new(n).map_err(|_| TerrainError::NonFiniteResult)?,
-                ))?;
+                );
+                let sample = if let Some(context) = context.as_deref_mut() {
+                    history.evaluate_point_with_context(location, context)?
+                } else {
+                    history.evaluate_point(location)?
+                };
                 let old = Differential::new(
                     sample.terrain().height_m(),
                     sample.terrain().tangent_gradient_m_per_unit_direction(),
@@ -503,6 +516,12 @@ impl ProvinceField {
             _ => return Err(TerrainError::InvalidConfig),
         };
         let total = raw.iter().sum::<f64>();
+        if let (Some(started), Some(context)) = (profile_started, context) {
+            let legacy_after = context.legacy_history_elapsed_ns();
+            context.record_province_exclusive(
+                elapsed_ns(started).saturating_sub(legacy_after.saturating_sub(legacy_before)),
+            );
+        }
         Ok((
             ProvinceSample {
                 height_m: height.value,
@@ -583,9 +602,10 @@ impl ProvinceField {
                         work.cells_visited += 1;
                         let feature = if let Some(context) = context.as_deref_mut() {
                             context
-                                .feature(PROVINCE_FEATURE_FAMILY, level, layout, x, y, z, || {
-                                    self.feature(x, y, z, level, layout).map(cache_feature)
-                                })
+                                .feature(
+                                    CellKey::new(PROVINCE_FEATURE_FAMILY, level, layout, x, y, z),
+                                    || self.feature(x, y, z, level, layout).map(cache_feature),
+                                )
                                 .map(uncache_feature)
                         } else {
                             self.feature(x, y, z, level, layout)
@@ -608,12 +628,7 @@ impl ProvinceField {
                         let window = (Differential::constant(1.0) - q2).cube();
                         let centre_controls = if let Some(context) = context.as_deref_mut() {
                             context.controls(
-                                PROVINCE_FEATURE_FAMILY,
-                                level,
-                                layout,
-                                x,
-                                y,
-                                z,
+                                CellKey::new(PROVINCE_FEATURE_FAMILY, level, layout, x, y, z),
                                 || self.controls(feature.center),
                             )?
                         } else {
@@ -868,6 +883,10 @@ impl ProvinceField {
         }
         Ok(output)
     }
+}
+
+fn elapsed_ns(started: Instant) -> u64 {
+    started.elapsed().as_nanos().min(u64::MAX as u128) as u64
 }
 fn winner(w: [f64; 4]) -> usize {
     (0..4).max_by(|&a, &b| w[a].total_cmp(&w[b])).unwrap_or(0)

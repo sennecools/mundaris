@@ -1,0 +1,167 @@
+{
+  "schema_version": 1,
+  "generator": "mundaris.compact-crater/1",
+  "recipe": {
+    "schema_version": 1,
+    "profile": "crater",
+    "seed": 81273,
+    "resolution": 256,
+    "min_resolution": 16,
+    "footprint_m": 2048.0,
+    "radius_m": 320.0,
+    "depth_fraction": 0.08,
+    "rim_fraction": 0.035,
+    "ejecta_fraction": 0.012,
+    "rock_gain": 0.8,
+    "ejecta_gain": 0.9
+  },
+  "generator_sha256": "ffa8fabe9236c6722ba3cc38834955b5f057ac955234b10c6a12df2646571d32",
+  "recipe_sha256": "47d274e5452971331d7dbf9cafc1902c57d78f07341e58543d063ca299fc7aa9",
+  "rules": {
+    "coordinate_basis": "right-handed local X,Y horizontal; +Z outward; row increases +Y",
+    "normal_basis": "XYZ local; normalize(-dh/dx,-dh/dy,1); central differences of stored level height",
+    "height_units": "signed metres; zero offset; positive outward",
+    "encoding": "linear little-endian float32; C-order [row,column,channel]",
+    "sample_location": "cell centres; x,y=-footprint/2+(index+0.5)*spacing; halo index=-1 or N",
+    "interpolation": "bilinear within each level; no wrap; exterior flat",
+    "edge_halo": "one exterior cell; height/masks/rock/ejecta=0; ground=1; normal=(0,0,1)",
+    "filter": "height and masks: 2x2 arithmetic mean; material weights: mean then normalize; normals: reconstruct from filtered height",
+    "bounds": "min/max over all represented base samples in each parent cell; outward float32 rounding; includes halo; not analytic local surface or triangle error bounds",
+    "composition": "height is compact and already returns to zero; add height directly; support is separate coverage, not a second amplitude multiplier; composition gradients must include any additional blend-mask gradient",
+    "channel_meanings": {
+      "height_m": "physical bowl+rim+ejecta displacement",
+      "support": "smooth blending coverage, not placement or erosion",
+      "rim": "unit compact rim shape",
+      "ejecta": "unit compact ejecta shape with seeded angular lobes",
+      "ground_weight": "remaining substrate fraction",
+      "rock_weight": "authored rim exposure fraction",
+      "ejecta_weight": "authored ejecta deposit fraction",
+      "normal_x": "signed local outward unit normal X",
+      "normal_y": "signed local outward unit normal Y",
+      "normal_z": "signed local outward unit normal Z"
+    },
+    "material_rules": "rock=rock_gain*rim; ejecta=ejecta_gain*ejecta_mask*(1-rock); ground=1-rock-ejecta; normalized after float32 filtering"
+  },
+  "channels": [
+    "height_m",
+    "support",
+    "rim",
+    "ejecta",
+    "ground_weight",
+    "rock_weight",
+    "ejecta_weight",
+    "normal_x",
+    "normal_y",
+    "normal_z"
+  ],
+  "halo_cells": 1,
+  "analytic_height_bound_m": [
+    -25.6,
+    15.04
+  ],
+  "support_radius_m": 480.0,
+  "source_dependencies": [],
+  "formula_reference": {
+    "path": "crates/world/src/terrain/crater.rs",
+    "sha256": "9d6e4a4b1aab7a0a145b831f5b75dd933239cd2a2315eb3752d5f8ce180b481e",
+    "role": "mathematical reference only; not a build input"
+  },
+  "levels": [
+    {
+      "index": 0,
+      "resolution": 256,
+      "spacing_m": 8.0,
+      "height_range_m": [
+        -25.600000381469727,
+        11.200052261352539
+      ],
+      "fields": {
+        "file": "level-0-fields.f32",
+        "bytes": 2662560,
+        "sha256": "523f90597c7e8ff539e93ea63384f6e30825926003a7e0a8ebe178ffc7434182"
+      },
+      "bounds": {
+        "file": "level-0-bounds.f32",
+        "bytes": 532512,
+        "sha256": "f6b5d77ff206ae23e12cabe6c60fc760ca698b9a86b10a701e8597c006b107a1"
+      }
+    },
+    {
+      "index": 1,
+      "resolution": 128,
+      "spacing_m": 16.0,
+      "height_range_m": [
+        -25.600000381469727,
+        10.682880401611328
+      ],
+      "fields": {
+        "file": "level-1-fields.f32",
+        "bytes": 676000,
+        "sha256": "3629d5472ec917a19afceba04e4536da03194dc304b04d6afe737eb3a45c87cd"
+      },
+      "bounds": {
+        "file": "level-1-bounds.f32",
+        "bytes": 135200,
+        "sha256": "226f85d16f7f2c53c352d2e856931d10e8213213b3efb9a08235780a70c1b126"
+      }
+    },
+    {
+      "index": 2,
+      "resolution": 64,
+      "spacing_m": 32.0,
+      "height_range_m": [
+        -25.600000381469727,
+        8.815293312072754
+      ],
+      "fields": {
+        "file": "level-2-fields.f32",
+        "bytes": 174240,
+        "sha256": "ad46c2895df52f3edb7adb2a76d86950accd1248c4d1cb788c9705ebf42b1c29"
+      },
+      "bounds": {
+        "file": "level-2-bounds.f32",
+        "bytes": 34848,
+        "sha256": "9e98db5b59d8280b8ae6736f840abeaa49a422afe63183537de70a976928d66c"
+      }
+    },
+    {
+      "index": 3,
+      "resolution": 32,
+      "spacing_m": 64.0,
+      "height_range_m": [
+        -25.600000381469727,
+        5.314517021179199
+      ],
+      "fields": {
+        "file": "level-3-fields.f32",
+        "bytes": 46240,
+        "sha256": "f16001186cbd79376cfd05cd601f2a90c74beac2879688c00f04e7de44394e33"
+      },
+      "bounds": {
+        "file": "level-3-bounds.f32",
+        "bytes": 9248,
+        "sha256": "be410f65b18342c68af55d145944dc78a755dd4f6db776b23c053a6411b643a4"
+      }
+    },
+    {
+      "index": 4,
+      "resolution": 16,
+      "spacing_m": 128.0,
+      "height_range_m": [
+        -25.600000381469727,
+        3.370145559310913
+      ],
+      "fields": {
+        "file": "level-4-fields.f32",
+        "bytes": 12960,
+        "sha256": "ccdb9ffee7be77dfd7ba524ecdf7e7fd32f880ce8205d2ae1e547324fce3715d"
+      },
+      "bounds": {
+        "file": "level-4-bounds.f32",
+        "bytes": 2592,
+        "sha256": "a1a472fac6afdea7cdce3aa0a69c99d4652eb451f71a1c6a07651d403f4e0bae"
+      }
+    }
+  ],
+  "content_sha256": "1f1da1b29383a8ed8bd0a89fd35f14fb5b1cd4550396c92794cfd5800fe245ec"
+}

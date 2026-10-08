@@ -734,15 +734,16 @@ mod tests {
         })
         .unwrap();
         let context = egui::Context::default();
-        let _ = context.run(
+        let ui_context = context.clone();
+        let _ = context.run_ui(
             egui::RawInput {
                 focused: false,
                 ..Default::default()
             },
-            |context| {
+            |root| {
                 let (info, controls) =
                     demo.ui_info(CelestialPreparationReport::default(), 0.1, 0.0);
-                draw_ui(context, controls, &info, &[]);
+                draw_ui(&ui_context, root, controls, &info, &[]);
             },
         );
         for _ in 0..60 {

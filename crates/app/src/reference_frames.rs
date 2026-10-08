@@ -577,7 +577,7 @@ impl ReferenceFrameDemo {
         let root = evaluation.root();
         let max_error = frame.max_component_error_m();
         let drawn = frame.vertex_count();
-        renderer.render_debug(&frame, |context| {
+        renderer.render_debug(&frame, |context, _root_ui| {
             egui::Window::new("Reference-frame validation")
                 .default_width(420.0)
                 .show(context, |ui| {

@@ -159,8 +159,8 @@ impl PlanetaryRenderer {
             };
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Planetary shell pipeline layout"),
-                bind_group_layouts: &layouts,
-                push_constant_ranges: &[],
+                bind_group_layouts: &layouts.iter().copied().map(Some).collect::<Vec<_>>(),
+                immediate_size: 0,
             });
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(entry_point),
@@ -191,13 +191,13 @@ impl PlanetaryRenderer {
                 },
                 depth_stencil: depth_test.then_some(wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: depth_write,
-                    depth_compare: wgpu::CompareFunction::GreaterEqual,
+                    depth_write_enabled: Some(depth_write),
+                    depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
                     stencil: Default::default(),
                     bias: Default::default(),
                 }),
                 multisample: Default::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             })
         };

@@ -10,8 +10,8 @@ samples. The script owns only the process it starts. It never rebuilds the app.
 #>
 [CmdletBinding()]
 param(
-    [string] $ExecutablePath = 'target/release/mundaris_app.exe',
-    [string] $DeveloperCliPath = 'target/release/mundaris_dev.exe',
+    [string] $ExecutablePath = '../target/release/mundaris_app.exe',
+    [string] $DeveloperCliPath = '../target/release/mundaris_dev.exe',
     [string] $EvidenceDirectory = '',
     [string] $RegistryPath = '',
     [string] $SessionId = '',
@@ -855,7 +855,7 @@ try {
     $script:DeveloperCliPath = if ([IO.Path]::IsPathRooted($DeveloperCliPath)) { [IO.Path]::GetFullPath($DeveloperCliPath) } else { [IO.Path]::GetFullPath((Join-Path $repoRoot $DeveloperCliPath)) }
     if (-not (Test-Path -LiteralPath $script:ExecutablePath -PathType Leaf)) { throw "App executable not found: $script:ExecutablePath" }
     if (-not (Test-Path -LiteralPath $script:DeveloperCliPath -PathType Leaf)) { throw "Developer CLI not found: $script:DeveloperCliPath" }
-    if ([string]::IsNullOrWhiteSpace($EvidenceDirectory)) { $EvidenceDirectory = Join-Path 'target/terrain-redesign/slice2d' ([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ') + '-' + [Guid]::NewGuid().ToString('N').Substring(0,8)) }
+    if ([string]::IsNullOrWhiteSpace($EvidenceDirectory)) { $EvidenceDirectory = Join-Path '../target/terrain-redesign/slice2d' ([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ') + '-' + [Guid]::NewGuid().ToString('N').Substring(0,8)) }
     $script:outputPath = if ([IO.Path]::IsPathRooted($EvidenceDirectory)) { [IO.Path]::GetFullPath($EvidenceDirectory) } else { [IO.Path]::GetFullPath((Join-Path $repoRoot $EvidenceDirectory)) }
     if (Test-Path -LiteralPath $script:outputPath) { throw "Evidence directory already exists: $script:outputPath" }
     New-Item -ItemType Directory -Path $script:outputPath -Force | Out-Null

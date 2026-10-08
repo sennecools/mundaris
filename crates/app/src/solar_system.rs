@@ -312,6 +312,7 @@ impl SolarSystemPreset {
     }
 
     pub fn create(self, namespace: NonZeroU64) -> anyhow::Result<CelestialSystem> {
+        let shared = crate::shared_test_system::SharedTestSystem::load()?;
         anyhow::ensure!(
             self.body_radius_scale.is_finite()
                 && self.body_radius_scale > 0.0
@@ -432,7 +433,17 @@ impl SolarSystemPreset {
                     AngularVelocity3::try_radians_per_second(omega)?,
                 ),
             )?;
-            if let Some(seed) = body.rocky_terrain_seed {
+            if let Some(prepared) = shared.surface(body.name) {
+                let seed = body.rocky_terrain_seed.unwrap_or(0);
+                system.edit_surface_definition(
+                    id,
+                    Some(SurfaceDefinition::from_prepared(
+                        TerrainIdentity(seed),
+                        TerrainSeed(seed),
+                        prepared,
+                    )),
+                )?;
+            } else if let Some(seed) = body.rocky_terrain_seed {
                 if body.identity == SolarBody::Moon {
                     system.edit_surface_definition(
                         id,

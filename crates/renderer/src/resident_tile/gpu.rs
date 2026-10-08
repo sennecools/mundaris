@@ -13,7 +13,7 @@ use std::sync::{
 };
 use wgpu::util::DeviceExt;
 
-const PARAM_BYTES: u64 = 384;
+const PARAM_BYTES: u64 = 448;
 const PARAM_STRIDE: u64 = 512;
 const SLOT_COUNT: usize = 5;
 const REGIONAL_SLOT_BASE: usize = SLOT_COUNT;
@@ -52,6 +52,7 @@ pub(crate) struct ResidentTileRenderer {
     regional_active_patches: Vec<usize>,
     regional_cells: u32,
     allocation_count: u32,
+    material_palette: [f32; 16],
 }
 
 struct ResidentTileGpuSlot {
@@ -241,8 +242,8 @@ impl ResidentTileRenderer {
         let layouts = [projection_layout, &tile_layout, &params_layout];
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Resident terrain tile pipeline layout"),
-            bind_group_layouts: &layouts,
-            push_constant_ranges: &[],
+            bind_group_layouts: &layouts.iter().copied().map(Some).collect::<Vec<_>>(),
+            immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Resident terrain tile reverse-Z draw"),
@@ -251,11 +252,11 @@ impl ResidentTileRenderer {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: 8,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &wgpu::vertex_attr_array![0=>Float32x2],
-                }],
+                })],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -274,13 +275,13 @@ impl ResidentTileRenderer {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::GreaterEqual,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
             multisample: Default::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         let validation_pipeline =
@@ -319,7 +320,16 @@ impl ResidentTileRenderer {
             regional_active_patches: Vec::new(),
             regional_cells: 0,
             allocation_count: (SLOT_COUNT * 2 + 2) as u32,
+            material_palette: crate::planet_surface::TerrainLighting::default()
+                .material_palette_uniform(),
         }
+    }
+
+    pub(crate) fn set_material_palette(
+        &mut self,
+        lighting: crate::planet_surface::TerrainLighting,
+    ) {
+        self.material_palette = lighting.material_palette_uniform();
     }
 
     pub(crate) fn prepare(
@@ -349,6 +359,7 @@ impl ResidentTileRenderer {
             0,
             0,
             0.0,
+            self.material_palette,
         );
         self.write_params(queue, 0, &params, PrepareKind::Render);
         self.prepared_draw_slots.clear();
@@ -428,6 +439,7 @@ impl ResidentTileRenderer {
             0,
             0,
             0.0,
+            self.material_palette,
         );
         self.write_params(queue, 0, &parent_params, kind);
         for (child_index, child) in draw.children.iter().enumerate() {
@@ -448,6 +460,7 @@ impl ResidentTileRenderer {
                 child_index + 1,
                 0,
                 0.0,
+                self.material_palette,
             );
             self.write_params(queue, child_index + 1, &params, kind);
         }
@@ -534,7 +547,7 @@ impl ResidentTileRenderer {
             .ok_or(RenderPreparationError::InvalidResidentTile)?;
         let edge_bytes = edge_buffer_bytes(draw.cells)?;
         if params_bytes > device.limits().max_buffer_size
-            || edge_bytes > device.limits().max_storage_buffer_binding_size as u64
+            || edge_bytes > device.limits().max_storage_buffer_binding_size
             || edge_bytes > device.limits().max_buffer_size
         {
             return Err(RenderPreparationError::InvalidResidentTile);
@@ -572,7 +585,7 @@ impl ResidentTileRenderer {
                 let capacity = bytes
                     .checked_next_power_of_two()
                     .ok_or(RenderPreparationError::InvalidResidentTile)?;
-                if capacity > device.limits().max_storage_buffer_binding_size as u64
+                if capacity > device.limits().max_storage_buffer_binding_size
                     || capacity > device.limits().max_buffer_size
                 {
                     return Err(RenderPreparationError::InvalidResidentTile);
@@ -724,6 +737,7 @@ impl ResidentTileRenderer {
                             patch.own_slot,
                             patch.parent_slot,
                             2.0,
+                            self.material_palette,
                         );
                         if self.write_params(queue, patch_index, &params, PrepareKind::Render) {
                             report.metadata_upload_bytes += PARAM_BYTES;
@@ -1030,6 +1044,7 @@ impl ResidentTileRenderer {
                 patch.own_slot,
                 patch.parent_slot,
                 if patch.quality_fallback { 1.0 } else { 0.0 },
+                self.material_palette,
             );
             if self.write_params(queue, patch_index, &params, PrepareKind::Render) {
                 report.metadata_upload_bytes += PARAM_BYTES;
@@ -1306,7 +1321,7 @@ impl ResidentTileRenderer {
             let capacity = payload_bytes
                 .checked_next_power_of_two()
                 .ok_or(RenderPreparationError::InvalidResidentTile)?;
-            if capacity > device.limits().max_storage_buffer_binding_size as u64
+            if capacity > device.limits().max_storage_buffer_binding_size
                 || capacity > device.limits().max_buffer_size
             {
                 return Err(RenderPreparationError::InvalidResidentTile);
@@ -1405,7 +1420,7 @@ impl ResidentTileRenderer {
         index: usize,
         required: u64,
     ) -> Result<(), RenderPreparationError> {
-        if required > device.limits().max_storage_buffer_binding_size as u64
+        if required > device.limits().max_storage_buffer_binding_size
             || required > device.limits().max_buffer_size
         {
             return Err(RenderPreparationError::InvalidResidentTile);
@@ -1668,6 +1683,7 @@ impl ResidentTileRenderer {
             0,
             0,
             0.0,
+            self.material_palette,
         );
         self.write_params(queue, 0, &params, PrepareKind::Validation);
         self.finish_report();
@@ -1803,7 +1819,9 @@ impl ResidentTileRenderer {
             .recv()
             .map_err(|error| RenderPreparationError::GpuProgress(error.to_string()))?
             .map_err(|error| RenderPreparationError::GpuProgress(error.to_string()))?;
-        let mapped = readback.get_mapped_range(..);
+        let mapped = readback
+            .get_mapped_range(..)
+            .map_err(|error| RenderPreparationError::GpuProgress(error.to_string()))?;
         let mut output = Vec::with_capacity(count as usize);
         for record in mapped.as_chunks::<{ VALIDATION_VERTEX_BYTES as usize }>().0 {
             let values: [f32; 16] = std::array::from_fn(|index| {
@@ -1959,8 +1977,9 @@ fn pack_params(
     own_slot: usize,
     parent_slot: usize,
     fallback_kind: f32,
+    material_palette: [f32; 16],
 ) -> [u8; PARAM_BYTES as usize] {
-    let mut values = [0.0_f32; 96];
+    let mut values = [0.0_f32; 112];
     values[..44].copy_from_slice(&pack_tile_params(draw));
     values[44..88].copy_from_slice(&pack_tile_params(parent));
     values[42] = f32::from(draw.tile.key.address.level());
@@ -1984,6 +2003,7 @@ fn pack_params(
             0.0
         },
     ]);
+    values[96..112].copy_from_slice(&material_palette);
     let mut bytes = [0_u8; PARAM_BYTES as usize];
     for (value, output) in values.into_iter().zip(bytes.as_chunks_mut::<4>().0) {
         output.copy_from_slice(&value.to_le_bytes());
@@ -2221,12 +2241,14 @@ mod regional_pressure_tests {
     #[ignore = "requires a real GPU adapter; exercises unsubmitted regional upload pressure"]
     fn blocked_replacement_keeps_and_rebases_previous_cover() {
         pollster::block_on(async {
-            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+            let instance =
+                wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
             let adapter = instance
                 .request_adapter(&wgpu::RequestAdapterOptions {
                     power_preference: wgpu::PowerPreference::HighPerformance,
                     force_fallback_adapter: false,
                     compatible_surface: None,
+                    apply_limit_buckets: false,
                 })
                 .await
                 .expect("GPU adapter required for regional pressure diagnostic");
@@ -2321,6 +2343,41 @@ mod regional_pressure_tests {
             assert_eq!(retained.own.mode, 10);
             assert_eq!(renderer.regional_report.metadata_upload_bytes, PARAM_BYTES);
         });
+    }
+}
+
+#[cfg(test)]
+mod resident_shader_layout_tests {
+    use super::PARAM_BYTES;
+
+    #[test]
+    fn resident_tile_shader_uniform_matches_cpu_draw_params_layout() {
+        let module =
+            naga::front::wgsl::parse_str(include_str!("../shaders/resident_tile.wgsl")).unwrap();
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .unwrap();
+
+        let (_, draw_params) = module
+            .types
+            .iter()
+            .find(|(_, ty)| ty.name.as_deref() == Some("DrawParams"))
+            .expect("DrawParams uniform type exists");
+        let naga::TypeInner::Struct { span, members } = &draw_params.inner else {
+            panic!("DrawParams remains a WGSL struct");
+        };
+        assert_eq!(u64::from(*span), PARAM_BYTES);
+        assert_eq!(
+            members
+                .iter()
+                .map(|member| member.offset)
+                .collect::<Vec<_>>(),
+            [0, 176, 352, 368, 384, 400, 416, 432]
+        );
+        assert_eq!(PARAM_BYTES as usize, std::mem::size_of::<[f32; 112]>());
     }
 }
 

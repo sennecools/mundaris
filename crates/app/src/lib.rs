@@ -27,12 +27,14 @@ pub mod planet_terrain;
 pub mod playback_metrics;
 pub mod regional_terrain;
 pub mod resident_terrain;
+mod shared_test_system;
 #[cfg(feature = "terrain-capture")]
 pub mod sky_capture;
 pub mod sky_definition;
 pub mod solar_system;
 pub mod surface_probe;
 pub mod system_view;
+mod terrain_authoring;
 pub mod terrain_inspection;
 pub mod terrain_population;
 pub mod terrain_trace;

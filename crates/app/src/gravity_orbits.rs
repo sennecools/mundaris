@@ -5,6 +5,7 @@ use crate::developer_snapshot::{
 };
 use crate::motion_session::{AnalyticSession, MotionSession, MotionSnapshot};
 use crate::planet_surface::*;
+use crate::terrain_authoring::{PanelAction, TerrainAuthoringPanel};
 use crate::{celestial_camera::*, gravity_fixtures::*, trails::*};
 use crate::{
     celestial_labels::*, celestial_selection::*, interactive_clock::*, orbit_guides::*,
@@ -16,10 +17,12 @@ use mundaris_math::*;
 use mundaris_renderer::planet_surface::*;
 use mundaris_renderer::*;
 use mundaris_simulation::*;
+use mundaris_world::terrain::{SurfaceDefinition, TerrainDefinition};
 use mundaris_world::*;
 use std::{
     collections::VecDeque,
     num::NonZeroU64,
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
@@ -41,9 +44,13 @@ enum Command {
     SeekSeconds(f64),
     CancelSeek,
     Reset,
+    #[cfg(test)]
     Load(GravityFixture),
     Select(BodyId),
-    Focus { fixed: bool, fit: bool },
+    Focus {
+        fixed: bool,
+        fit: bool,
+    },
     Overview,
     Subsystem,
     ReferenceOverview,
@@ -62,6 +69,13 @@ enum Command {
     Rename(String),
     TrailMode(bool),
     TerrainPreview(bool),
+    ApplyGraph {
+        body: BodyId,
+        graph: mundaris_terrain_fields::graph::Graph,
+    },
+    RestoreOriginalSurface {
+        body: BodyId,
+    },
     TrailReference(BodyId),
 }
 mod analytic_validation;
@@ -80,6 +94,7 @@ mod resident_fixture;
 mod visual_controls;
 struct Controls {
     performance_lab: crate::performance_lab::PerformanceLab,
+    terrain_authoring: TerrainAuthoringPanel,
     #[cfg(feature = "developer-tools")]
     automation_owner: Option<String>,
     #[cfg(feature = "developer-tools")]
@@ -133,8 +148,8 @@ struct Controls {
     filter_ids: Vec<BodyId>,
 }
 impl Controls {
-    fn new(body: &CelestialBody) -> Self {
-        Self {
+    fn new(body: &CelestialBody) -> Result<Self> {
+        Ok(Self {
             performance_lab: {
                 let mut lab = crate::performance_lab::PerformanceLab::default();
                 lab.open = std::env::var("MUNDARIS_PERFORMANCE_LAB").is_ok_and(|s| s == "1");
@@ -144,6 +159,7 @@ impl Controls {
                 crate::engine_profile::set_budget_ns("Adoption", Some(2_000_000));
                 lab
             },
+            terrain_authoring: TerrainAuthoringPanel::new()?,
             #[cfg(feature = "developer-tools")]
             automation_owner: None,
             #[cfg(feature = "developer-tools")]
@@ -204,7 +220,7 @@ impl Controls {
             gesture_dragged: false,
             gap_threshold_ms: 250.0,
             filter_ids: Vec::new(),
-        }
+        })
     }
     fn refresh_draft(&mut self, body: &CelestialBody) {
         self.name = body.name().into();
@@ -255,6 +271,9 @@ pub struct GravityOrbitsDemo {
     analytic_validation: Option<analytic_validation::Route>,
     surfaces: Vec<PlanetSurfaceSession>,
     surface_owners: Vec<bool>,
+    terrain_authoring_originals:
+        Vec<(BodyId, Option<SurfaceDefinition>, Option<TerrainDefinition>)>,
+    terrain_authoring_receipt_pending: Option<(BodyId, String, bool)>,
     system: CelestialSystem,
     motion: MotionSession,
     projection: CelestialFrameProjection,
@@ -504,6 +523,41 @@ impl GravityOrbitsDemo {
         };
         let mut demo = Self::create(scenario, 1, 1)?;
         demo.command(Command::TerrainPreview(true))?;
+        // The operator and native verification start at the same authored view
+        // within the ordinary shared solar system; no preview scene is created.
+        let view = crate::shared_test_system::initial_view()?;
+        let body = demo
+            .system
+            .bodies()
+            .find(|(_, b)| b.name() == view.catalogue_name)
+            .map(|(id, _)| id)
+            .ok_or_else(|| anyhow::anyhow!("shared initial-view body is absent"))?;
+        demo.command(Command::Select(body))?;
+        demo.command(Command::Pause(view.paused))?;
+        demo.command(Command::Focus {
+            fixed: true,
+            fit: true,
+        })?;
+        let pair = demo.projection.coherent_view(&demo.system)?;
+        let state = demo.system.body(body)?;
+        let radius = state.properties().reference_radius_m();
+        let n = DVec3::from_array(view.direction_body);
+        let surface = state
+            .surface_definition()
+            .ok_or_else(|| anyhow::anyhow!("shared view requires complete surface authority"))?;
+        let sample = mundaris_world::terrain::SurfaceGenerator::new(surface, radius)?
+            .evaluate_point(mundaris_math::surface::SurfaceLocation::new(
+                Direction3::try_new(n)?,
+            ))?;
+        let frame = pair.projection().frames_for(body)?.body_fixed;
+        let pose = FramePose::new(
+            FramePosition::new(
+                frame,
+                LocalPosition::try_metres(n * (sample.radius_m() + view.clearance_m))?,
+            ),
+            UnitRotation::try_from_quaternion(glam::DQuat::from_array(view.orientation_xyzw))?,
+        );
+        demo.camera.set_surface_pose(&pair, body, pose)?;
         if std::env::var("MUNDARIS_SOLAR_VALIDATE").as_deref() == Ok("1") {
             demo.solar_validation = Some((Duration::ZERO, 0));
         }
@@ -606,7 +660,7 @@ impl GravityOrbitsDemo {
         };
         let mut selection = BodySelection::default();
         selection.select(&system, ids[selected])?;
-        let mut controls = Controls::new(system.body(ids[selected])?);
+        let mut controls = Controls::new(system.body(ids[selected])?)?;
         if matches!(
             scenario,
             GravityFixture::GameplaySolarSystem | GravityFixture::RealSolarSystem
@@ -674,6 +728,8 @@ impl GravityOrbitsDemo {
             analytic_validation: None,
             surfaces,
             surface_owners: Vec::new(),
+            terrain_authoring_originals: Vec::new(),
+            terrain_authoring_receipt_pending: None,
             system,
             motion,
             projection,
@@ -789,11 +845,9 @@ impl GravityOrbitsDemo {
             && event.state == ElementState::Pressed
             && !event.repeat
             && self.controls.viewport_input.owns_keyboard()
-            && !self
-                .controls
-                .ui_context
-                .as_ref()
-                .is_some_and(|c| c.wants_keyboard_input() || c.memory(|m| m.focused().is_some()))
+            && !self.controls.ui_context.as_ref().is_some_and(|c| {
+                c.egui_wants_keyboard_input() || c.memory(|m| m.focused().is_some())
+            })
         {
             let command = match event.physical_key {
                 PhysicalKey::Code(KeyCode::KeyF) => Some(Command::Focus {
@@ -848,11 +902,13 @@ impl GravityOrbitsDemo {
             }
             WindowEvent::MouseWheel { delta, .. } => Some(match delta {
                 MouseScrollDelta::LineDelta(x, y) => egui::Event::MouseWheel {
+                    phase: egui::TouchPhase::Move,
                     unit: egui::MouseWheelUnit::Line,
                     delta: egui::vec2(*x, *y),
                     modifiers: egui::Modifiers::default(),
                 },
                 MouseScrollDelta::PixelDelta(p) => egui::Event::MouseWheel {
+                    phase: egui::TouchPhase::Move,
                     unit: egui::MouseWheelUnit::Point,
                     delta: egui::vec2((p.x / scale) as f32, (p.y / scale) as f32),
                     modifiers: egui::Modifiers::default(),
@@ -931,7 +987,7 @@ impl GravityOrbitsDemo {
             let blocked = context
                 .as_ref()
                 .map_or(self.controls.keyboard_blocked, |c| {
-                    c.wants_keyboard_input() || c.memory(|m| m.focused().is_some())
+                    c.egui_wants_keyboard_input() || c.memory(|m| m.focused().is_some())
                 });
             let inputs = self.controls.viewport_input.events(
                 &[event],
@@ -1158,6 +1214,7 @@ impl GravityOrbitsDemo {
                 self.seeking = false;
                 self.reseed_diagnostics()?;
             }
+            #[cfg(test)]
             Command::Load(scenario) => {
                 let system_namespace = self
                     .system_namespace
@@ -1375,6 +1432,90 @@ impl GravityOrbitsDemo {
                     .apply(&mut self.controls)?;
                 self.controls.surface_style.elevation_colors = enabled;
             }
+            Command::ApplyGraph { body, mut graph } => {
+                let state = self.system.body(body)?;
+                graph.reference_radius_m = state.properties().reference_radius_m();
+                let graph_surface = std::sync::Arc::new(
+                    mundaris_world::terrain::GraphSurface::compile(graph.clone())?,
+                );
+                let graph_identity = graph_surface.compiled().identities().graph.clone();
+                let geometry_identity = graph_surface.compiled().identities().geometry.clone();
+                let identity_prefix = geometry_identity
+                    .get(..16)
+                    .ok_or_else(|| anyhow::anyhow!("geometry identity is shorter than expected"))?;
+                let identity = u64::from_str_radix(identity_prefix, 16).map_err(|_| {
+                    anyhow::anyhow!("geometry identity is not a hexadecimal digest")
+                })?;
+                let seed = graph.seeds.geometry;
+                let definition = SurfaceDefinition::from_graph(
+                    mundaris_world::terrain::TerrainIdentity(identity),
+                    mundaris_world::terrain::TerrainSeed(seed),
+                    graph_surface,
+                );
+                if !self
+                    .terrain_authoring_originals
+                    .iter()
+                    .any(|(saved_body, _, _)| *saved_body == body)
+                {
+                    let state = self.system.body(body)?;
+                    self.terrain_authoring_originals.push((
+                        body,
+                        state.surface_definition().cloned(),
+                        state.terrain().cloned(),
+                    ));
+                }
+                self.system
+                    .edit_surface_definition(body, Some(definition))?;
+                if let Some(session) = self
+                    .surfaces
+                    .iter_mut()
+                    .find(|session| session.body() == body)
+                {
+                    *session = PlanetSurfaceSession::new(body, 2048)?;
+                }
+                self.surface_owners.fill(false);
+                let state = self.system.body(body)?;
+                self.controls.terrain_authoring.set_published(
+                    state.name().into(),
+                    graph_identity.clone(),
+                    state.terrain_revision().value(),
+                    false,
+                );
+                self.terrain_authoring_receipt_pending = Some((body, graph_identity, false));
+            }
+            Command::RestoreOriginalSurface { body } => {
+                let (_, original_surface, original_legacy) = self
+                    .terrain_authoring_originals
+                    .iter()
+                    .find(|(saved_body, _, _)| *saved_body == body)
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("no original surface was saved for this body")
+                    })?;
+                if let Some(legacy) = original_legacy {
+                    self.system.edit_terrain(body, Some(legacy))?;
+                } else {
+                    self.system
+                        .edit_surface_definition(body, original_surface)?;
+                }
+                if let Some(session) = self
+                    .surfaces
+                    .iter_mut()
+                    .find(|session| session.body() == body)
+                {
+                    *session = PlanetSurfaceSession::new(body, 2048)?;
+                }
+                self.surface_owners.fill(false);
+                let state = self.system.body(body)?;
+                self.controls.terrain_authoring.set_published(
+                    state.name().into(),
+                    "original authority".into(),
+                    state.terrain_revision().value(),
+                    true,
+                );
+                self.terrain_authoring_receipt_pending =
+                    Some((body, "original authority".into(), true));
+            }
             Command::Visual(command) => command.apply(&mut self.controls)?,
             Command::TrailMode(relative) => {
                 let mode = if relative {
@@ -1422,6 +1563,77 @@ impl GravityOrbitsDemo {
         {
             a.frame_published(&self.system, started.elapsed());
         }
+    }
+    fn write_terrain_authoring_receipt(
+        &self,
+        body: BodyId,
+        graph_identity: &str,
+        restored: bool,
+        planetary_binding_ready: bool,
+    ) -> Result<String> {
+        let state = self.system.body(body)?;
+        let revision = state.terrain_revision().value();
+        let session = self.surfaces.iter().find(|session| session.body() == body);
+        let owner_index = self.ids.iter().position(|candidate| *candidate == body);
+        let surface_definition_identity = state
+            .surface_definition()
+            .map(SurfaceDefinition::configuration_identity);
+        let binding_signature = self.planetary.binding_signature();
+        let owner_current_frame = owner_index
+            .is_some_and(|index| self.surface_owners.get(index).copied().unwrap_or(false));
+        let output_root = std::env::var_os("MUNDARIS_DEV_OUTPUT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from("D:/Mundaris/target/terrain-authoring-native/native-receipts")
+            });
+        let output_root = crate::terrain_authoring::validate_external_output(&output_root)
+            .map_err(anyhow::Error::msg)?;
+        std::fs::create_dir_all(&output_root)?;
+        let receipt = serde_json::json!({
+            "schema_version": 1,
+            "action": if restored { "restore_original" } else { "apply_graph" },
+            "selected_body": state.name(),
+            "graph_identity": graph_identity,
+            "surface_definition_identity": surface_definition_identity,
+            "terrain_revision": revision,
+            "planetary_binding_ready": planetary_binding_ready,
+            "planetary_bound_body_matches": self.planetary.body == Some(body),
+            "planetary_bound_definition_identity": binding_signature.map(|(definition, _, _)| definition.configuration_identity()),
+            "planetary_bound_radius_bits": binding_signature.map(|(_, radius_bits, _)| radius_bits),
+            "planetary_bound_revision": binding_signature.map(|(_, _, revision)| revision),
+            "planetary_binding_ready_state": self.planetary.binding_ready(),
+            "surface_session": {
+                "body_matches": session.is_some(),
+                "state": session.map(|value| format!("{:?}", value.state())),
+                "reset_for_publication": session.is_some_and(|value| value.state() == SurfaceRepresentationState::Far),
+            },
+            "owner_binding_current_frame": owner_current_frame,
+            "owner_binding_revision": if owner_current_frame { Some(revision) } else { None },
+        });
+        let bytes = serde_json::to_vec_pretty(&receipt)?;
+        anyhow::ensure!(
+            bytes.len() <= 16 * 1024,
+            "native authoring receipt exceeded its size cap"
+        );
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let path = output_root.join(format!("terrain-authoring-{stamp}.json"));
+        std::fs::write(&path, bytes)?;
+        Ok(format!(
+            "Native publication receipt: {} · resident binding {} · owner {}",
+            path.display(),
+            if planetary_binding_ready {
+                "ready"
+            } else {
+                "pending"
+            },
+            if owner_current_frame {
+                "current"
+            } else {
+                "waiting for coverage"
+            },
+        ))
     }
     /// Host duration is explicit and captured once. Surface retries never reuse it.
     pub fn update(&mut self, elapsed: Duration) {
@@ -1966,7 +2178,7 @@ impl GravityOrbitsDemo {
         let update_ms = update_started.elapsed().as_secs_f64() * 1000.0;
         if !self.coherent {
             let (info, controls) = self.ui_info(CelestialPreparationReport::default(), 0.0, 0.0);
-            renderer.render(|ctx| draw_ui(ctx, controls, &info, &[]))?;
+            renderer.render(|ctx, root| draw_ui(ctx, root, controls, &info, &[]))?;
             return Ok(());
         }
         let scale = renderer.pixels_per_point() as f64;
@@ -1997,7 +2209,7 @@ impl GravityOrbitsDemo {
             #[cfg(not(feature = "developer-tools"))]
             let fixture_camera = false;
             if !fixture_camera
-                && (first || self.camera.mode() == CameraMode::SystemOrbit)
+                && self.camera.mode() == CameraMode::SystemOrbit
                 && let Err(error) = self.refit(!first)
             {
                 self.diagnostic = Some(error.to_string());
@@ -2269,6 +2481,19 @@ impl GravityOrbitsDemo {
         }
         if let Some(palette) = readability {
             lighting = lighting.with_readability(palette);
+        }
+        if let Some(active) = if planetary_active {
+            self.planetary.body
+        } else {
+            self.terrain.active_body()
+        } && let Some(palette) = pair
+            .system()
+            .body(active)?
+            .surface_definition()
+            .and_then(SurfaceDefinition::graph_surface)
+            .map(|surface| surface.palette())
+        {
+            lighting = lighting.with_material_palette(palette)?;
         }
         let mut frame = CelestialFrame::new(&view, &mut self.staging, projection, &self.sphere);
         frame.set_terrain_lighting(lighting);
@@ -2582,7 +2807,7 @@ impl GravityOrbitsDemo {
             ));
             let (info, controls) =
                 self.ui_info(CelestialPreparationReport::default(), near, preparation_ms);
-            renderer.render(|ctx| draw_ui(ctx, controls, &info, &[]))?;
+            renderer.render(|ctx, root| draw_ui(ctx, root, controls, &info, &[]))?;
             return Ok(());
         }
         let report = frame.report();
@@ -2681,6 +2906,11 @@ impl GravityOrbitsDemo {
         // until submission. UI queues commands; it never mutates that borrowed state.
         let info = UiInfo {
             snapshot: Some(&snapshot),
+            can_restore_original: self.selection.selected().is_some_and(|body| {
+                self.terrain_authoring_originals
+                    .iter()
+                    .any(|(saved, _, _)| *saved == body)
+            }),
             terrain_clearance: self.terrain_clearance,
             ready_mesh_probe: self.ready_mesh_probe,
             clearance_query_us: self.clearance_query_us,
@@ -2733,12 +2963,28 @@ impl GravityOrbitsDemo {
         let render_started = Instant::now();
         let submission_span = crate::engine_profile::span("GPU submission / presentation");
         let mut ui_build_cpu_ms = 0.0;
-        renderer.render_celestial(&frame, |context| {
+        renderer.render_celestial(&frame, |context, root| {
             let _span = crate::engine_profile::span("UI");
             let ui_started = Instant::now();
-            draw_ui(context, controls, &info, frame.markers());
+            draw_ui(context, root, controls, &info, frame.markers());
             ui_build_cpu_ms += ui_started.elapsed().as_secs_f64() * 1000.0;
         })?;
+        if let Some((body, graph_identity, restored)) =
+            self.terrain_authoring_receipt_pending.clone()
+            && ((planetary_binding_ready && self.planetary.body == Some(body))
+                || self.terrain.active_body() == Some(body))
+        {
+            let receipt_status = self
+                .write_terrain_authoring_receipt(
+                    body,
+                    &graph_identity,
+                    restored,
+                    planetary_binding_ready,
+                )
+                .unwrap_or_else(|error| format!("Native binding receipt failed: {error}"));
+            self.controls.terrain_authoring.set_status(receipt_status);
+            self.terrain_authoring_receipt_pending = None;
+        }
         drop(submission_span);
         snapshot.performance.render_present_ms =
             Some(render_started.elapsed().as_secs_f64() * 1000.0);
@@ -3135,6 +3381,11 @@ impl GravityOrbitsDemo {
         (
             UiInfo {
                 snapshot: None,
+                can_restore_original: self.selection.selected().is_some_and(|body| {
+                    self.terrain_authoring_originals
+                        .iter()
+                        .any(|(saved, _, _)| *saved == body)
+                }),
                 terrain_clearance: self.terrain_clearance,
                 ready_mesh_probe: self.ready_mesh_probe,
                 clearance_query_us: self.clearance_query_us,
@@ -3339,6 +3590,7 @@ mod analytic_publication_tests {
 
 struct UiInfo<'a> {
     snapshot: Option<&'a crate::developer_snapshot::DeveloperSnapshot>,
+    can_restore_original: bool,
     terrain_clearance: Option<crate::terrain_inspection::TerrainClearance>,
     ready_mesh_probe: Option<crate::surface_probe::ReadyMeshProbe>,
     clearance_query_us: f64,
@@ -3382,12 +3634,12 @@ struct UiInfo<'a> {
     coarse_curves: usize,
 }
 fn draw_engineering_ui(
-    context: &egui::Context,
+    root: &mut egui::Ui,
     controls: &mut Controls,
     info: &UiInfo<'_>,
     markers: &[CelestialMarker],
 ) {
-    egui::SidePanel::left("celestial body inspector").exact_width(320.0).resizable(false).show(context,|ui| {
+    egui::Panel::left("celestial body inspector").default_size(320.0).resizable(false).show(root,|ui| {
         egui::ScrollArea::vertical().show(ui,|ui| {
         developer_ui::left(ui, controls, info);
         ui.separator();
@@ -3483,7 +3735,7 @@ fn draw_engineering_ui(
         }
         }
         if ui.button("Reset branch baseline (IDs / focus retained)").clicked() {controls.pending.push_back(Command::Reset);}
-        ui.horizontal_wrapped(|ui| {for (label,fixture) in [("Gameplay Solar System",GravityFixture::GameplaySolarSystem),("Real-scale Solar reference",GravityFixture::RealSolarSystem),("Load original hierarchy",GravityFixture::Hierarchy),("Load circular oracle",GravityFixture::Circular)] {if ui.button(label).clicked() {controls.pending.push_back(Command::Load(fixture));}}});
+        ui.label("Shared test solar system");
         ui.separator();
         if let (Some(advance), Some(diagnostics), Some(drift)) = (info.advance, info.diagnostics, info.drift) {
         ui.label(format!("{} bodies / {} pairs / {} new force passes this update",info.system.body_count(),pair_count(info.system.body_count()).expect("valid count"),advance.force_passes));
@@ -3519,7 +3771,7 @@ fn draw_engineering_ui(
             ui.text_edit_singleline(&mut controls.name);if ui.button("Apply name (retain history)").clicked() {controls.pending.push_back(Command::Rename(controls.name.clone()));}
             ui.text_edit_singleline(&mut controls.mass);if ui.button("Apply mass kg").clicked() {match controls.mass.parse() {Ok(value)=>controls.pending.push_back(Command::Mass(value)),Err(error)=>{ui.colored_label(egui::Color32::LIGHT_RED,format!("{error}"));}}}
             ui.text_edit_singleline(&mut controls.radius);if ui.button("Apply radius m (geometry only)").clicked() {match controls.radius.parse() {Ok(value)=>controls.pending.push_back(Command::Radius(value)),Err(error)=>{ui.colored_label(egui::Color32::LIGHT_RED,format!("{error}"));}}}
-            if info.motion.is_analytic() { ui.small("Velocity edits unavailable: prescribed trajectories determine velocity. Load a Newtonian scenario to edit it. Periods are independent of mass/radius edits."); }
+            if info.motion.is_analytic() { ui.small("Velocity edits unavailable: prescribed trajectories determine velocity. Periods are independent of mass/radius edits."); }
             ui.add_enabled_ui(!info.motion.is_analytic(), |ui| {
             for value in &mut controls.velocity {ui.text_edit_singleline(value);}
             if ui.button("Apply system velocity m/s").clicked() {
@@ -3558,10 +3810,32 @@ fn draw_engineering_ui(
 
 fn draw_ui(
     context: &egui::Context,
+    root: &mut egui::Ui,
     controls: &mut Controls,
     info: &UiInfo<'_>,
     markers: &[CelestialMarker],
 ) {
+    if let Some(&body) = info.ids.get(info.selected)
+        && let Ok(state) = info.system.body(body)
+        && let Some(action) = controls.terrain_authoring.draw(
+            context,
+            body,
+            state.name(),
+            state.properties().reference_radius_m(),
+            state.terrain_revision().value(),
+            info.can_restore_original,
+        )
+    {
+        match action {
+            PanelAction::Apply { body, graph } => controls.pending.push_back(Command::ApplyGraph {
+                body,
+                graph: *graph,
+            }),
+            PanelAction::Restore { body } => controls
+                .pending
+                .push_back(Command::RestoreOriginalSurface { body }),
+        }
+    }
     if let Some(snapshot) = info.snapshot {
         controls
             .performance_lab
@@ -3569,7 +3843,7 @@ fn draw_ui(
     } else {
         controls.performance_lab.draw(context, None, None);
     }
-    egui::SidePanel::right("planet surface / inspection").default_width(300.0).resizable(true).show(context,|ui| {
+    egui::Panel::right("planet surface / inspection").default_size(300.0).resizable(true).show(root,|ui| {
             egui::ScrollArea::vertical().show(ui,|ui| {
             developer_ui::right(ui, controls, info);
             ui.separator();
@@ -3758,7 +4032,7 @@ fn draw_ui(
             });
             });
         });
-    egui::TopBottomPanel::top("exact playback and navigation").show(context,|ui| {
+    egui::Panel::top("exact playback and navigation").show(root,|ui| {
         ui.horizontal(|ui|{
             ui.heading("Mundaris");
             if ui.button(if info.motion.paused(){"▶ Resume"}else{"⏸ Pause"}).clicked(){controls.pending.push_back(Command::Pause(!info.motion.paused()));}
@@ -3794,14 +4068,14 @@ fn draw_ui(
         } else { ui.small("Direct analytic sampling: no integration backlog, force passes, replay or conservation-fidelity claim."); }
         });
     });
-    egui::TopBottomPanel::bottom("celestial semantics legend").exact_height(28.0).show(context,|ui|{
+    egui::Panel::bottom("celestial semantics legend").default_size(28.0).show(root,|ui|{
         ui.horizontal(|ui|{ui.small(if info.motion.is_analytic(){"Dashed = authored ORBIT GUIDE · Solid/fading = published HISTORY · Rings/labels = navigation overlays"}else{"Dashed = instantaneous two-body ORBIT GUIDE · Solid/fading = committed HISTORY · Rings/labels = navigation overlays"});
             if let Some(gap)=info.gap_diagnostic {ui.colored_label(egui::Color32::YELLOW,gap);}else if let Some(error)=info.diagnostic {ui.colored_label(egui::Color32::LIGHT_RED,error);}
         });
     });
-    draw_engineering_ui(context, controls, info, markers);
+    draw_engineering_ui(root, controls, info, markers);
     let scale = context.pixels_per_point();
-    egui::CentralPanel::default().frame(egui::Frame::NONE).show(context,|ui|{
+    egui::CentralPanel::default().frame(egui::Frame::NONE).show(root,|ui|{
         let rect=ui.max_rect();
         controls.ui_context=Some(context.clone());
         controls.scene_layer=Some(ui.layer_id());
@@ -3861,7 +4135,7 @@ fn draw_ui(
         }
         if input.pointer.primary_released(){controls.gesture_start=None;}
         let local_look=matches!(info.camera.mode(),CameraMode::FreeFlight|CameraMode::SurfaceInspection);
-        let keyboard_blocked=context.wants_keyboard_input() || context.memory(|m|m.focused().is_some());
+        let keyboard_blocked=context.egui_wants_keyboard_input() || context.memory(|m|m.focused().is_some()) || controls.terrain_authoring.camera_input_blocked();
         controls.keyboard_blocked=keyboard_blocked;
         let automation_active={
             #[cfg(feature="developer-tools")]
@@ -3882,8 +4156,9 @@ fn draw_ui(
     if !controls.native_events
         && controls.input_focused
         && context.input(|i| i.focused)
-        && !context.wants_keyboard_input()
+        && !context.egui_wants_keyboard_input()
         && !context.memory(|m| m.focused().is_some())
+        && !controls.terrain_authoring.camera_input_blocked()
     {
         context.input(|input| {
             if input.key_pressed(egui::Key::I) {
@@ -4001,7 +4276,7 @@ mod tests {
     }
 
     #[test]
-    fn solar_development_starts_paused_with_earth_selected_and_no_terrain_work() {
+    fn shared_solar_system_starts_at_authored_body_fixed_surface_view() {
         use super::*;
         let demo = GravityOrbitsDemo::solar_system(false).unwrap();
         assert_eq!(demo.system.body_count(), 10);
@@ -4010,7 +4285,7 @@ mod tests {
                 .body(demo.selection.selected().unwrap())
                 .unwrap()
                 .name(),
-            "Earth"
+            "Moon"
         );
         assert_eq!(
             demo.system
@@ -4023,7 +4298,7 @@ mod tests {
         assert_eq!(demo.surfaces.len(), 5);
         assert!(demo.controls.terrain_preview);
         assert!(demo.motion.paused());
-        assert_eq!(demo.camera.mode(), CameraMode::SystemOrbit);
+        assert_eq!(demo.camera.mode(), CameraMode::SurfaceInspection);
         assert_eq!(demo.terrain.active_body(), None);
         assert_eq!(demo.terrain.cache.pending(), 0);
     }
@@ -4148,6 +4423,7 @@ mod tests {
             events: vec![
                 egui::Event::PointerMoved(egui::pos2(900.0, 500.0)),
                 egui::Event::MouseWheel {
+                    phase: egui::TouchPhase::Move,
                     unit: egui::MouseWheelUnit::Line,
                     delta: egui::vec2(0.0, 3.0),
                     modifiers: egui::Modifiers::NONE,
@@ -4156,7 +4432,11 @@ mod tests {
             ..Default::default()
         };
         let (info, controls) = demo.ui_info(CelestialPreparationReport::default(), 0.1, 0.0);
-        let _ = context.run(raw, |ctx| draw_ui(ctx, controls, &info, &[]));
+        let ui_context = context.clone();
+        let mut output =
+            context.run_ui(raw, |root| draw_ui(&ui_context, root, controls, &info, &[]));
+        // This input-only test does not submit the generated font atlas to a renderer.
+        output.textures_delta.clear();
         demo.update(Duration::from_millis(100));
         assert!(demo.camera.clearance_m() < before);
         assert_eq!(demo.camera.mode(), CameraMode::BodyOrbit);
@@ -4422,5 +4702,135 @@ mod tests {
         demo.update(Duration::ZERO);
         assert!(demo.coherent);
         assert_eq!(demo.system.revision(), revision);
+    }
+    #[test]
+    fn native_graph_apply_refreshes_surface_bindings_and_restores_shared_original() {
+        let mut demo = GravityOrbitsDemo::solar_system(false).unwrap();
+        let body = demo
+            .system
+            .bodies()
+            .find(|(_, state)| state.name() == "Moon")
+            .map(|(id, _)| id)
+            .unwrap();
+        demo.selection.select(&demo.system, body).unwrap();
+        let original = demo
+            .system
+            .body(body)
+            .unwrap()
+            .surface_definition()
+            .cloned();
+        let first_revision = demo.system.body(body).unwrap().terrain_revision();
+        let identity = demo.ids.iter().position(|id| *id == body).unwrap() as u64 + 1;
+        {
+            let pair = demo.projection.coherent_view(&demo.system).unwrap();
+            assert!(demo.planetary.bind(body, identity, &pair).unwrap());
+        }
+        let graph_json = mundaris_terrain_fields::graph::templates()[0]["graph"].clone();
+        let graph = serde_json::from_value(graph_json).unwrap();
+        demo.command(Command::ApplyGraph { body, graph }).unwrap();
+        let applied = demo.system.body(body).unwrap();
+        let applied_revision = applied.terrain_revision();
+        assert!(applied_revision.value() > first_revision.value());
+        let applied_definition = applied.surface_definition().unwrap().clone();
+        let applied_geometry_identity = applied_definition.geometry_identity();
+        let applied_material_identity = applied_definition.material_identity();
+        let applied_configuration_identity = applied_definition.configuration_identity();
+        let radius = applied.properties().reference_radius_m();
+        let direction = Direction3::try_new(DVec3::X).unwrap();
+        let first_physical_radius =
+            mundaris_world::terrain::SurfaceGenerator::new(&applied_definition, radius)
+                .unwrap()
+                .evaluate_point(mundaris_math::surface::SurfaceLocation::new(direction))
+                .unwrap()
+                .radius_m();
+        let mut palette_graph: mundaris_terrain_fields::graph::Graph =
+            serde_json::from_value(mundaris_terrain_fields::graph::templates()[0]["graph"].clone())
+                .unwrap();
+        let material_node = palette_graph
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "materials")
+            .unwrap();
+        material_node.params["palette"][0][0] = serde_json::json!(0.91);
+        demo.command(Command::ApplyGraph {
+            body,
+            graph: palette_graph,
+        })
+        .unwrap();
+        let recolored_definition = demo
+            .system
+            .body(body)
+            .unwrap()
+            .surface_definition()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            recolored_definition.geometry_identity(),
+            applied_geometry_identity
+        );
+        assert_ne!(
+            recolored_definition.material_identity(),
+            applied_material_identity
+        );
+        assert_ne!(
+            recolored_definition.configuration_identity(),
+            applied_configuration_identity
+        );
+        let recolored_physical_radius =
+            mundaris_world::terrain::SurfaceGenerator::new(&recolored_definition, radius)
+                .unwrap()
+                .evaluate_point(mundaris_math::surface::SurfaceLocation::new(direction))
+                .unwrap()
+                .radius_m();
+        assert_eq!(recolored_physical_radius, first_physical_radius);
+        let applied_definition = recolored_definition;
+        let graph_surface = applied_definition.graph_surface().unwrap();
+        let graph_identity = graph_surface.compiled().identities().graph.clone();
+        assert_eq!(
+            demo.controls
+                .terrain_authoring
+                .published_status()
+                .unwrap()
+                .1,
+            graph_identity.as_str()
+        );
+        let session = demo
+            .surfaces
+            .iter()
+            .find(|session| session.body() == body)
+            .unwrap();
+        assert_eq!(session.state(), SurfaceRepresentationState::Far);
+        {
+            let pair = demo.projection.coherent_view(&demo.system).unwrap();
+            assert!(demo.planetary.bind(body, identity, &pair).unwrap());
+        }
+        let (bound_definition, bound_radius_bits, bound_revision) =
+            demo.planetary.binding_signature().unwrap();
+        assert_eq!(bound_definition, &applied_definition);
+        assert_eq!(bound_radius_bits, radius.to_bits());
+        assert_eq!(bound_revision, applied_revision.value() + 1);
+        assert!(demo.planetary.binding_ready());
+        demo.command(Command::RestoreOriginalSurface { body })
+            .unwrap();
+        let restored = demo.system.body(body).unwrap();
+        assert!(restored.terrain_revision().value() > applied_revision.value());
+        assert_eq!(restored.surface_definition().cloned(), original);
+        {
+            let pair = demo.projection.coherent_view(&demo.system).unwrap();
+            assert!(demo.planetary.bind(body, identity, &pair).unwrap());
+        }
+        let (restored_binding, restored_radius_bits, restored_revision) =
+            demo.planetary.binding_signature().unwrap();
+        assert_eq!(restored_binding, original.as_ref().unwrap());
+        assert_eq!(restored_radius_bits, radius.to_bits());
+        assert_eq!(restored_revision, restored.terrain_revision().value());
+        assert!(demo.planetary.binding_ready());
+        assert!(
+            demo.controls
+                .terrain_authoring
+                .published_status()
+                .unwrap()
+                .3
+        );
     }
 }

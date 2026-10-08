@@ -92,7 +92,10 @@ impl ViewportInput {
                     self.pointer = None;
                 }
                 egui::Event::MouseWheel {
-                    unit, delta: wheel, ..
+                    phase: egui::TouchPhase::Move,
+                    unit,
+                    delta: wheel,
+                    ..
                 } => {
                     if self
                         .pointer
@@ -255,6 +258,7 @@ mod tests {
             &[
                 egui::Event::PointerMoved(egui::pos2(200.0, 200.0)),
                 egui::Event::MouseWheel {
+                    phase: egui::TouchPhase::Move,
                     unit: egui::MouseWheelUnit::Point,
                     delta: egui::vec2(0.0, 12.5),
                     modifiers: egui::Modifiers::default(),

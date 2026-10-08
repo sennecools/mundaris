@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod celestial_model;
 mod redraw;
@@ -295,7 +296,7 @@ impl MundarisApp {
     }
 }
 
-fn bootstrap_ui(context: &egui::Context) {
+fn bootstrap_ui(context: &egui::Context, _root_ui: &mut egui::Ui) {
     egui::Window::new("Mundaris")
         .collapsible(false)
         .resizable(false)
@@ -337,9 +338,7 @@ fn main() -> Result<()> {
         !dev_interface,
         "--dev-interface requires the developer-tools build feature"
     );
-    let legacy_terrain = arguments.iter().any(|a| a == "--legacy-terrain");
-    arguments.retain(|a| a != "--legacy-terrain");
-    let usage = "usage: mundaris_app [--solar-system | --real-solar-system | --reference-frames | --celestial-model | --gravity-orbits] [--legacy-terrain]";
+    let usage = "usage: mundaris_app [--solar-system] [--dev-interface]";
     anyhow::ensure!(
         arguments.len() <= 1,
         "conflicting or duplicate arguments; {usage}"
@@ -347,10 +346,6 @@ fn main() -> Result<()> {
     let (reference_frames, celestial_model, gravity_orbits, solar_scale) =
         match arguments.first().map(String::as_str) {
             None | Some("--solar-system") => (false, false, false, Some(false)),
-            Some("--real-solar-system") => (false, false, false, Some(true)),
-            Some("--reference-frames") => (true, false, false, None),
-            Some("--celestial-model") => (false, true, false, None),
-            Some("--gravity-orbits") => (false, false, true, None),
             Some(argument) => anyhow::bail!("unknown argument: {argument}; {usage}"),
         };
     let mut app = MundarisApp::new(
@@ -359,9 +354,6 @@ fn main() -> Result<()> {
         gravity_orbits,
         solar_scale,
     )?;
-    if legacy_terrain && let Some(demo) = &mut app.gravity_demo {
-        demo.use_legacy_terrain();
-    }
     #[cfg(feature = "developer-tools")]
     if dev_interface {
         anyhow::ensure!(

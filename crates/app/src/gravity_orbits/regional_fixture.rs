@@ -36,6 +36,49 @@ const PLANETARY_GPU_SLOTS: usize = 32768;
 const PLANETARY_CPU_TILES: usize = 49152;
 const PLANETARY_MAX_DESIRED_PATCHES: usize = 16384;
 
+/// Process-scoped resource pressure controls for reproducible native evidence.
+/// Ordinary builds retain the production settings without environment access.
+fn planetary_resource_settings() -> Result<(usize, usize, u64)> {
+    #[cfg(feature = "developer-tools")]
+    {
+        fn bounded(name: &str, default: usize, minimum: usize, maximum: usize) -> Result<usize> {
+            match std::env::var(name) {
+                Ok(value) => {
+                    let value = value
+                        .parse::<usize>()
+                        .with_context(|| format!("invalid {name}"))?;
+                    ensure!(
+                        (minimum..=maximum).contains(&value),
+                        "{name} outside {minimum}..={maximum}"
+                    );
+                    Ok(value)
+                }
+                Err(std::env::VarError::NotPresent) => Ok(default),
+                Err(error) => Err(error).with_context(|| format!("invalid {name}")),
+            }
+        }
+        Ok((
+            bounded(
+                "MUNDARIS_RESIDENT_CPU_TILES",
+                PLANETARY_CPU_TILES,
+                16,
+                PLANETARY_CPU_TILES,
+            )?,
+            bounded(
+                "MUNDARIS_RESIDENT_GPU_SLOTS",
+                PLANETARY_GPU_SLOTS,
+                16,
+                PLANETARY_GPU_SLOTS,
+            )?,
+            bounded("MUNDARIS_RESIDENT_WORKER_DELAY_MS", 0, 0, 5_000)? as u64,
+        ))
+    }
+    #[cfg(not(feature = "developer-tools"))]
+    {
+        Ok((PLANETARY_CPU_TILES, PLANETARY_GPU_SLOTS, 0))
+    }
+}
+
 #[derive(Clone, Copy)]
 #[cfg_attr(not(any(feature = "developer-tools", test)), allow(dead_code))]
 pub(super) struct RegionalSettings {
@@ -419,6 +462,12 @@ mod lifecycle_tests {
                 aggregate_priority: 20.0,
                 ready_children: 2,
                 parent_resident: true,
+                completion_priority: 0.0,
+                age: Duration::ZERO,
+                useful_floor_deficit_px: 0.0,
+                resident_children: 0,
+                missing_dependencies: 0,
+                blocker: RegionalCompletionBlocker::Ready,
             },
             RegionalSplitFrontier {
                 parent: b,
@@ -426,6 +475,12 @@ mod lifecycle_tests {
                 aggregate_priority: 10.0,
                 ready_children: 2,
                 parent_resident: true,
+                completion_priority: 0.0,
+                age: Duration::ZERO,
+                useful_floor_deficit_px: 0.0,
+                resident_children: 0,
+                missing_dependencies: 0,
+                blocker: RegionalCompletionBlocker::Ready,
             },
         ];
         let admission = select_gpu_frontier(&base, &groups, None, 6);
@@ -434,6 +489,16 @@ mod lifecycle_tests {
         assert_eq!(admission.reserved_parent, Some(a));
         groups[1].aggregate_priority = 100.0;
         groups[1].ready_children = 4;
+        // The ordinary runtime must execute the core's useful-view completion
+        // order even when optional detail has more resident children.
+        assert_eq!(
+            select_gpu_ranked_frontier(&base, &groups, None, 6).reserved_parent,
+            Some(a)
+        );
+        assert_eq!(
+            select_gpu_frontier(&base, &groups, None, 6).reserved_parent,
+            Some(b)
+        );
         assert_eq!(
             select_gpu_frontier(&base, &groups, Some(a), 6).reserved_parent,
             Some(a)
@@ -531,6 +596,12 @@ mod lifecycle_tests {
                 aggregate_priority: f64::NAN,
                 ready_children: 3,
                 parent_resident: false,
+                completion_priority: 0.0,
+                age: Duration::ZERO,
+                useful_floor_deficit_px: 0.0,
+                resident_children: 0,
+                missing_dependencies: 0,
+                blocker: RegionalCompletionBlocker::Ready,
             },
             RegionalSplitFrontier {
                 parent: addresses[3],
@@ -538,6 +609,12 @@ mod lifecycle_tests {
                 aggregate_priority: 10.0,
                 ready_children: 3,
                 parent_resident: true,
+                completion_priority: 0.0,
+                age: Duration::ZERO,
+                useful_floor_deficit_px: 0.0,
+                resident_children: 0,
+                missing_dependencies: 0,
+                blocker: RegionalCompletionBlocker::Ready,
             },
             RegionalSplitFrontier {
                 parent: addresses[2],
@@ -545,6 +622,12 @@ mod lifecycle_tests {
                 aggregate_priority: 10.0,
                 ready_children: 3,
                 parent_resident: true,
+                completion_priority: 0.0,
+                age: Duration::ZERO,
+                useful_floor_deficit_px: 0.0,
+                resident_children: 0,
+                missing_dependencies: 0,
+                blocker: RegionalCompletionBlocker::Ready,
             },
             RegionalSplitFrontier {
                 parent: addresses[11],
@@ -552,6 +635,12 @@ mod lifecycle_tests {
                 aggregate_priority: -0.0,
                 ready_children: 4,
                 parent_resident: false,
+                completion_priority: 0.0,
+                age: Duration::ZERO,
+                useful_floor_deficit_px: 0.0,
+                resident_children: 0,
+                missing_dependencies: 0,
+                blocker: RegionalCompletionBlocker::Ready,
             },
         ];
 
@@ -580,6 +669,12 @@ mod lifecycle_tests {
                         },
                         ready_children: (case + index * 3) % 5,
                         parent_resident: index % 2 == 0,
+                        completion_priority: 0.0,
+                        age: Duration::ZERO,
+                        useful_floor_deficit_px: 0.0,
+                        resident_children: 0,
+                        missing_dependencies: 0,
+                        blocker: RegionalCompletionBlocker::Ready,
                     }
                 })
                 .collect();
@@ -622,6 +717,12 @@ mod lifecycle_tests {
             aggregate_priority: 10.0,
             ready_children: 0,
             parent_resident: true,
+            completion_priority: 0.0,
+            age: Duration::ZERO,
+            useful_floor_deficit_px: 0.0,
+            resident_children: 0,
+            missing_dependencies: 0,
+            blocker: RegionalCompletionBlocker::Ready,
         };
         assert!(!select_gpu_frontier(&base, &[frontier], None, 10).pressure);
         assert_eq!(select_gpu_merge_restore(&base, &merges, 2), (None, true));
@@ -643,6 +744,12 @@ mod lifecycle_tests {
                 aggregate_priority: 1.0,
                 ready_children: 0,
                 parent_resident: true,
+                completion_priority: 0.0,
+                age: Duration::ZERO,
+                useful_floor_deficit_px: 0.0,
+                resident_children: 0,
+                missing_dependencies: 0,
+                blocker: RegionalCompletionBlocker::Ready,
             })
             .collect();
         let admission = select_gpu_frontier(&base, &groups, None, 12);
@@ -666,6 +773,12 @@ mod lifecycle_tests {
             aggregate_priority: 1.0,
             ready_children: 0,
             parent_resident: true,
+            completion_priority: 0.0,
+            age: Duration::ZERO,
+            useful_floor_deficit_px: 0.0,
+            resident_children: 0,
+            missing_dependencies: 0,
+            blocker: RegionalCompletionBlocker::Ready,
         };
         let base = BTreeSet::from([root]);
         assert!(!select_gpu_frontier(&base, &[frontier], None, 12).constrained);
@@ -735,9 +848,20 @@ mod lifecycle_tests {
         fixture
             .configure_planetary(generator.clone(), identity, 2)
             .unwrap();
+        let field = crate::resident_terrain::SharedDerivedField::new(&generator).unwrap();
+        let mut context = generator.prepared_query_context();
         for face in CubeFace::ALL {
             let address = CubePatchAddress::root(face);
-            let (tile, _) = ResidentTileBuilder::build(&generator, identity, address, 2).unwrap();
+            let (tile, _) = ResidentTileBuilder::build_derived(
+                &generator,
+                identity,
+                address,
+                2,
+                &mut context,
+                &field,
+                || false,
+            )
+            .unwrap();
             fixture
                 .core
                 .as_mut()
@@ -1956,6 +2080,27 @@ fn select_gpu_frontier(
     previous: Option<CubePatchAddress>,
     capacity: usize,
 ) -> GpuFrontierAdmission {
+    select_gpu_frontier_impl(base, frontiers, previous, capacity, false)
+}
+
+fn select_gpu_ranked_frontier(
+    base: &BTreeSet<CubePatchAddress>,
+    frontiers: &[RegionalSplitFrontier],
+    previous: Option<CubePatchAddress>,
+    capacity: usize,
+) -> GpuFrontierAdmission {
+    // The core supplies the completion order. This adapter only tests physical
+    // peak capacity and retains a feasible admitted quartet until completion.
+    select_gpu_frontier_impl(base, frontiers, previous, capacity, true)
+}
+
+fn select_gpu_frontier_impl(
+    base: &BTreeSet<CubePatchAddress>,
+    frontiers: &[RegionalSplitFrontier],
+    previous: Option<CubePatchAddress>,
+    capacity: usize,
+    core_ranked: bool,
+) -> GpuFrontierAdmission {
     let additional_capacity = capacity.saturating_sub(base.len());
     let mut unique_missing =
         HashSet::with_capacity(additional_capacity.min(frontiers.len().saturating_mul(4)));
@@ -1982,7 +2127,7 @@ fn select_gpu_frontier(
         }
         if peak <= capacity
             && best.is_none_or(|current: &RegionalSplitFrontier| {
-                frontier_rank_cmp(group, current).is_lt()
+                !core_ranked && frontier_rank_cmp(group, current).is_lt()
             })
         {
             best = Some(group);
@@ -2133,6 +2278,8 @@ pub(super) struct RegionalFixture {
     gpu_policy_priority_revision: u64,
     gpu_policy_drawable: Vec<CubePatchAddress>,
     gpu_policy_base_pins: BTreeSet<CubePatchAddress>,
+    draw_desired_signature: Vec<CubePatchAddress>,
+    draw_desired_ancestors: HashSet<CubePatchAddress>,
     gpu_minimum_peak_split_slots: Option<usize>,
     gpu_split_frontier_count: usize,
     cpu_publication_ms: f64,
@@ -2211,18 +2358,19 @@ impl RegionalFixture {
             .map(CubePatchAddress::root)
             .collect::<Vec<_>>();
         roots.sort();
+        let (cpu_tiles, gpu_slots, worker_delay_ms) = planetary_resource_settings()?;
         let config = RegionalConfig {
             roots,
             max_level: 24,
             cells,
-            cpu_tile_cap: PLANETARY_CPU_TILES,
-            cpu_byte_cap: PLANETARY_CPU_TILES.saturating_mul(
+            cpu_tile_cap: cpu_tiles,
+            cpu_byte_cap: cpu_tiles.saturating_mul(
                 (cells as usize + 3)
                     .saturating_mul(cells as usize + 3)
                     .saturating_mul(32),
             ),
             worker_count: 4,
-            worker_delay: Duration::ZERO,
+            worker_delay: Duration::from_millis(worker_delay_ms),
             queue_cap: 32,
             completion_cap: 8,
             admission_cap_per_tick: 4,
@@ -2236,7 +2384,7 @@ impl RegionalFixture {
             prediction_seconds: 0.15,
             high_speed_mps: 500.0,
         };
-        let core = RegionalTerrain::new(generator, identity, config)?;
+        let core = RegionalTerrain::new_derived(generator, identity, config)?;
         if self.publication_worker.is_none() {
             self.publication_worker = Some(PublicationWorker::new()?);
         }
@@ -2250,10 +2398,10 @@ impl RegionalFixture {
             settings: Some(RegionalSettings {
                 enabled: true,
                 max_depth: 24,
-                gpu_slots: PLANETARY_GPU_SLOTS,
-                cpu_tiles: PLANETARY_CPU_TILES,
+                gpu_slots,
+                cpu_tiles,
                 worker_count: 4,
-                worker_delay_ms: 0,
+                worker_delay_ms,
                 upload_tiles_per_frame: 4,
                 upload_bytes_per_frame: 8 * 1024 * 1024,
                 publication_groups_per_frame: 8,
@@ -2265,7 +2413,7 @@ impl RegionalFixture {
             publication_worker: self.publication_worker.take(),
             slots: {
                 let mut slots = slots;
-                slots.resize_with(PLANETARY_GPU_SLOTS, || None);
+                slots.resize_with(gpu_slots, || None);
                 slots
             },
             last_report: report,
@@ -2658,7 +2806,11 @@ impl RegionalFixture {
         let (merge_restore, merge_pressure) =
             select_gpu_merge_restore(&base, &self.gpu_merge_parents, capacity);
         let decision = if self.gpu_merge_parents.is_empty() {
-            select_gpu_frontier(&base, &frontiers, self.gpu_split_reservation, capacity)
+            if self.planetary {
+                select_gpu_ranked_frontier(&base, &frontiers, self.gpu_split_reservation, capacity)
+            } else {
+                select_gpu_frontier(&base, &frontiers, self.gpu_split_reservation, capacity)
+            }
         } else {
             GpuFrontierAdmission {
                 reserved_parent: None,
@@ -2708,10 +2860,11 @@ impl RegionalFixture {
         self.publication_stages.gpu_frontier_selection_ms =
             selection_started.elapsed().as_secs_f64() * 1000.0;
         let allowlist_started = std::time::Instant::now();
-        self.core
-            .as_mut()
-            .context("regional core unavailable")?
-            .set_upload_allowlist(allowed.as_deref());
+        let core = self.core.as_mut().context("regional core unavailable")?;
+        core.set_upload_allowlist(allowed.as_deref());
+        if self.planetary {
+            core.set_completion_gpu_reservation(self.gpu_split_reservation);
+        }
         self.publication_stages.gpu_upload_allowlist_ms =
             allowlist_started.elapsed().as_secs_f64() * 1000.0;
         Ok(())
@@ -3342,14 +3495,54 @@ impl RegionalFixture {
     }
 
     fn adopt_prepared_publications_inner(&mut self, started: std::time::Instant) -> Result<()> {
+        if self.prepared_publications.is_empty() {
+            return Ok(());
+        }
         let core = self.core.as_ref().context("regional core unavailable")?;
+        // Freeze rank and age once. Consulting elapsed time or re-discovering
+        // completion groups from a comparator can change its order mid-sort.
+        let now = std::time::Instant::now();
+        // Rank only the bounded prepared queue. Reconstructing every proposed
+        // cover here can exhaust admission before any product is adopted.
+        let completion_ranks: HashMap<_, _> = self
+            .prepared_publications
+            .iter()
+            .filter(|_| self.planetary)
+            .map(|pending| {
+                (
+                    pending.prepared.group_id,
+                    core.publication_completion_rank(&pending.candidate, now),
+                )
+            })
+            .collect();
+        let priorities: HashMap<_, _> = if self.planetary {
+            HashMap::new()
+        } else {
+            self.prepared_publications
+                .iter()
+                .map(|pending| {
+                    (
+                        pending.prepared.group_id,
+                        core.publication_priority(&pending.candidate),
+                    )
+                })
+                .collect()
+        };
+        let age_threshold = if self.planetary {
+            Duration::from_secs(2)
+        } else {
+            Duration::from_secs(5)
+        };
         self.prepared_publications
             .make_contiguous()
             .sort_by(|a, b| {
-                // Age protection overrides priority after five seconds, with stable
-                // group identity resolving equal visual contribution deterministically.
-                let a_old = a.ready_at.elapsed().as_secs_f64() >= 5.0;
-                let b_old = b.ready_at.elapsed().as_secs_f64() >= 5.0;
+                if self.planetary {
+                    return completion_ranks[&a.prepared.group_id]
+                        .compare(completion_ranks[&b.prepared.group_id])
+                        .then(a.prepared.group_id.cmp(&b.prepared.group_id));
+                }
+                let a_old = now.saturating_duration_since(a.ready_at) >= age_threshold;
+                let b_old = now.saturating_duration_since(b.ready_at) >= age_threshold;
                 b_old
                     .cmp(&a_old)
                     .then_with(|| {
@@ -3360,8 +3553,13 @@ impl RegionalFixture {
                         }
                     })
                     .then_with(|| {
-                        core.publication_priority(&b.candidate)
-                            .total_cmp(&core.publication_priority(&a.candidate))
+                        priorities
+                            .get(&b.prepared.group_id)
+                            .copied()
+                            .unwrap_or(0.0)
+                            .total_cmp(
+                                &priorities.get(&a.prepared.group_id).copied().unwrap_or(0.0),
+                            )
                     })
                     .then(a.prepared.group_id.cmp(&b.prepared.group_id))
             });
@@ -4178,17 +4376,24 @@ impl RegionalFixture {
         }
         self.publication_stages.resident_slot_allocation_ms =
             draw_started.elapsed().as_secs_f64() * 1000.0;
-        let mut desired_ancestors = HashSet::new();
-        if let Some(core) = &self.core {
+        if let Some(core) = &self.core
+            && self.draw_desired_signature != core.desired()
+        {
+            self.draw_desired_signature = core.desired().to_vec();
+            self.draw_desired_ancestors.clear();
             for desired in core.desired() {
                 let mut ancestor = desired.parent();
                 while let Some(address) = ancestor {
-                    desired_ancestors.insert(address);
+                    self.draw_desired_ancestors.insert(address);
                     ancestor = address.parent();
                 }
             }
         }
-        let mut patches = Vec::new();
+        let mut patches = Vec::with_capacity(self.patches.len());
+        // Repeated parent draws share one presentation record within this frame.
+        // Camera/light transforms and slot tokens are recomputed every frame;
+        // only immutable desired-ancestor membership is retained across frames.
+        let mut frame_tile_draws = HashMap::with_capacity(self.patches.len());
         for (address, patch) in &self.patches {
             if self.planetary
                 && self.planetary_projection.is_some()
@@ -4208,11 +4413,11 @@ impl RegionalFixture {
                 .and_then(|id| self.groups.iter().find(|g| g.id == id).map(|g| g.fraction))
                 .unwrap_or(1.0);
             patches.push(RegionalPatchDraw {
-                quality_fallback: desired_ancestors.contains(address),
+                quality_fallback: self.draw_desired_ancestors.contains(address),
                 own_slot,
                 parent_slot,
-                own: self.tile_draw(*address, root_draw)?,
-                parent: self.tile_draw(patch.parent, root_draw)?,
+                own: self.frame_tile_draw(*address, root_draw, &mut frame_tile_draws)?,
+                parent: self.frame_tile_draw(patch.parent, root_draw, &mut frame_tile_draws)?,
                 morph_fraction: if patch.quadrant.is_some() {
                     if patch.merging { 1.0 - t } else { t }
                 } else {
@@ -4240,6 +4445,20 @@ impl RegionalFixture {
             uploads,
             patches,
         })
+    }
+
+    fn frame_tile_draw(
+        &self,
+        address: CubePatchAddress,
+        root_draw: &TileDraw,
+        cache: &mut HashMap<CubePatchAddress, TileDraw>,
+    ) -> Result<TileDraw> {
+        if let Some(draw) = cache.get(&address) {
+            return Ok(draw.clone());
+        }
+        let draw = self.tile_draw(address, root_draw)?;
+        cache.insert(address, draw.clone());
+        Ok(draw)
     }
 
     pub(super) fn trace(&self) -> Option<Arc<TerrainTrace>> {
@@ -4699,6 +4918,7 @@ impl RegionalFixture {
             "cpu_cache_payload_bytes":cached_bytes,
             "cpu_generation_query_workspace_bound_bytes":core_snapshot.estimated_worker_scratch_bytes,
             "cpu_frontier_priority_cache_bound_bytes":core_snapshot.frontier_priority_cache_bytes_upper_bound,
+            "cpu_screen_coverage_diagnostic_overlap_bound_bytes":core_snapshot.screen_coverage_diagnostic_overlap_bytes_upper_bound,
             "cpu_frontier_priority_index_entries":core_snapshot.frontier_priority_index_entries,
             "cpu_renderer_metadata_capacity_bytes":self.last_report.metadata_cpu_capacity_bytes,
             "cpu_renderer_boundary_capacity_bytes":self.last_report.boundary_cpu_capacity_bytes,

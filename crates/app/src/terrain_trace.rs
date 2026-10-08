@@ -883,7 +883,7 @@ impl TerrainTrace {
             finish_queue_snapshots(queue_accumulators, now, completed_rate_window_complete);
         let block_reasons = finish_block_snapshots(block_accumulators);
         let jobs = row_jobs.iter().map(|job| snapshot_job(job, now)).collect();
-        let span_us = now.min(RATE_WINDOW_US).max(1);
+        let span_us = now.clamp(1, RATE_WINDOW_US);
         TerrainTraceSnapshot {
             schema_version: 1,
             enabled: true,
@@ -1302,7 +1302,7 @@ fn finish_queue_snapshots(
     now: u64,
     rate_window_complete: bool,
 ) -> Vec<TerrainTraceQueueSnapshot> {
-    let rate_window = now.min(RATE_WINDOW_US).max(1) as f64;
+    let rate_window = now.clamp(1, RATE_WINDOW_US) as f64;
     TerrainTraceQueue::ALL
         .into_iter()
         .map(|queue| {
@@ -1754,7 +1754,7 @@ mod tests {
     fn test_key(identity: u32) -> TileKey {
         TileKey {
             body_identity: 1,
-            definition_words: vec![identity],
+            definition_words: vec![u64::from(identity)],
             radius_bits: 1,
             surface_revision: 1,
             material_revision: 1,

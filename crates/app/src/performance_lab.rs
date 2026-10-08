@@ -606,12 +606,13 @@ impl PerformanceLab {
             }
             paint_metric_segment(&painter, &mut segment, color);
         }
-        if response.clicked() && !self.history.is_empty() {
-            if let Some(pointer) = response.interact_pointer_pos() {
-                let fraction = ((pointer.x - chart.left()) / chart.width()).clamp(0.0, 1.0);
-                let index = (fraction * (self.history.len() - 1) as f32).round() as usize;
-                self.selected_frame = self.history.get(index).map(|sample| sample.frame);
-            }
+        if response.clicked()
+            && !self.history.is_empty()
+            && let Some(pointer) = response.interact_pointer_pos()
+        {
+            let fraction = ((pointer.x - chart.left()) / chart.width()).clamp(0.0, 1.0);
+            let index = (fraction * (self.history.len() - 1) as f32).round() as usize;
+            self.selected_frame = self.history.get(index).map(|sample| sample.frame);
         }
         ui.horizontal(|ui| {
             for (metric, color) in series {
@@ -1078,10 +1079,10 @@ impl PerformanceLab {
             } else {
                 ui.label("No capture metadata in the current snapshot.");
             }
-            if ui.button("Copy current diagnostic JSON").clicked() {
-                if let Ok(json) = serde_json::to_string_pretty(snapshot) {
-                    ui.ctx().copy_text(json);
-                }
+            if ui.button("Copy current diagnostic JSON").clicked()
+                && let Ok(json) = serde_json::to_string_pretty(snapshot)
+            {
+                ui.ctx().copy_text(json);
             }
         } else {
             ui.label("Waiting for a diagnostic snapshot.");

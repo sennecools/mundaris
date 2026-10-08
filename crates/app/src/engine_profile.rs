@@ -205,9 +205,7 @@ impl EventRing {
     }
 
     fn clear(&mut self) {
-        for entry in &mut self.entries {
-            *entry = None;
-        }
+        self.entries.fill(None);
         self.next = 0;
         self.len = 0;
         self.dropped = 0;
@@ -485,7 +483,6 @@ pub fn span(name: &'static str) -> ProfileSpan {
         return ProfileSpan::disabled();
     }
 
-    let start;
     let mut lane_id = None;
     let mut event_id = 0;
     let mut parent_event_id = None;
@@ -518,7 +515,7 @@ pub fn span(name: &'static str) -> ProfileSpan {
     if depth >= MAX_NESTING {
         return ProfileSpan::disabled();
     }
-    start = now_ns();
+    let start = now_ns();
     ProfileSpan {
         name,
         lane_id: Some(lane_id),

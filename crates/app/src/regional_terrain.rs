@@ -9,6 +9,13 @@
 //! height bound, which would make distant tiles appear uniformly close. This
 //! local residual proxy is deterministic but does not certify unsampled error.
 
+mod coverage;
+
+pub use coverage::{
+    CoverageAddressWitness, CoverageCubeFace, CoverageDrawableAddress, ScreenCoverageCell,
+    ScreenCoverageDiagnostic,
+};
+
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -22,13 +29,20 @@ use glam::{DMat3, DVec3};
 use mundaris_math::surface::{CubeFace, CubePatchAddress, PatchEdge};
 use mundaris_renderer::CelestialProjection;
 use mundaris_renderer::planet_surface::{PatchMetadata, SurfaceExtent, SurfaceTopology};
-use mundaris_world::terrain::SurfaceGenerator;
+use mundaris_world::terrain::{SurfaceGenerator, SurfacePreparationStoreStats};
 use serde::Serialize;
 
 const BUILD_CANDIDATE_STARVATION_AFTER: Duration = Duration::from_secs(2);
+const USEFUL_DETAIL_FLOOR_ERROR_PX: f64 = 4.0;
+const PUBLICATION_STARVATION_AGE_TICKS: u64 = 32;
+const MAX_SUPPORTED_TILE_CELLS: usize = 128;
+const TILE_FILTER_TAPS_PER_ROW_SAMPLE: usize = 7;
+const MAX_TILE_ROW_SAMPLES: usize =
+    (MAX_SUPPORTED_TILE_CELLS + 3) * TILE_FILTER_TAPS_PER_ROW_SAMPLE;
 
 use crate::resident_terrain::{
-    ResidentTileBuilder, TileBuildDiagnostics, TileBuildIdentity, TileData, TileKey,
+    ResidentTileBuilder, SharedDerivedField, TileBuildDiagnostics, TileBuildIdentity, TileData,
+    TileKey,
 };
 use crate::terrain_trace::{BlockReason, Stage, TerrainTrace};
 
@@ -182,7 +196,29 @@ pub struct RegionalSnapshot {
     pub completion_capacity: usize,
     pub upload_tile_capacity: usize,
     pub upload_byte_capacity: usize,
+    /// Configured capacity estimate, not live RSS. Includes bounded worker
+    /// query/builder buffers and shared prepared/derived caches; excludes allocator overhead.
     pub estimated_worker_scratch_bytes: usize,
+    /// Aggregate maximum row buffers: 917 locations plus the active exact or
+    /// derived sample type, multiplied by the configured worker count.
+    pub tile_builder_row_workspace_bytes: usize,
+    /// Aggregate builder-reported fixed stack estimate per worker; it is an
+    /// estimate, not a platform stack high-water measurement.
+    pub tile_builder_stack_scratch_bytes: usize,
+    pub derived_generation_workspace_bytes: usize,
+    /// Fixed worker query contexts plus the shared prepared-page store bound.
+    pub prepared_generation_workspace_bytes: usize,
+    pub prepared_store_capacity_bytes: usize,
+    pub prepared_store_retained_bytes: usize,
+    pub prepared_store_high_water_bytes: usize,
+    pub prepared_store_transient_build_reservation_bytes: usize,
+    pub derived_field_cache_capacity_bytes: usize,
+    pub derived_field_cache_retained_bytes: usize,
+    pub derived_batch_scratch_bound_bytes: usize,
+    /// Sample evaluations spent in build attempts that ended by cancellation.
+    pub cancelled_attempt_sample_evaluations: u64,
+    /// Preparation bytes built during canceled attempts; pages remain reusable.
+    pub cancelled_attempt_preparation_bytes: u64,
     /// Current desired-ancestor priority entries retained for frontier discovery.
     pub frontier_priority_index_entries: usize,
     /// Conservative configured upper bound for the index and exact-key signature.
@@ -249,6 +285,12 @@ pub struct RegionalSnapshot {
     pub worst_visible_unresolved_error_px: Option<f64>,
     pub useful_detail_reached: bool,
     pub useful_detail_proxy_error_threshold_px: f64,
+    /// Cached 3 × 3 reference-sphere mask for the exact current view and cover.
+    pub screen_coverage: Option<ScreenCoverageDiagnostic>,
+    /// Three diagnostic instances during cache/snapshot/transient overlap,
+    /// including inline vector headers and bounded witness payloads. Shared
+    /// sampled-area map storage is excluded.
+    pub screen_coverage_diagnostic_overlap_bytes_upper_bound: usize,
     pub visible_proxy_error_certified: bool,
     pub visible_proxy_error_model: &'static str,
     /// Whole-cover split/merge operations applied by the planetary selector
@@ -382,6 +424,84 @@ pub struct RegionalSplitFrontier {
     pub parent_resident: bool,
     pub ready_children: usize,
     pub aggregate_priority: f64,
+    /// Shared whole-view completion rank consumed by CPU and native GPU admission.
+    pub completion_priority: f64,
+    /// Time since this drawable parent first became an eligible refinement group.
+    pub age: Duration,
+    /// Current drawable error above the useful coarse-detail floor, in pixels.
+    pub useful_floor_deficit_px: f64,
+    pub resident_children: usize,
+    /// Children which have not reached the CPU cache, upload queue, or residency.
+    pub missing_dependencies: usize,
+    pub blocker: RegionalCompletionBlocker,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CompletionRank {
+    pub(crate) priority: f64,
+    pub(crate) under_floor: bool,
+    pub(crate) age: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScreenCoverageKey {
+    view_projection_bits: [u64; 20],
+    drawable_cover_revision: u64,
+    score_revision: u64,
+    max_level: u8,
+}
+
+struct ScreenCoverageCacheEntry {
+    key: ScreenCoverageKey,
+    diagnostic: ScreenCoverageDiagnostic,
+}
+
+impl CompletionRank {
+    pub(crate) fn compare(self, other: Self) -> std::cmp::Ordering {
+        let self_starved = self.age >= BUILD_CANDIDATE_STARVATION_AFTER;
+        let other_starved = other.age >= BUILD_CANDIDATE_STARVATION_AFTER;
+        other_starved
+            .cmp(&self_starved)
+            .then_with(|| {
+                if self_starved && other_starved {
+                    other.age.cmp(&self.age)
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .then_with(|| other.under_floor.cmp(&self.under_floor))
+            .then_with(|| other.priority.total_cmp(&self.priority))
+    }
+}
+
+fn completion_group_rank(
+    error_px: f64,
+    target_error_px: f64,
+    projected_area_px: f64,
+    age: Duration,
+) -> CompletionRank {
+    let floor_deficit = (error_px - USEFUL_DETAIL_FLOOR_ERROR_PX).max(0.0);
+    let under_floor = floor_deficit > 0.0;
+    CompletionRank {
+        priority: projected_area_px.max(1.0e-9)
+            * if under_floor {
+                floor_deficit
+            } else {
+                (error_px - target_error_px).max(0.0)
+            },
+        under_floor,
+        age,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionalCompletionBlocker {
+    Admission,
+    CpuPreparation,
+    Upload,
+    Residency,
+    Publication,
+    Ready,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -458,6 +578,10 @@ struct BuildResult {
     token: Arc<BuildToken>,
     result: Option<(Arc<TileData>, TileBuildDiagnostics)>,
     elapsed: Duration,
+    cancelled_sample_evaluations: u64,
+    cancelled_preparation_bytes: u64,
+    query_workspace_bound_bytes: usize,
+    prepared_store_stats: SurfacePreparationStoreStats,
 }
 
 struct WorkerPool {
@@ -470,6 +594,12 @@ struct DesiredPriorityIndex {
     /// Exact ordered key and priority-bit signature; avoids hash-collision reuse.
     signature: Vec<(CubePatchAddress, u64)>,
     priorities: HashMap<CubePatchAddress, f64>,
+    /// Parent, rank bits, and the two-second promotion state for native caches.
+    completion_signature: Vec<(CubePatchAddress, u64, bool, bool)>,
+    completion_summary_inputs: Option<(u64, u64, u64, bool)>,
+    next_completion_promotion: Option<Instant>,
+    #[cfg(test)]
+    completion_frontier_scans: usize,
     revision: u64,
 }
 
@@ -486,6 +616,7 @@ struct BuildCandidateWait {
 /// complete resident 2:1 cover may become drawable.
 pub struct RegionalTerrain {
     generator: Arc<SurfaceGenerator>,
+    derived_field: Option<SharedDerivedField>,
     identity: TileBuildIdentity,
     config: RegionalConfig,
     trace: Arc<TerrainTrace>,
@@ -494,6 +625,10 @@ pub struct RegionalTerrain {
     surface_topology: SurfaceTopology,
     patch_metadata: RefCell<HashMap<CubePatchAddress, PatchMetadata>>,
     planetary_scores: RefCell<BTreeMap<CubePatchAddress, (f64, f64, f64, f64)>>,
+    planetary_footprint_weights: RefCell<HashMap<CubePatchAddress, f64>>,
+    screen_coverage_cache: RefCell<Option<ScreenCoverageCacheEntry>>,
+    drawable_cover_revision: u64,
+    coverage_score_revision: u64,
     workers: WorkerPool,
     completions: Receiver<BuildResult>,
     completion_backlog: Arc<AtomicUsize>,
@@ -534,6 +669,8 @@ pub struct RegionalTerrain {
     desired_priority_index: RefCell<DesiredPriorityIndex>,
     build_candidate_waits: HashMap<TileKey, BuildCandidateWait>,
     build_candidate_wait_epoch: u64,
+    completion_group_first_eligible: RefCell<HashMap<CubePatchAddress, Instant>>,
+    completion_gpu_reservation: Option<CubePatchAddress>,
     tile_key_definition_word_count: usize,
     selector_budget_exhausted: bool,
     merge_scan_cursor: Option<CubePatchAddress>,
@@ -561,6 +698,10 @@ struct Counters {
     build_time_discarded_micros: u64,
     build_time_micros: u64,
     worker_elapsed_micros: u64,
+    cancelled_attempt_sample_evaluations: u64,
+    cancelled_attempt_preparation_bytes: u64,
+    worker_query_workspace_bound_bytes: usize,
+    prepared_store_stats: SurfacePreparationStoreStats,
     recent_build_elapsed_micros: VecDeque<u64>,
     build_failures: u64,
     completion_drain_micros: u64,
@@ -590,12 +731,42 @@ impl RegionalTerrain {
         identity: TileBuildIdentity,
         config: RegionalConfig,
     ) -> Result<Self, RegionalError> {
+        Self::new_with_derived_field(generator, identity, config, None)
+    }
+
+    /// Create a planetary regional scheduler with the shared bounded derived
+    /// field used by production tile workers. Finite/reference fixtures retain
+    /// the exact filtered tile representation through `new`.
+    pub fn new_derived(
+        generator: SurfaceGenerator,
+        identity: TileBuildIdentity,
+        config: RegionalConfig,
+    ) -> Result<Self, RegionalError> {
+        validate_config(&config)?;
+        let field = SharedDerivedField::new(&generator).map_err(|_| RegionalError::TileBuild)?;
+        Self::new_with_derived_field(generator, identity, config, Some(field))
+    }
+
+    fn new_with_derived_field(
+        generator: SurfaceGenerator,
+        identity: TileBuildIdentity,
+        config: RegionalConfig,
+        derived_field: Option<SharedDerivedField>,
+    ) -> Result<Self, RegionalError> {
         validate_config(&config)?;
         let generator = Arc::new(generator);
-        let tile_key_definition_word_count =
+        let first_key = if derived_field.is_some() {
+            ResidentTileBuilder::derived_tile_key(
+                &generator,
+                identity,
+                config.roots[0],
+                config.cells,
+            )
+        } else {
             ResidentTileBuilder::tile_key(&generator, identity, config.roots[0], config.cells)
-                .map(|key| key.definition_words.len())
-                .unwrap_or(0);
+        };
+        let tile_key_definition_word_count =
+            first_key.map(|key| key.definition_words.len()).unwrap_or(0);
         let worker_count = config.worker_count;
         let (job_sender, job_receiver) = mpsc::sync_channel::<BuildJob>(config.queue_cap);
         let (completion_sender, completion_receiver) =
@@ -613,6 +784,7 @@ impl RegionalTerrain {
             let running = Arc::clone(&worker_running);
             let backlog = Arc::clone(&completion_backlog);
             let trace = Arc::clone(&trace);
+            let worker_derived_field = derived_field.clone();
             thread::Builder::new()
                 .name("regional-terrain-builder".into())
                 .stack_size(4 * 1024 * 1024)
@@ -643,6 +815,11 @@ impl RegionalTerrain {
                         },
                         |name| crate::engine_profile::worker_scope_named(name),
                     );
+                    // Prepared query pages are immutable and shared by the
+                    // generator; each worker keeps only its bounded leases and
+                    // batch scratch so neighboring jobs can reuse preparation.
+                    let mut query_context = generator.prepared_query_context();
+                    let derived_field = worker_derived_field;
                     loop {
                         let job = {
                             let receiver = receiver
@@ -661,6 +838,11 @@ impl RegionalTerrain {
                                     token: job.token,
                                     result: None,
                                     elapsed: Duration::ZERO,
+                                    cancelled_sample_evaluations: 0,
+                                    cancelled_preparation_bytes: 0,
+                                    query_workspace_bound_bytes: query_context
+                                        .total_workspace_bound_bytes(),
+                                    prepared_store_stats: query_context.store_stats(),
                                 })
                                 .is_err()
                             {
@@ -673,6 +855,7 @@ impl RegionalTerrain {
                         trace.event_key(&job.key, Stage::GenerationStarted);
                         running.fetch_add(1, AtomicOrdering::AcqRel);
                         let started = std::time::Instant::now();
+                        let query_stats_before = query_context.stats();
                         let generation_span =
                             crate::engine_profile::span("terrain tile generation");
                         let mut remaining = delay;
@@ -688,12 +871,27 @@ impl RegionalTerrain {
                             None
                         } else {
                             let build_span = crate::engine_profile::span("terrain tile sampling");
-                            let built = ResidentTileBuilder::build_cached(
-                                &generator,
-                                identity,
-                                job.address,
-                                job.key.cells,
-                            );
+                            let cancelled = || job.token.cancelled.load(AtomicOrdering::Acquire);
+                            let built = if let Some(field) = derived_field.as_ref() {
+                                ResidentTileBuilder::build_derived(
+                                    &generator,
+                                    identity,
+                                    job.address,
+                                    job.key.cells,
+                                    &mut query_context,
+                                    field,
+                                    cancelled,
+                                )
+                            } else {
+                                ResidentTileBuilder::build_prepared(
+                                    &generator,
+                                    identity,
+                                    job.address,
+                                    job.key.cells,
+                                    &mut query_context,
+                                    cancelled,
+                                )
+                            };
                             drop(build_span);
                             match built {
                                 Ok((tile, diagnostics)) => {
@@ -701,13 +899,20 @@ impl RegionalTerrain {
                                     Some((Arc::new(tile), diagnostics))
                                 }
                                 Err(_) => {
-                                    trace.event_key(&job.key, Stage::GenerationFailed);
+                                    if job.token.cancelled.load(AtomicOrdering::Acquire) {
+                                        trace.event_key(&job.key, Stage::GenerationCancelled);
+                                    } else {
+                                        trace.event_key(&job.key, Stage::GenerationFailed);
+                                    }
                                     None
                                 }
                             }
                         };
                         drop(generation_span);
                         let elapsed = started.elapsed();
+                        let query_stats_after = query_context.stats();
+                        let cancelled_work =
+                            result.is_none() && job.token.cancelled.load(AtomicOrdering::Acquire);
                         running.fetch_sub(1, AtomicOrdering::AcqRel);
                         backlog.fetch_add(1, AtomicOrdering::AcqRel);
                         if sender
@@ -717,6 +922,23 @@ impl RegionalTerrain {
                                 token: job.token,
                                 result,
                                 elapsed,
+                                cancelled_sample_evaluations: if cancelled_work {
+                                    query_stats_after
+                                        .sample_evaluations
+                                        .saturating_sub(query_stats_before.sample_evaluations)
+                                } else {
+                                    0
+                                },
+                                cancelled_preparation_bytes: if cancelled_work {
+                                    query_stats_after
+                                        .preparation_bytes
+                                        .saturating_sub(query_stats_before.preparation_bytes)
+                                } else {
+                                    0
+                                },
+                                query_workspace_bound_bytes: query_context
+                                    .total_workspace_bound_bytes(),
+                                prepared_store_stats: query_context.store_stats(),
                             })
                             .is_err()
                         {
@@ -731,6 +953,7 @@ impl RegionalTerrain {
 
         Ok(Self {
             generator,
+            derived_field,
             identity,
             config,
             trace,
@@ -739,6 +962,10 @@ impl RegionalTerrain {
             surface_topology: SurfaceTopology::new(),
             patch_metadata: RefCell::new(HashMap::new()),
             planetary_scores: RefCell::new(BTreeMap::new()),
+            planetary_footprint_weights: RefCell::new(HashMap::new()),
+            screen_coverage_cache: RefCell::new(None),
+            drawable_cover_revision: 0,
+            coverage_score_revision: 0,
             workers: WorkerPool {
                 sender: job_sender,
                 _worker_count: worker_count,
@@ -786,6 +1013,8 @@ impl RegionalTerrain {
             desired_priority_index: RefCell::new(DesiredPriorityIndex::default()),
             build_candidate_waits: HashMap::new(),
             build_candidate_wait_epoch: 0,
+            completion_group_first_eligible: RefCell::new(HashMap::new()),
+            completion_gpu_reservation: None,
             tile_key_definition_word_count,
             selector_budget_exhausted: false,
             merge_scan_cursor: None,
@@ -824,6 +1053,7 @@ impl RegionalTerrain {
         let previous_desired = self.desired_addresses.clone();
         let selector_span = crate::engine_profile::span("terrain desired cover");
         self.select_desired();
+        self.prune_completion_ages();
         drop(selector_span);
         if crate::engine_profile::is_enabled() && previous_desired != self.desired_addresses {
             let previous: HashSet<_> = previous_desired.iter().copied().collect();
@@ -959,16 +1189,22 @@ impl RegionalTerrain {
         {
             return Err(RegionalError::InvalidView);
         }
-        self.planetary_view = Some(PlanetaryView {
+        let view = PlanetaryView {
             body_to_view,
             projection,
-        });
+        };
+        if !view.matches(self.planetary_view) {
+            self.coverage_score_revision = self.coverage_score_revision.wrapping_add(1);
+        }
+        self.planetary_view = Some(view);
         Ok(())
     }
 
     /// Return to the original finite-region selection policy.
     pub fn clear_planetary_view(&mut self) {
-        self.planetary_view = None;
+        if self.planetary_view.take().is_some() {
+            self.coverage_score_revision = self.coverage_score_revision.wrapping_add(1);
+        }
     }
 
     /// Whether a patch's conservative displaced bounds intersect the current
@@ -1055,6 +1291,7 @@ impl RegionalTerrain {
         {
             self.drawable.clone_from(&self.config.roots);
             self.drawable.sort();
+            self.drawable_cover_revision = self.drawable_cover_revision.wrapping_add(1);
             for &root in &self.drawable {
                 self.trace.set_drawable(root, true);
             }
@@ -1128,7 +1365,71 @@ impl RegionalTerrain {
     /// Current visual priority used to reprioritize prepared local work without
     /// rescoring tiles. Missing cached scores fall back to stored desired scores.
     pub(crate) fn publication_priority(&self, candidate: &RegionalPublication) -> f64 {
-        self.cached_publication_priority(candidate)
+        if self.planetary_view.is_some() {
+            self.publication_completion_rank(candidate, Instant::now())
+                .priority
+        } else {
+            self.cached_publication_priority(candidate)
+        }
+    }
+
+    /// Rank one already prepared publication without rediscovering whole-cover
+    /// frontiers. The caller supplies one frozen instant for its bounded batch.
+    pub(crate) fn publication_completion_rank(
+        &self,
+        candidate: &RegionalPublication,
+        now: Instant,
+    ) -> CompletionRank {
+        let parent = publication_parent(candidate);
+        let priority = || {
+            self.planetary_scores
+                .borrow()
+                .get(&parent)
+                .map(|score| score.1)
+                .or_else(|| self.desired.get(&parent).map(|patch| patch.priority))
+                .unwrap_or_else(|| match candidate {
+                    RegionalPublication::Split { children, .. }
+                    | RegionalPublication::Merge { children, .. } => children
+                        .iter()
+                        .filter_map(|child| self.desired.get(child).map(|patch| patch.priority))
+                        .fold(0.0, f64::max),
+                })
+        };
+        if self.planetary_view.is_none() {
+            return CompletionRank {
+                priority: priority(),
+                under_floor: false,
+                age: Duration::ZERO,
+            };
+        }
+        if matches!(candidate, RegionalPublication::Split { .. }) {
+            let error = self.score(parent).0;
+            let area = self.projected_footprint_weight(parent);
+            let age = if error > self.config.split_threshold_px && area > 0.0 {
+                self.completion_group_first_eligible
+                    .borrow()
+                    .get(&parent)
+                    .map(|first| now.saturating_duration_since(*first))
+                    .unwrap_or_default()
+            } else {
+                Duration::ZERO
+            };
+            return completion_group_rank(error, self.config.split_threshold_px, area, age);
+        }
+        let ticks = self
+            .publication_candidate_ages
+            .get(&parent)
+            .copied()
+            .unwrap_or(0);
+        CompletionRank {
+            priority: priority(),
+            under_floor: false,
+            age: if ticks >= PUBLICATION_STARVATION_AGE_TICKS {
+                Duration::from_secs(2).saturating_add(Duration::from_millis(ticks))
+            } else {
+                Duration::ZERO
+            },
+        }
     }
 
     pub(crate) fn publication_candidate_age_ticks(&self, candidate: &RegionalPublication) -> u64 {
@@ -1211,6 +1512,20 @@ impl RegionalTerrain {
         result
     }
 
+    /// Pin the GPU adapter's currently feasible completion group so CPU cache
+    /// reservation and GPU slot reservation advance the same sibling quartet.
+    pub(crate) fn set_completion_gpu_reservation(&mut self, parent: Option<CubePatchAddress>) {
+        self.completion_gpu_reservation = parent.filter(|parent| {
+            self.drawable.contains(parent)
+                && parent.children().is_ok_and(|children| {
+                    local_replacement_is_balanced(*parent, true, &self.drawable, &self.config.roots)
+                        && children.iter().all(|child| {
+                            self.desired.keys().any(|desired| child.contains(*desired))
+                        })
+                })
+        });
+    }
+
     /// Balanced coarsening groups whose parent is required by the desired cover.
     pub fn merge_frontiers(&self) -> Vec<CubePatchAddress> {
         self.drawable
@@ -1222,7 +1537,12 @@ impl RegionalTerrain {
                 let mut ancestor = Some(*parent);
                 while let Some(address) = ancestor {
                     if self.desired.contains_key(&address) {
-                        return local_replacement_is_balanced(*parent, false, &self.drawable);
+                        return local_replacement_is_balanced(
+                            *parent,
+                            false,
+                            &self.drawable,
+                            &self.config.roots,
+                        );
                     }
                     ancestor = address.parent();
                 }
@@ -1241,7 +1561,7 @@ impl RegionalTerrain {
         cover: &[CubePatchAddress],
     ) -> Result<(), RegionalError> {
         if parent.children().ok() != Some(children)
-            || !local_replacement_is_balanced(parent, false, &self.drawable)
+            || !local_replacement_is_balanced(parent, false, &self.drawable, &self.config.roots)
         {
             return Err(RegionalError::InvalidCover);
         }
@@ -1345,7 +1665,7 @@ impl RegionalTerrain {
                 return false;
             }
         }
-        if !local_replacement_is_balanced(parent, split, &self.drawable) {
+        if !local_replacement_is_balanced(parent, split, &self.drawable, &self.config.roots) {
             return false;
         }
         true
@@ -1406,6 +1726,7 @@ impl RegionalTerrain {
                 .unwrap_or_else(|index| index);
             self.drawable.insert(index, parent);
         }
+        self.drawable_cover_revision = self.drawable_cover_revision.wrapping_add(1);
         // This local replacement changes exactly one parent and its four
         // children. Recording that delta avoids rescanning the whole cover.
         self.trace.set_drawable(parent, !split);
@@ -1473,6 +1794,7 @@ impl RegionalTerrain {
         }
         self.drawable = cover.to_vec();
         self.drawable.sort();
+        self.drawable_cover_revision = self.drawable_cover_revision.wrapping_add(1);
         for &address in &self.drawable {
             if !drawable_set.contains(&address) {
                 self.trace.set_drawable(address, true);
@@ -1517,6 +1839,11 @@ impl RegionalTerrain {
         // projected scoring for every drawable leaf would make evidence itself
         // a per-frame terrain evaluation workload.
         let mut diagnostic_scores = HashMap::new();
+        let derived_stats = self
+            .derived_field
+            .as_ref()
+            .and_then(|field| field.stats().ok())
+            .unwrap_or_default();
         let drawable_addresses: HashSet<_> = self
             .drawable
             .iter()
@@ -1648,6 +1975,7 @@ impl RegionalTerrain {
             .filter(|_| include_details)
             .map(|a| format!("{a:?}"))
             .collect();
+        let screen_coverage = self.screen_coverage_diagnostic();
         let target_quality_reached = !self.pressure.desired_capacity
             && (self.planetary_view.is_none() || self.selector_can_reuse_fixed_point)
             && !self.selector_budget_exhausted
@@ -1798,7 +2126,12 @@ impl RegionalTerrain {
                 self.drawable_proxy_hotspot(address, error_px, projected_footprint_weight)
             })
             .collect();
-        let frontier_priority_index_entries = self.desired_priority_index.borrow().priorities.len();
+        let priority_index = self.desired_priority_index.borrow();
+        let frontier_priority_index_entries = priority_index
+            .priorities
+            .len()
+            .saturating_add(priority_index.completion_signature.len());
+        drop(priority_index);
         let frontier_priority_cache_bytes_upper_bound =
             desired_priority_cache_bytes_upper_bound(&self.config);
         let build_candidate_wait_entries = self.build_candidate_waits.len();
@@ -1806,6 +2139,21 @@ impl RegionalTerrain {
             self.build_candidate_wait_entries_upper_bound();
         let build_candidate_wait_bytes_upper_bound =
             self.build_candidate_wait_bytes_upper_bound(build_candidate_wait_entries_upper_bound);
+        let builder_row_sample_size =
+            std::mem::size_of::<mundaris_math::surface::SurfaceLocation>()
+                + if self.derived_field.is_some() {
+                    std::mem::size_of::<crate::resident_terrain::DerivedSample>()
+                } else {
+                    std::mem::size_of::<mundaris_world::terrain::SurfaceSample>()
+                };
+        let tile_builder_row_workspace_bytes = MAX_TILE_ROW_SAMPLES
+            .saturating_mul(builder_row_sample_size)
+            .saturating_mul(self.config.worker_count);
+        let tile_builder_stack_scratch_bytes =
+            (std::mem::size_of::<[mundaris_math::Direction3; 7]>()
+                + std::mem::size_of::<[f64; 4]>()
+                + std::mem::size_of::<mundaris_world::terrain::SurfaceSample>())
+            .saturating_mul(self.config.worker_count);
         RegionalSnapshot {
             tick: self.tick,
             configuration: RegionalConfigSnapshot {
@@ -1869,10 +2217,39 @@ impl RegionalTerrain {
             upload_tile_capacity: self.config.upload_tile_cap,
             upload_byte_capacity: self.config.upload_byte_cap,
             estimated_worker_scratch_bytes: self
-                .generator
-                .query_workspace_bytes()
-                .saturating_add(ResidentTileBuilder::query_cache_workspace_bound_bytes())
+                .stats
+                .worker_query_workspace_bound_bytes
+                .saturating_mul(self.config.worker_count)
+                .saturating_add(self.stats.prepared_store_stats.capacity_bytes)
+                .saturating_add(derived_stats.cache_capacity_bytes)
+                .saturating_add(
+                    derived_stats
+                        .batch_scratch_bound_bytes
+                        .saturating_mul(self.config.worker_count),
+                )
+                .saturating_add(tile_builder_row_workspace_bytes)
+                .saturating_add(tile_builder_stack_scratch_bytes),
+            tile_builder_row_workspace_bytes,
+            tile_builder_stack_scratch_bytes,
+            derived_generation_workspace_bytes: derived_stats
+                .batch_scratch_bound_bytes
                 .saturating_mul(self.config.worker_count),
+            prepared_generation_workspace_bytes: self
+                .stats
+                .worker_query_workspace_bound_bytes
+                .saturating_mul(self.config.worker_count),
+            prepared_store_capacity_bytes: self.stats.prepared_store_stats.capacity_bytes,
+            prepared_store_retained_bytes: self.stats.prepared_store_stats.retained_bytes,
+            prepared_store_high_water_bytes: self.stats.prepared_store_stats.high_water_bytes,
+            prepared_store_transient_build_reservation_bytes: self
+                .stats
+                .prepared_store_stats
+                .transient_build_reservation_bytes,
+            derived_field_cache_capacity_bytes: derived_stats.cache_capacity_bytes,
+            derived_field_cache_retained_bytes: derived_stats.retained_cache_bytes,
+            derived_batch_scratch_bound_bytes: derived_stats.batch_scratch_bound_bytes,
+            cancelled_attempt_sample_evaluations: self.stats.cancelled_attempt_sample_evaluations,
+            cancelled_attempt_preparation_bytes: self.stats.cancelled_attempt_preparation_bytes,
             frontier_priority_index_entries,
             frontier_priority_cache_bytes_upper_bound,
             build_candidate_wait_entries,
@@ -1915,6 +2292,12 @@ impl RegionalTerrain {
             worst_visible_unresolved_error_px,
             useful_detail_reached,
             useful_detail_proxy_error_threshold_px: 1.0,
+            screen_coverage,
+            screen_coverage_diagnostic_overlap_bytes_upper_bound: std::mem::size_of::<
+                ScreenCoverageDiagnostic,
+            >()
+            .saturating_add(coverage::coverage_witness_heap_capacity_bytes())
+            .saturating_mul(3),
             visible_proxy_error_certified: false,
             visible_proxy_error_model: "approximate selector proxy; uncertified",
             planetary_topology_operations: self.planetary_topology_operations,
@@ -1950,8 +2333,22 @@ impl RegionalTerrain {
     }
 
     fn key_for(&self, address: CubePatchAddress) -> Result<TileKey, RegionalError> {
-        ResidentTileBuilder::tile_key(&self.generator, self.identity, address, self.config.cells)
-            .map_err(|_| RegionalError::TileBuild)
+        let key = if self.derived_field.is_some() {
+            ResidentTileBuilder::derived_tile_key(
+                &self.generator,
+                self.identity,
+                address,
+                self.config.cells,
+            )
+        } else {
+            ResidentTileBuilder::tile_key(
+                &self.generator,
+                self.identity,
+                address,
+                self.config.cells,
+            )
+        };
+        key.map_err(|_| RegionalError::TileBuild)
     }
 
     fn drawable_proxy_hotspot(
@@ -2021,6 +2418,39 @@ impl RegionalTerrain {
         let Some(view) = self.planetary_view else {
             return 0.0;
         };
+        if let Some(sampled_area) = self.cached_sampled_drawable_areas() {
+            if let Some(area) = sampled_area.get(&address).copied() {
+                return area.max(0.0);
+            }
+            // Desired children often lie below a coarser drawable fallback.
+            // Assign them their conservative quarter-area share per level so
+            // selection does not erase real on-screen coverage before split.
+            let mut ancestor = address;
+            let mut depth = 0u32;
+            while let Some(parent) = ancestor.parent() {
+                depth += 1;
+                if let Some(area) = sampled_area.get(&parent).copied() {
+                    return (area / 4_f64.powi(depth as i32)).max(0.0);
+                }
+                ancestor = parent;
+            }
+            // The reference sphere omits displaced-only silhouette pixels. Keep
+            // conservative geometry candidates alive with negligible area so
+            // broad culling bounds cannot monopolize the useful-floor tier.
+            return if self.patch_visible(address) {
+                1.0e-6
+            } else {
+                0.0
+            };
+        }
+        if let Some(weight) = self
+            .planetary_footprint_weights
+            .borrow()
+            .get(&address)
+            .copied()
+        {
+            return weight;
+        }
         let corner = |i, j| address.sample_direction(i, j, 1).ok().map(|d| d.unit());
         let Some([a, b, c, d]) =
             (|| Some([corner(0, 0)?, corner(1, 0)?, corner(1, 1)?, corner(0, 1)?]))()
@@ -2042,11 +2472,102 @@ impl RegionalTerrain {
             * center.dot(to_camera).max(0.0)
             * view.projection.focal_pixels().powi(2)
             / distance.powi(3);
-        if projected.is_finite() {
+        let weight = if projected.is_finite() {
             projected
         } else {
             0.0
+        };
+        let mut weights = self.planetary_footprint_weights.borrow_mut();
+        let limit = self.config.max_desired_patches.saturating_mul(2).max(8192);
+        if weights.len() >= limit
+            && !weights.contains_key(&address)
+            && let Some(evicted) = weights
+                .keys()
+                .find(|candidate| !self.desired.contains_key(candidate))
+                .copied()
+        {
+            weights.remove(&evicted);
         }
+        if weights.len() < limit || weights.contains_key(&address) {
+            weights.insert(address, weight);
+        }
+        weight
+    }
+
+    fn screen_coverage_key(&self) -> Option<ScreenCoverageKey> {
+        let view = self.planetary_view?;
+        let mut view_projection_bits = [0u64; 20];
+        let body_position_bits = self.view.body_position_m.to_array().map(f64::to_bits);
+        let transform_bits = view.body_to_view.to_cols_array().map(f64::to_bits);
+        view_projection_bits[..3].copy_from_slice(&body_position_bits);
+        view_projection_bits[3..12].copy_from_slice(&transform_bits);
+        let [width, height] = view.projection.viewport();
+        let [origin_x, origin_y] = view.projection.origin();
+        view_projection_bits[12..].copy_from_slice(&[
+            u64::from(width),
+            u64::from(height),
+            u64::from(origin_x),
+            u64::from(origin_y),
+            view.projection.near_m().to_bits(),
+            view.projection.vertical_fov_rad().to_bits(),
+            self.generator.radius_m().to_bits(),
+            self.config.split_threshold_px.to_bits(),
+        ]);
+        Some(ScreenCoverageKey {
+            view_projection_bits,
+            drawable_cover_revision: self.drawable_cover_revision,
+            score_revision: self.coverage_score_revision,
+            max_level: self.config.max_level,
+        })
+    }
+
+    fn cached_sampled_drawable_areas(&self) -> Option<Arc<HashMap<CubePatchAddress, f64>>> {
+        let key = self.screen_coverage_key()?;
+        self.screen_coverage_cache
+            .borrow()
+            .as_ref()
+            .filter(|entry| entry.key == key)
+            .map(|entry| Arc::clone(&entry.diagnostic.sampled_drawable_area_pixels))
+    }
+
+    fn has_current_screen_coverage_cache(&self) -> bool {
+        let Some(key) = self.screen_coverage_key() else {
+            return false;
+        };
+        self.screen_coverage_cache
+            .borrow()
+            .as_ref()
+            .is_some_and(|entry| entry.key == key)
+    }
+
+    fn screen_coverage_diagnostic(&self) -> Option<ScreenCoverageDiagnostic> {
+        let view = self.planetary_view?;
+        let key = self.screen_coverage_key()?;
+        if let Some(entry) = self.screen_coverage_cache.borrow().as_ref()
+            && entry.key == key
+        {
+            return Some(entry.diagnostic.clone());
+        }
+        let mut scores = HashMap::with_capacity(self.drawable.len());
+        let mut score_cache = HashMap::new();
+        for &address in &self.drawable {
+            let error = self.selection_score(address, &mut score_cache).0;
+            scores.insert(address, error.is_finite().then_some(error));
+        }
+        let diagnostic = coverage::screen_coverage_diagnostic(
+            self.view.body_position_m,
+            view.body_to_view,
+            view.projection,
+            self.generator.radius_m(),
+            self.config.max_level,
+            &scores,
+            self.config.split_threshold_px,
+        );
+        *self.screen_coverage_cache.borrow_mut() = Some(ScreenCoverageCacheEntry {
+            key,
+            diagnostic: diagnostic.clone(),
+        });
+        Some(diagnostic)
     }
 
     fn center_screen_drawable_error(
@@ -2116,6 +2637,8 @@ impl RegionalTerrain {
             self.merge_scan_cursor = None;
             self.cull_scan_cursor = None;
             self.planetary_scores.borrow_mut().clear();
+            self.planetary_footprint_weights.borrow_mut().clear();
+            self.coverage_score_revision = self.coverage_score_revision.wrapping_add(1);
         }
         if self.selector_can_reuse_fixed_point
             && self.last_selection_view == Some(self.view)
@@ -2296,6 +2819,7 @@ impl RegionalTerrain {
             });
         }
         let mut candidates = Vec::new();
+        let now = Instant::now();
         // Score a bounded slice before the full settling bookkeeping below.
         // A whole-cover "nothing to refine" scan here can consume the deadline
         // on every tick and permanently starve the last few required splits.
@@ -2318,13 +2842,14 @@ impl RegionalTerrain {
                     continue;
                 }
                 if let Ok(children) = address.children() {
-                    candidates.push((priority, error, address, children, approach, speed));
+                    let rank = self.selection_completion_rank(address, error, priority, now);
+                    candidates.push((rank, priority, error, address, children, approach, speed));
                 }
             }
             self.planetary_score_cursor = (start + scanned) % cover.len();
             self.planetary_split_candidates_scanned = scanned;
         }
-        candidates.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.2.cmp(&b.2)));
+        candidates.sort_by(|a, b| a.0.compare(b.0).then_with(|| a.3.cmp(&b.3)));
 
         let had_split_candidate = !candidates.is_empty();
         let mut accepted = None;
@@ -2343,7 +2868,7 @@ impl RegionalTerrain {
                         self.selector_budget_exhausted = true;
                         break;
                     }
-                    let (priority, error, parent, _children, approach, speed) =
+                    let (_rank, priority, error, parent, _children, approach, speed) =
                         candidates[(start + offset) % candidates.len()];
                     if let Some(balanced) = balance_planetary_split(
                         &cover,
@@ -2482,6 +3007,7 @@ impl RegionalTerrain {
         self.selector_fixed_point_reused = false;
         self.last_selection_view = Some(self.view);
         self.last_selection_planetary_view = self.planetary_view;
+        self.prune_completion_ages();
     }
 
     fn best_planetary_merge(
@@ -2684,6 +3210,77 @@ impl RegionalTerrain {
         score
     }
 
+    fn selection_completion_rank(
+        &self,
+        address: CubePatchAddress,
+        error_px: f64,
+        legacy_priority: f64,
+        now: Instant,
+    ) -> CompletionRank {
+        if self.planetary_view.is_none() {
+            return CompletionRank {
+                priority: legacy_priority,
+                under_floor: false,
+                age: Duration::ZERO,
+            };
+        }
+        let area = self.projected_footprint_weight(address);
+        let age = if self.drawable.contains(&address) && area > 0.0 {
+            self.begin_completion_eligibility(address, now)
+        } else {
+            Duration::ZERO
+        };
+        completion_group_rank(error_px, self.config.split_threshold_px, area, age)
+    }
+
+    fn completion_rank_map(&self) -> HashMap<CubePatchAddress, CompletionRank> {
+        let mut ranks = HashMap::new();
+        if self.planetary_view.is_none() {
+            return ranks;
+        }
+        for group in self.split_frontier_groups() {
+            let rank = CompletionRank {
+                priority: group.completion_priority,
+                under_floor: group.useful_floor_deficit_px > 0.0,
+                age: group.age,
+            };
+            for child in group.children {
+                ranks.insert(child, rank);
+            }
+        }
+        ranks
+    }
+
+    fn completion_rank_for_address(
+        &self,
+        address: CubePatchAddress,
+        group_ranks: &HashMap<CubePatchAddress, CompletionRank>,
+    ) -> CompletionRank {
+        if let Some(rank) = group_ranks.get(&address).copied() {
+            return rank;
+        }
+        let (error, legacy_priority, _, _) = self
+            .desired
+            .get(&address)
+            .map(|patch| (patch.projected_error_px, patch.priority, 1.0, 1.0))
+            .unwrap_or_else(|| self.score(address));
+        self.selection_completion_rank(address, error, legacy_priority, Instant::now())
+    }
+
+    fn prune_completion_ages(&self) {
+        if self.planetary_view.is_none() {
+            self.completion_group_first_eligible.borrow_mut().clear();
+            return;
+        }
+        let mut ages = self.completion_group_first_eligible.borrow_mut();
+        ages.retain(|parent, _| {
+            self.drawable.contains(parent)
+                && parent.level() < self.config.max_level
+                && !self.too_transient(*parent)
+                && self.score(*parent).0 > self.config.split_threshold_px
+        });
+    }
+
     fn score(&self, address: CubePatchAddress) -> (f64, f64, f64, f64) {
         if !self.patch_visible(address) {
             return (0.0, 0.0, 1.0, 1.0);
@@ -2796,6 +3393,7 @@ impl RegionalTerrain {
     fn admit_builds(&mut self) {
         let drawable: HashSet<_> = self.drawable.iter().copied().collect();
         let merge_frontier = self.merge_parent_dependencies();
+        let group_ranks = self.completion_rank_map();
         let addresses: Vec<_> = self.scheduled_dependencies().into_iter().collect();
         let mut candidates = Vec::new();
         for address in addresses {
@@ -2837,25 +3435,27 @@ impl RegionalTerrain {
             {
                 continue;
             }
-            let score = self
-                .desired
-                .get(&address)
-                .map(|patch| patch.priority)
-                .unwrap_or_else(|| self.score(address).1);
-            candidates.push((score, address, key));
+            let rank = self.completion_rank_for_address(address, &group_ranks);
+            candidates.push((rank, address, key));
         }
-        candidates.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        candidates.sort_by(|a, b| a.0.compare(b.0).then(a.1.cmp(&b.1)));
         let now = Instant::now();
-        self.refresh_build_candidate_waits(&candidates, now);
-        if let Some(index) = oldest_starved_candidate_index(
-            candidates.iter().map(|(_, _, key)| key),
-            &self.build_candidate_waits,
-            now,
-        ) && index > 0
-        {
-            // Promote just the oldest starved key; the rotation keeps every
-            // other candidate in its original score/address order.
-            candidates[..=index].rotate_right(1);
+        if self.planetary_view.is_none() {
+            let wait_candidates: Vec<_> = candidates
+                .iter()
+                .map(|(rank, address, key)| (rank.priority, *address, key.clone()))
+                .collect();
+            self.refresh_build_candidate_waits(&wait_candidates, now);
+            if let Some(index) = oldest_starved_candidate_index(
+                candidates.iter().map(|(_, _, key)| key),
+                &self.build_candidate_waits,
+                now,
+            ) && index > 0
+            {
+                candidates[..=index].rotate_right(1);
+            }
+        } else {
+            self.build_candidate_waits.clear();
         }
         self.trace
             .sync_generation_candidates(candidates.iter().map(|(_, _, key)| key));
@@ -2870,7 +3470,7 @@ impl RegionalTerrain {
         self.pressure.queue = self.in_flight.len() >= self.config.queue_cap;
         let mut admitted = 0;
         self.last_priorities.clear();
-        for (priority, address, key) in candidates {
+        for (rank, address, key) in candidates {
             if admitted >= self.config.admission_cap_per_tick {
                 break;
             }
@@ -2899,7 +3499,7 @@ impl RegionalTerrain {
                         projected_error_px: error,
                         approach_multiplier: approach,
                         high_speed_multiplier: speed,
-                        total: priority,
+                        total: rank.priority,
                     });
                 }
                 Err(TrySendError::Full(_)) => {
@@ -2951,6 +3551,19 @@ impl RegionalTerrain {
                 .stats
                 .worker_elapsed_micros
                 .saturating_add(result.elapsed.as_micros().min(u128::from(u64::MAX)) as u64);
+            self.stats.cancelled_attempt_sample_evaluations = self
+                .stats
+                .cancelled_attempt_sample_evaluations
+                .saturating_add(result.cancelled_sample_evaluations);
+            self.stats.cancelled_attempt_preparation_bytes = self
+                .stats
+                .cancelled_attempt_preparation_bytes
+                .saturating_add(result.cancelled_preparation_bytes);
+            self.stats.worker_query_workspace_bound_bytes = self
+                .stats
+                .worker_query_workspace_bound_bytes
+                .max(result.query_workspace_bound_bytes);
+            self.stats.prepared_store_stats = result.prepared_store_stats;
             self.stats
                 .recent_build_elapsed_micros
                 .push_back(result.elapsed.as_micros().min(u128::from(u64::MAX)) as u64);
@@ -3027,10 +3640,11 @@ impl RegionalTerrain {
         }
     }
 
-    fn upload_candidates(&self) -> Vec<(f64, CubePatchAddress, Arc<TileData>)> {
+    fn upload_candidates(&self) -> Vec<(CompletionRank, CubePatchAddress, Arc<TileData>)> {
         let _span = crate::engine_profile::span("Upload candidate indexing");
         let drawable: HashSet<_> = self.drawable.iter().copied().collect();
         let merge_frontier = self.merge_parent_dependencies();
+        let group_ranks = self.completion_rank_map();
         let desired_ancestor_index = self
             .reserved_split_parent
             .is_none()
@@ -3100,14 +3714,11 @@ impl RegionalTerrain {
             {
                 continue;
             }
-            let Some(priority) = self.desired.get(&address).map(|patch| patch.priority) else {
-                candidates.push((self.score(address).1, address, Arc::clone(tile)));
-                continue;
-            };
-            candidates.push((priority, address, Arc::clone(tile)));
+            let rank = self.completion_rank_for_address(address, &group_ranks);
+            candidates.push((rank, address, Arc::clone(tile)));
         }
         drop(desired_ancestor_index);
-        candidates.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        candidates.sort_by(|a, b| a.0.compare(b.0).then(a.1.cmp(&b.1)));
         candidates
     }
 
@@ -3124,7 +3735,6 @@ impl RegionalTerrain {
         self.publications.clear();
         self.publications_dirty = false;
         const MAX_CANDIDATES: usize = 32;
-        const STARVATION_AGE_TICKS: u64 = 32;
         let publication_limit = if self.planetary_view.is_some() {
             MAX_CANDIDATES
         } else {
@@ -3172,7 +3782,7 @@ impl RegionalTerrain {
             if has_desired_descendant
                 && self.resident.contains(&parent)
                 && children.iter().all(|child| self.resident.contains(child))
-                && local_replacement_is_balanced(parent, true, &self.drawable)
+                && local_replacement_is_balanced(parent, true, &self.drawable, &self.config.roots)
             {
                 current_candidate_parents.insert(parent);
                 candidates.push(RegionalPublication::Split {
@@ -3203,7 +3813,7 @@ impl RegionalTerrain {
                 && children
                     .iter()
                     .all(|child| self.drawable.binary_search(child).is_ok())
-                && local_replacement_is_balanced(parent, false, &self.drawable)
+                && local_replacement_is_balanced(parent, false, &self.drawable, &self.config.roots)
             {
                 current_candidate_parents.insert(parent);
                 candidates.push(RegionalPublication::Merge {
@@ -3222,33 +3832,48 @@ impl RegionalTerrain {
         }
         self.publication_candidate_ages
             .retain(|parent, _| current_candidate_parents.contains(parent));
-        candidates.sort_by(|a, b| {
-            let parent_a = publication_parent(a);
-            let parent_b = publication_parent(b);
-            let age_a = self
-                .publication_candidate_ages
-                .get(&parent_a)
-                .copied()
-                .unwrap_or(0);
-            let age_b = self
-                .publication_candidate_ages
-                .get(&parent_b)
-                .copied()
-                .unwrap_or(0);
-            let starved_a = age_a >= STARVATION_AGE_TICKS;
-            let starved_b = age_b >= STARVATION_AGE_TICKS;
-            starved_b
-                .cmp(&starved_a)
-                .then_with(|| {
-                    if starved_a && starved_b {
-                        age_b.cmp(&age_a)
-                    } else {
-                        self.cached_publication_priority(b)
-                            .total_cmp(&self.cached_publication_priority(a))
-                    }
+        if self.planetary_view.is_some() {
+            // Freeze every rank before sorting. Recomputing group ages inside
+            // the comparator lets a sort cross the two-second promotion
+            // boundary halfway through and violates its total-order contract.
+            let now = Instant::now();
+            let ranked: Vec<_> = candidates
+                .into_iter()
+                .map(|candidate| {
+                    let rank = self.publication_completion_rank(&candidate, now);
+                    (candidate, rank)
                 })
-                .then_with(|| parent_a.cmp(&parent_b))
-        });
+                .collect();
+            candidates = sort_planetary_publication_candidates(ranked);
+        } else {
+            candidates.sort_by(|a, b| {
+                let parent_a = publication_parent(a);
+                let parent_b = publication_parent(b);
+                let age_a = self
+                    .publication_candidate_ages
+                    .get(&parent_a)
+                    .copied()
+                    .unwrap_or(0);
+                let age_b = self
+                    .publication_candidate_ages
+                    .get(&parent_b)
+                    .copied()
+                    .unwrap_or(0);
+                let starved_a = age_a >= PUBLICATION_STARVATION_AGE_TICKS;
+                let starved_b = age_b >= PUBLICATION_STARVATION_AGE_TICKS;
+                starved_b
+                    .cmp(&starved_a)
+                    .then_with(|| {
+                        if starved_a && starved_b {
+                            age_b.cmp(&age_a)
+                        } else {
+                            self.cached_publication_priority(b)
+                                .total_cmp(&self.cached_publication_priority(a))
+                        }
+                    })
+                    .then_with(|| parent_a.cmp(&parent_b))
+            });
+        }
         candidates.truncate(publication_limit);
         self.publications = candidates;
     }
@@ -3470,21 +4095,20 @@ impl RegionalTerrain {
             return;
         }
 
+        if let Some(parent) = self.completion_gpu_reservation
+            && groups.iter().any(|group| group.parent == parent)
+        {
+            self.reserved_split_parent = Some(parent);
+            return;
+        }
+
         if let Some(parent) = self.reserved_split_parent
             && groups.iter().any(|group| group.parent == parent)
         {
             return;
         }
 
-        let mut candidates = groups;
-        candidates.sort_by(|a, b| {
-            b.parent_resident
-                .cmp(&a.parent_resident)
-                .then_with(|| b.ready_children.cmp(&a.ready_children))
-                .then_with(|| b.aggregate_priority.total_cmp(&a.aggregate_priority))
-                .then_with(|| a.parent.cmp(&b.parent))
-        });
-        self.reserved_split_parent = candidates
+        self.reserved_split_parent = groups
             .into_iter()
             .find(|group| {
                 let needed = anchors.len()
@@ -3502,6 +4126,8 @@ impl RegionalTerrain {
     fn split_frontier_groups(&self) -> Vec<RegionalSplitFrontier> {
         let mut groups = Vec::new();
         let desired_priority_index = self.desired_priority_by_ancestor();
+        let now = Instant::now();
+        let mut next_completion_promotion = None;
         for &parent in &self.drawable {
             let Ok(children) = parent.children() else {
                 continue;
@@ -3513,7 +4139,7 @@ impl RegionalTerrain {
             if child_priorities.iter().any(Option::is_none) {
                 continue;
             }
-            if !local_replacement_is_balanced(parent, true, &self.drawable) {
+            if !local_replacement_is_balanced(parent, true, &self.drawable, &self.config.roots) {
                 continue;
             }
             let aggregate_priority = child_priorities.iter().flatten().copied().sum::<f64>();
@@ -3528,20 +4154,106 @@ impl RegionalTerrain {
                             .is_ok_and(|key| self.in_flight.contains_key(&key))
                 })
                 .count();
+            let resident_children = children
+                .iter()
+                .filter(|child| self.resident.contains(child))
+                .count();
+            let (error, _, _, _) = self.score(parent);
+            let useful_floor_deficit_px = (error - USEFUL_DETAIL_FLOOR_ERROR_PX).max(0.0);
+            let raw_footprint = self.projected_footprint_weight(parent);
+            let age = if self.planetary_view.is_some()
+                && error > self.config.split_threshold_px
+                && raw_footprint > 0.0
+            {
+                self.completion_age(parent, now)
+            } else {
+                Duration::ZERO
+            };
+            if self.planetary_view.is_some()
+                && age < BUILD_CANDIDATE_STARVATION_AFTER
+                && error > self.config.split_threshold_px
+                && raw_footprint > 0.0
+                && let Some(promotion) = now.checked_add(BUILD_CANDIDATE_STARVATION_AFTER - age)
+            {
+                next_completion_promotion = Some(
+                    next_completion_promotion
+                        .map_or(promotion, |current: Instant| current.min(promotion)),
+                );
+            }
+            let rank = if self.planetary_view.is_some() {
+                completion_group_rank(error, self.config.split_threshold_px, raw_footprint, age)
+            } else {
+                CompletionRank {
+                    priority: aggregate_priority,
+                    under_floor: useful_floor_deficit_px > 0.0,
+                    age,
+                }
+            };
+            let missing_dependencies = children.len().saturating_sub(ready_children);
+            let blocker = if resident_children == children.len() {
+                RegionalCompletionBlocker::Publication
+            } else if ready_children < children.len() {
+                if self
+                    .in_flight
+                    .keys()
+                    .any(|key| children.contains(&key.address))
+                {
+                    RegionalCompletionBlocker::CpuPreparation
+                } else if children
+                    .iter()
+                    .any(|child| self.cached_tiles_by_address.contains_key(child))
+                {
+                    RegionalCompletionBlocker::Upload
+                } else {
+                    RegionalCompletionBlocker::Admission
+                }
+            } else {
+                RegionalCompletionBlocker::Residency
+            };
             groups.push(RegionalSplitFrontier {
                 parent,
                 children,
                 parent_resident: self.resident.contains(&parent),
                 ready_children,
                 aggregate_priority,
+                completion_priority: rank.priority,
+                age,
+                useful_floor_deficit_px,
+                resident_children,
+                missing_dependencies,
+                blocker,
             });
         }
-        groups.sort_by(|a, b| {
-            b.aggregate_priority
-                .total_cmp(&a.aggregate_priority)
-                .then_with(|| a.parent.cmp(&b.parent))
-        });
+        drop(desired_priority_index);
+        sort_split_frontier_groups(&mut groups, self.planetary_view.is_some());
+        let signature = split_frontier_completion_signature(&groups, self.planetary_view.is_some());
+        let mut index = self.desired_priority_index.borrow_mut();
+        if index.completion_signature != signature {
+            index.completion_signature = signature;
+            index.revision = index.revision.wrapping_add(1);
+        }
+        index.completion_summary_inputs = Some((
+            index.revision,
+            self.drawable_cover_revision,
+            self.coverage_score_revision,
+            self.has_current_screen_coverage_cache(),
+        ));
+        index.next_completion_promotion = next_completion_promotion;
+        #[cfg(test)]
+        {
+            index.completion_frontier_scans = index.completion_frontier_scans.saturating_add(1);
+        }
         groups
+    }
+
+    fn completion_age(&self, parent: CubePatchAddress, now: Instant) -> Duration {
+        let mut ages = self.completion_group_first_eligible.borrow_mut();
+        let first = ages.entry(parent).or_insert(now);
+        now.saturating_duration_since(*first)
+    }
+
+    fn begin_completion_eligibility(&self, parent: CubePatchAddress, now: Instant) -> Duration {
+        self.completion_age(parent, now)
     }
 
     fn desired_priority_by_ancestor(&self) -> std::cell::Ref<'_, HashMap<CubePatchAddress, f64>> {
@@ -3584,9 +4296,24 @@ impl RegionalTerrain {
 
     /// Monotonic revision for consumers caching summaries of desired priorities.
     pub(crate) fn desired_priority_revision(&self) -> u64 {
-        // Sampling consumers get a current revision even if no frontier query
-        // ran after the selector last changed desired priorities.
         drop(self.desired_priority_by_ancestor());
+        let now = Instant::now();
+        let needs_refresh = {
+            let index = self.desired_priority_index.borrow();
+            index.completion_summary_inputs
+                != Some((
+                    index.revision,
+                    self.drawable_cover_revision,
+                    self.coverage_score_revision,
+                    self.has_current_screen_coverage_cache(),
+                ))
+                || index
+                    .next_completion_promotion
+                    .is_some_and(|promotion| now >= promotion)
+        };
+        if needs_refresh {
+            let _ = self.split_frontier_groups();
+        }
         self.desired_priority_index.borrow().revision
     }
 
@@ -3683,6 +4410,47 @@ impl Drop for RegionalTerrain {
             token.cancelled.store(true, AtomicOrdering::Release);
         }
     }
+}
+
+fn sort_split_frontier_groups(groups: &mut [RegionalSplitFrontier], planetary: bool) {
+    if planetary {
+        groups.sort_by(|a, b| {
+            CompletionRank {
+                priority: a.completion_priority,
+                under_floor: a.useful_floor_deficit_px > 0.0,
+                age: a.age,
+            }
+            .compare(CompletionRank {
+                priority: b.completion_priority,
+                under_floor: b.useful_floor_deficit_px > 0.0,
+                age: b.age,
+            })
+            .then_with(|| a.parent.cmp(&b.parent))
+        });
+    } else {
+        groups.sort_by(|a, b| {
+            b.aggregate_priority
+                .total_cmp(&a.aggregate_priority)
+                .then_with(|| a.parent.cmp(&b.parent))
+        });
+    }
+}
+
+fn split_frontier_completion_signature(
+    groups: &[RegionalSplitFrontier],
+    planetary: bool,
+) -> Vec<(CubePatchAddress, u64, bool, bool)> {
+    groups
+        .iter()
+        .map(|group| {
+            (
+                group.parent,
+                group.completion_priority.to_bits(),
+                planetary && group.useful_floor_deficit_px > 0.0,
+                group.age >= BUILD_CANDIDATE_STARVATION_AFTER,
+            )
+        })
+        .collect()
 }
 
 fn validate_config(config: &RegionalConfig) -> Result<(), RegionalError> {
@@ -4170,6 +4938,16 @@ fn publication_parent(publication: &RegionalPublication) -> CubePatchAddress {
     }
 }
 
+fn sort_planetary_publication_candidates(
+    mut ranked: Vec<(RegionalPublication, CompletionRank)>,
+) -> Vec<RegionalPublication> {
+    ranked.sort_by(|a, b| {
+        a.1.compare(b.1)
+            .then_with(|| publication_parent(&a.0).cmp(&publication_parent(&b.0)))
+    });
+    ranked.into_iter().map(|(candidate, _)| candidate).collect()
+}
+
 fn useful_detail_reached(
     has_planetary_view: bool,
     visible_drawable_count: usize,
@@ -4208,6 +4986,7 @@ fn local_replacement_is_balanced(
     parent: CubePatchAddress,
     split: bool,
     cover: &[CubePatchAddress],
+    roots: &[CubePatchAddress],
 ) -> bool {
     if split {
         if cover.binary_search(&parent).is_err() {
@@ -4226,6 +5005,16 @@ fn local_replacement_is_balanced(
     }
     PatchEdge::ALL.into_iter().all(|edge| {
         let relation = parent.neighbor(edge);
+        // A local regional cover may end at its configured root boundary. Such
+        // an edge has no terrain neighbor to constrain the replacement. The
+        // relation still participates when it overlaps any configured root,
+        // including a coarser/finer root that contains it or is contained by it.
+        if !roots
+            .iter()
+            .any(|root| root.contains(relation.address) || relation.address.contains(*root))
+        {
+            return true;
+        }
         let mut ancestor = Some(relation.address);
         while let Some(address) = ancestor {
             if cover.binary_search(&address).is_ok() {
@@ -4315,6 +5104,11 @@ fn desired_priority_cache_bytes_upper_bound(config: &RegionalConfig) -> usize {
             index_entries
                 .saturating_mul(std::mem::size_of::<(CubePatchAddress, f64)>())
                 .saturating_mul(3),
+        )
+        .saturating_add(
+            desired_capacity
+                .saturating_mul(std::mem::size_of::<(CubePatchAddress, u64, bool, bool)>())
+                .saturating_mul(2),
         )
 }
 
@@ -4449,6 +5243,374 @@ mod frontier_tests {
             oldest_starved_candidate_index(&keys[3..], &waits, now),
             None
         );
+    }
+
+    #[test]
+    fn completion_rank_finishes_useful_floor_before_optional_detail_then_promotes_age() {
+        let useful_edge = CompletionRank {
+            priority: 2.0,
+            under_floor: true,
+            age: Duration::from_millis(1_999),
+        };
+        let optional_center = CompletionRank {
+            priority: 1_000_000.0,
+            under_floor: false,
+            age: Duration::ZERO,
+        };
+        assert!(useful_edge.compare(optional_center).is_lt());
+
+        let promoted_optional = CompletionRank {
+            age: Duration::from_secs(2),
+            ..optional_center
+        };
+        assert!(promoted_optional.compare(useful_edge).is_lt());
+    }
+
+    #[test]
+    fn completion_rank_is_transitive_around_the_age_promotion_boundary() {
+        let ranks = [
+            CompletionRank {
+                priority: 1_000.0,
+                under_floor: false,
+                age: Duration::from_millis(1_999),
+            },
+            CompletionRank {
+                priority: 2.0,
+                under_floor: true,
+                age: Duration::from_millis(2_000),
+            },
+            CompletionRank {
+                priority: 0.5,
+                under_floor: false,
+                age: Duration::from_millis(2_001),
+            },
+            CompletionRank {
+                priority: 10.0,
+                under_floor: false,
+                age: Duration::ZERO,
+            },
+        ];
+        for a in ranks {
+            for b in ranks {
+                assert_eq!(a.compare(b), b.compare(a).reverse());
+                for c in ranks {
+                    if a.compare(b).is_le() && b.compare(c).is_le() {
+                        assert!(a.compare(c).is_le());
+                    }
+                }
+            }
+        }
+        let mut sorted = ranks.to_vec();
+        sorted.sort_by(|a, b| a.compare(*b));
+        assert!(
+            sorted
+                .windows(2)
+                .all(|pair| pair[0].compare(pair[1]).is_le())
+        );
+    }
+
+    #[test]
+    fn completion_signature_tracks_useful_floor_tier_at_equal_priority() {
+        let parents = [
+            CubePatchAddress::root(CubeFace::PositiveX),
+            CubePatchAddress::root(CubeFace::NegativeX),
+        ];
+        let make_group = |parent, floor_deficit| RegionalSplitFrontier {
+            parent,
+            children: parent.children().unwrap(),
+            parent_resident: true,
+            ready_children: 0,
+            aggregate_priority: 12.0,
+            completion_priority: 12.0,
+            age: Duration::ZERO,
+            useful_floor_deficit_px: floor_deficit,
+            resident_children: 0,
+            missing_dependencies: 4,
+            blocker: RegionalCompletionBlocker::Admission,
+        };
+        let groups = vec![make_group(parents[0], 2.0), make_group(parents[1], 0.0)];
+        let with_floor_tier = split_frontier_completion_signature(&groups, true);
+        let without_floor_tier = split_frontier_completion_signature(&groups, false);
+        assert_ne!(with_floor_tier, without_floor_tier);
+        assert!(with_floor_tier[0].2);
+        assert!(!with_floor_tier[1].2);
+        assert!(with_floor_tier.iter().all(|entry| !entry.3));
+    }
+
+    #[test]
+    fn finite_split_frontiers_keep_aggregate_priority_ahead_of_floor_deficit() {
+        let floor_parent = CubePatchAddress::root(CubeFace::PositiveX);
+        let optional_parent = CubePatchAddress::root(CubeFace::NegativeX);
+        let make_group = |parent, aggregate_priority, floor_deficit| RegionalSplitFrontier {
+            parent,
+            children: parent.children().unwrap(),
+            parent_resident: true,
+            ready_children: 0,
+            aggregate_priority,
+            completion_priority: aggregate_priority,
+            age: Duration::ZERO,
+            useful_floor_deficit_px: floor_deficit,
+            resident_children: 0,
+            missing_dependencies: 4,
+            blocker: RegionalCompletionBlocker::Admission,
+        };
+        let mut groups = vec![
+            make_group(floor_parent, 1.0, 8.0),
+            make_group(optional_parent, 100.0, 0.0),
+        ];
+
+        sort_split_frontier_groups(&mut groups, false);
+        assert_eq!(groups[0].parent, optional_parent);
+        assert_eq!(groups[1].parent, floor_parent);
+
+        sort_split_frontier_groups(&mut groups, true);
+        assert_eq!(groups[0].parent, floor_parent);
+        assert_eq!(groups[1].parent, optional_parent);
+    }
+
+    #[test]
+    fn mixed_split_merge_publications_use_one_frozen_ordering_key() {
+        let useful_parent = CubePatchAddress::root(CubeFace::PositiveX);
+        let optional_parent = CubePatchAddress::root(CubeFace::NegativeX);
+        let merge_parent = CubePatchAddress::root(CubeFace::PositiveY);
+        let split = |parent| RegionalPublication::Split {
+            parent,
+            children: parent.children().unwrap(),
+            cover: Vec::new(),
+        };
+        let merge = RegionalPublication::Merge {
+            parent: merge_parent,
+            children: merge_parent.children().unwrap(),
+            cover: Vec::new(),
+        };
+        let rank = |priority, under_floor| CompletionRank {
+            priority,
+            under_floor,
+            age: Duration::ZERO,
+        };
+        // The old comparator switched to raw priority for mixed split/merge
+        // pairs, which can reverse an already-ranked split pair.
+        let sorted = sort_planetary_publication_candidates(vec![
+            (merge, rank(500.0, false)),
+            (split(optional_parent), rank(1_000.0, false)),
+            (split(useful_parent), rank(1.0, true)),
+        ]);
+        let parents: Vec<_> = sorted.iter().map(publication_parent).collect();
+        assert_eq!(parents, vec![useful_parent, optional_parent, merge_parent]);
+    }
+
+    #[test]
+    fn completion_group_age_survives_cpu_upload_residency_and_publication_stages() {
+        use crate::resident_terrain::ResidentTileBuilder;
+
+        let parent = CubePatchAddress::root(CubeFace::PositiveZ);
+        let children = parent.children().unwrap();
+        let mut terrain = test_terrain(vec![parent]);
+        terrain.drawable = vec![parent];
+        terrain.resident.insert(parent);
+        let projection =
+            CelestialProjection::try_new(800, 600, 70.0_f64.to_radians(), 0.1).unwrap();
+        terrain
+            .set_planetary_view(DMat3::IDENTITY, projection)
+            .unwrap();
+        terrain.view = RegionalView {
+            body_position_m: DVec3::Z * (terrain.generator.radius_m() + 1_000.0),
+            body_velocity_mps: DVec3::ZERO,
+            projection_scale_px: projection.focal_pixels(),
+        };
+        for child in children {
+            let (error, priority, _, _) = terrain.score(child);
+            terrain.desired.insert(
+                child,
+                RegionalPatchSnapshot {
+                    address: format!("{child:?}"),
+                    level: child.level(),
+                    projected_error_px: error,
+                    priority,
+                    state: "desired",
+                },
+            );
+        }
+        terrain.split_frontiers();
+        let first_eligible = Instant::now() - Duration::from_secs(3);
+        terrain
+            .completion_group_first_eligible
+            .borrow_mut()
+            .insert(parent, first_eligible);
+
+        let frontier = |terrain: &RegionalTerrain| {
+            terrain
+                .split_frontiers()
+                .into_iter()
+                .find(|group| group.parent == parent)
+                .unwrap()
+        };
+        let initial = frontier(&terrain);
+        assert!(initial.age >= Duration::from_secs(3));
+        assert_eq!(initial.missing_dependencies, 4);
+        assert_eq!(initial.blocker, RegionalCompletionBlocker::Admission);
+        let first_eligible = terrain
+            .completion_group_first_eligible
+            .borrow()
+            .get(&parent)
+            .copied()
+            .unwrap();
+        let candidate = RegionalPublication::Split {
+            parent,
+            children,
+            cover: Vec::new(),
+        };
+        let prepared_rank = terrain.publication_completion_rank(&candidate, Instant::now());
+        assert_eq!(
+            prepared_rank.priority.to_bits(),
+            initial.completion_priority.to_bits()
+        );
+        assert_eq!(
+            prepared_rank.under_floor,
+            initial.useful_floor_deficit_px > 0.0
+        );
+        assert!(prepared_rank.age >= initial.age);
+        assert_eq!(
+            terrain
+                .completion_group_first_eligible
+                .borrow()
+                .get(&parent),
+            Some(&first_eligible),
+            "ranking a prepared product must not create or reset group age"
+        );
+
+        let key = terrain.key_for(children[0]).unwrap();
+        terrain.in_flight.insert(
+            key,
+            Arc::new(BuildToken {
+                cancelled: AtomicBool::new(false),
+                started: AtomicBool::new(true),
+            }),
+        );
+        let preparing = frontier(&terrain);
+        assert_eq!(preparing.blocker, RegionalCompletionBlocker::CpuPreparation);
+        assert!(preparing.age >= initial.age);
+        terrain.in_flight.clear();
+
+        let generator = terrain.generator.clone();
+        let tile_identity = terrain.identity;
+        for child in children {
+            let tile =
+                ResidentTileBuilder::build(&generator, tile_identity, child, terrain.config.cells)
+                    .unwrap()
+                    .0;
+            assert_eq!(
+                terrain.cache_insert(Arc::new(tile), false, None),
+                CacheInsertResult::Inserted
+            );
+        }
+        let cached = frontier(&terrain);
+        assert_eq!(cached.blocker, RegionalCompletionBlocker::Residency);
+        assert!(cached.age >= initial.age);
+        terrain.resident.extend(children);
+        let resident = frontier(&terrain);
+        assert_eq!(resident.blocker, RegionalCompletionBlocker::Publication);
+        assert_eq!(resident.missing_dependencies, 0);
+        assert!(resident.age >= initial.age);
+
+        let now = Instant::now();
+        terrain
+            .completion_group_first_eligible
+            .borrow_mut()
+            .insert(parent, now);
+        let unpromoted = frontier(&terrain);
+        assert!(unpromoted.age < BUILD_CANDIDATE_STARVATION_AFTER);
+        let unpromoted_revision = terrain.desired_priority_revision();
+        terrain.completion_group_first_eligible.borrow_mut().insert(
+            parent,
+            now - BUILD_CANDIDATE_STARVATION_AFTER - Duration::from_millis(1),
+        );
+        terrain
+            .desired_priority_index
+            .borrow_mut()
+            .next_completion_promotion = Some(now - Duration::from_millis(1));
+        let promoted_revision = terrain.desired_priority_revision();
+        assert!(promoted_revision > unpromoted_revision);
+    }
+
+    #[test]
+    fn constrained_cpu_reservation_uses_oldest_ranked_visible_group() {
+        use glam::DQuat;
+        let parents = [
+            CubePatchAddress::root(CubeFace::PositiveZ),
+            CubePatchAddress::root(CubeFace::PositiveX),
+        ];
+        let roots: Vec<_> = CubeFace::ALL
+            .into_iter()
+            .map(CubePatchAddress::root)
+            .collect();
+        let mut terrain = test_terrain(roots.clone());
+        terrain.drawable = roots.clone();
+        terrain.resident.extend(roots);
+        terrain.config.cpu_tile_cap = 10;
+        terrain.config.cpu_byte_cap = usize::MAX;
+        let projection =
+            CelestialProjection::try_new(800, 600, 120.0_f64.to_radians(), 0.1).unwrap();
+        let camera_direction = DVec3::new(1.0, 0.0, 1.0).normalize();
+        let body_to_view = DMat3::from_quat(DQuat::from_rotation_arc(camera_direction, DVec3::Z));
+        terrain
+            .set_planetary_view(body_to_view, projection)
+            .unwrap();
+        terrain.view = RegionalView {
+            body_position_m: camera_direction * (terrain.generator.radius_m() + 1_000.0),
+            body_velocity_mps: DVec3::ZERO,
+            projection_scale_px: projection.focal_pixels(),
+        };
+        let mut sampled_areas = HashMap::new();
+        sampled_areas.insert(parents[0], 12.0);
+        sampled_areas.insert(parents[1], 8.0);
+        terrain
+            .screen_coverage_cache
+            .replace(Some(ScreenCoverageCacheEntry {
+                key: terrain.screen_coverage_key().unwrap(),
+                diagnostic: ScreenCoverageDiagnostic {
+                    method: "test sampled cover",
+                    certified: false,
+                    limitation: "unit-test fixture",
+                    sampling_valid: true,
+                    samples_per_cell_axis: 1,
+                    useful_proxy_error_threshold_px: USEFUL_DETAIL_FLOOR_ERROR_PX,
+                    target_proxy_error_threshold_px: terrain.config.split_threshold_px,
+                    all_view: ScreenCoverageCell::default(),
+                    cells: std::array::from_fn(|_| ScreenCoverageCell::default()),
+                    sampled_drawable_area_pixels: Arc::new(sampled_areas),
+                },
+            }));
+        for parent in parents {
+            for child in parent.children().unwrap() {
+                let (error, priority, _, _) = terrain.score(child);
+                terrain.desired.insert(
+                    child,
+                    RegionalPatchSnapshot {
+                        address: format!("{child:?}"),
+                        level: child.level(),
+                        projected_error_px: error,
+                        priority,
+                        state: "desired",
+                    },
+                );
+            }
+        }
+        let now = Instant::now();
+        terrain
+            .completion_group_first_eligible
+            .borrow_mut()
+            .insert(parents[0], now - Duration::from_millis(2_500));
+        terrain
+            .completion_group_first_eligible
+            .borrow_mut()
+            .insert(parents[1], now - Duration::from_millis(3_000));
+        let groups = terrain.split_frontiers();
+        assert_eq!(groups.len(), 2);
+        let chosen = groups.first().unwrap().parent;
+        assert_eq!(chosen, parents[1]);
+        terrain.update_split_reservation();
+        assert_eq!(terrain.reserved_split_parent, Some(chosen));
     }
 
     #[test]
@@ -4762,7 +5924,7 @@ mod frontier_tests {
             let actual = terrain
                 .upload_candidates()
                 .into_iter()
-                .map(|(priority, address, _)| (priority, address))
+                .map(|(rank, address, _)| (rank.priority, address))
                 .collect::<Vec<_>>();
             assert_eq!(actual.len(), expected.len(), "scenario {scenario}");
             for ((actual_priority, actual_address), (expected_priority, expected_address)) in
@@ -4991,19 +6153,32 @@ mod frontier_tests {
                             .is_ok_and(|key| terrain.in_flight.contains_key(&key))
                 })
                 .count();
+            let resident_children = children
+                .iter()
+                .filter(|child| terrain.resident.contains(child))
+                .count();
+            let aggregate_priority = child_priorities.iter().flatten().copied().sum();
             groups.push(RegionalSplitFrontier {
                 parent,
                 children,
                 parent_resident: terrain.resident.contains(&parent),
                 ready_children,
-                aggregate_priority: child_priorities.iter().flatten().copied().sum(),
+                aggregate_priority,
+                completion_priority: aggregate_priority,
+                age: Duration::ZERO,
+                useful_floor_deficit_px: 0.0,
+                resident_children,
+                missing_dependencies: children.len().saturating_sub(ready_children),
+                blocker: RegionalCompletionBlocker::Admission,
             });
         }
-        groups.sort_by(|a, b| {
-            b.aggregate_priority
-                .total_cmp(&a.aggregate_priority)
-                .then_with(|| a.parent.cmp(&b.parent))
-        });
+        if terrain.planetary_view.is_none() {
+            groups.sort_by(|a, b| {
+                b.aggregate_priority
+                    .total_cmp(&a.aggregate_priority)
+                    .then_with(|| a.parent.cmp(&b.parent))
+            });
+        }
         groups
     }
 
@@ -5204,6 +6379,225 @@ mod frontier_tests {
     }
 
     #[test]
+    fn desired_priority_revision_reuses_rank_summary_across_readiness_churn() {
+        let roots: Vec<_> = CubeFace::ALL
+            .into_iter()
+            .map(CubePatchAddress::root)
+            .collect();
+        let mut terrain = test_terrain(roots.clone());
+        terrain.drawable = roots.clone();
+        let parent = roots[0];
+        let children = parent.children().unwrap();
+        for (index, child) in children.iter().copied().enumerate() {
+            let priority = (index + 1) as f64;
+            terrain.desired.insert(
+                child,
+                RegionalPatchSnapshot {
+                    address: format!("{child:?}"),
+                    level: child.level(),
+                    projected_error_px: priority,
+                    priority,
+                    state: "desired",
+                },
+            );
+        }
+
+        let initial_ready_children = terrain
+            .split_frontiers()
+            .iter()
+            .find(|group| group.parent == parent)
+            .unwrap()
+            .ready_children;
+        assert_eq!(initial_ready_children, 0);
+        let revision = terrain.desired_priority_revision();
+        let scans = terrain
+            .desired_priority_index
+            .borrow()
+            .completion_frontier_scans;
+        for _ in 0..4 {
+            assert_eq!(terrain.desired_priority_revision(), revision);
+        }
+        assert_eq!(
+            terrain
+                .desired_priority_index
+                .borrow()
+                .completion_frontier_scans,
+            scans,
+            "an unchanged policy query must not enumerate drawable parents"
+        );
+
+        terrain.resident.extend(children);
+        let ready = terrain.split_frontiers();
+        assert_eq!(
+            ready
+                .iter()
+                .find(|group| group.parent == parent)
+                .unwrap()
+                .ready_children,
+            4
+        );
+        assert_eq!(terrain.desired_priority_revision(), revision);
+        assert_eq!(
+            terrain
+                .desired_priority_index
+                .borrow()
+                .completion_frontier_scans,
+            scans + 1,
+            "readiness diagnostics may refresh without invalidating rank policy"
+        );
+    }
+
+    #[test]
+    fn desired_priority_revision_refreshes_for_topology_view_and_age_inputs() {
+        let roots: Vec<_> = CubeFace::ALL
+            .into_iter()
+            .map(CubePatchAddress::root)
+            .collect();
+        let mut terrain = test_terrain(roots.clone());
+        terrain.drawable = roots;
+        let parent = CubePatchAddress::root(CubeFace::PositiveZ);
+        for (index, child) in parent.children().unwrap().into_iter().enumerate() {
+            let priority = (index + 1) as f64;
+            terrain.desired.insert(
+                child,
+                RegionalPatchSnapshot {
+                    address: format!("{child:?}"),
+                    level: child.level(),
+                    projected_error_px: priority,
+                    priority,
+                    state: "desired",
+                },
+            );
+        }
+        let initial_revision = terrain.desired_priority_revision();
+        let mut scans = terrain
+            .desired_priority_index
+            .borrow()
+            .completion_frontier_scans;
+
+        let projection =
+            CelestialProjection::try_new(800, 600, 70.0_f64.to_radians(), 0.1).unwrap();
+        terrain
+            .set_planetary_view(DMat3::IDENTITY, projection)
+            .unwrap();
+        let after_view = terrain.desired_priority_revision();
+        assert!(after_view >= initial_revision);
+        scans += 1;
+        assert_eq!(
+            terrain
+                .desired_priority_index
+                .borrow()
+                .completion_frontier_scans,
+            scans,
+            "changed view weights refresh the cached rank summary"
+        );
+        terrain.drawable_cover_revision = terrain.drawable_cover_revision.wrapping_add(1);
+        let after_topology = terrain.desired_priority_revision();
+        assert!(after_topology >= after_view);
+        scans += 1;
+        assert_eq!(
+            terrain
+                .desired_priority_index
+                .borrow()
+                .completion_frontier_scans,
+            scans,
+            "changed drawable topology refreshes the cached rank summary"
+        );
+        let expired = Instant::now() - Duration::from_millis(1);
+        terrain
+            .desired_priority_index
+            .borrow_mut()
+            .next_completion_promotion = Some(expired);
+        let after_age = terrain.desired_priority_revision();
+        scans += 1;
+        assert_eq!(
+            terrain
+                .desired_priority_index
+                .borrow()
+                .completion_frontier_scans,
+            scans,
+            "an elapsed age-promotion deadline refreshes the rank summary"
+        );
+        assert!(after_age >= after_topology);
+    }
+
+    #[test]
+    fn sampled_coverage_availability_invalidates_same_view_frontier_priority() {
+        let roots: Vec<_> = CubeFace::ALL
+            .into_iter()
+            .map(CubePatchAddress::root)
+            .collect();
+        let mut terrain = test_terrain(roots.clone());
+        terrain.drawable = roots.clone();
+        terrain.resident.extend(roots);
+        let parent = CubePatchAddress::root(CubeFace::PositiveZ);
+        let projection =
+            CelestialProjection::try_new(800, 600, 70.0_f64.to_radians(), 0.1).unwrap();
+        terrain
+            .set_planetary_view(DMat3::IDENTITY, projection)
+            .unwrap();
+        terrain.view = RegionalView {
+            body_position_m: DVec3::Z * (terrain.generator.radius_m() + 1_000.0),
+            body_velocity_mps: DVec3::ZERO,
+            projection_scale_px: projection.focal_pixels(),
+        };
+        terrain
+            .planetary_footprint_weights
+            .borrow_mut()
+            .insert(parent, 1.0);
+        for (index, child) in parent.children().unwrap().into_iter().enumerate() {
+            let priority = (index + 1) as f64;
+            terrain.desired.insert(
+                child,
+                RegionalPatchSnapshot {
+                    address: format!("{child:?}"),
+                    level: child.level(),
+                    projected_error_px: priority,
+                    priority,
+                    state: "desired",
+                },
+            );
+        }
+        let without_mask = terrain.desired_priority_revision();
+        let old_rank = terrain
+            .split_frontiers()
+            .into_iter()
+            .find(|group| group.parent == parent)
+            .unwrap()
+            .completion_priority;
+
+        let mut sampled_areas = HashMap::new();
+        sampled_areas.insert(parent, 100.0);
+        terrain
+            .screen_coverage_cache
+            .replace(Some(ScreenCoverageCacheEntry {
+                key: terrain.screen_coverage_key().unwrap(),
+                diagnostic: ScreenCoverageDiagnostic {
+                    method: "test sampled cover",
+                    certified: false,
+                    limitation: "unit-test fixture",
+                    sampling_valid: true,
+                    samples_per_cell_axis: 1,
+                    useful_proxy_error_threshold_px: USEFUL_DETAIL_FLOOR_ERROR_PX,
+                    target_proxy_error_threshold_px: terrain.config.split_threshold_px,
+                    all_view: ScreenCoverageCell::default(),
+                    cells: std::array::from_fn(|_| ScreenCoverageCell::default()),
+                    sampled_drawable_area_pixels: Arc::new(sampled_areas),
+                },
+            }));
+
+        let with_mask = terrain.desired_priority_revision();
+        let new_rank = terrain
+            .split_frontiers()
+            .into_iter()
+            .find(|group| group.parent == parent)
+            .unwrap()
+            .completion_priority;
+        assert_ne!(old_rank.to_bits(), new_rank.to_bits());
+        assert!(with_mask > without_mask);
+    }
+
+    #[test]
     fn local_publication_descriptor_acks_one_sorted_delta_and_public_api_keeps_full_cover() {
         let roots: Vec<_> = CubeFace::ALL
             .into_iter()
@@ -5253,14 +6647,26 @@ mod frontier_tests {
 
         terrain.resident.remove(&children[0]);
         assert!(terrain.publication_locally_current(first));
+        let before_rejected_ack = terrain.drawable_cover_revision;
         assert_eq!(
             terrain.ack_local_publication(first),
             Err(RegionalError::NotResident)
         );
+        assert_eq!(terrain.drawable_cover_revision, before_rejected_ack);
         terrain.resident.insert(children[0]);
+        let before_local_ack = terrain.drawable_cover_revision;
         terrain.ack_local_publication(first).unwrap();
+        assert_eq!(terrain.drawable_cover_revision, before_local_ack + 1);
+        let before_stale_ack = terrain.drawable_cover_revision;
+        assert_eq!(
+            terrain.ack_local_publication(first),
+            Err(RegionalError::InvalidCover)
+        );
+        assert_eq!(terrain.drawable_cover_revision, before_stale_ack);
         assert!(terrain.publication_locally_current(second));
+        let before_second_ack = terrain.drawable_cover_revision;
         terrain.ack_local_publication(second).unwrap();
+        assert_eq!(terrain.drawable_cover_revision, before_second_ack + 1);
         assert!(terrain.drawable.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(!terrain.drawable.contains(&parent));
         assert!(!terrain.drawable.contains(&independent_parent));
@@ -5448,6 +6854,7 @@ mod frontier_tests {
         terrain.drawable.sort();
         terrain.resident.extend(terrain.drawable.iter().copied());
         let original = terrain.drawable.clone();
+        let before_rejected_merge = terrain.drawable_cover_revision;
         assert_eq!(
             terrain.ack_local_merge(parent, children, &roots[..5]),
             Err(RegionalError::InvalidCover)
@@ -5456,9 +6863,12 @@ mod frontier_tests {
             terrain.ack_local_merge(parent, children, &roots),
             Err(RegionalError::NotResident)
         );
+        assert_eq!(terrain.drawable_cover_revision, before_rejected_merge);
         assert_eq!(terrain.drawable, original);
         terrain.resident.insert(parent);
+        let before_merge = terrain.drawable_cover_revision;
         terrain.ack_local_merge(parent, children, &roots).unwrap();
+        assert_eq!(terrain.drawable_cover_revision, before_merge + 1);
         assert_eq!(terrain.drawable, roots);
         assert!(terrain.cover_is_valid(&terrain.drawable));
     }
@@ -5585,7 +6995,10 @@ mod frontier_tests {
                     replacement_is_balanced(parent, true, &set, &descendants),
                     full
                 );
-                assert_eq!(local_replacement_is_balanced(parent, true, &cover), full);
+                assert_eq!(
+                    local_replacement_is_balanced(parent, true, &cover, &roots),
+                    full
+                );
                 rejected_splits += usize::from(!full);
             }
             for parent in cover
@@ -5607,7 +7020,10 @@ mod frontier_tests {
                         replacement_is_balanced(parent, false, &set, &descendants),
                         full
                     );
-                    assert_eq!(local_replacement_is_balanced(parent, false, &cover), full);
+                    assert_eq!(
+                        local_replacement_is_balanced(parent, false, &cover, &roots),
+                        full
+                    );
                     rejected_merges += usize::from(!full);
                 }
             }

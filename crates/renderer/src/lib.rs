@@ -41,7 +41,7 @@ use std::sync::Arc;
 use egui_wgpu::ScreenDescriptor;
 use egui_winit::State as EguiWinitState;
 use tracing::{info, warn};
-use wgpu::SurfaceError;
+use wgpu::CurrentSurfaceTexture;
 use winit::{event::WindowEvent, window::Window};
 
 /// Failures that can occur while preparing or presenting a native renderer.
@@ -279,13 +279,14 @@ impl Renderer {
     }
 
     async fn new_async(window: Arc<Window>) -> Result<Self, RendererError> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = instance.create_surface(Arc::clone(&window))?;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 force_fallback_adapter: false,
                 compatible_surface: Some(&surface),
+                apply_limit_buckets: false,
             })
             .await?;
         let adapter_info = adapter.get_info();
@@ -329,6 +330,7 @@ impl Renderer {
             desired_maximum_frame_latency: 2,
             alpha_mode,
             view_formats: vec![],
+            color_space: wgpu::SurfaceColorSpace::Auto,
         };
         if !suspended {
             surface.configure(&device, &surface_config);
@@ -454,7 +456,10 @@ impl Renderer {
     }
 
     /// Clears and presents a frame containing UI supplied by the application.
-    pub fn render(&mut self, ui: impl FnMut(&egui::Context)) -> Result<(), RendererError> {
+    pub fn render(
+        &mut self,
+        ui: impl FnMut(&egui::Context, &mut egui::Ui),
+    ) -> Result<(), RendererError> {
         self.render_frame(None, None, ui)
     }
 
@@ -462,7 +467,7 @@ impl Renderer {
     pub fn render_debug(
         &mut self,
         frame: &DebugFrame<'_, '_, '_>,
-        ui: impl FnMut(&egui::Context),
+        ui: impl FnMut(&egui::Context, &mut egui::Ui),
     ) -> Result<(), RendererError> {
         self.render_frame(Some(frame), None, ui)
     }
@@ -470,7 +475,7 @@ impl Renderer {
     pub fn render_celestial(
         &mut self,
         frame: &CelestialFrame<'_, '_, '_>,
-        ui: impl FnMut(&egui::Context),
+        ui: impl FnMut(&egui::Context, &mut egui::Ui),
     ) -> Result<(), RendererError> {
         if let Err(error) = frame.validate() {
             self.last_render_outcome = RenderOutcome::Skipped(RenderSkipReason::PreparationFailed);
@@ -483,7 +488,7 @@ impl Renderer {
         &mut self,
         debug_frame: Option<&DebugFrame<'_, '_, '_>>,
         celestial_frame: Option<&CelestialFrame<'_, '_, '_>>,
-        ui: impl FnMut(&egui::Context),
+        mut ui: impl FnMut(&egui::Context, &mut egui::Ui),
     ) -> Result<(), RendererError> {
         self.last_render_outcome = RenderOutcome::Skipped(RenderSkipReason::PreparationFailed);
         if self.suspended {
@@ -514,28 +519,26 @@ impl Renderer {
         let timestamp_active = celestial_frame.is_some() && timestamp_slot_idle;
 
         let frame = match self.surface.get_current_texture() {
-            Ok(frame) => frame,
-            Err(SurfaceError::Lost) => {
+            CurrentSurfaceTexture::Success(frame) | CurrentSurfaceTexture::Suboptimal(frame) => {
+                frame
+            }
+            CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.surface_config);
                 self.last_render_outcome = RenderOutcome::Skipped(RenderSkipReason::SurfaceLost);
                 return Ok(());
             }
-            Err(SurfaceError::Outdated) => {
+            CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.surface_config);
                 self.last_render_outcome =
                     RenderOutcome::Skipped(RenderSkipReason::SurfaceOutdated);
                 return Ok(());
             }
-            Err(SurfaceError::Timeout) => {
+            CurrentSurfaceTexture::Timeout | CurrentSurfaceTexture::Occluded => {
                 warn!("timed out acquiring the next presentation frame");
                 self.last_render_outcome = RenderOutcome::Skipped(RenderSkipReason::SurfaceTimeout);
                 return Ok(());
             }
-            Err(SurfaceError::OutOfMemory) => {
-                self.last_render_outcome = RenderOutcome::Skipped(RenderSkipReason::OutOfMemory);
-                return Err(RendererError::OutOfMemory);
-            }
-            Err(SurfaceError::Other) => {
+            CurrentSurfaceTexture::Validation => {
                 warn!("surface could not acquire a frame; retrying on the next redraw");
                 self.last_render_outcome = RenderOutcome::Skipped(RenderSkipReason::SurfaceOther);
                 return Ok(());
@@ -549,7 +552,10 @@ impl Renderer {
         };
 
         let raw_input = self.egui_state.take_egui_input(self.window.as_ref());
-        let full_output = self.egui_context.run(raw_input, ui);
+        let full_output = self.egui_context.run_ui(raw_input, |root_ui| {
+            let context = root_ui.ctx().clone();
+            ui(&context, root_ui);
+        });
         self.egui_state
             .handle_platform_output(self.window.as_ref(), full_output.platform_output);
 
@@ -557,8 +563,10 @@ impl Renderer {
             .egui_context
             .tessellate(full_output.shapes, full_output.pixels_per_point);
         for (texture_id, image_delta) in &full_output.textures_delta.set {
-            self.egui_renderer
-                .update_texture(&self.device, &self.queue, *texture_id, image_delta);
+            for delta in image_delta {
+                self.egui_renderer
+                    .update_texture(&self.device, &self.queue, *texture_id, delta);
+            }
         }
 
         let screen_descriptor = ScreenDescriptor {
@@ -672,6 +680,8 @@ impl Renderer {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+
+                multiview_mask: None,
             });
             self.egui_renderer.render(
                 &mut render_pass.forget_lifetime(),
@@ -720,7 +730,7 @@ impl Renderer {
         }
         // Wayland uses this notification to coordinate compositor frame callbacks.
         self.window.pre_present_notify();
-        frame.present();
+        self.queue.present(frame);
         self.last_render_outcome = RenderOutcome::Submitted {
             submission_id,
             presentation_requested: true,

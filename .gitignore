@@ -20,8 +20,6 @@ target/
 /generated-images/
 /imagegen/
 /artifacts/
-/.opencode/results/
-/.codex/results/
 
 # Python-generated caches
 __pycache__/
@@ -48,3 +46,15 @@ Desktop.ini
 
 # Rust analyzer/editor state
 .rust-analyzer/
+/docs
+/scripts/*
+!/scripts/shared-test-system.ps1
+/docs
+/Engine_Ideas
+
+# Keep the mandatory engine policy eligible for version control.
+!/docs/
+/docs/*
+!/docs/DATA_DRIVEN_ENGINE_POLICY.md
+!/docs/PLANET_TERRAIN_GENERATION_OPTIMIZATION_PLAN.md
+!/docs/GEOLOGICAL_ASSET_PIPELINE.md

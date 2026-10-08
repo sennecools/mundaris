@@ -414,10 +414,9 @@ impl CelestialCamera {
         self.response_clearance_m = self.sample_clearance(pair, body, self.pose)?;
         Ok(())
     }
-    /// Set a fixture-controlled observer while retaining the normal surface
-    /// inspection controller and the same published body-fixed frame.
-    #[cfg(feature = "developer-tools")]
-    pub(crate) fn developer_set_surface_pose(
+    /// Set an authored observer while retaining normal surface navigation and
+    /// the coherent published body-fixed frame.
+    pub(crate) fn set_surface_pose(
         &mut self,
         pair: &CoherentCelestialView<'_>,
         body: BodyId,
@@ -469,7 +468,21 @@ impl CelestialCamera {
         self.wheel_pending = DVec3::ZERO;
         self.terrain_approach = true;
         self.initialize_surface_angles(anchor.tangent.up().unit());
-        self.developer_fixture_pose = Some(pose);
+        #[cfg(feature = "developer-tools")]
+        {
+            self.developer_fixture_pose = None;
+        }
+        Ok(())
+    }
+    #[cfg(feature = "developer-tools")]
+    pub(crate) fn developer_set_surface_pose(
+        &mut self,
+        pair: &CoherentCelestialView<'_>,
+        body: BodyId,
+        pose: FramePose,
+    ) -> Result<()> {
+        self.set_surface_pose(pair, body, pose)?;
+        self.developer_fixture_pose = Some(self.pose);
         Ok(())
     }
     pub fn look_surface_horizon(&mut self) -> Result<()> {

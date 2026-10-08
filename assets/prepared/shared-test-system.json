@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "scene_identity": "mundaris.shared-test-system/1",
+  "surfaces": [
+    {
+      "catalogue_name": "Moon",
+      "definition": "composition.native.json"
+    }
+  ],
+  "initial_view": {
+    "catalogue_name": "Moon",
+    "direction_body": [
+      0.0017999968590082214,
+      0.0004999991275022838,
+      0.9999982550045675
+    ],
+    "orientation_xyzw": [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ],
+    "clearance_m": 1200.0,
+    "paused": true
+  }
+}

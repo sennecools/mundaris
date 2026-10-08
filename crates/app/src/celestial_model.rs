@@ -408,7 +408,7 @@ impl CelestialModelDemo {
         let pending = &mut self.pending;
         let draft = &mut self.draft;
         let seek_seconds = &mut self.seek_seconds;
-        renderer.render_debug(&debug, |context| {
+        renderer.render_debug(&debug, |context, _root_ui| {
             egui::Window::new("Celestial model validation")
                 .default_width(440.0)
                 .vscroll(true)

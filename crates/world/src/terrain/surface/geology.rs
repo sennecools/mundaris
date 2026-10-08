@@ -80,7 +80,9 @@ impl GeologyField {
             // emplacement <= 1.07 with budgets summing to .81, and impacts
             // <= .84*(.07+.045+.025+.015)=.131. Total < 1.32.
             SurfaceAlgorithm::VolcanicV1 => 1.62,
-            SurfaceAlgorithm::RockyV3
+            SurfaceAlgorithm::PreparedV1
+            | SurfaceAlgorithm::GraphV1
+            | SurfaceAlgorithm::RockyV3
             | SurfaceAlgorithm::RockyV4
             | SurfaceAlgorithm::RockyV5
             | SurfaceAlgorithm::IcyV2
@@ -177,7 +179,9 @@ impl GeologyField {
         let labels = match self.algorithm {
             SurfaceAlgorithm::IcyV1 => &icy_labels,
             SurfaceAlgorithm::VolcanicV1 => &volcanic_labels,
-            SurfaceAlgorithm::RockyV3
+            SurfaceAlgorithm::PreparedV1
+            | SurfaceAlgorithm::GraphV1
+            | SurfaceAlgorithm::RockyV3
             | SurfaceAlgorithm::RockyV4
             | SurfaceAlgorithm::RockyV5
             | SurfaceAlgorithm::IcyV2
@@ -203,7 +207,9 @@ impl GeologyField {
                         SurfaceAlgorithm::VolcanicV1 => {
                             edge * (0.13 + 0.06 * unit(key ^ 0x4943_595f_5241_4401)) * 1.75
                         }
-                        SurfaceAlgorithm::RockyV3
+                        SurfaceAlgorithm::PreparedV1
+                        | SurfaceAlgorithm::GraphV1
+                        | SurfaceAlgorithm::RockyV3
                         | SurfaceAlgorithm::RockyV4
                         | SurfaceAlgorithm::RockyV5
                         | SurfaceAlgorithm::IcyV2
@@ -218,7 +224,9 @@ impl GeologyField {
                         unit(key ^ 0x4943_595f_4445_4e53) < 0.40 + 0.54 * self.parameters.activity
                     }
                     SurfaceAlgorithm::VolcanicV1 => true,
-                    SurfaceAlgorithm::RockyV3
+                    SurfaceAlgorithm::PreparedV1
+                    | SurfaceAlgorithm::GraphV1
+                    | SurfaceAlgorithm::RockyV3
                     | SurfaceAlgorithm::RockyV4
                     | SurfaceAlgorithm::RockyV5
                     | SurfaceAlgorithm::IcyV2
@@ -285,7 +293,9 @@ impl GeologyField {
         let epoch = match self.algorithm {
             SurfaceAlgorithm::IcyV1 => 3,
             SurfaceAlgorithm::VolcanicV1 => 2,
-            SurfaceAlgorithm::RockyV3
+            SurfaceAlgorithm::PreparedV1
+            | SurfaceAlgorithm::GraphV1
+            | SurfaceAlgorithm::RockyV3
             | SurfaceAlgorithm::RockyV4
             | SurfaceAlgorithm::RockyV5
             | SurfaceAlgorithm::IcyV2
@@ -352,7 +362,9 @@ impl GeologyField {
                         ("volcanic-epoch2-lobed-front", front),
                     ]);
                 }
-                SurfaceAlgorithm::RockyV3
+                SurfaceAlgorithm::PreparedV1
+                | SurfaceAlgorithm::GraphV1
+                | SurfaceAlgorithm::RockyV3
                 | SurfaceAlgorithm::RockyV4
                 | SurfaceAlgorithm::RockyV5
                 | SurfaceAlgorithm::IcyV2
@@ -383,7 +395,9 @@ impl GeologyField {
         let (height, gradient, mut weights, work) = match self.algorithm {
             SurfaceAlgorithm::IcyV1 => self.icy(n, halo)?,
             SurfaceAlgorithm::VolcanicV1 => self.volcanic(n, halo)?,
-            SurfaceAlgorithm::RockyV3
+            SurfaceAlgorithm::PreparedV1
+            | SurfaceAlgorithm::GraphV1
+            | SurfaceAlgorithm::RockyV3
             | SurfaceAlgorithm::RockyV4
             | SurfaceAlgorithm::RockyV5
             | SurfaceAlgorithm::IcyV2
@@ -1165,7 +1179,9 @@ fn algorithm_tag(algorithm: SurfaceAlgorithm) -> u64 {
     match algorithm {
         SurfaceAlgorithm::IcyV1 => 0x4943_595f_5631_0001,
         SurfaceAlgorithm::VolcanicV1 => 0x564f_4c43_5631_0001,
-        SurfaceAlgorithm::RockyV3 => 0x524f_434b_5900_0003,
+        SurfaceAlgorithm::PreparedV1 | SurfaceAlgorithm::GraphV1 | SurfaceAlgorithm::RockyV3 => {
+            0x524f_434b_5900_0003
+        }
         SurfaceAlgorithm::RockyV4
         | SurfaceAlgorithm::RockyV5
         | SurfaceAlgorithm::IcyV2
@@ -1345,7 +1361,9 @@ mod tests {
                 assert!(match algorithm {
                     SurfaceAlgorithm::IcyV1 => label.starts_with("icy-fracture-epoch3-"),
                     SurfaceAlgorithm::VolcanicV1 => label.starts_with("volcanic-epoch2-"),
-                    SurfaceAlgorithm::RockyV3
+                    SurfaceAlgorithm::PreparedV1
+                    | SurfaceAlgorithm::GraphV1
+                    | SurfaceAlgorithm::RockyV3
                     | SurfaceAlgorithm::RockyV4
                     | SurfaceAlgorithm::RockyV5
                     | SurfaceAlgorithm::IcyV2

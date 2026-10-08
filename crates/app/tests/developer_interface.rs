@@ -129,7 +129,7 @@ fn moon_snapshot_identifies_the_native_compositional_authority() {
     assert_eq!(snapshot.terrain.active_body.as_ref().unwrap().index, 4);
     assert_eq!(
         snapshot.terrain.generator_algorithm.as_deref(),
-        Some("RockyV5")
+        Some("PreparedV1")
     );
     assert_eq!(
         snapshot.terrain.certificate_kind.as_deref(),

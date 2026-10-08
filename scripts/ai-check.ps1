@@ -3,7 +3,7 @@
 .SYNOPSIS
 Run focused developer capture, interface tests, and formatting checks.
 .DESCRIPTION
-Each invocation writes isolated evidence under target/ai-check/<timestamp> unless
+Each invocation writes isolated evidence under ../target/ai-check/<timestamp> unless
 -OutputDirectory is supplied. The target must not already contain files.
 #>
 [CmdletBinding()]
@@ -17,7 +17,7 @@ $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $stamp = [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss-fff')
-    $OutputDirectory = Join-Path $repo ("target/ai-check/$stamp")
+    $OutputDirectory = Join-Path $repo ("../target/ai-check/$stamp")
 } elseif (-not [IO.Path]::IsPathRooted($OutputDirectory)) {
     $OutputDirectory = Join-Path (Get-Location).Path $OutputDirectory
 }

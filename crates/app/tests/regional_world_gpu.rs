@@ -5,7 +5,8 @@ use std::{collections::BTreeMap, num::NonZeroU64, path::PathBuf, sync::Arc, time
 use anyhow::{Context, Result, ensure};
 use glam::{DMat3, DVec3};
 use mundaris_app::resident_terrain::{
-    ResidentTileBuilder, TileBuildDiagnostics, TileBuildIdentity,
+    DERIVED_TILE_FILTER_VERSION, ResidentTileBuilder, SharedDerivedField, TILE_FILTER_VERSION,
+    TileBuildDiagnostics, TileBuildIdentity,
 };
 use mundaris_math::{
     Direction3, Displacement3, FrameId, FramePose, FramePosition, FrameState, FrameTree,
@@ -201,10 +202,21 @@ fn point_at(
     &points[(grid[1] * (CELLS + 1) + grid[0]) as usize]
 }
 
-fn write_evidence(evidence: &serde_json::Value) -> Result<PathBuf> {
-    let path = std::env::var_os("MUNDARIS_REGIONAL_WORLD_GPU_EVIDENCE")
+fn write_evidence(evidence: &serde_json::Value, derived: bool) -> Result<PathBuf> {
+    let (variable, default_path) = if derived {
+        (
+            "MUNDARIS_REGIONAL_WORLD_GPU_DERIVED_EVIDENCE",
+            "target/terrain-redesign/phase2f/regional-world-gpu-derived.json",
+        )
+    } else {
+        (
+            "MUNDARIS_REGIONAL_WORLD_GPU_EVIDENCE",
+            "target/terrain-redesign/slice2c/worldgpu.json",
+        )
+    };
+    let path = std::env::var_os(variable)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("target/terrain-redesign/slice2c/worldgpu.json"));
+        .unwrap_or_else(|| PathBuf::from(default_path));
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -234,11 +246,10 @@ fn make_tile_draw(
 }
 
 fn build_cover(
-    generator: &SurfaceGenerator,
-    identity: TileBuildIdentity,
     parent_address: CubePatchAddress,
     split_child: usize,
     builds: &mut Vec<serde_json::Value>,
+    build_tile: &mut impl FnMut(CubePatchAddress) -> Result<(TileData, TileBuildDiagnostics)>,
 ) -> Result<CoverTransition> {
     let initial_addresses = parent_address.children()?;
     ensure!(split_child < 4, "split child index outside quadtree");
@@ -251,7 +262,7 @@ fn build_cover(
     let mut all = BTreeMap::new();
     for address in addresses {
         let started = Instant::now();
-        let (tile, diagnostics) = ResidentTileBuilder::build(generator, identity, address, CELLS)?;
+        let (tile, diagnostics) = build_tile(address)?;
         let elapsed = started.elapsed();
         builds.push(build_record(address, &tile, diagnostics, elapsed));
         all.insert(address, Arc::new(tile));
@@ -278,11 +289,10 @@ fn build_cover(
 }
 
 fn build_parent_neighbor_cover(
-    generator: &SurfaceGenerator,
-    identity: TileBuildIdentity,
     parent: CubePatchAddress,
     neighbor_edges: &[PatchEdge],
     builds: &mut Vec<serde_json::Value>,
+    build_tile: &mut impl FnMut(CubePatchAddress) -> Result<(TileData, TileBuildDiagnostics)>,
 ) -> Result<CoverTransition> {
     let mut neighbors = BTreeMap::new();
     for edge in neighbor_edges {
@@ -307,7 +317,7 @@ fn build_parent_neighbor_cover(
     let mut all = BTreeMap::new();
     for address in all_addresses {
         let started = Instant::now();
-        let (tile, diagnostics) = ResidentTileBuilder::build(generator, identity, address, CELLS)?;
+        let (tile, diagnostics) = build_tile(address)?;
         builds.push(build_record(address, &tile, diagnostics, started.elapsed()));
         all.insert(address, Arc::new(tile));
     }
@@ -345,6 +355,7 @@ fn build_record(
         "radius_bits": tile.key.radius_bits,
         "surface_revision": tile.key.surface_revision,
         "material_revision": tile.key.material_revision,
+        "filter_version": tile.key.filter_version,
         "cells": tile.key.cells,
         "authoritative_query_count": diagnostics.authoritative_query_count,
         "payload_bytes": diagnostics.payload_bytes,
@@ -552,6 +563,17 @@ fn record_seam(
 #[test]
 #[ignore = "requires a real GPU adapter; checks world-generated mixed-LOD regional reconstruction"]
 fn rocky_world_mixed_lod_regional_gpu_matches_f64_oracle_and_shared_edges() -> Result<()> {
+    run_mixed_lod_gpu_matrix(false)
+}
+
+#[test]
+#[ignore = "requires a real GPU adapter; checks derived-v2 mixed-LOD regional reconstruction"]
+fn rocky_world_derived_v2_mixed_lod_regional_gpu_matches_f64_oracle_and_shared_edges() -> Result<()>
+{
+    run_mixed_lod_gpu_matrix(true)
+}
+
+fn run_mixed_lod_gpu_matrix(derived: bool) -> Result<()> {
     let mut renderer = TerrainCaptureRenderer::new(32, 32)
         .expect("GPU adapter required; this acceptance gate must not silently skip");
     let mut staging = CelestialStaging::default();
@@ -578,29 +600,58 @@ fn rocky_world_mixed_lod_regional_gpu_matches_f64_oracle_and_shared_edges() -> R
         let parent_address =
             CubePatchAddress::try_new(CubeFace::PositiveZ, fixture.level, fixture.x, fixture.y)?;
         let mut build_records = Vec::new();
+        let mut context = generator.prepared_query_context();
+        let derived_field = derived
+            .then(|| SharedDerivedField::new(&generator))
+            .transpose()?;
+        let mut build_tile = |address| {
+            if let Some(field) = derived_field.as_ref() {
+                ResidentTileBuilder::build_derived(
+                    &generator,
+                    identity,
+                    address,
+                    CELLS,
+                    &mut context,
+                    field,
+                    || false,
+                )
+                .map_err(anyhow::Error::from)
+            } else {
+                ResidentTileBuilder::build(&generator, identity, address, CELLS)
+                    .map_err(anyhow::Error::from)
+            }
+        };
         let (initial, target, split_parent) = match fixture.cover {
             CoverShape::FourChildren => build_cover(
-                &generator,
-                identity,
                 parent_address,
                 fixture.split_child,
                 &mut build_records,
+                &mut build_tile,
             )?,
             CoverShape::ParentWithUMaxNeighbor => build_parent_neighbor_cover(
-                &generator,
-                identity,
                 parent_address,
                 &[PatchEdge::UMax],
                 &mut build_records,
+                &mut build_tile,
             )?,
             CoverShape::ParentWithUMaxAndVMaxNeighbors => build_parent_neighbor_cover(
-                &generator,
-                identity,
                 parent_address,
                 &[PatchEdge::UMax, PatchEdge::VMax],
                 &mut build_records,
+                &mut build_tile,
             )?,
         };
+        let expected_filter_version = if derived {
+            DERIVED_TILE_FILTER_VERSION
+        } else {
+            TILE_FILTER_VERSION
+        };
+        ensure!(
+            build_records.iter().all(|record| {
+                record["filter_version"].as_u64() == Some(u64::from(expected_filter_version))
+            }),
+            "fixture contains a tile with an unexpected filter version"
+        );
         let old_boundaries = build_boundaries(&initial)?;
         let target_boundaries = build_boundaries(&target)?;
         let all_tiles: BTreeMap<_, _> = initial
@@ -879,6 +930,7 @@ fn rocky_world_mixed_lod_regional_gpu_matches_f64_oracle_and_shared_edges() -> R
                 .filter(|edge| parent_address.neighbor(*edge).address.face() != parent_address.face())
                 .map(|edge| neighbor_json(parent_address, edge)).collect::<Vec<_>>(),
             "cells": CELLS,
+            "filter_version": expected_filter_version,
             "initial_leaf_count": initial.len(),
             "mixed_leaf_count": target.len(),
             "resident_tile_count_including_parents": all_tiles.len(),
@@ -894,7 +946,10 @@ fn rocky_world_mixed_lod_regional_gpu_matches_f64_oracle_and_shared_edges() -> R
     }
 
     let evidence = serde_json::json!({
-        "schema": "mundaris.regional_world_gpu.v1",
+        "schema": if derived { "mundaris.regional_world_gpu.derived.v1" } else { "mundaris.regional_world_gpu.v1" },
+        "producer": if derived { "shared_derived_field_v2" } else { "exact_v1" },
+        "filter_version": if derived { DERIVED_TILE_FILTER_VERSION } else { TILE_FILTER_VERSION },
+        "limitations": if derived { Some("Six inherited GPU fixtures at 16 cells. The separate gameplay/real-Moon CPU corpus does not establish GPU acceptance for those fixtures.") } else { None },
         "gpu_adapter": renderer.adapter_name(),
         "gpu_backend": renderer.adapter_backend(),
         "position_local_contract": "GPU and reconstruct_patch_node both return parent-local; child-surface positions include the own-to-parent anchor delta",
@@ -908,7 +963,7 @@ fn rocky_world_mixed_lod_regional_gpu_matches_f64_oracle_and_shared_edges() -> R
         "violations": violations,
     });
     println!("{}", serde_json::to_string_pretty(&evidence)?);
-    let path = write_evidence(&evidence)?;
+    let path = write_evidence(&evidence, derived)?;
     println!("wrote regional world GPU evidence to {}", path.display());
     ensure!(
         violations.is_empty(),

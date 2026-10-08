@@ -19,6 +19,10 @@ struct DrawParams {
     parent: TileParams,
     hierarchy: vec4<f32>, // child anchor in parent axes, morph fraction
     patch_info: vec4<f32>, // 0 single, 1 hierarchy parent, 2 child; quadrant xy
+    material_palette_0: vec4<f32>,
+    material_palette_1: vec4<f32>,
+    material_palette_2: vec4<f32>,
+    material_default: vec4<f32>, // xyz fourth-channel color, w authored-palette flag
 }
 struct TileSample { geometry: vec4<f32>, material: vec4<f32> }
 struct TriangleValue { position: vec3<f32>, normal_varying: vec3<f32>, material: vec4<f32> }
@@ -188,6 +192,12 @@ fn debug_slot_color(slot: f32) -> vec3<f32> {
         f32((id * 23u + 149u) % 239u)
     ) / 238.0;
 }
+fn palette_material_color(weights: vec4<f32>) -> vec3<f32> {
+    return weights.x * params.material_palette_0.xyz
+        + weights.y * params.material_palette_1.xyz
+        + weights.z * params.material_palette_2.xyz
+        + weights.w * params.material_default.xyz;
+}
 struct VertexOut {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) normal_varying: vec3<f32>,
@@ -217,10 +227,7 @@ struct VertexOut {
     } else if mode == 2u {
         color = normal * 0.5 + vec3<f32>(0.5);
     } else if mode == 3u {
-        color = input.material.x * vec3<f32>(0.72, 0.54, 0.30)
-            + input.material.y * vec3<f32>(0.34, 0.38, 0.42)
-            + input.material.z * vec3<f32>(0.45, 0.30, 0.22)
-            + input.material.w * vec3<f32>(0.78, 0.73, 0.64);
+        color = palette_material_color(input.material);
     } else if mode == 4u {
         color = vec3<f32>(input.uv, 0.0);
     } else if mode == 5u {
@@ -249,10 +256,17 @@ struct VertexOut {
         } else {
             color = vec3<f32>(0.12, 0.82, 0.28);
         }
+    } else if mode == 11u {
+        let diffuse = max(dot(normal, normalize(params.own.sun.xyz)), 0.0);
+        color = vec3<f32>(0.55) * (0.2 + 0.8 * diffuse);
     } else {
         let diffuse = max(dot(normal, normalize(params.own.sun.xyz)), 0.0);
-        color *= 0.2 + 0.8 * diffuse;
-        color = mix(color, input.material.xyz, 0.18);
+        if mode == 0u && params.material_default.w > 0.5 {
+            color = palette_material_color(input.material) * (0.2 + 0.8 * diffuse);
+        } else {
+            color *= 0.2 + 0.8 * diffuse;
+            color = mix(color, input.material.xyz, 0.18);
+        }
     }
     return vec4<f32>(color, 1.0);
 }

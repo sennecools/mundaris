@@ -62,7 +62,9 @@ impl NativeTerrainDefinition {
                     + TerrainGenerator::working_heap_bound_bytes(definition.config())
             }
             Self::Surface(_) => {
-                size_of::<SurfaceGenerator>() + SurfaceGenerator::working_heap_bound_bytes()
+                // This private adapter creates its own generator and only uses
+                // scalar queries; it never initializes the optional prepared store.
+                size_of::<SurfaceGenerator>() + SurfaceGenerator::scalar_working_heap_bound_bytes()
             }
         }
     }

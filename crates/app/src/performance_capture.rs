@@ -24,6 +24,7 @@ use std::io::Read;
 
 /// One outstanding sampled timeline export. Sorting and JSON construction stay
 /// on the diagnostic worker; the frame owner never waits for its result.
+#[derive(Default)]
 pub struct ProfileSampler {
     sender: Option<SyncSender<()>>,
     receiver: Option<mpsc::Receiver<ProfileSample>>,
@@ -37,15 +38,6 @@ enum ProfileSample {
     WorkerUnavailable,
 }
 
-impl Default for ProfileSampler {
-    fn default() -> Self {
-        Self {
-            sender: None,
-            receiver: None,
-            outstanding: false,
-        }
-    }
-}
 impl ProfileSampler {
     pub fn poll_value(&mut self) -> Option<Value> {
         match self.poll()? {
@@ -177,18 +169,10 @@ fn env_threshold(name: &str, default: f64, maximum: f64) -> f64 {
 
 /// At most one deep terrain snapshot is requested or returned at a time.
 /// Snapshot construction, sorting, and JSON conversion all run on this worker.
+#[derive(Default)]
 pub struct TerrainTraceSampler {
     request: Option<SyncSender<Arc<TerrainTrace>>>,
     result: Option<Receiver<Result<Value, String>>>,
-}
-
-impl Default for TerrainTraceSampler {
-    fn default() -> Self {
-        Self {
-            request: None,
-            result: None,
-        }
-    }
 }
 
 impl TerrainTraceSampler {
@@ -316,9 +300,7 @@ impl ConvergenceWatch {
 
         if progress || self.last_progress.is_none() {
             self.last_progress = Some(now);
-            self.best_visible_ratio = if target_changed {
-                frame.visible_convergence
-            } else if ratio_progress {
+            self.best_visible_ratio = if target_changed || ratio_progress {
                 frame.visible_convergence
             } else {
                 self.best_visible_ratio.or(frame.visible_convergence)
@@ -449,17 +431,16 @@ impl PerformanceCapture {
                 .and_then(Value::as_f64)
         };
         self.poll_trace_result();
-        if let Some(bundle) = &mut self.pending {
-            if bundle.terrain_trace_status == "pending"
-                && bundle
-                    .terrain_trace_requested_at
-                    .is_some_and(|at| at.elapsed() >= PROFILE_RESULT_TIMEOUT)
-            {
-                bundle.terrain_trace_status = "timeout";
-                bundle.terrain_trace_error =
-                    Some("terrain trace snapshot exceeded the bounded wait".into());
-                self.trace_sampler = None;
-            }
+        if let Some(bundle) = &mut self.pending
+            && bundle.terrain_trace_status == "pending"
+            && bundle
+                .terrain_trace_requested_at
+                .is_some_and(|at| at.elapsed() >= PROFILE_RESULT_TIMEOUT)
+        {
+            bundle.terrain_trace_status = "timeout";
+            bundle.terrain_trace_error =
+                Some("terrain trace snapshot exceeded the bounded wait".into());
+            self.trace_sampler = None;
         }
         let frame = Frame {
             frame: snapshot.general.frame_number,
@@ -483,11 +464,11 @@ impl PerformanceCapture {
         let convergence_stalled =
             self.convergence
                 .stalled(&frame, now, self.thresholds.convergence_stall);
-        if let Some(bundle) = &mut self.pending {
-            if bundle.post_remaining > 0 {
-                bundle.frames.push(frame.clone());
-                bundle.post_remaining -= 1;
-            }
+        if let Some(bundle) = &mut self.pending
+            && bundle.post_remaining > 0
+        {
+            bundle.frames.push(frame.clone());
+            bundle.post_remaining -= 1;
         }
         self.finish_pending_if_ready();
         if self.history.len() == PRE_FRAMES {

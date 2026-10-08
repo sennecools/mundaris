@@ -320,7 +320,7 @@ fn rocky_terrain_definitions_are_distinct_and_attached() {
                     assert_eq!(body.surface_definition().unwrap().seed(), TerrainSeed(seed));
                     assert_eq!(
                         body.surface_definition().unwrap().terrain().algorithm(),
-                        SurfaceAlgorithm::RockyV5
+                        SurfaceAlgorithm::PreparedV1
                     );
                     continue;
                 }
@@ -395,7 +395,7 @@ fn rocky_terrain_definitions_are_distinct_and_attached() {
 }
 
 #[test]
-fn moon_surface_is_native_rocky_v5_and_clearance_queries_the_same_field() {
+fn moon_surface_is_prepared_and_clearance_queries_the_same_field() {
     for (namespace, preset) in [
         (ns(31), SolarSystemPreset::gameplay()),
         (ns(32), SolarSystemPreset::real_scale()),
@@ -408,7 +408,11 @@ fn moon_surface_is_native_rocky_v5_and_clearance_queries_the_same_field() {
         let definition = moon.surface_definition().expect("native Moon surface");
         let original_surface = definition.clone();
         assert!(moon.terrain().is_none());
-        assert_eq!(definition.terrain().algorithm(), SurfaceAlgorithm::RockyV5);
+        assert_eq!(
+            definition.terrain().algorithm(),
+            SurfaceAlgorithm::PreparedV1
+        );
+        assert!(definition.prepared().is_some());
 
         let radius_m = moon.properties().reference_radius_m();
         let location = mundaris_math::surface::SurfaceLocation::new(
@@ -435,7 +439,7 @@ fn moon_surface_is_native_rocky_v5_and_clearance_queries_the_same_field() {
         assert!((clearance.surface_radius_m - sample.radius_m()).abs() < 1e-10 * radius_m);
 
         // Keep the historical CrateredV1 recipe independently constructible and
-        // replayable even though the native preset now selects RockyV5.
+        // replayable even though the native preset now selects prepared assets.
         let seed = definition.seed();
         let historical =
             cratered_terrain_definition(definition.identity(), seed, radius_m).unwrap();

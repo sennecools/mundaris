@@ -10,12 +10,13 @@ use super::{
     director::DirectedSample,
     mix,
     provinces::{ProvinceField, ProvinceSample},
-    query_context::{CachedFeature, HIERARCHICAL_FEATURE_FAMILY, SurfaceQueryContext},
+    query_context::{CachedFeature, CellKey, HIERARCHICAL_FEATURE_FAMILY, SurfaceQueryContext},
     unit,
 };
 use glam::{DMat3, DVec3};
 use mundaris_math::noise::gradient_noise;
 use std::ops::{Add, Div, Mul, Neg, Sub};
+use std::time::Instant;
 
 const SUPPORT: f64 = 0.52;
 const JITTER: f64 = 0.16;
@@ -304,13 +305,19 @@ impl HierarchicalField {
         if !direction.is_finite() || direction.length_squared() <= f64::MIN_POSITIVE {
             return Err(TerrainError::InvalidConfig);
         }
+        let profile_started = context
+            .as_deref()
+            .is_some_and(SurfaceQueryContext::profiling)
+            .then(Instant::now);
         let n = direction.normalize();
+        let parent_started = profile_started.map(|_| Instant::now());
         let (inherited, parent_context) = if let Some(context) = context.as_deref_mut() {
             self.parent
                 .evaluate_with_query_context(direction, context)?
         } else {
             self.parent.evaluate_with_context(direction)?
         };
+        let parent_elapsed_ns = parent_started.map_or(0, elapsed_ns);
         let directed = parent_context.directed;
         let parent_controls = directed.controls;
         let point = n * self.radius_m;
@@ -367,6 +374,10 @@ impl HierarchicalField {
                 _ => None,
             };
         }
+        if let (Some(started), Some(context)) = (profile_started, context) {
+            context
+                .record_hierarchy_exclusive(elapsed_ns(started).saturating_sub(parent_elapsed_ns));
+        }
         Ok(Evaluation {
             sample: ProvinceSample {
                 height_m: total.value,
@@ -421,9 +432,17 @@ impl HierarchicalField {
                         work.cells_visited += 1;
                         let feature = if let Some(context) = context.as_deref_mut() {
                             context
-                                .feature(HIERARCHICAL_FEATURE_FAMILY, band, layout, x, y, z, || {
-                                    self.feature(x, y, z, band, layout, edge).map(cache_feature)
-                                })
+                                .feature(
+                                    CellKey::new(
+                                        HIERARCHICAL_FEATURE_FAMILY,
+                                        band,
+                                        layout,
+                                        x,
+                                        y,
+                                        z,
+                                    ),
+                                    || self.feature(x, y, z, band, layout, edge).map(cache_feature),
+                                )
                                 .map(uncache_feature)
                         } else {
                             self.feature(x, y, z, band, layout, edge)
@@ -445,12 +464,7 @@ impl HierarchicalField {
                         let window = (Differential::constant(1.0) - q2).cube();
                         let controls = if let Some(context) = context.as_deref_mut() {
                             context.controls(
-                                HIERARCHICAL_FEATURE_FAMILY,
-                                band,
-                                layout,
-                                x,
-                                y,
-                                z,
+                                CellKey::new(HIERARCHICAL_FEATURE_FAMILY, band, layout, x, y, z),
                                 || self.parent.controls(feature.center.normalize()),
                             )?
                         } else {
@@ -866,6 +880,10 @@ impl HierarchicalField {
         }
         best.map(|(_, feature)| feature)
     }
+}
+
+fn elapsed_ns(started: Instant) -> u64 {
+    started.elapsed().as_nanos().min(u64::MAX as u128) as u64
 }
 
 fn hash(seed: u64, x: i64, y: i64, z: i64) -> u64 {

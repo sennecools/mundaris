@@ -10,8 +10,8 @@ numeric comparisons and null for unavailable metrics.
 #>
 [CmdletBinding()]
 param(
-    [string] $ExecutablePath = 'target/release/mundaris_app.exe',
-    [string] $DeveloperCliPath = 'target/release/mundaris_dev.exe',
+    [string] $ExecutablePath = '../target/release/mundaris_app.exe',
+    [string] $DeveloperCliPath = '../target/release/mundaris_dev.exe',
     [string] $FrozenSourceDirectory = '',
     [string] $EvidenceRoot = '',
     [ValidateSet('Sweep','FarOrbit','100km','Close')][string] $Workload = 'Sweep',
@@ -45,7 +45,7 @@ if (-not [string]::IsNullOrWhiteSpace($FrozenSourceDirectory)) {
     }
 }
 if ([string]::IsNullOrWhiteSpace($EvidenceRoot)) {
-    $EvidenceRoot = Join-Path $repoRoot (Join-Path 'target/terrain-redesign/phase2e' ([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ') + '-' + [Guid]::NewGuid().ToString('N').Substring(0,8)))
+    $EvidenceRoot = Join-Path $repoRoot (Join-Path '../target/terrain-redesign/phase2e' ([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ') + '-' + [Guid]::NewGuid().ToString('N').Substring(0,8)))
 }
 $outputPath = if ([IO.Path]::IsPathRooted($EvidenceRoot)) { [IO.Path]::GetFullPath($EvidenceRoot) } else { [IO.Path]::GetFullPath((Join-Path $repoRoot $EvidenceRoot)) }
 if (Test-Path -LiteralPath $outputPath) { throw "Evidence root already exists: $outputPath" }

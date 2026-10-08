@@ -4,6 +4,13 @@ use glam::DVec3;
 
 use crate::RenderPreparationError;
 
+const DEFAULT_MATERIAL_PALETTE: [[f32; 3]; 4] = [
+    [0.72, 0.54, 0.30],
+    [0.34, 0.38, 0.42],
+    [0.45, 0.30, 0.22],
+    [0.78, 0.73, 0.64],
+];
+
 /// Surface visualization selected by the terrain renderer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
@@ -129,6 +136,7 @@ pub struct TerrainLighting {
     mode: TerrainRenderMode,
     readability: Option<TerrainReadability>,
     land_profile: Option<crate::PlanetLandProfile>,
+    material_palette: Option<[[f64; 3]; 3]>,
 }
 
 impl Default for TerrainLighting {
@@ -140,6 +148,7 @@ impl Default for TerrainLighting {
             mode: TerrainRenderMode::Lit,
             readability: None,
             land_profile: None,
+            material_palette: None,
         }
     }
 }
@@ -177,6 +186,7 @@ impl TerrainLighting {
             mode,
             readability: None,
             land_profile: None,
+            material_palette: None,
         })
     }
 
@@ -198,6 +208,48 @@ impl TerrainLighting {
 
     pub fn with_mode(self, mode: TerrainRenderMode) -> Self {
         Self { mode, ..self }
+    }
+
+    /// Adds authored linear RGB colors for the first three material-weight channels.
+    /// The fourth material channel keeps the renderer's centralized default color.
+    pub fn with_material_palette(
+        mut self,
+        palette: [[f64; 3]; 3],
+    ) -> Result<Self, RenderPreparationError> {
+        if palette
+            .iter()
+            .flatten()
+            .any(|channel| !channel.is_finite() || !(0.0..=1.0).contains(channel))
+        {
+            return Err(RenderPreparationError::InvalidMaterialPalette);
+        }
+        self.material_palette = Some(palette);
+        Ok(self)
+    }
+
+    /// Returns the optional authored linear RGB colors, independently of material weights.
+    pub fn material_palette(self) -> Option<[[f64; 3]; 3]> {
+        self.material_palette
+    }
+
+    /// Four vec4 values for the resident-tile shader: three authored channels,
+    /// the centralized fourth-channel default, and its optional-palette flag in w.
+    pub(crate) fn material_palette_uniform(self) -> [f32; 16] {
+        let mut values = [0.0; 16];
+        let palette = self.material_palette.unwrap_or_else(|| {
+            std::array::from_fn(|index| DEFAULT_MATERIAL_PALETTE[index].map(f64::from))
+        });
+        for (index, color) in palette.iter().enumerate() {
+            let offset = index * 4;
+            values[offset..offset + 3].copy_from_slice(&color.map(|channel| channel as f32));
+        }
+        values[12..15].copy_from_slice(&DEFAULT_MATERIAL_PALETTE[3]);
+        values[15] = if self.material_palette.is_some() {
+            1.0
+        } else {
+            0.0
+        };
+        values
     }
 
     pub fn with_readability(mut self, config: TerrainReadability) -> Self {
@@ -303,6 +355,28 @@ mod tests {
                 TerrainLighting::try_new(DVec3::Z, ambient, diffuse, TerrainRenderMode::Lit)
                     .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn material_palette_is_optional_and_validates_linear_rgb_channels() {
+        let lighting = TerrainLighting::default();
+        assert_eq!(lighting.material_palette(), None);
+
+        let palette = [[0.0, 0.25, 1.0], [0.1, 0.2, 0.3], [1.0, 0.5, 0.0]];
+        let configured = lighting.with_material_palette(palette).unwrap();
+        assert_eq!(configured.material_palette(), Some(palette));
+
+        for invalid in [
+            [[f64::NAN, 0.0, 0.0]; 3],
+            [[f64::INFINITY, 0.0, 0.0]; 3],
+            [[-0.01, 0.0, 0.0]; 3],
+            [[0.0, 1.01, 0.0]; 3],
+        ] {
+            assert!(matches!(
+                lighting.with_material_palette(invalid),
+                Err(RenderPreparationError::InvalidMaterialPalette)
+            ));
         }
     }
 }

@@ -141,7 +141,7 @@ impl PlanetSurfaceRenderer {
         if proposed.iter().sum::<u64>() + self.index_bytes + 64 > 80 * 1024 * 1024
             || proposed[..2]
                 .iter()
-                .any(|&n| n > u64::from(device.limits().max_storage_buffer_binding_size))
+                .any(|&n| n > device.limits().max_storage_buffer_binding_size)
             || proposed
                 .iter()
                 .any(|&n| n > device.limits().max_buffer_size)
@@ -338,19 +338,19 @@ fn pipeline(
     clipped: bool,
     underside: bool,
 ) -> wgpu::RenderPipeline {
-    let groups = [projection, storage];
+    let groups = [Some(projection), Some(storage)];
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("Surface reverse-Z layout"),
         bind_group_layouts: &groups,
-        push_constant_ranges: &[],
+        immediate_size: 0,
     });
     let attributes =
         wgpu::vertex_attr_array![0=>Float32x4,1=>Float32x4,2=>Float32x4,3=>Float32x4,4=>Float32x4];
-    let buffers = [wgpu::VertexBufferLayout {
+    let buffers = [Some(wgpu::VertexBufferLayout {
         array_stride: 80,
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &attributes,
-    }];
+    })];
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("Planet batched surface"),
         layout: Some(&layout),
@@ -381,13 +381,13 @@ fn pipeline(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::GreaterEqual,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
             stencil: Default::default(),
             bias: Default::default(),
         }),
         multisample: Default::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     })
 }

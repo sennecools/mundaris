@@ -192,7 +192,10 @@ impl NativeCapture {
             }
             Ok(Ok(())) => {
                 let slot = self.slot.take().expect("readback slot was present");
-                let mapped = slot.buffer.get_mapped_range(..);
+                let mapped = slot
+                    .buffer
+                    .get_mapped_range(..)
+                    .map_err(|error| format!("native capture mapped range failed: {error}"))?;
                 let rgba = convert_rows(
                     &mapped,
                     slot.width,

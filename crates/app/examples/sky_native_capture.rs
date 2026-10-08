@@ -96,7 +96,7 @@ impl App {
             return self.fail(event_loop, error.into());
         }
         let report = frame.report();
-        if let Err(error) = renderer.render_celestial(&frame, |_| {}) {
+        if let Err(error) = renderer.render_celestial(&frame, |_, _| {}) {
             return self.fail(event_loop, error.into());
         }
         self.ready_frames = self.ready_frames.saturating_add(1);
