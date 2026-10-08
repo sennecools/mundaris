@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "recipe_id": "original-temperate-highlands-v1",
+  "reference_radius_m": 6371000.0,
+  "seeds": { "geometry": 1907, "climate": 2309, "material": 4523 },
+  "height": { "base_m": 0.0, "amplitude_m": 7200.0, "wavelength_m": 260000.0, "octaves": 6, "persistence": 0.53 },
+  "climate": { "mean_temperature_k": 282.0, "temperature_variation_k": 37.0, "temperature_wavelength_m": 1450000.0, "humidity_mean": 0.54, "humidity_variation": 0.38, "humidity_wavelength_m": 620000.0, "octaves": 5 },
+  "materials": {
+    "names": ["forest_soil", "exposed_stone", "snow_ice"], "height_transition_m": 2600.0, "temperature_transition_k": 52.0,
+    "variation_wavelength_m": 90000.0, "variation_strength": 0.35,
+    "humidity_bias": [0.45, -0.05, -0.2],
+    "linear_palette": [[0.12, 0.25, 0.09], [0.39, 0.34, 0.27], [0.78, 0.84, 0.90]]
+  }
+}
