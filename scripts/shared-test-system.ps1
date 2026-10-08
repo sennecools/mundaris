@@ -2,6 +2,7 @@
 [CmdletBinding()]
 param(
     [switch] $Build,
+    [switch] $BuildOnly,
     [string] $OutputDirectory,
     [switch] $DeveloperInterface
 )
@@ -84,6 +85,10 @@ $claim.Dispose()
 
 $head = (& git -C $repo rev-parse HEAD 2>&1 | Out-String).Trim()
 if ($LASTEXITCODE -ne 0) { throw "Could not identify checkout HEAD: $head" }
+if ($BuildOnly -and -not $Build) { throw "-BuildOnly requires -Build" }
+if (Get-Process -Name mundaris_app -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $executable }) {
+    throw "Close this checkout native app before building or launching another run."
+}
 $sourceBefore = Get-SourceSnapshot
 $content = Get-ContentSnapshot $contentRoot
 
@@ -112,6 +117,7 @@ $executableHash = (Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash
 if ($Build) {
     $receipt = [pscustomobject]@{ source_sha256 = $sourceAfter.sha256; binary_sha256 = $executableHash; developer_binary_sha256 = (Get-FileHash -LiteralPath (Join-Path $repo 'target\release\mundaris_dev.exe') -Algorithm SHA256).Hash.ToLowerInvariant() }
     [IO.File]::WriteAllText($buildReceiptPath, (ConvertTo-Json $receipt), $utf8)
+    if ($BuildOnly) { Write-Output "Built and recorded receipt: $buildReceiptPath"; return }
 } else {
     if (-not (Test-Path -LiteralPath $buildReceiptPath -PathType Leaf)) { throw 'Missing shared build receipt. Run this launcher with -Build.' }
     $receipt = Get-Content -LiteralPath $buildReceiptPath -Raw | ConvertFrom-Json

@@ -18,7 +18,7 @@ if (!$IncludeGpu -and @($Only | Where-Object { $_ -in @('native_close_surface','
     throw 'Selected GPU checks require -IncludeGpu; refusing an empty/unexecuted selection.'
 }
 $repo = Split-Path -Parent $PSScriptRoot
-if (-not $OutputDirectory) { $OutputDirectory = Join-Path $repo ('target/full-validation/' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss-fff')) }
+if (-not $OutputDirectory) { $OutputDirectory = Join-Path $repo ('../target/full-validation/' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss-fff')) }
 $root = [IO.Path]::GetFullPath($OutputDirectory)
 if (Test-Path -LiteralPath $root) {
     if (@(Get-ChildItem -LiteralPath $root -Force).Count -gt 0) { throw "Refusing to replace evidence: $root" }

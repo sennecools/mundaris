@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "generator": "mundaris.prepared-composition/1",
+  "generator_sha256": "3992a55d41baddad281d8789872f691ff5392fecd1ade95fc3cd0d15d2da09da",
+  "recipe": {
+    "schema_version": 1,
+    "resolution": 9,
+    "seed": 81273,
+    "base_coefficients_m": [
+      120.0,
+      35.0,
+      -20.0,
+      15.0,
+      12.0
+    ],
+    "crater_coefficients": [
+      0.45,
+      0.15,
+      -0.1,
+      0.05,
+      0.0
+    ]
+  },
+  "rules": {
+    "address": "unit body-local XYZ direction; trilinear cube [-1,1]^3; independent of rendering face",
+    "layout": "little-endian float32 C-order [z,y,x,channel]",
+    "channels": [
+      "base_height_m",
+      "flat_preference",
+      "crater_preference"
+    ],
+    "selectors": {
+      "0": "flat",
+      "1": "crater"
+    },
+    "derivative": "exact derivative of piecewise trilinear data, metres per unit direction for height",
+    "bounds": "global stored-sample extrema enclose convex interpolation; not mesh error",
+    "boundary": "closed cube; no wrap; right cell derivative at internal planes, left at +1"
+  },
+  "shape": [
+    9,
+    9,
+    9,
+    3
+  ],
+  "fields": {
+    "file": "controls.f32",
+    "bytes": 8748,
+    "sha256": "16b6ba97851964850e4e2c7e7b0be92e76dba7bc4c184cbbd885b51a79a65ce6"
+  },
+  "base_bounds_m": [
+    62.0,
+    202.0
+  ],
+  "content_sha256": "8aecbdaf2df4750250853421c4ef7cd9bc6ad4db8f4f71d5037ce78a55e64d0e"
+}

@@ -96,6 +96,8 @@ pub enum RenderPreparationError {
     InvalidProjection,
     #[error("invalid debug color or incomplete line list")]
     InvalidDebugGeometry,
+    #[error("terrain material palette channels must be finite linear RGB values in [0, 1]")]
+    InvalidMaterialPalette,
     #[error("debug frame contains a failed batch and cannot be submitted")]
     FailedDebugFrame,
     #[error("GPU progress during bounded resource growth: {0}")]

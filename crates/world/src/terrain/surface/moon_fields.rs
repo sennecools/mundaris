@@ -7,7 +7,7 @@
 use super::{
     GeologicalParameters, MoonCraterProfileDefinition, MoonFieldDefinition, SurfaceQueryWork,
     TerrainError, mix,
-    query_context::{CachedFeature, MOON_FIELDS_FEATURE_FAMILY, SurfaceQueryContext},
+    query_context::{CachedFeature, CellKey, MOON_FIELDS_FEATURE_FAMILY, SurfaceQueryContext},
     unit,
 };
 use glam::{DMat3, DVec3};
@@ -620,10 +620,13 @@ impl MoonFieldsV1 {
                         work.cells_visited = work.cells_visited.saturating_add(1);
                         let recipe = if let Some(cache) = context.as_deref_mut() {
                             cache
-                                .feature(MOON_FIELDS_FEATURE_FAMILY, band, layout, x, y, z, || {
-                                    self.recipe(x, y, z, band, layout, edge)
-                                        .map(|recipe| cache_recipe(recipe, edge, band))
-                                })
+                                .feature(
+                                    CellKey::new(MOON_FIELDS_FEATURE_FAMILY, band, layout, x, y, z),
+                                    || {
+                                        self.recipe(x, y, z, band, layout, edge)
+                                            .map(|recipe| cache_recipe(recipe, edge, band))
+                                    },
+                                )
                                 .map(|feature| {
                                     uncache_recipe(
                                         feature,

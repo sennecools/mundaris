@@ -7,7 +7,7 @@ does not infer or claim that the developer interface is faster or slower.
 
 Example (release executable built with the developer-tools feature)::
 
-    py -3 scripts/measure-developer-interface.py --binary target/release/mundaris_app.exe --output target/developer-interface-measurement
+    py -3 scripts/measure-developer-interface.py --binary ../target/release/mundaris_app.exe --output ../target/developer-interface-measurement
 """
 
 from __future__ import annotations

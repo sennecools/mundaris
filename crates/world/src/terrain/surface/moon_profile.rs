@@ -1092,7 +1092,9 @@ mod tests {
         let generator = SurfaceGenerator::new(&definition, 109_000.0).unwrap();
         assert_eq!(
             generator.resident_heap_bytes(),
-            32 * 32 * std::mem::size_of::<u16>() + std::mem::size_of::<TerrainHeightDetailLayer>()
+            32 * 32 * std::mem::size_of::<u16>()
+                + std::mem::size_of::<TerrainHeightDetailLayer>()
+                + super::super::PREPARATION_STORE_OWNER_BYTES
         );
         assert!(SurfaceGenerator::working_heap_bound_bytes() >= MAX_PROFILE_WORKING_HEAP_BYTES);
     }

@@ -175,6 +175,36 @@ impl GeologicalDistribution {
                 },
                 ..common
             },
+            // Compatibility fields are unused by prepared and graph producers; their
+            // authored controls live entirely in the validated source definition.
+            SurfaceAlgorithm::PreparedV1 | SurfaceAlgorithm::GraphV1 => Self {
+                resurfacing: GeologicalAffineControl {
+                    base: 0.0,
+                    age_complement: false,
+                    age: 0.0,
+                    activity: 0.0,
+                    random: 0.0,
+                },
+                impact_retention: GeologicalAffineControl {
+                    base: 0.0,
+                    age_complement: false,
+                    age: 0.0,
+                    activity: 0.0,
+                    random: 0.0,
+                },
+                relief_fraction: GeologicalAffineControl {
+                    base: 0.0,
+                    age_complement: false,
+                    age: 0.0,
+                    activity: 0.0,
+                    random: 0.0,
+                },
+                feature_scale_fraction: AffineRandomRange {
+                    start: 0.05,
+                    span: 0.0,
+                },
+                ..common
+            },
             SurfaceAlgorithm::IcyV1 | SurfaceAlgorithm::IcyV2 | SurfaceAlgorithm::IcyV3 => Self {
                 resurfacing: GeologicalAffineControl {
                     base: 0.15,
@@ -635,6 +665,7 @@ mod tests {
                 0.20 + 0.16 * unit(salt ^ 3),
             ),
             SurfaceAlgorithm::MoonProfileV1 => (0.0, 1.0, 0.00685, 0.20 + 0.16 * unit(salt ^ 3)),
+            SurfaceAlgorithm::PreparedV1 | SurfaceAlgorithm::GraphV1 => (0.0, 0.0, 0.0, 0.05),
             SurfaceAlgorithm::IcyV1 | SurfaceAlgorithm::IcyV2 | SurfaceAlgorithm::IcyV3 => (
                 0.15 + 0.75 * activity,
                 0.10 + 0.65 * age,
@@ -693,6 +724,8 @@ mod tests {
             SurfaceAlgorithm::RockyV5,
             SurfaceAlgorithm::MoonFieldsV1,
             SurfaceAlgorithm::MoonProfileV1,
+            SurfaceAlgorithm::PreparedV1,
+            SurfaceAlgorithm::GraphV1,
             SurfaceAlgorithm::IcyV1,
             SurfaceAlgorithm::IcyV2,
             SurfaceAlgorithm::IcyV3,

@@ -328,6 +328,9 @@ pub struct DeveloperSnapshot {
     /// Atlas terrain runtime (ADR 0016).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terrain_atlas: Option<Value>,
+    /// Prepared authority identity; no sampling or generation during collection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prepared_sources: Vec<Value>,
     /// Bounded sampled CPU timeline; timestamps use its own monotonic epoch.
     #[serde(
         default,
@@ -500,6 +503,23 @@ impl DeveloperSnapshot {
             motion: input.motion,
             development: None,
             terrain_atlas: None,
+            prepared_sources: world
+                .bodies()
+                .enumerate()
+                .filter_map(|(index, (_, body))| {
+                    let definition = body.surface_definition()?;
+                    let source = definition.prepared()?;
+                    Some(serde_json::json!({
+                        "body_index": index, "body_name": body.name(),
+                        "algorithm": "PreparedV1", "authority_level": 0,
+                        "content_identity": source.content_identity(),
+                        "authored_revision": source.revision(),
+                        "displacement_bounds_m": source.displacement_bounds_m(),
+                        "retained_source_payload_bytes": source.resident_bytes(),
+                        "coordinate_space": "body_local_unit_direction"
+                    }))
+                })
+                .collect(),
             engine_profile: None,
             shared_scene: None,
         };

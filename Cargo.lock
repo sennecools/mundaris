@@ -2850,6 +2850,7 @@ dependencies = [
  "mundaris_math",
  "mundaris_renderer",
  "mundaris_simulation",
+ "mundaris_terrain_fields",
  "mundaris_world",
  "png",
  "pollster",
@@ -2903,13 +2904,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "mundaris_terrain_fields"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "mundaris_world"
 version = "0.0.1"
 dependencies = [
  "criterion",
  "glam",
  "mundaris_math",
+ "mundaris_terrain_fields",
  "serde",
+ "serde_json",
  "sha2",
  "thiserror 2.0.21",
 ]

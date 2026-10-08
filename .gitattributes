@@ -19,3 +19,11 @@ docs/evidence/phase513a/** -text
 docs/evidence/phase513b/** -text
 docs/evidence/phase513c/** -text
 docs/evidence/phase513cr/** -text
+
+# Content assets are pinned by SHA-256 of their exact bytes; never normalize
+# their line endings. Raw terrain channels are binary data.
+assets/** -text
+*.f32 binary
+*.r16 binary
+*.r8 binary
+*.rg8 binary

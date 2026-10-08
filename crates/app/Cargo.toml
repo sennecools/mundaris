@@ -16,6 +16,7 @@ glam.workspace = true
 mundaris_math = { path = "../math" }
 mundaris_renderer = { path = "../renderer" }
 mundaris_simulation = { path = "../simulation" }
+mundaris_terrain_fields = { path = "../terrain_fields" }
 mundaris_world = { path = "../world" }
 png = { workspace = true, optional = true }
 serde.workspace = true

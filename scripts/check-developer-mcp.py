@@ -390,7 +390,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--session", type=Path, required=True, help="path to the existing native session descriptor JSON")
     parser.add_argument("--output", type=Path, required=True, help="fresh directory for result JSON, RPC metadata, and returned PNGs")
-    parser.add_argument("--binary", type=Path, default=Path("target/release/mundaris_dev.exe"), help="mundaris_dev executable (default: target/release/mundaris_dev.exe)")
+    parser.add_argument("--binary", type=Path, default=Path("../target/release/mundaris_dev.exe"), help="mundaris_dev executable (default: ../target/release/mundaris_dev.exe)")
     parser.add_argument("--registry", type=Path, help="session registry directory (default: descriptor's parent directory)")
     args = parser.parse_args()
     try:
