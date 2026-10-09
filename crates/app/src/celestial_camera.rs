@@ -1015,10 +1015,16 @@ impl CelestialCamera {
             let active = input.drag != [0.0; 2]
                 || input.scroll_notches != 0.0
                 || input.translation != DVec3::ZERO;
-            if !active {
+            // The fixture only holds the idle surface inspection pose it placed.
+            // A pending transition or another mode (overview, body orbit, flight)
+            // is an explicit command that the frozen pose must not swallow.
+            let fixture_state =
+                self.mode == CameraMode::SurfaceInspection && self.transition.is_none();
+            if !active && fixture_state {
                 return Ok(());
             }
-            // Explicit navigation returns control to the ordinary camera path.
+            // Explicit navigation or a camera command returns control to the
+            // ordinary camera path.
             self.developer_fixture_pose = None;
         }
         let mut candidate = self.clone();
