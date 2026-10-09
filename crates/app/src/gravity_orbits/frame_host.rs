@@ -7,10 +7,10 @@ pub(super) struct FrameHost<'a> {
     pub pixels_per_point: f32,
 }
 impl FrameHost<'_> {
-    pub fn take_terrain_atlas_bounds(&mut self) -> Vec<mundaris_renderer::AtlasBounds> {
+    pub fn take_terrain_atlas_bounds(&mut self) -> Vec<astrum_renderer::AtlasBounds> {
         self.renderer.take_terrain_atlas_bounds()
     }
-    pub fn terrain_atlas_report(&self) -> mundaris_renderer::TerrainAtlasReport {
+    pub fn terrain_atlas_report(&self) -> astrum_renderer::TerrainAtlasReport {
         self.renderer.terrain_atlas_report()
     }
     pub fn terrain_atlas_layer_limit(&self) -> u32 {
@@ -21,12 +21,12 @@ impl FrameHost<'_> {
     ) -> Option<crate::developer_snapshot::TimestampSamplingSnapshot> {
         Some(self.renderer.timestamp_profiling_metrics().into())
     }
-    pub fn native_render_timings(&self) -> mundaris_renderer::NativeRenderTimings {
+    pub fn native_render_timings(&self) -> astrum_renderer::NativeRenderTimings {
         self.renderer.native_render_timings()
     }
     pub fn native_submission_id(&self) -> Option<u64> {
         match self.renderer.last_render_outcome() {
-            mundaris_renderer::RenderOutcome::Submitted { submission_id, .. } => {
+            astrum_renderer::RenderOutcome::Submitted { submission_id, .. } => {
                 Some(submission_id)
             }
             _ => None,
@@ -46,10 +46,10 @@ impl FrameHost<'_> {
     pub fn deterministic(&self) -> bool {
         false
     }
-    pub fn latest_gpu_profile(&self) -> mundaris_renderer::GpuProfile {
+    pub fn latest_gpu_profile(&self) -> astrum_renderer::GpuProfile {
         self.renderer.latest_gpu_profile()
     }
-    pub fn timestamp_availability(&self) -> mundaris_renderer::TimestampAvailability {
+    pub fn timestamp_availability(&self) -> astrum_renderer::TimestampAvailability {
         self.renderer.timestamp_availability()
     }
     pub fn gpu_source_frame(&self) -> Option<u64> {
@@ -57,13 +57,13 @@ impl FrameHost<'_> {
     }
     pub fn set_render_settings(
         &mut self,
-        settings: mundaris_renderer::RenderSettings,
+        settings: astrum_renderer::RenderSettings,
     ) -> Result<()> {
         self.renderer
             .set_render_settings(settings)
             .map_err(anyhow::Error::msg)
     }
-    pub fn shadow_report(&self) -> mundaris_renderer::ShadowReport {
+    pub fn shadow_report(&self) -> astrum_renderer::ShadowReport {
         self.renderer.shadow_report()
     }
     pub fn render_empty(&mut self) -> Result<()> {

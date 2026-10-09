@@ -10,7 +10,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $contentRoot = [IO.Path]::GetFullPath((Join-Path $repo 'content'))
-$executable = Join-Path $repo 'target\release\mundaris_app.exe'
+$executable = Join-Path $repo 'target\release\astrum_app.exe'
 $buildReceiptPath = Join-Path $repo 'target\shared-test-system-build.json'
 $utf8 = New-Object Text.UTF8Encoding($false)
 
@@ -86,7 +86,7 @@ $claim.Dispose()
 $head = (& git -C $repo rev-parse HEAD 2>&1 | Out-String).Trim()
 if ($LASTEXITCODE -ne 0) { throw "Could not identify checkout HEAD: $head" }
 if ($BuildOnly -and -not $Build) { throw "-BuildOnly requires -Build" }
-if (Get-Process -Name mundaris_app -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $executable }) {
+if (Get-Process -Name astrum_app -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $executable }) {
     throw "Close this checkout native app before building or launching another run."
 }
 $sourceBefore = Get-SourceSnapshot
@@ -99,7 +99,7 @@ if ($Build) {
     $previousPreference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        & cargo build --locked --release -p mundaris_app --bin mundaris_app --bin mundaris_dev --features developer-tools --target-dir (Join-Path $repo 'target') *> (Join-Path $runDirectory 'build.log')
+        & cargo build --locked --release -p astrum_app --bin astrum_app --bin astrum_dev --features developer-tools --target-dir (Join-Path $repo 'target') *> (Join-Path $runDirectory 'build.log')
         if ($LASTEXITCODE -ne 0) { throw "Locked release developer-tools build failed; see $(Join-Path $runDirectory 'build.log')" }
     } finally {
         $ErrorActionPreference = $previousPreference
@@ -107,7 +107,7 @@ if ($Build) {
     }
 }
 if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
-    throw "Ordinary mundaris_app release executable is missing. Run this script with -Build: $executable"
+    throw "Ordinary astrum_app release executable is missing. Run this script with -Build: $executable"
 }
 $sourceAfter = Get-SourceSnapshot
 if ($sourceBefore.sha256 -ne $sourceAfter.sha256) { throw 'Build inputs changed while preparing the launch; refusing uncertain attribution.' }
@@ -115,14 +115,14 @@ $contentAfter = Get-ContentSnapshot $contentRoot
 if ($content.sha256 -ne $contentAfter.sha256) { throw 'Canonical content changed while preparing the launch; refusing uncertain attribution.' }
 $executableHash = (Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($Build) {
-    $receipt = [pscustomobject]@{ source_sha256 = $sourceAfter.sha256; binary_sha256 = $executableHash; developer_binary_sha256 = (Get-FileHash -LiteralPath (Join-Path $repo 'target\release\mundaris_dev.exe') -Algorithm SHA256).Hash.ToLowerInvariant() }
+    $receipt = [pscustomobject]@{ source_sha256 = $sourceAfter.sha256; binary_sha256 = $executableHash; developer_binary_sha256 = (Get-FileHash -LiteralPath (Join-Path $repo 'target\release\astrum_dev.exe') -Algorithm SHA256).Hash.ToLowerInvariant() }
     [IO.File]::WriteAllText($buildReceiptPath, (ConvertTo-Json $receipt), $utf8)
     if ($BuildOnly) { Write-Output "Built and recorded receipt: $buildReceiptPath"; return }
 } else {
     if (-not (Test-Path -LiteralPath $buildReceiptPath -PathType Leaf)) { throw 'Missing shared build receipt. Run this launcher with -Build.' }
     $receipt = Get-Content -LiteralPath $buildReceiptPath -Raw | ConvertFrom-Json
     if ($receipt.source_sha256 -ne $sourceAfter.sha256 -or $receipt.binary_sha256 -ne $executableHash) { throw 'Executable build receipt does not match current source/binary. Run with -Build.' }
-    if ($DeveloperInterface -and $receipt.developer_binary_sha256 -ne (Get-FileHash -LiteralPath (Join-Path $repo 'target\release\mundaris_dev.exe') -Algorithm SHA256).Hash.ToLowerInvariant()) { throw 'Developer executable differs from its shared build receipt.' }
+    if ($DeveloperInterface -and $receipt.developer_binary_sha256 -ne (Get-FileHash -LiteralPath (Join-Path $repo 'target\release\astrum_dev.exe') -Algorithm SHA256).Hash.ToLowerInvariant()) { throw 'Developer executable differs from its shared build receipt.' }
 }
 $sourceManifest = [pscustomobject]@{ head = $head; sha256 = $sourceAfter.sha256; files = $sourceAfter.files }
 $contentManifest = [pscustomobject]@{
@@ -160,17 +160,17 @@ if ($DeveloperInterface) {
     $null = New-Item -ItemType Directory -Path $registryPath
     $null = New-Item -ItemType Directory -Path $nativeOutputPath
 }
-$environmentNames = @('MUNDARIS_DEV_REGISTRY', 'MUNDARIS_DEV_OUTPUT', 'MUNDARIS_DEV_BUILD_MANIFEST', 'MUNDARIS_PERFORMANCE_LAB', 'MUNDARIS_CAPTURE_DIR')
+$environmentNames = @('ASTRUM_DEV_REGISTRY', 'ASTRUM_DEV_OUTPUT', 'ASTRUM_DEV_BUILD_MANIFEST', 'ASTRUM_PERFORMANCE_LAB', 'ASTRUM_CAPTURE_DIR')
 $previousEnvironment = @{}
 foreach ($name in $environmentNames) { $previousEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
 try {
     if ($DeveloperInterface) {
-        $env:MUNDARIS_DEV_REGISTRY = $registryPath
-        $env:MUNDARIS_DEV_OUTPUT = $nativeOutputPath
-        $env:MUNDARIS_DEV_BUILD_MANIFEST = $buildManifestPath
+        $env:ASTRUM_DEV_REGISTRY = $registryPath
+        $env:ASTRUM_DEV_OUTPUT = $nativeOutputPath
+        $env:ASTRUM_DEV_BUILD_MANIFEST = $buildManifestPath
     }
-    Remove-Item Env:MUNDARIS_PERFORMANCE_LAB, Env:MUNDARIS_CAPTURE_DIR -ErrorAction SilentlyContinue
-    if (-not $DeveloperInterface) { Remove-Item Env:MUNDARIS_DEV_REGISTRY, Env:MUNDARIS_DEV_OUTPUT, Env:MUNDARIS_DEV_BUILD_MANIFEST -ErrorAction SilentlyContinue }
+    Remove-Item Env:ASTRUM_PERFORMANCE_LAB, Env:ASTRUM_CAPTURE_DIR -ErrorAction SilentlyContinue
+    if (-not $DeveloperInterface) { Remove-Item Env:ASTRUM_DEV_REGISTRY, Env:ASTRUM_DEV_OUTPUT, Env:ASTRUM_DEV_BUILD_MANIFEST -ErrorAction SilentlyContinue }
     $process = Start-Process -FilePath $executable -ArgumentList $arguments -WorkingDirectory $repo -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
 } finally {
     foreach ($name in $environmentNames) { [Environment]::SetEnvironmentVariable($name, $previousEnvironment[$name], 'Process') }
@@ -180,7 +180,7 @@ $launch = [pscustomobject]@{
     schema = 1
     started_utc = [DateTime]::UtcNow.ToString('o')
     pid = $process.Id
-    process_name = 'mundaris_app'
+    process_name = 'astrum_app'
     arguments = $arguments
     developer_interface = [bool]$DeveloperInterface
     checkout = $repo

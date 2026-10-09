@@ -1,7 +1,7 @@
 //! Studio design tokens (docs/STUDIO_UI.md §6) applied to egui's style.
 
 use egui::{Color32, CornerRadius, FontFamily, FontId, Stroke, TextStyle, Theme, Vec2};
-use mundaris_app::studio::view::Tone;
+use astrum_app::studio::view::Tone;
 
 pub const SURFACE_0: Color32 = Color32::from_rgb(0x0b, 0x0e, 0x13);
 pub const SURFACE_1: Color32 = Color32::from_rgb(0x12, 0x16, 0x1d);

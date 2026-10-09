@@ -1,10 +1,10 @@
 //! Disposable reference policy and conic geometry. No guide advances a physical body.
 use anyhow::{Result, ensure};
 use glam::DVec3;
-use mundaris_simulation::{
+use astrum_simulation::{
     ConicClass, GRAVITATIONAL_CONSTANT_M3_KG_S2 as G, TwoBodyElements, osculating_elements,
 };
-use mundaris_world::{
+use astrum_world::{
     BodyId, CelestialMotionDefinition, CelestialSystem, CelestialTranslation, EllipticOrbit,
     SimulationInstant,
 };

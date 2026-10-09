@@ -11,7 +11,7 @@ use super::{
     unit,
 };
 use glam::{DMat3, DVec3};
-use mundaris_math::{Direction3, noise::gradient_noise, surface::SurfaceLocation};
+use astrum_math::{Direction3, noise::gradient_noise, surface::SurfaceLocation};
 use std::ops::{Add, Div, Mul, Neg, Sub};
 use std::time::Instant;
 

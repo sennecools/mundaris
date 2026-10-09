@@ -1,7 +1,7 @@
 //! W2 biome catalog and heightmap variants: compose the world map with
 //! library detail on the CPU and write hillshade crops at chosen spots.
 //!
-//! cargo run --release -p mundaris_world --example biome_preview -- \
+//! cargo run --release -p astrum_world --example biome_preview -- \
 //!     <catalog.json> <world_map_recipe.json> <out_dir> --library <dir> [--library <dir> ...]
 //!
 //! Spots are chosen automatically: the most interior point of each biome and
@@ -11,7 +11,7 @@
 //! overview, and `preview.json` with spot positions, weights and detail RMS.
 
 use glam::DVec3;
-use mundaris_world::terrain::world_map::{
+use astrum_world::terrain::world_map::{
     BiomeCatalog, ComposedSurface, DetailTile, MOON_BIOMES, MoonWorldMapRecipe, bake_moon,
     texel_directions,
 };

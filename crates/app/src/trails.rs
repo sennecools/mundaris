@@ -1,9 +1,9 @@
 //! Bounded app-owned actual committed f64 history, independent of FrameId lifetime.
 use anyhow::{Result, ensure};
 use glam::DVec3;
-use mundaris_math::{FrameId, FramePosition, LocalPosition};
-use mundaris_renderer::{CelestialProjection, DebugLine, PreparedView};
-use mundaris_world::{BodyId, CelestialFrameProjection, CelestialSystem};
+use astrum_math::{FrameId, FramePosition, LocalPosition};
+use astrum_renderer::{CelestialProjection, DebugLine, PreparedView};
+use astrum_world::{BodyId, CelestialFrameProjection, CelestialSystem};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrailMode {
@@ -457,7 +457,7 @@ impl TrailHistory {
 mod tests {
     use super::*;
     use crate::gravity_fixtures::GravityFixture;
-    use mundaris_simulation::*;
+    use astrum_simulation::*;
     use std::{num::NonZeroU64, time::Duration};
     #[test]
     fn display_keeps_committed_vertices_extrema_age_and_screen_tolerance() {
@@ -478,11 +478,11 @@ mod tests {
         let root = frames.tree().root();
         let view = PreparedView::new(
             &frames.tree().evaluate(),
-            mundaris_math::FramePose::new(
+            astrum_math::FramePose::new(
                 FramePosition::new(root, LocalPosition::try_metres(DVec3::Z * 1e8).unwrap()),
-                mundaris_math::UnitRotation::identity(),
+                astrum_math::UnitRotation::identity(),
             ),
-            mundaris_renderer::RenderPrecisionBudget::near_debug(),
+            astrum_renderer::RenderPrecisionBudget::near_debug(),
         )
         .unwrap();
         let projection = CelestialProjection::try_new(1280, 800, 1.0, 0.1).unwrap();

@@ -2,8 +2,8 @@
 
 use crate::{GravityError, GravityEvaluationReport, evaluate_resolved_accelerations};
 use glam::DVec3;
-use mundaris_math::*;
-use mundaris_world::{BodyId, BodyState, BodyStateUpdate, CelestialSystem, CelestialSystemError};
+use astrum_math::*;
+use astrum_world::{BodyId, BodyState, BodyStateUpdate, CelestialSystem, CelestialSystemError};
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum SimulationError {

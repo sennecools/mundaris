@@ -1,5 +1,5 @@
 use glam::DVec3;
-use mundaris_math::noise::{GLOBAL_BOUNDS, gradient_noise, gradient_noise_value, lattice_hash};
+use astrum_math::noise::{GLOBAL_BOUNDS, gradient_noise, gradient_noise_value, lattice_hash};
 
 #[test]
 fn fixed_hash_vectors_and_signed_indices() {

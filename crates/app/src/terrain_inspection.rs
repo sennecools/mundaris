@@ -1,11 +1,11 @@
 //! Read-only point terrain diagnostics; this module never creates render geometry.
 use anyhow::Result;
 use glam::DVec3;
-use mundaris_math::{Direction3, FramePose, surface::SurfaceLocation};
-use mundaris_world::terrain::{
+use astrum_math::{Direction3, FramePose, surface::SurfaceLocation};
+use astrum_world::terrain::{
     SurfaceGenerator, TerrainDefinition, TerrainFootprint, TerrainGenerator, TerrainQuery,
 };
-use mundaris_world::{BodyId, CelestialBody, CoherentCelestialView};
+use astrum_world::{BodyId, CelestialBody, CoherentCelestialView};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TerrainClearance {

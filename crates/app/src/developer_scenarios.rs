@@ -25,7 +25,7 @@ const MAX_WAIT_SECONDS: f64 = 300.0;
 const MAX_ACTION_SECONDS: f64 = 60.0;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_BUILD_DURATION: Duration = Duration::from_secs(30 * 60);
-const OUTPUT_CLAIM_FILE: &str = ".mundaris-scenario-claim";
+const OUTPUT_CLAIM_FILE: &str = ".astrum-scenario-claim";
 pub const SHARED_TEST_SYSTEM_PRESET: &str = "test-solar-system";
 
 static OWNED_CHILDREN: OnceLock<Mutex<HashMap<u32, Child>>> = OnceLock::new();
@@ -317,9 +317,9 @@ pub fn launch_owned_cancellable(
         "--locked",
         "--release",
         "-p",
-        "mundaris_app",
+        "astrum_app",
         "--bin",
-        "mundaris_app",
+        "astrum_app",
         "--features",
         "developer-tools",
     ]);
@@ -350,7 +350,7 @@ pub fn launch_owned_cancellable(
     let mut build_manifest = source_after;
     build_manifest["build_elapsed_s"] = json!(build_started.elapsed().as_secs_f64());
     build_manifest["command"] = json!(format!(
-        "cargo build --locked --release -p mundaris_app --bin mundaris_app --features developer-tools --target-dir {}",
+        "cargo build --locked --release -p astrum_app --bin astrum_app --features developer-tools --target-dir {}",
         repo.join("target").display()
     ));
     for (key, program, args) in [
@@ -384,9 +384,9 @@ pub fn launch_owned_cancellable(
     command
         .current_dir(&repo)
         .arg("--dev-interface")
-        .env("MUNDARIS_DEV_REGISTRY", &registry)
-        .env("MUNDARIS_DEV_OUTPUT", &output)
-        .env("MUNDARIS_DEV_BUILD_MANIFEST", &build_manifest_path)
+        .env("ASTRUM_DEV_REGISTRY", &registry)
+        .env("ASTRUM_DEV_OUTPUT", &output)
+        .env("ASTRUM_DEV_BUILD_MANIFEST", &build_manifest_path)
         .stdout(Stdio::from(fs::File::create(output.join("stdout.txt"))?))
         .stderr(Stdio::from(fs::File::create(output.join("stderr.txt"))?));
     let mut child = command
@@ -1310,9 +1310,9 @@ fn repository_root() -> Result<PathBuf> {
 
 fn executable_name() -> &'static str {
     if cfg!(windows) {
-        "mundaris_app.exe"
+        "astrum_app.exe"
     } else {
-        "mundaris_app"
+        "astrum_app"
     }
 }
 
@@ -1654,7 +1654,7 @@ mod tests {
             steps: Vec::new(),
         };
         let output = std::env::temp_dir().join(format!(
-            "mundaris-cancelled-scenario-{}-{}",
+            "astrum-cancelled-scenario-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1670,7 +1670,7 @@ mod tests {
     #[test]
     fn output_claim_is_atomic_and_static_json_cannot_be_replaced() {
         let root = std::env::temp_dir().join(format!(
-            "mundaris-output-claim-{}-{}",
+            "astrum-output-claim-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)

@@ -2,8 +2,8 @@
 use crate::celestial_labels::ScreenRect;
 use anyhow::{Result, ensure};
 use glam::DVec3;
-use mundaris_renderer::CelestialProjection;
-use mundaris_world::{BodyId, CelestialSystem};
+use astrum_renderer::CelestialProjection;
+use astrum_world::{BodyId, CelestialSystem};
 #[derive(Default)]
 pub struct BodySelection(Option<BodyId>);
 impl BodySelection {

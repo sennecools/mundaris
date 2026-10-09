@@ -1,8 +1,8 @@
 //! Focused controller and complete-terrain query timings, excluding rendering/I/O.
 use anyhow::Result;
 use glam::DVec3;
-use mundaris_app::{celestial_camera::*, solar_system::SolarSystemPreset, terrain_inspection};
-use mundaris_world::CelestialFrameProjection;
+use astrum_app::{celestial_camera::*, solar_system::SolarSystemPreset, terrain_inspection};
+use astrum_world::CelestialFrameProjection;
 use std::{
     hint::black_box,
     num::NonZeroU64,

@@ -1,5 +1,5 @@
 [package]
-name = "mundaris_math"
+name = "astrum_math"
 version.workspace = true
 edition.workspace = true
 publish = false

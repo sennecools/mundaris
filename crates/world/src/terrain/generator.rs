@@ -2,7 +2,7 @@
 //! not sampled extrema or a claim of tight regional interval subdivision.
 use super::*;
 use glam::{DMat3, DQuat, DVec3};
-use mundaris_math::{
+use astrum_math::{
     noise::{GLOBAL_BOUNDS, gradient_noise},
     surface::{DirectionalCap, SurfaceLocation},
 };
@@ -790,7 +790,7 @@ impl TerrainGenerator {
             )?;
         }
         let cap = DirectionalCap::new(
-            mundaris_math::Direction3::try_new(DVec3::X)
+            astrum_math::Direction3::try_new(DVec3::X)
                 .map_err(|_| TerrainError::InvalidConfig)?,
             if self.craters.is_some() {
                 std::f64::consts::PI

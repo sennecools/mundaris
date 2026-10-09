@@ -1,8 +1,8 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use glam::DVec3;
-use mundaris_math::*;
-use mundaris_simulation::*;
-use mundaris_world::*;
+use astrum_math::*;
+use astrum_simulation::*;
+use astrum_world::*;
 use std::{f64::consts::TAU, hint::black_box, num::NonZeroU64, time::Duration};
 
 fn fixture(count: usize) -> (CelestialSystem, AnalyticMotionProducer) {

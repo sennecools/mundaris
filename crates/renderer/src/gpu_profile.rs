@@ -314,7 +314,7 @@ impl CelestialQueries {
             .contains(wgpu::Features::TIMESTAMP_QUERY)
             .then(|| Self {
                 set: device.create_query_set(&wgpu::QuerySetDescriptor {
-                    label: Some("Mundaris native frame and celestial timestamps"),
+                    label: Some("Astrum native frame and celestial timestamps"),
                     ty: wgpu::QueryType::Timestamp,
                     count: QUERY_COUNT,
                 }),
@@ -449,13 +449,13 @@ impl AsyncTimestampSlot {
         Some(Self {
             queries,
             resolve: device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Mundaris timestamp resolve"),
+                label: Some("Astrum timestamp resolve"),
                 size,
                 usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             }),
             readback: device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Mundaris timestamp readback"),
+                label: Some("Astrum timestamp readback"),
                 size,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,

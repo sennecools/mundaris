@@ -22,8 +22,8 @@ use super::catalog::{BiomeCatalog, WorldField};
 use super::cube::{CubeMap, neighbours, texel_directions};
 use super::detail::DetailTile;
 use glam::DVec3;
-use mundaris_math::noise::gradient_noise_value;
-use mundaris_math::surface::CubeFace;
+use astrum_math::noise::gradient_noise_value;
+use astrum_math::surface::CubeFace;
 
 /// Biome weights fade out smoothly below about twice this.
 const MIN_WEIGHT: f64 = 1.0 / 64.0;

@@ -107,12 +107,12 @@ try {
     [IO.File]::WriteAllText((Join-Path $runDirectory 'source-files.sha256.json'), (ConvertTo-Json -InputObject $fingerprint -Depth 3), [Text.UTF8Encoding]::new($false))
     $null = Invoke-CheckedNative 'format' 'cargo' @('fmt', '--all', '--', '--check') (Join-Path $logsDirectory 'format.log')
     $testLog = Join-Path $logsDirectory 'developer-interface.log'
-    $null = Invoke-CheckedNative 'developer_interface' 'cargo' @('test', '--locked', '-p', 'mundaris_app', '--test', 'developer_interface') $testLog
+    $null = Invoke-CheckedNative 'developer_interface' 'cargo' @('test', '--locked', '-p', 'astrum_app', '--test', 'developer_interface') $testLog
     Copy-Item -LiteralPath $testLog -Destination $testResultsPath -Force
-    $null = Invoke-CheckedNative 'developer_commands' 'cargo' @('test','--locked','-p','mundaris_app','--features','developer-tools','--test','developer_commands') (Join-Path $logsDirectory 'developer-commands.log')
-    $null = Invoke-CheckedNative 'developer_bridge' 'cargo' @('test','--locked','-p','mundaris_app','--features','developer-tools','--test','developer_bridge') (Join-Path $logsDirectory 'developer-bridge.log')
+    $null = Invoke-CheckedNative 'developer_commands' 'cargo' @('test','--locked','-p','astrum_app','--features','developer-tools','--test','developer_commands') (Join-Path $logsDirectory 'developer-commands.log')
+    $null = Invoke-CheckedNative 'developer_bridge' 'cargo' @('test','--locked','-p','astrum_app','--features','developer-tools','--test','developer_bridge') (Join-Path $logsDirectory 'developer-bridge.log')
     $null = Invoke-CheckedNative 'developer_capture' 'cargo' @(
-        'run', '--locked', '--release', '-p', 'mundaris_app', '--features',
+        'run', '--locked', '--release', '-p', 'astrum_app', '--features',
         'terrain-capture,surface-profile', '--example', 'developer_capture', '--',
         $Scene, $runDirectory
     ) (Join-Path $logsDirectory 'developer-capture.log')

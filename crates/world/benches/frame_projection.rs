@@ -1,6 +1,6 @@
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use mundaris_math::*;
-use mundaris_world::*;
+use astrum_math::*;
+use astrum_world::*;
 use std::{hint::black_box, num::NonZeroU64};
 
 fn ns(value: u64) -> NonZeroU64 {

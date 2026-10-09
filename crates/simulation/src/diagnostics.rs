@@ -2,8 +2,8 @@
 
 use crate::{GRAVITATIONAL_CONSTANT_M3_KG_S2 as G, SimulationError};
 use glam::DVec3;
-use mundaris_math::SimulationInstant;
-use mundaris_world::{BodyState, CelestialSystem};
+use astrum_math::SimulationInstant;
+use astrum_world::{BodyState, CelestialSystem};
 
 #[derive(Default)]
 struct Sum {

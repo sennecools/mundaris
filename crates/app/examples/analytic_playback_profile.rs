@@ -1,6 +1,6 @@
 //! Bounded host-stage measurements; not native FPS or a gravity-solver comparison.
 use anyhow::{Context, Result, ensure};
-use mundaris_app::GravityOrbitsDemo;
+use astrum_app::GravityOrbitsDemo;
 use serde_json::json;
 use std::{
     path::PathBuf,
@@ -14,7 +14,7 @@ fn main() -> Result<()> {
         .context("provide a fresh output JSON path")?;
     ensure!(!output.exists(), "refusing to replace existing evidence");
     let mut fixtures = Vec::new();
-    for scene in [mundaris_app::shared_system::SCENE_NAME] {
+    for scene in [astrum_app::shared_system::SCENE_NAME] {
         for time_s in [0.0, 31_557_600_000.0, -31_557_600_000.0] {
             let mut app = GravityOrbitsDemo::shared_test_system()?;
             app.seek_seconds(time_s)?;

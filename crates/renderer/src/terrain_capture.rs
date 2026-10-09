@@ -94,7 +94,7 @@ impl TerrainCaptureRenderer {
         let adapter_backend = format!("{:?}", info.backend);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                label: Some("Mundaris terrain capture device"),
+                label: Some("Astrum terrain capture device"),
                 required_features: requested_features,
                 required_limits: wgpu::Limits::default(),
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),

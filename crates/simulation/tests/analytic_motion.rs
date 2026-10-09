@@ -1,7 +1,7 @@
 use glam::{DQuat, DVec3};
-use mundaris_math::*;
-use mundaris_simulation::*;
-use mundaris_world::*;
+use astrum_math::*;
+use astrum_simulation::*;
+use astrum_world::*;
 use std::{
     f64::consts::{PI, TAU},
     num::NonZeroU64,

@@ -1,7 +1,7 @@
 use glam::DVec3;
-use mundaris_app::{celestial_selection::*, gravity_fixtures::*, orbit_guides::*, system_view::*};
-use mundaris_math::*;
-use mundaris_world::*;
+use astrum_app::{celestial_selection::*, gravity_fixtures::*, orbit_guides::*, system_view::*};
+use astrum_math::*;
+use astrum_world::*;
 use std::num::NonZeroU64;
 #[test]
 fn empty_single_local_and_outlier_policy() {

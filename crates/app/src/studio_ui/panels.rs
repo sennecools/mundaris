@@ -3,11 +3,11 @@
 //! report interactions as [`StudioAction`]s; they hold no engine state.
 
 use egui::{Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, Stroke, Ui};
-use mundaris_app::render_settings::{SPECS, SettingKind, SettingValue};
-use mundaris_app::studio::view::{
+use astrum_app::render_settings::{SPECS, SettingKind, SettingValue};
+use astrum_app::studio::view::{
     CAMERA_MODES, Overlay, RATE_PRESETS, StatItem, StudioAction, StudioView,
 };
-use mundaris_renderer::TerrainViewMode;
+use astrum_renderer::TerrainViewMode;
 
 use super::theme::{self, *};
 
@@ -114,7 +114,7 @@ pub fn toolbar(
 ) {
     ui.horizontal_centered(|ui| {
         ui.label(
-            RichText::new("Mundaris")
+            RichText::new("Astrum")
                 .size(FONT_HEADING)
                 .strong()
                 .color(TEXT_PRIMARY),

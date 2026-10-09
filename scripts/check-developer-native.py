@@ -164,7 +164,7 @@ def run(args):
             user.GetWindowThreadProcessId(window, ctypes.byref(process_id))
             title=ctypes.create_unicode_buffer(256)
             user.GetWindowTextW(window,title,256)
-            if process_id.value == descriptor["pid"] and title.value == "Mundaris":
+            if process_id.value == descriptor["pid"] and title.value == "Astrum":
                 windows.append(window)
             return True
         user.EnumWindows(callback, 0)
@@ -231,7 +231,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--session", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--binary", type=Path, default=Path("../target/release/mundaris_dev.exe"))
+    parser.add_argument("--binary", type=Path, default=Path("../target/release/astrum_dev.exe"))
     parser.add_argument("--skip-raw", action="store_true", help="Check malformed transport separately with the Rust transport tests")
     parser.add_argument("--lease-expiry", action="store_true", help="Also wait 31 seconds to check actual lease expiry")
     run(parser.parse_args())

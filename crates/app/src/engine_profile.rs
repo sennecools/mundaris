@@ -25,7 +25,7 @@ use std::{
 };
 
 #[cfg(feature = "surface-profile")]
-use mundaris_renderer::CpuStageTimer;
+use astrum_renderer::CpuStageTimer;
 
 const MAX_LANES: usize = 16;
 const MAIN_EVENT_CAPACITY: usize = 8_192;
@@ -238,7 +238,7 @@ pub struct ProfileSnapshot {
     pub schema_version: u32,
     pub enabled: bool,
     /// True only when the process was launched with
-    /// `MUNDARIS_PROFILE_THREAD_CPU=1` and the `surface-profile` feature.
+    /// `ASTRUM_PROFILE_THREAD_CPU=1` and the `surface-profile` feature.
     pub thread_cpu_timing_enabled: bool,
     pub capture_id: u64,
     pub dropped_nesting: u64,
@@ -522,7 +522,7 @@ impl Profiler {
 
 #[cfg(feature = "surface-profile")]
 fn thread_cpu_timing_requested() -> bool {
-    std::env::var_os("MUNDARIS_PROFILE_THREAD_CPU").is_some_and(|value| value == "1")
+    std::env::var_os("ASTRUM_PROFILE_THREAD_CPU").is_some_and(|value| value == "1")
 }
 
 #[cfg(not(feature = "surface-profile"))]

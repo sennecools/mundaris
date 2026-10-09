@@ -15,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const FORMAT: &str = "mundaris.terrain-bundle.v1";
-pub const GENERATOR: &str = "mundaris_terrain_bake";
+pub const GENERATOR: &str = "astrum_terrain_bake";
 pub const GENERATOR_VERSION: &str = "erosion-pipes-1";
 const METADATA_FILE: &str = "bundle.json";
 

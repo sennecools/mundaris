@@ -1,13 +1,13 @@
 use glam::DVec3;
-use mundaris_math::{
+use astrum_math::{
     AngularVelocity3, Direction3, LinearVelocity3, LocalPosition, UnitRotation,
     surface::SurfaceLocation,
 };
-use mundaris_terrain_fields::{
+use astrum_terrain_fields::{
     cube_direction,
     graph::{Graph, Node, templates},
 };
-use mundaris_world::{
+use astrum_world::{
     BodyProperties, BodyState, CelestialSystem, SimulationInstant,
     terrain::{
         GraphSurface, SurfaceAlgorithm, SurfaceDefinition, SurfaceGenerator, TerrainIdentity,
@@ -149,7 +149,7 @@ fn semantic_words_ignore_editor_labels_and_layout_but_include_complete_graph_dat
     let mut decorated = source.clone();
     decorated.layout.insert(
         "base".into(),
-        mundaris_terrain_fields::graph::LayoutPoint { x: 23.0, y: -9.0 },
+        astrum_terrain_fields::graph::LayoutPoint { x: 23.0, y: -9.0 },
     );
     node_mut(&mut decorated, "base").label = "A UI label".into();
     let decorated = compiled(decorated);

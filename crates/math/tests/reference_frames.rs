@@ -1,5 +1,5 @@
 use glam::DVec3;
-use mundaris_math::*;
+use astrum_math::*;
 use std::num::NonZeroU64;
 
 fn tree(namespace: u64) -> FrameTree {

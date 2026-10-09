@@ -1,7 +1,7 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use glam::DVec3;
-use mundaris_math::{Direction3, surface::SurfaceLocation};
-use mundaris_world::terrain::*;
+use astrum_math::{Direction3, surface::SurfaceLocation};
+use astrum_world::terrain::*;
 use std::{hint::black_box, time::Duration};
 
 fn definition() -> TerrainDefinition {
@@ -97,7 +97,7 @@ fn terrain(c: &mut Criterion) {
                 .unwrap()
         })
     });
-    let cap = mundaris_math::surface::DirectionalCap::new(axis, 0.1).unwrap();
+    let cap = astrum_math::surface::DirectionalCap::new(axis, 0.1).unwrap();
     foundation.bench_function("cap_certificate", |b| {
         b.iter(|| black_box(analytic).bounds_for_region(black_box(cap)))
     });

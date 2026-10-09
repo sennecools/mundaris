@@ -1,5 +1,5 @@
 [package]
-name = "mundaris_terrain_fields"
+name = "astrum_terrain_fields"
 version.workspace = true
 edition.workspace = true
 publish = false

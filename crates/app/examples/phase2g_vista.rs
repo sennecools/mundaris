@@ -3,13 +3,13 @@
 //! This is an offline composition aid. Its PNG is a software projection of a
 //! finite exact-source mesh, not a native renderer capture or terrain guarantee.
 //!
-//! Usage: cargo run --locked -p mundaris_app --features developer-tools --example phase2g_vista -- <root.r16> <new-output-directory> [--detail-profile <r16> <footprint_m> <amplitude_m>] [--radius <m>]
+//! Usage: cargo run --locked -p astrum_app --features developer-tools --example phase2g_vista -- <root.r16> <new-output-directory> [--detail-profile <r16> <footprint_m> <amplitude_m>] [--radius <m>]
 
 use anyhow::{Context, Result, ensure};
 use glam::{DMat3, DQuat, DVec3};
-use mundaris_app::terrain_profile::load_height_profile;
-use mundaris_math::surface::{CubeFace, SurfaceLocation};
-use mundaris_world::terrain::{
+use astrum_app::terrain_profile::load_height_profile;
+use astrum_math::surface::{CubeFace, SurfaceLocation};
+use astrum_world::terrain::{
     SurfaceAlgorithm, SurfaceDefinition, SurfaceGenerator, TerrainIdentity, TerrainSeed,
 };
 use serde_json::{Value, json};
@@ -21,9 +21,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const DEFAULT_RADIUS_M: f64 = mundaris_app::solar_system::SOLAR_SYSTEM_CONTENT[4]
+const DEFAULT_RADIUS_M: f64 = astrum_app::solar_system::SOLAR_SYSTEM_CONTENT[4]
     .real_mean_radius_m
-    * mundaris_app::solar_system::SolarSystemPreset::gameplay().body_radius_scale;
+    * astrum_app::solar_system::SolarSystemPreset::gameplay().body_radius_scale;
 const ROOT_FOOTPRINT_M: f64 = 4_000.0;
 const ROOT_AMPLITUDE_M: f64 = 600.0;
 const SEARCH_HALF_EXTENT_M: f64 = 2_000.0;

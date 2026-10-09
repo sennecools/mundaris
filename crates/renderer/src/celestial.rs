@@ -3,7 +3,7 @@ use crate::{
     CelestialProjection, DebugLine, PreparedView, RenderPreparationError, reference_sphere_occludes,
 };
 use glam::DVec3;
-use mundaris_math::{Direction3, FrameId, FramePosition, LocalPosition};
+use astrum_math::{Direction3, FrameId, FramePosition, LocalPosition};
 use std::collections::BTreeMap;
 
 /// Deterministic level-3 icosphere: 642 unit vertices, 1280 outward triangles.
@@ -94,7 +94,7 @@ impl Icosphere {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mundaris_math::*;
+    use astrum_math::*;
     #[test]
     fn vertex_uniform_layout_is_explicit_and_complete() {
         let tree = FrameTree::new(std::num::NonZeroU64::new(1).unwrap());

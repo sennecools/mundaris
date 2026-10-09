@@ -1,9 +1,9 @@
 use glam::DVec3;
-use mundaris_math::{
+use astrum_math::{
     Direction3,
     surface::{DirectionalCap, SurfaceLocation},
 };
-use mundaris_world::terrain::*;
+use astrum_world::terrain::*;
 
 #[test]
 fn subnormal_amplitudes_have_outward_regional_envelopes() {

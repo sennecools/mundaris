@@ -3,7 +3,7 @@
 use super::{TerrainError, TerrainIdentity, TerrainSample, TerrainSeed};
 use crate::terrain::SurfaceQueryContext;
 use glam::{DMat3, DVec3};
-use mundaris_math::{Direction3, noise::gradient_noise, surface::SurfaceLocation};
+use astrum_math::{Direction3, noise::gradient_noise, surface::SurfaceLocation};
 mod ancient;
 
 const MIN_CELL_EDGE_M: f64 = 8.0;

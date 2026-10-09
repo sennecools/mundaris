@@ -6,7 +6,7 @@ use egui::{
     Align2, Color32, CornerRadius, CursorIcon, Event, EventFilter, FontId, Key, MouseWheelUnit,
     Pos2, Rect, Sense, Stroke, StrokeKind, TextureId, Ui,
 };
-use mundaris_app::{
+use astrum_app::{
     studio::view::{LabelState, Shortcut, StatItem, StudioView},
     viewport::{FlightKey, PointerButton, ViewportEvent},
 };

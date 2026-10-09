@@ -1,6 +1,6 @@
 use glam::DVec3;
-use mundaris_math::*;
-use mundaris_world::*;
+use astrum_math::*;
+use astrum_world::*;
 use std::num::NonZeroU64;
 
 fn ns(value: u64) -> NonZeroU64 {

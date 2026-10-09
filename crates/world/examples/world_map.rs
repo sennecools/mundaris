@@ -1,7 +1,7 @@
 //! W1 Moon world-map generation: bake a world map from a recipe and write the
 //! fields plus viewable equirectangular images.
 //!
-//! cargo run --release -p mundaris_world --example world_map -- <recipe.json> <out_dir>
+//! cargo run --release -p astrum_world --example world_map -- <recipe.json> <out_dir>
 //!
 //! Writes `elevation.f32` (6·n² little-endian f32, faces in `CubeFace::ALL`
 //! order, rows along +v), `biomes.rgba8` (weights × 255 in `MOON_BIOMES` order),
@@ -9,7 +9,7 @@
 //! `hillshade.png`, `biomes.png` (biome colours × hillshade) and `legend.txt`.
 
 use glam::DVec3;
-use mundaris_world::terrain::world_map::{CubeMap, MOON_BIOMES, MoonWorldMapRecipe, bake_moon};
+use astrum_world::terrain::world_map::{CubeMap, MOON_BIOMES, MoonWorldMapRecipe, bake_moon};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
@@ -63,9 +63,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::write(out.join("biomes.rgba8"), &biomes)?;
     let hex = |b: &[u8]| format!("{:x}", Sha256::digest(b));
     let meta = serde_json::json!({
-        "format": "mundaris.world-map.v1",
+        "format": "astrum.world-map.v1",
         "status": "W1 preview output; runtime format not yet defined (W3)",
-        "generator": "mundaris_world::terrain::world_map::bake_moon",
+        "generator": "astrum_world::terrain::world_map::bake_moon",
         "recipe_sha256": hex(&recipe_bytes),
         "recipe": recipe,
         "radius_m": recipe.radius_m,

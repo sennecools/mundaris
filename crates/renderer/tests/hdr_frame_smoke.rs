@@ -3,8 +3,8 @@
 //! overlays, under wgpu validation. Runs without occupying the GPU.
 #![cfg(feature = "terrain-capture")]
 use glam::DVec3;
-use mundaris_math::*;
-use mundaris_renderer::{
+use astrum_math::*;
+use astrum_renderer::{
     CelestialFrame, CelestialLineStyle, CelestialPolyline, CelestialProjection,
     CelestialRenderBody, CelestialStaging, FrameLighting, Icosphere, PreparedView,
     RenderPrecisionBudget, RenderSettings, SurfaceMaterial, TerrainAtlasConfig, TerrainViewMode,
@@ -14,10 +14,10 @@ use std::num::NonZeroU64;
 
 const SIZE: u32 = 256;
 
-/// Writes `image` (tightly packed RGBA8) as a PNG when `MUNDARIS_SMOKE_PNG`
+/// Writes `image` (tightly packed RGBA8) as a PNG when `ASTRUM_SMOKE_PNG`
 /// names a directory; evidence for visual review, never an assertion.
 fn dump(name: &str, width: u32, height: u32, image: &[u8]) {
-    let Some(dir) = std::env::var_os("MUNDARIS_SMOKE_PNG") else {
+    let Some(dir) = std::env::var_os("ASTRUM_SMOKE_PNG") else {
         return;
     };
     let path = std::path::Path::new(&dir).join(format!("{name}.png"));

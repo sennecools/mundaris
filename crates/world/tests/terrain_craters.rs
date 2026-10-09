@@ -1,9 +1,9 @@
 use glam::DVec3;
-use mundaris_math::{
+use astrum_math::{
     Direction3,
     surface::{CubeFace, CubePatchAddress, DirectionalCap, SurfaceLocation},
 };
-use mundaris_world::terrain::*;
+use astrum_world::terrain::*;
 
 fn definition(seed: u64, version: TerrainGeneratorVersion) -> TerrainDefinition {
     let flat = TerrainBandConfig::new(

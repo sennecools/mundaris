@@ -1,4 +1,4 @@
-//! Native GPU rendering for Mundaris.
+//! Native GPU rendering for Astrum.
 //!
 //! This crate renders the scene into an offscreen texture that the application
 //! presents inside its UI, and owns the disposable frame resources.
@@ -145,7 +145,7 @@ impl GpuContext {
         let timestamp_availability = gpu_profile::availability(requested_features);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                label: Some("Mundaris device"),
+                label: Some("Astrum device"),
                 required_features: requested_features,
                 // The terrain atlas needs more texture-array layers than the
                 // portable default; request what the adapter offers, capped.
@@ -518,7 +518,7 @@ impl Renderer {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Mundaris scene encoder"),
+                label: Some("Astrum scene encoder"),
             });
         let frame_timing = timestamp_active
             && self
@@ -529,7 +529,7 @@ impl Renderer {
             let mut timing_encoder =
                 self.device
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("Mundaris frame timing start"),
+                        label: Some("Astrum frame timing start"),
                     });
             if let Some(slot) = &self.timestamp_slot {
                 timing_encoder.write_timestamp(

@@ -6,13 +6,13 @@
 use std::sync::Arc;
 
 use glam::{DQuat, DVec3};
-use mundaris_renderer::RenderPreparationError;
-use mundaris_renderer::sky::{
+use astrum_renderer::RenderPreparationError;
+use astrum_renderer::sky::{
     SkyBackground, SkyBranch, SkyCavity, SkyComplex, SkyDefinition, SkyDiskRegion, SkyIdentity,
     SkyMorphology, SkyStar,
 };
 
-pub const PRESET_ID: &str = "mundaris.decorative-galactic-sky";
+pub const PRESET_ID: &str = "astrum.decorative-galactic-sky";
 pub const PRESET_VERSION: u32 = 4;
 pub const PRESET_SEED: u64 = 0x6d75_6e64_6172_6973;
 pub const FINITE_STAR_MIN_DISTANCE_M: f64 = 1.0e18;
@@ -538,7 +538,7 @@ mod tests {
     #[cfg(feature = "terrain-capture")]
     #[test]
     fn generated_field_has_offband_focal_light_and_quiet_directions() {
-        use mundaris_renderer::sky::sample_background;
+        use astrum_renderer::sky::sample_background;
         let sky = default_sky().unwrap();
         let luminosity = |direction| {
             sample_background(&sky, direction)

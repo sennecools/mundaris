@@ -839,7 +839,7 @@ mod tests {
         ShapeDefinition, SurfaceAlgorithm, SurfaceDefinition, SurfaceMaterialDefinition,
         SurfaceMaterialVersion, SurfaceTerrainDefinition, TerrainIdentity, TerrainSeed,
     };
-    use mundaris_math::{Direction3, surface::SurfaceLocation};
+    use astrum_math::{Direction3, surface::SurfaceLocation};
 
     fn locations() -> Vec<SurfaceLocation> {
         [

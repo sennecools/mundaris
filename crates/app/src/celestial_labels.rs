@@ -1,5 +1,5 @@
 //! Bounded deterministic screen-space label placement. Coordinates are physical pixels.
-use mundaris_world::BodyId;
+use astrum_world::BodyId;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ScreenRect {
     pub min: [f64; 2],

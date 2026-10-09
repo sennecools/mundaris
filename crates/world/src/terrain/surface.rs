@@ -5,13 +5,13 @@ use super::{
     PreparedSurface, TerrainError, TerrainIdentity, TerrainSample, TerrainSeed,
 };
 use glam::{DMat3, DVec3};
-use mundaris_math::{Direction3, noise::gradient_noise, surface::SurfaceLocation};
+use astrum_math::{Direction3, noise::gradient_noise, surface::SurfaceLocation};
 mod authoring;
 pub use authoring::{
     AffineRandomRange, GeologicalAffineControl, GeologicalDistribution,
     MoonCraterProfileDefinition, MoonFieldBandDefinition, MoonFieldDefinition,
 };
-use mundaris_terrain_fields::graph::{CompiledGraph, Graph};
+use astrum_terrain_fields::graph::{CompiledGraph, Graph};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 mod shape;

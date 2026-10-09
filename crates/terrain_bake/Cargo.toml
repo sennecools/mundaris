@@ -1,5 +1,5 @@
 [package]
-name = "mundaris_terrain_bake"
+name = "astrum_terrain_bake"
 version.workspace = true
 edition.workspace = true
 publish = false

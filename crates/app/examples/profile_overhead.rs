@@ -1,4 +1,4 @@
-use mundaris_app::engine_profile::{self, ProfileSnapshot, span};
+use astrum_app::engine_profile::{self, ProfileSnapshot, span};
 use serde::Serialize;
 use std::{env, hint::black_box, process, time::Instant};
 

@@ -91,7 +91,7 @@ struct Node {
 /// Prepared conversions borrow the tree, so authoritative edits cannot stale them.
 /// ```compile_fail
 /// use std::num::NonZeroU64;
-/// use mundaris_math::*;
+/// use astrum_math::*;
 /// let mut tree = FrameTree::new(NonZeroU64::new(1).unwrap());
 /// let prepared = tree.evaluate().prepare_conversion(tree.root(), tree.root()).unwrap();
 /// tree.update_states(1.0, &[]).unwrap();

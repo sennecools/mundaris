@@ -1,8 +1,8 @@
 use glam::DVec3;
-use mundaris_app::{celestial_camera::*, gravity_fixtures::*, terrain_inspection};
-use mundaris_math::*;
-use mundaris_renderer::CelestialProjection;
-use mundaris_world::*;
+use astrum_app::{celestial_camera::*, gravity_fixtures::*, terrain_inspection};
+use astrum_math::*;
+use astrum_renderer::CelestialProjection;
+use astrum_world::*;
 use std::{num::NonZeroU64, time::Duration};
 
 fn fixture() -> (CelestialSystem, CelestialFrameProjection) {

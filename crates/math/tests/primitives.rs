@@ -1,5 +1,5 @@
 use glam::{DQuat, DVec3};
-use mundaris_math::*;
+use astrum_math::*;
 
 fn position(value: DVec3) -> LocalPosition {
     LocalPosition::try_metres(value).unwrap()

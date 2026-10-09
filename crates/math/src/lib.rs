@@ -1,4 +1,4 @@
-//! Checked reference-frame mathematics for Mundaris.
+//! Checked reference-frame mathematics for Astrum.
 //!
 //! Physical values use `f64`, metres, seconds and radians. Frames are right-handed
 //! and orthonormal; positive angles follow the right-hand rule. Column-vector

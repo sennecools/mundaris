@@ -1,6 +1,6 @@
 use glam::DVec3;
-use mundaris_math::{Direction3, surface::CubeFace};
-use mundaris_world::terrain::{ShapeDefinition, TerrainError};
+use astrum_math::{Direction3, surface::CubeFace};
+use astrum_world::terrain::{ShapeDefinition, TerrainError};
 
 fn direction(vector: DVec3) -> Direction3 {
     Direction3::try_new(vector).unwrap()

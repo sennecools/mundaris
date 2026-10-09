@@ -1,6 +1,6 @@
 use glam::DVec3;
-use mundaris_math::*;
-use mundaris_world::*;
+use astrum_math::*;
+use astrum_world::*;
 use std::num::NonZeroU64;
 pub fn fixture(count: usize) -> CelestialSystem {
     let mut system = CelestialSystem::new(NonZeroU64::new(1).unwrap(), SimulationInstant::ZERO);

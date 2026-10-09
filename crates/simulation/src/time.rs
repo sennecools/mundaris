@@ -1,4 +1,4 @@
-use mundaris_math::{InstantError, SimulationInstant};
+use astrum_math::{InstantError, SimulationInstant};
 use std::time::Duration;
 
 /// Simulation seconds per monotonic host second. No engine-wide rate limit.

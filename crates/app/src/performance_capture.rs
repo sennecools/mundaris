@@ -136,13 +136,13 @@ struct CaptureThresholds {
 impl CaptureThresholds {
     fn from_environment() -> Self {
         Self {
-            frame_cpu_ms: env_threshold("MUNDARIS_CAPTURE_FRAME_CPU_MS", 100.0, 60_000.0),
-            publication_ms: env_threshold("MUNDARIS_CAPTURE_PUBLICATION_MS", 2.0, 60_000.0),
-            terrain_update_ms: env_threshold("MUNDARIS_CAPTURE_TERRAIN_UPDATE_MS", 12.0, 60_000.0),
-            queue_age_ms: env_threshold("MUNDARIS_CAPTURE_QUEUE_AGE_MS", 5_000.0, 3_600_000.0),
+            frame_cpu_ms: env_threshold("ASTRUM_CAPTURE_FRAME_CPU_MS", 100.0, 60_000.0),
+            publication_ms: env_threshold("ASTRUM_CAPTURE_PUBLICATION_MS", 2.0, 60_000.0),
+            terrain_update_ms: env_threshold("ASTRUM_CAPTURE_TERRAIN_UPDATE_MS", 12.0, 60_000.0),
+            queue_age_ms: env_threshold("ASTRUM_CAPTURE_QUEUE_AGE_MS", 5_000.0, 3_600_000.0),
             convergence_stall: Duration::from_secs_f64(
                 env_threshold(
-                    "MUNDARIS_CAPTURE_CONVERGENCE_STALL_MS",
+                    "ASTRUM_CAPTURE_CONVERGENCE_STALL_MS",
                     10_000.0,
                     3_600_000.0,
                 ) / 1000.0,
@@ -247,7 +247,7 @@ impl ConvergenceWatch {
     }
 }
 
-/// Captures are opt-in via `MUNDARIS_CAPTURE_DIR`. No file I/O occurs in observe.
+/// Captures are opt-in via `ASTRUM_CAPTURE_DIR`. No file I/O occurs in observe.
 pub struct PerformanceCapture {
     writer: Option<SyncSender<Bundle>>,
     output_root: PathBuf,
@@ -266,7 +266,7 @@ pub struct PerformanceCapture {
 
 impl PerformanceCapture {
     pub fn from_environment() -> Self {
-        let configured_root = std::env::var_os("MUNDARIS_CAPTURE_DIR").map(PathBuf::from);
+        let configured_root = std::env::var_os("ASTRUM_CAPTURE_DIR").map(PathBuf::from);
         let output_root = configured_root
             .clone()
             .unwrap_or_else(|| PathBuf::from("target/terrain-captures"))
@@ -595,11 +595,11 @@ fn write_bundle(root: &std::path::Path, bundle: Bundle) -> std::io::Result<()> {
             "profile_error":bundle.profile_error,
             "profile_wait_ms":bundle.profile_wait_ms,
             "thresholds":{
-                "frame_cpu_ms":env_threshold("MUNDARIS_CAPTURE_FRAME_CPU_MS",100.0,60_000.0),
-                "publication_ms":env_threshold("MUNDARIS_CAPTURE_PUBLICATION_MS",2.0,60_000.0),
-                "terrain_update_ms":env_threshold("MUNDARIS_CAPTURE_TERRAIN_UPDATE_MS",12.0,60_000.0),
-                "queue_age_ms":env_threshold("MUNDARIS_CAPTURE_QUEUE_AGE_MS",5_000.0,3_600_000.0),
-                "convergence_stall_ms":env_threshold("MUNDARIS_CAPTURE_CONVERGENCE_STALL_MS",10_000.0,3_600_000.0),
+                "frame_cpu_ms":env_threshold("ASTRUM_CAPTURE_FRAME_CPU_MS",100.0,60_000.0),
+                "publication_ms":env_threshold("ASTRUM_CAPTURE_PUBLICATION_MS",2.0,60_000.0),
+                "terrain_update_ms":env_threshold("ASTRUM_CAPTURE_TERRAIN_UPDATE_MS",12.0,60_000.0),
+                "queue_age_ms":env_threshold("ASTRUM_CAPTURE_QUEUE_AGE_MS",5_000.0,3_600_000.0),
+                "convergence_stall_ms":env_threshold("ASTRUM_CAPTURE_CONVERGENCE_STALL_MS",10_000.0,3_600_000.0),
             },
             "identity":identity,
         }),

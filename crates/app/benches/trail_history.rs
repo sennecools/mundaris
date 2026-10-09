@@ -1,10 +1,10 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use glam::DVec3;
-use mundaris_app::trails::{TrailDisplayScratch, TrailHistory};
-use mundaris_math::*;
-use mundaris_renderer::*;
-use mundaris_simulation::*;
-use mundaris_world::*;
+use astrum_app::trails::{TrailDisplayScratch, TrailHistory};
+use astrum_math::*;
+use astrum_renderer::*;
+use astrum_simulation::*;
+use astrum_world::*;
 use std::{hint::black_box, num::NonZeroU64, time::Duration};
 fn benches(c: &mut Criterion) {
     let mut group = c.benchmark_group("trail_history_sampling");
@@ -55,7 +55,7 @@ fn benches(c: &mut Criterion) {
     }
     group.finish();
     let mut group = c.benchmark_group("hierarchy_committed_512_trails_projection");
-    let mut world = mundaris_app::gravity_fixtures::GravityFixture::Hierarchy
+    let mut world = astrum_app::gravity_fixtures::GravityFixture::Hierarchy
         .create(NonZeroU64::new(2).unwrap())
         .unwrap();
     let mut runner =
@@ -223,7 +223,7 @@ fn benches(c: &mut Criterion) {
                 if relative {
                     history
                         .set_mode(
-                            mundaris_app::trails::TrailMode::SimultaneousBodyRelative(ids[1]),
+                            astrum_app::trails::TrailMode::SimultaneousBodyRelative(ids[1]),
                             0,
                             (samples - 1) as u64,
                             &world,

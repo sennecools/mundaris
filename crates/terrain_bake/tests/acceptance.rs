@@ -2,14 +2,14 @@
 //! CPU/GPU base-noise agreement, repeatability, mass conservation, periodic
 //! seams, bundle round trip and recipe validation.
 //!
-//! GPU tests skip when no adapter is available unless `MUNDARIS_REQUIRE_GPU=1`.
+//! GPU tests skip when no adapter is available unless `ASTRUM_REQUIRE_GPU=1`.
 
-use mundaris_terrain_bake::bake::{BakeOutput, bake};
-use mundaris_terrain_bake::bundle::{self, PublishInputs, seam_report};
-use mundaris_terrain_bake::derive::derive;
-use mundaris_terrain_bake::gpu::Gpu;
-use mundaris_terrain_bake::noise::base_sample;
-use mundaris_terrain_bake::recipe::{Process, Recipe, StageRecipe};
+use astrum_terrain_bake::bake::{BakeOutput, bake};
+use astrum_terrain_bake::bundle::{self, PublishInputs, seam_report};
+use astrum_terrain_bake::derive::derive;
+use astrum_terrain_bake::gpu::Gpu;
+use astrum_terrain_bake::noise::base_sample;
+use astrum_terrain_bake::recipe::{Process, Recipe, StageRecipe};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -26,7 +26,7 @@ fn smoke_recipe() -> (Recipe, Vec<u8>) {
 fn gpu() -> Option<Gpu> {
     match Gpu::new() {
         Ok(gpu) => Some(gpu),
-        Err(error) if std::env::var("MUNDARIS_REQUIRE_GPU").as_deref() != Ok("1") => {
+        Err(error) if std::env::var("ASTRUM_REQUIRE_GPU").as_deref() != Ok("1") => {
             eprintln!("skipping GPU test: {error:#}");
             None
         }
@@ -61,7 +61,7 @@ fn small_recipe() -> Recipe {
 
 fn scratch_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "mundaris-terrain-bake-{}-{name}",
+        "astrum-terrain-bake-{}-{name}",
         std::process::id()
     ));
     if dir.exists() {

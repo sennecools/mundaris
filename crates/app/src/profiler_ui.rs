@@ -1,6 +1,6 @@
 //! Builds the Studio profiler panel from the profiler history and CPU profile.
 
-use mundaris_app::{
+use astrum_app::{
     GravityOrbitsDemo,
     profiler::FrameSample,
     studio::{

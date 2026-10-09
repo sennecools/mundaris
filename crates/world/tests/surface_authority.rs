@@ -1,5 +1,5 @@
-use mundaris_math::{AngularVelocity3, LinearVelocity3, LocalPosition, UnitRotation};
-use mundaris_world::{
+use astrum_math::{AngularVelocity3, LinearVelocity3, LocalPosition, UnitRotation};
+use astrum_world::{
     BodyProperties, BodyState, CelestialFrameProjection, CelestialSystem, SimulationInstant,
     terrain::*,
 };

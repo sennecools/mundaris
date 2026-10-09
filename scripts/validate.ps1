@@ -61,11 +61,11 @@ try {
     $oldFlags = $env:RUSTDOCFLAGS
     try { $env:RUSTDOCFLAGS='-D warnings'; Run-Check 'rustdoc' @('doc','--locked','--workspace','--all-features','--no-deps') }
     finally { $env:RUSTDOCFLAGS=$oldFlags }
-    Run-Check 'long-orbits' @('test','--locked','--release','-p','mundaris_simulation','--test','orbits','--','--ignored','--nocapture')
-    Run-Check 'developer_bridge' @('test','--locked','--release','-p','mundaris_app','--features','developer-tools','--test','developer_bridge','--','--nocapture')
+    Run-Check 'long-orbits' @('test','--locked','--release','-p','astrum_simulation','--test','orbits','--','--ignored','--nocapture')
+    Run-Check 'developer_bridge' @('test','--locked','--release','-p','astrum_app','--features','developer-tools','--test','developer_bridge','--','--nocapture')
     if ($IncludeGpu) {
         foreach ($test in @('native_close_surface','native_full_frame','developer_interface','developer_scenarios')) {
-            Run-Check $test @('test','--locked','--release','-p','mundaris_app','--all-features','--test',$test,'--','--ignored','--nocapture')
+            Run-Check $test @('test','--locked','--release','-p','astrum_app','--all-features','--test',$test,'--','--ignored','--nocapture')
         }
     }
 } finally {

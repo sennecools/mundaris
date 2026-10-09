@@ -1,8 +1,8 @@
 use glam::DVec3;
-use mundaris_app::{GravityOrbitsDemo, orbit_guides::OrbitGuideReference};
-use mundaris_math::{FramePosition, LocalPosition};
-use mundaris_simulation::ANALYTIC_TIME_LIMIT_SECONDS;
-use mundaris_world::{BodyId, CelestialSystem};
+use astrum_app::{GravityOrbitsDemo, orbit_guides::OrbitGuideReference};
+use astrum_math::{FramePosition, LocalPosition};
+use astrum_simulation::ANALYTIC_TIME_LIMIT_SECONDS;
+use astrum_world::{BodyId, CelestialSystem};
 use std::time::Duration;
 
 fn bits(world: &CelestialSystem) -> Vec<(BodyId, [u64; 13])> {
@@ -49,7 +49,7 @@ fn body_id(world: &CelestialSystem, authored_name: &str) -> BodyId {
         .unwrap_or_else(|| panic!("shared test system is missing body {authored_name}"))
 }
 
-fn assert_pose_near(actual: mundaris_math::FramePose, expected: mundaris_math::FramePose) {
+fn assert_pose_near(actual: astrum_math::FramePose, expected: astrum_math::FramePose) {
     assert_eq!(actual.position().frame(), expected.position().frame());
     assert!(
         (actual.position().local().metres() - expected.position().local().metres()).length() < 1e-6

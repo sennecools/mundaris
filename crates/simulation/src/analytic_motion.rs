@@ -1,8 +1,8 @@
 //! Direct, transactional sampling of authored system-local elliptical motion.
 
 use glam::DVec3;
-use mundaris_math::{AngularVelocity3, LinearVelocity3, LocalPosition, MathError, UnitRotation};
-use mundaris_world::{
+use astrum_math::{AngularVelocity3, LinearVelocity3, LocalPosition, MathError, UnitRotation};
+use astrum_world::{
     BodyState, BodyStateUpdate, CelestialMotionDefinition, CelestialSystem, CelestialSystemError,
     CelestialTranslation, SimulationInstant,
 };
@@ -300,8 +300,8 @@ fn anomaly_minus_sine(anomaly: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mundaris_math::Direction3;
-    use mundaris_world::{AxialSpin, BodyMotion, BodyProperties};
+    use astrum_math::Direction3;
+    use astrum_world::{AxialSpin, BodyMotion, BodyProperties};
     use std::num::NonZeroU64;
 
     #[test]

@@ -1,8 +1,8 @@
 mod common;
 use common::*;
 use glam::DVec3;
-use mundaris_simulation::{FixedStepRunner, SimulationConfig};
-use mundaris_world::terrain::*;
+use astrum_simulation::{FixedStepRunner, SimulationConfig};
+use astrum_world::terrain::*;
 
 #[test]
 fn terrain_definition_changes_do_not_rebranch_or_stale_orbital_replay() {

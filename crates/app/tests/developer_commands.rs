@@ -1,5 +1,5 @@
 #![cfg(feature = "developer-tools")]
-use mundaris_app::{
+use astrum_app::{
     GravityOrbitsDemo,
     developer_protocol::{DevCommand, DevRequest},
 };

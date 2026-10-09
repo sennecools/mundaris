@@ -1,6 +1,6 @@
 use glam::DVec3;
-use mundaris_math::*;
-use mundaris_renderer::*;
+use astrum_math::*;
+use astrum_renderer::*;
 use std::num::NonZeroU64;
 
 #[test]

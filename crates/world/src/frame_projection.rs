@@ -1,5 +1,5 @@
 use crate::{BodyId, BodyState, CelestialSystem};
-use mundaris_math::*;
+use astrum_math::*;
 use std::num::NonZeroU64;
 
 /// Runtime debugging/attachment handles, never domain or persistent identity.
@@ -177,7 +177,7 @@ impl CelestialFrameProjection {
 
 /// Read-only world/projection pair known to describe one committed state.
 /// ```compile_fail
-/// use mundaris_world::*;
+/// use astrum_world::*;
 /// use std::num::NonZeroU64;
 /// let mut world=CelestialSystem::new(NonZeroU64::new(1).unwrap(),SimulationInstant::ZERO);
 /// let projection=CelestialFrameProjection::build(&world,NonZeroU64::new(1).unwrap()).unwrap();

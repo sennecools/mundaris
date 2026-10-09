@@ -1,7 +1,7 @@
 //! Bounded, tile-local memoization for immutable surface feature queries.
 use super::{GeologicalControls, SurfaceGenerator, SurfaceSample, TerrainError};
 use glam::DVec3;
-use mundaris_math::surface::SurfaceLocation;
+use astrum_math::surface::SurfaceLocation;
 use std::any::Any;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};

@@ -1,5 +1,5 @@
 [package]
-name = "mundaris_core"
+name = "astrum_core"
 version.workspace = true
 edition.workspace = true
 publish = false

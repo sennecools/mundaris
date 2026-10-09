@@ -10,10 +10,10 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use glam::DVec3;
-use mundaris_math::*;
-use mundaris_renderer::*;
-use mundaris_simulation::*;
-use mundaris_world::*;
+use astrum_math::*;
+use astrum_renderer::*;
+use astrum_simulation::*;
+use astrum_world::*;
 use std::{
     collections::VecDeque,
     num::NonZeroU64,
@@ -71,7 +71,7 @@ struct Controls {
     sun_from_star: bool,
     terrain_view: TerrainViewMode,
     /// Session render settings (registry: `crate::render_settings`).
-    render_settings: mundaris_renderer::RenderSettings,
+    render_settings: astrum_renderer::RenderSettings,
     pending: VecDeque<Command>,
     name: String,
     mass: String,
@@ -106,9 +106,9 @@ impl Controls {
         Self {
             profiler: {
                 let mut profiler = crate::profiler::Profiler::default();
-                profiler.enabled = std::env::var("MUNDARIS_PERFORMANCE_LAB")
+                profiler.enabled = std::env::var("ASTRUM_PERFORMANCE_LAB")
                     .is_ok_and(|s| s == "1")
-                    || std::env::var("MUNDARIS_PROFILE").is_ok_and(|s| s == "1");
+                    || std::env::var("ASTRUM_PROFILE").is_ok_and(|s| s == "1");
                 crate::engine_profile::set_enabled(profiler.enabled);
                 crate::engine_profile::set_budget_ns("Frame", Some(100_000_000));
                 profiler
@@ -120,7 +120,7 @@ impl Controls {
             terrain_preview: false,
             sun_from_star: false,
             terrain_view: terrain_view_from_environment(),
-            render_settings: mundaris_renderer::RenderSettings::default(),
+            render_settings: astrum_renderer::RenderSettings::default(),
             pending: VecDeque::new(),
             name: body.name().into(),
             mass: body.properties().mass_kg().to_string(),
@@ -266,7 +266,7 @@ impl GravityOrbitsDemo {
             .system
             .body(self.ids[self.sun_index])
             .map_or(1.0, |body| body.properties().reference_radius_m());
-        let light = mundaris_renderer::FrameLighting {
+        let light = astrum_renderer::FrameLighting {
             sun_center_view_m: DVec3::ZERO,
             sun_radius_m: radius,
             sun_color: self.lighting.sun_color,
@@ -291,9 +291,9 @@ fn inspection_near_plane(clearance_m: f64) -> f64 {
     }
 }
 
-/// Terrain view selected at launch; `MUNDARIS_TERRAIN_MODE` takes a view-mode name.
+/// Terrain view selected at launch; `ASTRUM_TERRAIN_MODE` takes a view-mode name.
 fn terrain_view_from_environment() -> TerrainViewMode {
-    std::env::var("MUNDARIS_TERRAIN_MODE")
+    std::env::var("ASTRUM_TERRAIN_MODE")
         .ok()
         .and_then(|name| TerrainViewMode::from_name(&name))
         .unwrap_or_default()
@@ -468,7 +468,7 @@ impl GravityOrbitsDemo {
             #[cfg(feature = "developer-tools")]
             #[cfg(feature = "developer-tools")]
             developer_navigation: None,
-            navigation_snapshot_path: std::env::var_os("MUNDARIS_NAVIGATION_SNAPSHOT")
+            navigation_snapshot_path: std::env::var_os("ASTRUM_NAVIGATION_SNAPSHOT")
                 .map(std::path::PathBuf::from),
             navigation_wall_at: None,
             developer_frame_number: 0,
@@ -1525,7 +1525,7 @@ impl GravityOrbitsDemo {
         let mut frame = CelestialFrame::new(&view, &mut self.staging, projection, &self.sphere);
         frame.set_view_mode(self.controls.terrain_view);
         let overlays = self.controls.render_settings.overlays;
-        frame.set_line_style(mundaris_renderer::LineStyleScale {
+        frame.set_line_style(astrum_renderer::LineStyleScale {
             width: overlays.line_width_scale,
             opacity: overlays.opacity,
         });
@@ -1572,7 +1572,7 @@ impl GravityOrbitsDemo {
                 let sun = sun_centre.normalize();
                 (index, up.dot(sun).clamp(-1.0, 1.0).asin().to_degrees())
             });
-        frame.set_lighting(mundaris_renderer::FrameLighting {
+        frame.set_lighting(astrum_renderer::FrameLighting {
             sun_center_view_m: sun_centre,
             sun_radius_m: sun_radius,
             sun_color: self.lighting.sun_color,
@@ -1586,7 +1586,7 @@ impl GravityOrbitsDemo {
                 .enumerate()
                 .filter(|(index, _)| *index != self.sun_index)
                 .map(|(_, occluder)| *occluder)
-                .take(mundaris_renderer::MAX_OCCLUDERS)
+                .take(astrum_renderer::MAX_OCCLUDERS)
                 .collect(),
         })?;
         renderer.set_render_settings(self.controls.render_settings)?;
@@ -1820,7 +1820,7 @@ impl GravityOrbitsDemo {
         snapshot.performance.native_gpu_timestamp_sampling = renderer.native_timestamp_sampling();
         snapshot.performance.native_presentation_mode = Some(renderer.presentation_mode_label());
         snapshot.performance.native_redraw_uncapped = cfg!(feature = "developer-tools")
-            && std::env::var("MUNDARIS_UNCAPPED").is_ok_and(|value| value == "1");
+            && std::env::var("ASTRUM_UNCAPPED").is_ok_and(|value| value == "1");
         #[cfg(feature = "developer-tools")]
         if renderer.deterministic() {
             snapshot.performance = snapshot

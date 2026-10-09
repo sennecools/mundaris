@@ -3,14 +3,14 @@
 //! GTAO, exposure, bloom, tonemap and overlays under wgpu validation, without
 //! occupying the GPU. Slow (software rasterisation), so ignored by default:
 //!
-//! `cargo test -p mundaris_app --features developer-tools --test hdr_moon_software -- --ignored`
+//! `cargo test -p astrum_app --features developer-tools --test hdr_moon_software -- --ignored`
 //!
-//! Set `MUNDARIS_SMOKE_PNG=<dir>` to keep the frames as evidence.
+//! Set `ASTRUM_SMOKE_PNG=<dir>` to keep the frames as evidence.
 #![cfg(feature = "developer-tools")]
-use mundaris_app::GravityOrbitsDemo;
-use mundaris_app::render_settings::{SettingValue, index_of};
-use mundaris_app::studio::view::StudioAction;
-use mundaris_renderer::{GpuContext, Renderer};
+use astrum_app::GravityOrbitsDemo;
+use astrum_app::render_settings::{SettingValue, index_of};
+use astrum_app::studio::view::StudioAction;
+use astrum_renderer::{GpuContext, Renderer};
 
 const WIDTH: u32 = 480;
 const HEIGHT: u32 = 270;
@@ -65,7 +65,7 @@ fn read_scene(context: &GpuContext, renderer: &Renderer) -> Vec<u8> {
 }
 
 fn dump(name: &str, rgba: &[u8]) {
-    let Some(dir) = std::env::var_os("MUNDARIS_SMOKE_PNG") else {
+    let Some(dir) = std::env::var_os("ASTRUM_SMOKE_PNG") else {
         return;
     };
     let file = std::io::BufWriter::new(

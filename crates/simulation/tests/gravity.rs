@@ -1,5 +1,5 @@
 use glam::DVec3;
-use mundaris_simulation::*;
+use astrum_simulation::*;
 
 const G: f64 = 6.67430e-11;
 

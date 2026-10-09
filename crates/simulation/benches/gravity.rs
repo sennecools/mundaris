@@ -1,7 +1,7 @@
 mod common;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use glam::DVec3;
-use mundaris_simulation::*;
+use astrum_simulation::*;
 use std::{hint::black_box, time::Duration};
 fn benches(c: &mut Criterion) {
     let mut group = c.benchmark_group("gravity_force_pass");

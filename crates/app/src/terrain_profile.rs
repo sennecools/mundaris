@@ -6,7 +6,7 @@
 use std::{fs::File, io::Read, path::Path};
 
 use anyhow::{Context, ensure};
-use mundaris_world::terrain::TerrainHeightProfile;
+use astrum_world::terrain::TerrainHeightProfile;
 
 pub const MOON_PROFILE_WIDTH: u32 = 2048;
 pub const MOON_PROFILE_HEIGHT: u32 = 2048;
@@ -150,7 +150,7 @@ mod tests {
                 .expect("system clock is after Unix epoch")
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "mundaris-height-profile-{}-{stamp}-{unique}.r16",
+                "astrum-height-profile-{}-{stamp}-{unique}.r16",
                 std::process::id()
             ));
             fs::write(&path, bytes).expect("write small temporary fixture");
@@ -234,7 +234,7 @@ mod tests {
     fn reports_missing_fixture_path() {
         let unique = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "mundaris-height-profile-missing-{}-{unique}.r16",
+            "astrum-height-profile-missing-{}-{unique}.r16",
             std::process::id()
         ));
         let error = load_height_profile(&path).expect_err("missing fixture must fail");

@@ -822,7 +822,7 @@ mod tests {
         use super::super::SurfaceGenerator;
         use super::super::{SurfaceAlgorithm, SurfaceDefinition};
         use glam::DVec3;
-        use mundaris_math::{Direction3, surface::SurfaceLocation};
+        use astrum_math::{Direction3, surface::SurfaceLocation};
 
         let definition = SurfaceDefinition::generated(
             TerrainIdentity(55),

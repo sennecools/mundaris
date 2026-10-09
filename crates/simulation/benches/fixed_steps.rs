@@ -1,8 +1,8 @@
 mod common;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use mundaris_math::SimulationInstant;
-use mundaris_simulation::*;
-use mundaris_world::BodyStateUpdate;
+use astrum_math::SimulationInstant;
+use astrum_simulation::*;
+use astrum_world::BodyStateUpdate;
 use std::{hint::black_box, time::Duration};
 fn benches(c: &mut Criterion) {
     let mut group = c.benchmark_group("fixed_steps");

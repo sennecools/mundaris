@@ -1,6 +1,6 @@
 #![cfg(feature = "developer-tools")]
 
-use mundaris_app::{
+use astrum_app::{
     developer_bridge::{Client, discover},
     developer_protocol::{
         DevOperation, DevRequest, DevResponse, PROTOCOL_VERSION, SessionDescriptor,
@@ -25,7 +25,7 @@ impl Scratch {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "mundaris-dev-bridge-{}-{unique}",
+            "astrum-dev-bridge-{}-{unique}",
             std::process::id()
         ));
         fs::create_dir_all(&path).unwrap();
@@ -45,7 +45,7 @@ fn descriptor(session_id: &str, endpoint: String) -> SessionDescriptor {
         endpoint,
         pid: std::process::id(),
         preset: "gameplay".into(),
-        executable: "mundaris_app".into(),
+        executable: "astrum_app".into(),
         output_directory: "target/dev".into(),
         binary_sha256: "test-hash".into(),
         build_manifest: None,
@@ -207,7 +207,7 @@ fn session_selection_rejects_ambiguity_and_honors_explicit_live_id() {
     // probes both again and then inspects only session-b.
     let first_server = bounded_responder(first_listener, first_id.into(), 2);
     let chosen_server = bounded_responder(second_listener, chosen_id.into(), 3);
-    let binary = env!("CARGO_BIN_EXE_mundaris_dev");
+    let binary = env!("CARGO_BIN_EXE_astrum_dev");
     let ambiguous = Command::new(binary)
         .args(["inspect", "--registry"])
         .arg(&scratch.0)

@@ -4,8 +4,8 @@
 //! attributes. It does not evaluate shape, terrain, or material fields itself.
 
 use glam::{DQuat, DVec3};
-use mundaris_math::{Direction3, surface::SurfaceLocation};
-use mundaris_world::terrain::{
+use astrum_math::{Direction3, surface::SurfaceLocation};
+use astrum_world::terrain::{
     GeologicalControls, MoonTerrainGenerator, SurfaceDetailDiagnostics, SurfaceGenerator,
 };
 
@@ -287,7 +287,7 @@ impl<'a> RotatedSurfaceQuery<'a> {
         )?))
     }
 
-    fn to_chart_sample(self, sample: mundaris_world::terrain::SurfaceSample) -> ReferenceSample {
+    fn to_chart_sample(self, sample: astrum_world::terrain::SurfaceSample) -> ReferenceSample {
         let body_to_chart = self.chart_to_body.conjugate();
         ReferenceSample {
             shape_radius_m: sample.shape().radius_m(),

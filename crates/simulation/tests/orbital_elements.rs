@@ -1,5 +1,5 @@
 use glam::{DQuat, DVec3};
-use mundaris_simulation::*;
+use astrum_simulation::*;
 
 #[test]
 fn independent_circular_eccentric_inclined_conics() {

@@ -6,7 +6,7 @@
 //! the fragment shader turns that into analytic coverage.
 use crate::{CelestialProjection, PreparedView, RenderPreparationError};
 use glam::DVec3;
-use mundaris_math::FramePosition;
+use astrum_math::FramePosition;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CelestialLineStyle {
     Solid,
@@ -299,7 +299,7 @@ pub(crate) fn emit_polyline(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mundaris_math::*;
+    use astrum_math::*;
     use std::num::NonZeroU64;
 
     fn read(bytes: &[u8], vertex: usize, float: usize) -> f32 {

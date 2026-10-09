@@ -1,8 +1,8 @@
 mod common;
 use common::*;
 use glam::DVec3;
-use mundaris_simulation::*;
-use mundaris_world::*;
+use astrum_simulation::*;
+use astrum_world::*;
 use std::time::Duration;
 
 fn runner(world: &CelestialSystem, work: u32, debt: u64, slots: usize) -> FixedStepRunner {
@@ -238,7 +238,7 @@ fn edit_preflight_rejects_without_changing_session_and_name_retains_history() {
         old[1].center_in_system(),
         old[1].center_velocity_in_system(),
         old[1].body_to_system(),
-        mundaris_math::AngularVelocity3::try_radians_per_second(DVec3::X * f64::MAX).unwrap(),
+        astrum_math::AngularVelocity3::try_radians_per_second(DVec3::X * f64::MAX).unwrap(),
     );
     assert!(r.edit_state(&mut w, ids[1], invalid_spin).is_err());
     assert_eq!(states(&w), old);
@@ -375,7 +375,7 @@ fn thousand_gravity_commits_projection_coherence_and_rebuild() {
                     .unwrap()
                     .parent_from_local()
                     .translation(),
-                mundaris_math::Displacement3::zero()
+                astrum_math::Displacement3::zero()
             );
         }
     }
@@ -457,12 +457,12 @@ fn orientation_and_spin_branch_do_not_change_gravity_or_translation() {
     let changed = BodyState::new(
         old.center_in_system(),
         old.center_velocity_in_system(),
-        mundaris_math::UnitRotation::from_axis_angle(
-            mundaris_math::Direction3::try_new(DVec3::Y).unwrap(),
+        astrum_math::UnitRotation::from_axis_angle(
+            astrum_math::Direction3::try_new(DVec3::Y).unwrap(),
             0.7,
         )
         .unwrap(),
-        mundaris_math::AngularVelocity3::try_radians_per_second(DVec3::new(0.0001, 0.0002, 0.0003))
+        astrum_math::AngularVelocity3::try_radians_per_second(DVec3::new(0.0001, 0.0002, 0.0003))
             .unwrap(),
     );
     br.edit_state(&mut b, id, changed).unwrap();

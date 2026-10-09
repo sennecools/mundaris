@@ -1,12 +1,12 @@
 use glam::DVec3;
-use mundaris_math::*;
-use mundaris_simulation::GRAVITATIONAL_CONSTANT_M3_KG_S2 as G;
-use mundaris_world::*;
+use astrum_math::*;
+use astrum_simulation::GRAVITATIONAL_CONSTANT_M3_KG_S2 as G;
+use astrum_world::*;
 use std::num::NonZeroU64;
 /// Deterministic plausible planet/moon pairs. A scale fixture, not an accuracy oracle.
 pub fn fixture(count: usize) -> CelestialSystem {
     if count == 3 {
-        return mundaris_app::gravity_fixtures::GravityFixture::Hierarchy
+        return astrum_app::gravity_fixtures::GravityFixture::Hierarchy
             .create(NonZeroU64::new(1).unwrap())
             .unwrap();
     }

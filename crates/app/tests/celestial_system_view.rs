@@ -1,9 +1,9 @@
 use glam::DVec3;
-use mundaris_app::{
+use astrum_app::{
     celestial_labels::*, celestial_selection::*, gravity_fixtures::*, orbit_guides::*,
     system_view::*,
 };
-use mundaris_renderer::*;
+use astrum_renderer::*;
 use std::num::NonZeroU64;
 #[test]
 fn references_bounds_labels_and_selection_are_read_only() {
@@ -216,7 +216,7 @@ fn explicit_unbound_reference_classification_and_equal_mass_ambiguity() {
     guides.update(&world);
     assert_eq!(
         guides.guides()[1].elements.unwrap().class(),
-        mundaris_simulation::ConicClass::Hyperbolic
+        astrum_simulation::ConicClass::Hyperbolic
     );
     let mut vertices = Vec::new();
     guides.guides()[1].vertices(64, &mut vertices).unwrap();

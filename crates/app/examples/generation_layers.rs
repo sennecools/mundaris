@@ -4,12 +4,12 @@
 
 use anyhow::{Context, ensure};
 use glam::DVec3;
-use mundaris_app::shared_system::SharedTestSystem;
-use mundaris_math::{
+use astrum_app::shared_system::SharedTestSystem;
+use astrum_math::{
     Direction3,
     surface::{CubeFace, SurfaceLocation},
 };
-use mundaris_world::terrain::{MoonProfileEvaluationDiagnostics, SurfaceGenerator};
+use astrum_world::terrain::{MoonProfileEvaluationDiagnostics, SurfaceGenerator};
 use serde::Serialize;
 use std::{
     fs::{self, OpenOptions},
@@ -68,7 +68,7 @@ struct ExistingWorkReport {
     accepted_features: Option<u32>,
 }
 
-fn sample_bits(sample: mundaris_world::terrain::SurfaceSample) -> [u64; 20] {
+fn sample_bits(sample: astrum_world::terrain::SurfaceSample) -> [u64; 20] {
     let terrain = sample.terrain();
     let shape = sample.shape();
     let tg = terrain.tangent_gradient_m_per_unit_direction();
@@ -171,7 +171,7 @@ fn run_pass(
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args_os().skip(1);
     let output_directory = args.next().map(PathBuf::from).context(
-        "usage: cargo run -p mundaris_app --example generation_layers -- <new-output-directory>",
+        "usage: cargo run -p astrum_app --example generation_layers -- <new-output-directory>",
     )?;
     ensure!(
         args.next().is_none(),

@@ -5,7 +5,7 @@
 //! units. Ordinary camera motion uploads only a small uniform, never the catalogue.
 use crate::{CelestialProjection, PreparedView, RenderPreparationError};
 use glam::{DQuat, DVec3, Mat3, Vec3};
-use mundaris_math::{Direction3, FrameId};
+use astrum_math::{Direction3, FrameId};
 use std::{sync::Arc, time::Instant};
 
 #[path = "sky_background.rs"]
@@ -428,7 +428,7 @@ pub fn sample_background(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mundaris_math::{FramePose, FramePosition, FrameTree, LocalPosition, UnitRotation};
+    use astrum_math::{FramePose, FramePosition, FrameTree, LocalPosition, UnitRotation};
     use std::num::NonZeroU64;
 
     fn definition() -> Arc<SkyDefinition> {

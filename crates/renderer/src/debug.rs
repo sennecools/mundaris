@@ -2,7 +2,7 @@
 
 use crate::{PreparedView, RenderPreparationError, RenderRelativePosition};
 use glam::Mat4;
-use mundaris_math::{FrameId, FramePosition};
+use astrum_math::{FrameId, FramePosition};
 
 const STRIDE: u64 = 32;
 const ATTRIBUTES: [wgpu::VertexAttribute; 2] =
@@ -362,7 +362,7 @@ impl DebugRenderer {
 mod tests {
     use super::*;
     use glam::{DVec3, Vec4};
-    use mundaris_math::*;
+    use astrum_math::*;
     use std::num::NonZeroU64;
     #[test]
     fn projection_layout_and_shader_contract() {

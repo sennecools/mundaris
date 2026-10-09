@@ -5,7 +5,7 @@
 
 use super::{TerrainError, TerrainFootprint};
 use glam::DVec3;
-use mundaris_math::{Direction3, surface::DirectionalCap};
+use astrum_math::{Direction3, surface::DirectionalCap};
 
 const MAX_FEATURES: u16 = 128;
 const MIN_RADIUS_M: f64 = 64.0;

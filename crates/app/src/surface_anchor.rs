@@ -1,8 +1,8 @@
 //! Body-relative surface inspection anchor used by camera navigation.
 use anyhow::Result;
 use glam::DVec3;
-use mundaris_math::{surface::*, *};
-use mundaris_world::BodyId;
+use astrum_math::{surface::*, *};
+use astrum_world::BodyId;
 
 /// Explicit f64 regional pose relative to fixed body axes. Never a tree node or patch ID.
 #[derive(Debug, Clone, Copy)]

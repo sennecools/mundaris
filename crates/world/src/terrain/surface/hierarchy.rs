@@ -14,7 +14,7 @@ use super::{
     unit,
 };
 use glam::{DMat3, DVec3};
-use mundaris_math::noise::gradient_noise;
+use astrum_math::noise::gradient_noise;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 use std::time::Instant;
 

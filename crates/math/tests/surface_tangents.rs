@@ -1,5 +1,5 @@
 use glam::DVec3;
-use mundaris_math::{Direction3, surface::*};
+use astrum_math::{Direction3, surface::*};
 
 #[test]
 fn poles_handedness_and_transport() {

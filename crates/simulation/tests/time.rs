@@ -1,4 +1,4 @@
-use mundaris_simulation::*;
+use astrum_simulation::*;
 use std::time::Duration;
 
 #[test]

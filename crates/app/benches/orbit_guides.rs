@@ -1,8 +1,8 @@
 mod common;
 use criterion::{Criterion, criterion_group, criterion_main};
 use glam::DVec3;
-use mundaris_app::orbit_guides::*;
-use mundaris_simulation::*;
+use astrum_app::orbit_guides::*;
+use astrum_simulation::*;
 use std::{hint::black_box, time::Duration};
 fn benches(c: &mut Criterion) {
     let mut group = c.benchmark_group("orbit_guides");

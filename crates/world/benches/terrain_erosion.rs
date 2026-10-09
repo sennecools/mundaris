@@ -1,7 +1,7 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use glam::DVec3;
-use mundaris_math::{Direction3, surface::SurfaceLocation};
-use mundaris_world::terrain::*;
+use astrum_math::{Direction3, surface::SurfaceLocation};
+use astrum_world::terrain::*;
 use std::{hint::black_box, time::Duration};
 
 fn definition(version: TerrainGeneratorVersion, erosion_octaves: u8) -> TerrainDefinition {

@@ -1,9 +1,9 @@
 use glam::DVec3;
-use mundaris_math::{
+use astrum_math::{
     Direction3,
     surface::{DirectionalCap, SurfaceLocation},
 };
-use mundaris_world::terrain::*;
+use astrum_world::terrain::*;
 
 const RADIUS: f64 = 6_371_000.0;
 

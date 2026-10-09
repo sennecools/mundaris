@@ -150,6 +150,110 @@ dependencies = [
 ]
 
 [[package]]
+name = "astrum_app"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "astrum_math",
+ "astrum_renderer",
+ "astrum_simulation",
+ "astrum_terrain_fields",
+ "astrum_world",
+ "base64",
+ "criterion",
+ "egui",
+ "egui-wgpu",
+ "egui-winit",
+ "glam",
+ "png",
+ "pollster",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tracing",
+ "tracing-subscriber",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
+name = "astrum_core"
+version = "0.0.1"
+
+[[package]]
+name = "astrum_math"
+version = "0.0.1"
+dependencies = [
+ "criterion",
+ "glam",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "astrum_renderer"
+version = "0.0.1"
+dependencies = [
+ "astrum_math",
+ "cpu-time",
+ "criterion",
+ "glam",
+ "naga",
+ "png",
+ "pollster",
+ "thiserror 2.0.21",
+ "tracing",
+ "wgpu",
+]
+
+[[package]]
+name = "astrum_simulation"
+version = "0.0.1"
+dependencies = [
+ "astrum_math",
+ "astrum_world",
+ "criterion",
+ "glam",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "astrum_terrain_bake"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "png",
+ "pollster",
+ "serde",
+ "serde_json",
+ "sha2",
+ "wgpu",
+]
+
+[[package]]
+name = "astrum_terrain_fields"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "astrum_world"
+version = "0.0.1"
+dependencies = [
+ "astrum_math",
+ "astrum_terrain_fields",
+ "criterion",
+ "glam",
+ "png",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1252,110 +1356,6 @@ checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
 dependencies = [
  "adler2",
  "simd-adler32",
-]
-
-[[package]]
-name = "mundaris_app"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "base64",
- "criterion",
- "egui",
- "egui-wgpu",
- "egui-winit",
- "glam",
- "mundaris_math",
- "mundaris_renderer",
- "mundaris_simulation",
- "mundaris_terrain_fields",
- "mundaris_world",
- "png",
- "pollster",
- "serde",
- "serde_json",
- "sha2",
- "tracing",
- "tracing-subscriber",
- "wgpu",
- "winit",
-]
-
-[[package]]
-name = "mundaris_core"
-version = "0.0.1"
-
-[[package]]
-name = "mundaris_math"
-version = "0.0.1"
-dependencies = [
- "criterion",
- "glam",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "mundaris_renderer"
-version = "0.0.1"
-dependencies = [
- "cpu-time",
- "criterion",
- "glam",
- "mundaris_math",
- "naga",
- "png",
- "pollster",
- "thiserror 2.0.21",
- "tracing",
- "wgpu",
-]
-
-[[package]]
-name = "mundaris_simulation"
-version = "0.0.1"
-dependencies = [
- "criterion",
- "glam",
- "mundaris_math",
- "mundaris_world",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "mundaris_terrain_bake"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "png",
- "pollster",
- "serde",
- "serde_json",
- "sha2",
- "wgpu",
-]
-
-[[package]]
-name = "mundaris_terrain_fields"
-version = "0.0.1"
-dependencies = [
- "serde",
- "serde_json",
- "sha2",
-]
-
-[[package]]
-name = "mundaris_world"
-version = "0.0.1"
-dependencies = [
- "criterion",
- "glam",
- "mundaris_math",
- "mundaris_terrain_fields",
- "png",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.21",
 ]
 
 [[package]]

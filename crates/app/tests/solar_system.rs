@@ -1,7 +1,7 @@
-use mundaris_app::solar_system::*;
-use mundaris_math::*;
-use mundaris_simulation::{GRAVITATIONAL_CONSTANT_M3_KG_S2 as G, IntegrationWorkspace};
-use mundaris_world::terrain::*;
+use astrum_app::solar_system::*;
+use astrum_math::*;
+use astrum_simulation::{GRAVITATIONAL_CONSTANT_M3_KG_S2 as G, IntegrationWorkspace};
+use astrum_world::terrain::*;
 use std::num::NonZeroU64;
 
 fn ns(value: u64) -> NonZeroU64 {
@@ -10,7 +10,7 @@ fn ns(value: u64) -> NonZeroU64 {
 
 #[test]
 fn analytic_authored_periods_preserve_original_setup_pacing_and_spin() {
-    use mundaris_app::motion_session::AnalyticSession;
+    use astrum_app::motion_session::AnalyticSession;
     for preset in [
         SolarSystemPreset::gameplay(),
         SolarSystemPreset::real_scale(),
@@ -33,7 +33,7 @@ fn analytic_authored_periods_preserve_original_setup_pacing_and_spin() {
             let distance = content.real_orbital_distance_m * preset.orbital_distance_scale;
             let expected = std::f64::consts::TAU * distance / (G * mass / distance).sqrt();
             let orbit = match session.definition().definitions()[i].translation {
-                mundaris_world::CelestialTranslation::Elliptic(orbit) => orbit,
+                astrum_world::CelestialTranslation::Elliptic(orbit) => orbit,
                 _ => panic!("non-central solar body must orbit"),
             };
             assert!(
@@ -78,7 +78,7 @@ fn analytic_authored_periods_preserve_original_setup_pacing_and_spin() {
         }
     }
 }
-fn bodies(system: &mundaris_world::CelestialSystem) -> Vec<&mundaris_world::CelestialBody> {
+fn bodies(system: &astrum_world::CelestialSystem) -> Vec<&astrum_world::CelestialBody> {
     system.bodies().map(|(_, body)| body).collect()
 }
 
@@ -286,8 +286,8 @@ fn both_presets_advance_with_the_unchanged_resolved_newtonian_integrator() {
         SolarSystemPreset::real_scale(),
     ] {
         let mut system = preset.create(ns(40)).unwrap();
-        let baseline = mundaris_simulation::DiagnosticBaseline(
-            mundaris_simulation::system_diagnostics(&system).unwrap(),
+        let baseline = astrum_simulation::DiagnosticBaseline(
+            astrum_simulation::system_diagnostics(&system).unwrap(),
         );
         let mut workspace = IntegrationWorkspace::new(&system, 60.0).unwrap();
         for tick in 1..=1000 {
@@ -301,7 +301,7 @@ fn both_presets_advance_with_the_unchanged_resolved_newtonian_integrator() {
                 )
                 .unwrap();
         }
-        let drift = baseline.drift(mundaris_simulation::system_diagnostics(&system).unwrap());
+        let drift = baseline.drift(astrum_simulation::system_diagnostics(&system).unwrap());
         assert!(drift.relative_energy.abs() < 1e-7, "{drift:?}");
         assert!(drift.normalized_momentum < 1e-12, "{drift:?}");
     }
@@ -375,7 +375,7 @@ fn rocky_terrain_definitions_are_distinct_and_attached() {
             .unwrap()
             .unwrap();
         let generator = TerrainGenerator::new(&definition, radius).unwrap();
-        let location = mundaris_math::surface::SurfaceLocation::new(
+        let location = astrum_math::surface::SurfaceLocation::new(
             Direction3::try_new(glam::DVec3::new(1.0, 2.0, 3.0)).unwrap(),
         );
         let mut samples = [TerrainSample::default(); 1];
@@ -411,7 +411,7 @@ fn moon_surface_is_native_rocky_v5_and_clearance_queries_the_same_field() {
         assert_eq!(definition.terrain().algorithm(), SurfaceAlgorithm::RockyV5);
 
         let radius_m = moon.properties().reference_radius_m();
-        let location = mundaris_math::surface::SurfaceLocation::new(
+        let location = astrum_math::surface::SurfaceLocation::new(
             Direction3::try_new(glam::DVec3::new(1.0, 2.0, 3.0)).unwrap(),
         );
         let sample = SurfaceGenerator::new(definition, radius_m)
@@ -419,7 +419,7 @@ fn moon_surface_is_native_rocky_v5_and_clearance_queries_the_same_field() {
             .evaluate_point(location)
             .unwrap();
         let body_position = location.direction().unit() * (radius_m + 500.0);
-        let clearance = mundaris_app::terrain_inspection::clearance_at_body_position(
+        let clearance = astrum_app::terrain_inspection::clearance_at_body_position(
             moon,
             body_position,
             moon_id,
@@ -457,7 +457,7 @@ fn moon_surface_is_native_rocky_v5_and_clearance_queries_the_same_field() {
         system
             .edit_properties(
                 moon_id,
-                mundaris_world::BodyProperties::new(mass_kg, edited_radius_m).unwrap(),
+                astrum_world::BodyProperties::new(mass_kg, edited_radius_m).unwrap(),
             )
             .unwrap();
         let edited_moon = system.body(moon_id).unwrap();
@@ -521,7 +521,7 @@ fn cratered_recipe_is_seeded_reusable_and_bounded_for_arbitrary_bodies() {
         ]
         .into_iter()
         .map(|direction| {
-            mundaris_math::surface::SurfaceLocation::new(Direction3::try_new(direction).unwrap())
+            astrum_math::surface::SurfaceLocation::new(Direction3::try_new(direction).unwrap())
         })
         .collect();
         let mut samples = vec![TerrainSample::default(); locations.len()];

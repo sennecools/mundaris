@@ -4,7 +4,7 @@ use crate::{
     IntegrationWorkspace, PlaybackRate, SimulationError, SimulationInstant, TimeController,
     history::History, pair_count,
 };
-use mundaris_world::{BodyId, BodyProperties, BodyState, CelestialSystem};
+use astrum_world::{BodyId, BodyProperties, BodyState, CelestialSystem};
 use std::time::Duration;
 
 const MAX_EXACT_TICK: u64 = (1u64 << 53) - 1;

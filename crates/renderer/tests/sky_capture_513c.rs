@@ -1,7 +1,7 @@
 #![cfg(feature = "terrain-capture")]
 use glam::{DQuat, DVec3};
-use mundaris_math::*;
-use mundaris_renderer::{
+use astrum_math::*;
+use astrum_renderer::{
     CelestialFrame, CelestialProjection, CelestialRenderBody, CelestialStaging, Icosphere,
     PreparedView, RenderPrecisionBudget,
     sky::{

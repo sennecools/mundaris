@@ -1,7 +1,7 @@
 //! Continuous, body-fixed geological province controls.
 use super::{GeologicalControls, GeologicalParameters, SurfaceAlgorithm, TerrainError, mix, unit};
 use glam::{DMat3, DVec3};
-use mundaris_math::noise::gradient_noise;
+use astrum_math::noise::gradient_noise;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct DirectedSample {

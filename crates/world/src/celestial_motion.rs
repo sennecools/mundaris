@@ -1,7 +1,7 @@
 //! Authored prescribed motion, independent of mass, radius, rendering and gravity.
 
 use crate::{BodyId, CelestialSystem, CelestialSystemError, SimulationInstant};
-use mundaris_math::{Direction3, LocalPosition, UnitRotation};
+use astrum_math::{Direction3, LocalPosition, UnitRotation};
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum CelestialMotionError {

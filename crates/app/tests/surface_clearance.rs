@@ -1,9 +1,9 @@
 use glam::DVec3;
-use mundaris_app::celestial_camera::{CelestialCamera, NavigationInput};
-use mundaris_app::terrain_inspection::{clearance_at_body_position, terrain_clearance};
-use mundaris_math::surface::SurfaceLocation;
-use mundaris_math::*;
-use mundaris_world::{
+use astrum_app::celestial_camera::{CelestialCamera, NavigationInput};
+use astrum_app::terrain_inspection::{clearance_at_body_position, terrain_clearance};
+use astrum_math::surface::SurfaceLocation;
+use astrum_math::*;
+use astrum_world::{
     BodyProperties, BodyState, CelestialFrameProjection, CelestialSystem, SimulationInstant,
     terrain::*,
 };

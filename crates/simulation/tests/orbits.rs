@@ -1,8 +1,8 @@
 mod common;
 use common::*;
 use glam::DVec3;
-use mundaris_math::*;
-use mundaris_simulation::*;
+use astrum_math::*;
+use astrum_simulation::*;
 
 #[derive(Debug, Default)]
 struct Maxima {
@@ -177,7 +177,7 @@ fn constant_system_axis_spin_100000_steps() {
     world
         .edit_state(
             id,
-            mundaris_world::BodyState::new(
+            astrum_world::BodyState::new(
                 original.center_in_system(),
                 original.center_velocity_in_system(),
                 q,
@@ -217,7 +217,7 @@ fn radius_independence_full_velocity_and_failing_candidate_rollback() {
         let properties = *b.body(id).unwrap().properties();
         b.edit_properties(
             id,
-            mundaris_world::BodyProperties::new(
+            astrum_world::BodyProperties::new(
                 properties.mass_kg(),
                 100.0 * properties.reference_radius_m(),
             )

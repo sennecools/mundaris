@@ -1,7 +1,7 @@
 //! CPU precision boundary; no GPU/device is required to prepare a view.
 
 use glam::DVec3;
-use mundaris_math::{
+use astrum_math::{
     Displacement3, FrameError, FrameEvaluation, FrameId, FramePose, FramePosition, LocalPosition,
     MathError, UnitRotation,
 };
@@ -55,8 +55,8 @@ impl RenderPrecisionBudget {
 /// Disposable view-relative GPU value, only valid for the view that produced it.
 /// No constructor accepts world coordinates and no conversion back to math exists.
 /// ```compile_fail
-/// use mundaris_math::LocalPosition;
-/// use mundaris_renderer::RenderRelativePosition;
+/// use astrum_math::LocalPosition;
+/// use astrum_renderer::RenderRelativePosition;
 /// fn authoritative(render: RenderRelativePosition) -> LocalPosition { render.into() }
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -110,8 +110,8 @@ pub enum RenderPreparationError {
 /// Retains a tree borrow even if the lightweight evaluation wrapper is dropped.
 /// ```compile_fail
 /// use std::num::NonZeroU64;
-/// use mundaris_math::*;
-/// use mundaris_renderer::*;
+/// use astrum_math::*;
+/// use astrum_renderer::*;
 /// let mut tree = FrameTree::new(NonZeroU64::new(1).unwrap());
 /// let pose = FramePose::new(FramePosition::new(tree.root(), LocalPosition::origin()), UnitRotation::identity());
 /// let view = PreparedView::new(&tree.evaluate(), pose, RenderPrecisionBudget::near_debug()).unwrap();
@@ -184,8 +184,8 @@ impl PreparedRenderFrame<'_> {
     /// Camera-axis unit normal/direction; no origin or translation contribution.
     pub fn view_direction(
         &self,
-        direction: mundaris_math::Direction3,
-    ) -> Result<mundaris_math::Direction3, RenderPreparationError> {
+        direction: astrum_math::Direction3,
+    ) -> Result<astrum_math::Direction3, RenderPreparationError> {
         Ok(self.camera_from_source.rotate_direction(direction)?)
     }
     /// High-precision view displacement for CPU diagnostics/explicit range selection.

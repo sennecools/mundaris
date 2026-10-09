@@ -1,7 +1,7 @@
 #![cfg(feature = "developer-tools")]
 //! Developer camera commands must visibly move the observer in the canonical
 //! paused scene, whose startup surface pose is a developer fixture pose.
-use mundaris_app::{
+use astrum_app::{
     GravityOrbitsDemo, celestial_camera::CameraMode, developer_protocol::DevCommand,
 };
 use std::time::Duration;

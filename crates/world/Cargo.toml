@@ -1,12 +1,12 @@
 [package]
-name = "mundaris_world"
+name = "astrum_world"
 version.workspace = true
 edition.workspace = true
 publish = false
 
 [dependencies]
-mundaris_math = { path = "../math" }
-mundaris_terrain_fields = { path = "../terrain_fields" }
+astrum_math = { path = "../math" }
+astrum_terrain_fields = { path = "../terrain_fields" }
 thiserror.workspace = true
 glam.workspace = true
 sha2 = "=0.10.9"

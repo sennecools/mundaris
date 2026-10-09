@@ -1,6 +1,6 @@
 //! Pure CDLOD quadtree geometry and selection over cube-sphere charts.
 use glam::{DMat3, DVec3};
-use mundaris_math::surface::{CubeFace, CubePatchAddress};
+use astrum_math::surface::{CubeFace, CubePatchAddress};
 
 /// f64 cube-chart placement of one node; mirrors the GPU chart reconstruction.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -97,7 +97,7 @@ pub struct Frustum {
     /// Accept every direction.
     all: bool,
     /// Cull against one sun shadow cascade's light-space box instead.
-    cascade: Option<(mundaris_renderer::Cascades, usize)>,
+    cascade: Option<(astrum_renderer::Cascades, usize)>,
 }
 
 impl Frustum {
@@ -128,7 +128,7 @@ impl Frustum {
 
     /// Casters of one shadow cascade: inside its light-space box, including
     /// off-screen terrain between receivers and the sun.
-    pub fn cascade(cascades: mundaris_renderer::Cascades, index: usize) -> Self {
+    pub fn cascade(cascades: astrum_renderer::Cascades, index: usize) -> Self {
         Self {
             planes: [DVec3::ZERO; 4],
             all: false,
@@ -276,7 +276,7 @@ mod tests {
     fn ranges(radius: f64, cells: u32, max_level: u8) -> Vec<f64> {
         (0..=max_level)
             .map(|level| {
-                let cell = mundaris_world::terrain::producer::tile_texel_m(radius, level, cells);
+                let cell = astrum_world::terrain::producer::tile_texel_m(radius, level, cells);
                 (cell * 700.0 / 4.0).max(3.0 * cell * f64::from(cells))
             })
             .collect()
@@ -383,7 +383,7 @@ mod tests {
             .map(|s| (s.address, s.address.level()))
             .collect();
         for selected in &result.selected {
-            for edge in mundaris_math::surface::PatchEdge::ALL {
+            for edge in astrum_math::surface::PatchEdge::ALL {
                 let mut neighbour = selected.address.neighbor(edge).address;
                 // Find the selected node covering the neighbour region, if any.
                 loop {

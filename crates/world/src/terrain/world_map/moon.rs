@@ -29,7 +29,7 @@
 use super::cube::{CubeMap, neighbours, texel_directions};
 use super::neukum;
 use glam::DVec3;
-use mundaris_math::noise::gradient_noise_value;
+use astrum_math::noise::gradient_noise_value;
 use serde::{Deserialize, Serialize};
 
 /// Biome channels, in storage order. `crater_floor` and `crater_rim_ejecta`

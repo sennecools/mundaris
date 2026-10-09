@@ -17,7 +17,7 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 }
 
 fn inspect(args: &[String]) -> Result<()> {
-    use mundaris_terrain_bake::inspect;
+    use astrum_terrain_bake::inspect;
     let path = PathBuf::from(args.first().context(INSPECT_USAGE)?);
     let out = PathBuf::from(flag(args, "--out").context(INSPECT_USAGE)?);
     let num = |name: &str| -> Result<Option<f64>> {
@@ -98,7 +98,7 @@ fn score(args: &[String]) -> Result<()> {
     let out = out.context("score needs --out")?;
     print!(
         "{}",
-        mundaris_terrain_bake::score::score(&refs, &cands, &out)?
+        astrum_terrain_bake::score::score(&refs, &cands, &out)?
     );
     Ok(())
 }
@@ -110,8 +110,8 @@ fn main() -> Result<()> {
         [command, rest @ ..] if command == "score" => score(rest)?,
         [command, recipe, library] if command == "bake" => {
             let dir =
-                mundaris_terrain_bake::bake_and_publish(Path::new(recipe), Path::new(library))?;
-            let metadata = mundaris_terrain_bake::bundle::validate(&dir)?;
+                astrum_terrain_bake::bake_and_publish(Path::new(recipe), Path::new(library))?;
+            let metadata = astrum_terrain_bake::bundle::validate(&dir)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -127,7 +127,7 @@ fn main() -> Result<()> {
             let resolution = rest.first().map_or(Ok(1024), |r| r.parse())?;
             println!(
                 "{}",
-                mundaris_terrain_bake::preview_base(Path::new(recipe), Path::new(out), resolution)?
+                astrum_terrain_bake::preview_base(Path::new(recipe), Path::new(out), resolution)?
             );
         }
         [command, file, order, side, footprint, relief] if command == "metrics" => {
@@ -160,11 +160,11 @@ fn main() -> Result<()> {
             let footprint: f64 = footprint.parse()?;
             println!(
                 "{}",
-                mundaris_terrain_bake::pipeline::metrics(&height, n, footprint / n as f64)
+                astrum_terrain_bake::pipeline::metrics(&height, n, footprint / n as f64)
             );
         }
         [command, bundle] if command == "validate" => {
-            let metadata = mundaris_terrain_bake::bundle::validate(Path::new(bundle))?;
+            let metadata = astrum_terrain_bake::bundle::validate(Path::new(bundle))?;
             println!(
                 "valid {} ({}², {} channels)",
                 metadata.bundle_id,

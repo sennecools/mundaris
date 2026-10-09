@@ -16,13 +16,13 @@ pub mod select;
 
 use anyhow::{Context, Result, ensure};
 use glam::{DMat3, DVec3};
-use mundaris_math::{Direction3, FrameId, surface::CubePatchAddress};
-use mundaris_renderer::{
+use astrum_math::{Direction3, FrameId, surface::CubePatchAddress};
+use astrum_renderer::{
     AtlasBounds, AtlasInstance, AtlasProduceJob, AtlasSampleSource, AtlasSource,
     CelestialProjection, MAX_ATLAS_JOBS_PER_FRAME, PreparedView, ShadowView, SurfaceMaterial,
     TerrainAtlasConfig, TerrainAtlasFrame,
 };
-use mundaris_world::{
+use astrum_world::{
     BodyId,
     terrain::{SurfaceDefinition, SurfaceGenerator, producer::ProducerRecipe},
 };
@@ -159,7 +159,7 @@ type BoundsGrid = [[f64; 2]; GRID_CELLS];
 /// selection; this caps that CPU cache (about 260 B per entry).
 const BOUNDS_CACHE_CAPACITY: usize = 65_536;
 
-const GRID: usize = mundaris_renderer::ATLAS_BOUNDS_GRID;
+const GRID: usize = astrum_renderer::ATLAS_BOUNDS_GRID;
 const GRID_CELLS: usize = GRID * GRID;
 /// Refinement may run at most this many levels ahead of measured bounds.
 const MEASURED_LOOKAHEAD: u8 = 2;
@@ -215,7 +215,7 @@ pub struct AtlasBodyInput<'a> {
 /// Sun shadow inputs of one frame: render settings and the sun position.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ShadowCasterPolicy {
-    pub settings: mundaris_renderer::ShadowSettings,
+    pub settings: astrum_renderer::ShadowSettings,
     /// Sun centre in view metres (the effective light, studio or star).
     pub sun_centre_view_m: DVec3,
 }
@@ -485,7 +485,7 @@ impl PlanetLod {
             let data_offset = policy.data_level_offset();
             let ranges: Vec<f64> = (0..=policy.max_level)
                 .map(|level| {
-                    let cell = mundaris_world::terrain::producer::tile_texel_m(
+                    let cell = astrum_world::terrain::producer::tile_texel_m(
                         radius,
                         level,
                         policy.draw_cells,
@@ -526,7 +526,7 @@ impl PlanetLod {
             let mut wanted: Vec<(u8, f64, CubePatchAddress)> = Vec::new();
             if !self.hold {
                 for level in 0..=policy.base_resident_level {
-                    for face in mundaris_math::surface::CubeFace::ALL {
+                    for face in astrum_math::surface::CubeFace::ALL {
                         let count = 1u32 << level;
                         for y in 0..count {
                             for x in 0..count {
@@ -660,13 +660,13 @@ impl PlanetLod {
                 };
                 let body_centre = body_to_view * (-observer);
                 let sun_view = (shadow_policy.sun_centre_view_m - body_centre).normalize();
-                if let Some(cascades) = mundaris_renderer::fit_cascades(
+                if let Some(cascades) = astrum_renderer::fit_cascades(
                     &view,
                     sun_view,
                     projection,
                     &shadow_policy.settings,
                 ) {
-                    let mut shadow = mundaris_renderer::AtlasShadowFrame {
+                    let mut shadow = astrum_renderer::AtlasShadowFrame {
                         cascades,
                         ..Default::default()
                     };
@@ -680,7 +680,7 @@ impl PlanetLod {
                         let reach = 0.5 * texel * f64::from(shadow_policy.settings.resolution);
                         let caster_ranges: Vec<f64> = (0..=policy.max_level)
                             .map(|level| {
-                                let cell = mundaris_world::terrain::producer::tile_texel_m(
+                                let cell = astrum_world::terrain::producer::tile_texel_m(
                                     radius,
                                     level,
                                     policy.draw_cells,
@@ -785,7 +785,7 @@ impl PlanetLod {
         &self,
         terrain: &mut crate::developer_snapshot::TerrainSnapshot,
         ids: &[BodyId],
-        system: &mundaris_world::CelestialSystem,
+        system: &astrum_world::CelestialSystem,
     ) {
         terrain.backend = "ATLAS CDLOD".into();
         terrain.refinement_demand_kind = Some("cdlod_pixel_error".into());
@@ -978,7 +978,7 @@ fn build_instance(
         (start as f32, end as f32)
     };
     let cell =
-        mundaris_world::terrain::producer::tile_texel_m(c.radius, level, c.policy.draw_cells);
+        astrum_world::terrain::producer::tile_texel_m(c.radius, level, c.policy.draw_cells);
     Some(BuiltInstance {
         instance: AtlasInstance {
             anchor_view_m: anchor_view.as_vec3().to_array(),
@@ -1168,7 +1168,7 @@ mod tests {
 
     #[test]
     fn eviction_takes_oldest_unused_nodes_but_never_base_levels_or_current_nodes() {
-        use mundaris_math::surface::CubeFace;
+        use astrum_math::surface::CubeFace;
         let root = CubePatchAddress::root(CubeFace::PositiveX);
         let a = root.children().unwrap()[0];
         let b = a.children().unwrap()[1];
@@ -1197,8 +1197,8 @@ mod tests {
     }
 
     fn test_body_id() -> BodyId {
-        use mundaris_math::*;
-        use mundaris_world::*;
+        use astrum_math::*;
+        use astrum_world::*;
         let mut system = CelestialSystem::new(
             std::num::NonZeroU64::new(1).unwrap(),
             SimulationInstant::ZERO,
@@ -1219,9 +1219,9 @@ mod tests {
 
     fn test_body(nodes: HashMap<CubePatchAddress, Resident>) -> BodyLod {
         let definition = SurfaceDefinition::generated(
-            mundaris_world::terrain::TerrainIdentity(1),
-            mundaris_world::terrain::TerrainSeed(2),
-            mundaris_world::terrain::SurfaceAlgorithm::MoonFieldsV1,
+            astrum_world::terrain::TerrainIdentity(1),
+            astrum_world::terrain::TerrainSeed(2),
+            astrum_world::terrain::SurfaceAlgorithm::MoonFieldsV1,
         );
         let generator = SurfaceGenerator::new(&definition, 140_000.0).unwrap();
         let recipe = generator.producer_recipe().unwrap();
@@ -1247,7 +1247,7 @@ mod tests {
     #[test]
     #[ignore = "requires a real GPU adapter; compares GPU atlas tiles with the CPU band-limited reference"]
     fn gpu_tiles_match_the_cpu_band_limited_reference() {
-        use mundaris_math::surface::CubeFace;
+        use astrum_math::surface::CubeFace;
         let loaded = crate::shared_system::SharedTestSystem::load_canonical(
             std::num::NonZeroU64::new(5).unwrap(),
         )
@@ -1287,8 +1287,8 @@ mod tests {
         // Nodes: a root, a face corner, and the canonical camera's path at
         // middle and deep levels.
         let path_node = |level: u8| {
-            let (face, uv) = mundaris_math::surface::SurfaceLocation::new(
-                mundaris_math::Direction3::try_new(camera).unwrap(),
+            let (face, uv) = astrum_math::surface::SurfaceLocation::new(
+                astrum_math::Direction3::try_new(camera).unwrap(),
             )
             .face_uv();
             let count = 1u32 << level;
@@ -1323,7 +1323,7 @@ mod tests {
                     }
                 })
                 .collect();
-            let produced = mundaris_renderer::produce_for_validation(
+            let produced = astrum_renderer::produce_for_validation(
                 &device,
                 &queue,
                 config,
@@ -1333,7 +1333,7 @@ mod tests {
             .unwrap();
             for (node, tile) in nodes.iter().zip(&produced) {
                 let chart = select::chart(*node);
-                let texel = mundaris_world::terrain::producer::tile_texel_m(
+                let texel = astrum_world::terrain::producer::tile_texel_m(
                     radius,
                     node.level(),
                     config.cells,
@@ -1389,7 +1389,7 @@ mod tests {
 
     #[test]
     fn missing_nodes_draw_from_the_finest_resident_ancestor() {
-        use mundaris_math::surface::CubeFace;
+        use astrum_math::surface::CubeFace;
         let root = CubePatchAddress::root(CubeFace::NegativeZ);
         let child = root.children().unwrap()[2];
         let grandchild = child.children().unwrap()[1];

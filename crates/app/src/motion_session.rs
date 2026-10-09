@@ -1,7 +1,7 @@
 //! Concrete app-owned selection between prescribed motion and integrated histories.
 use anyhow::{Result, anyhow, ensure};
-use mundaris_simulation::*;
-use mundaris_world::*;
+use astrum_simulation::*;
+use astrum_world::*;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 

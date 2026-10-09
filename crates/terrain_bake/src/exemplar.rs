@@ -54,7 +54,7 @@ pub struct ExemplarRecipe {
 pub struct ExemplarSource {
     /// Product name, e.g. `APOLLO16` (NASA LROC NAC DTM `NAC_DTM_<product>`).
     pub product: String,
-    /// GeoTIFF path. A relative path resolves against `MUNDARIS_DEM_ROOT`.
+    /// GeoTIFF path. A relative path resolves against `ASTRUM_DEM_ROOT`.
     pub path: String,
     /// Lower-case hex SHA-256 of the file; verified before any use.
     pub sha256: String,
@@ -184,10 +184,10 @@ impl ExemplarRecipe {
     }
 }
 
-/// Worker threads for the candidate search; `MUNDARIS_BAKE_THREADS` overrides.
+/// Worker threads for the candidate search; `ASTRUM_BAKE_THREADS` overrides.
 /// The output does not depend on this.
 pub fn thread_count() -> usize {
-    std::env::var("MUNDARIS_BAKE_THREADS")
+    std::env::var("ASTRUM_BAKE_THREADS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&t| t > 0)
@@ -352,8 +352,8 @@ fn resolve_path(path: &str) -> Result<PathBuf> {
     if p.is_absolute() {
         return Ok(p);
     }
-    let root = std::env::var_os("MUNDARIS_DEM_ROOT")
-        .with_context(|| format!("relative source path {path} needs MUNDARIS_DEM_ROOT"))?;
+    let root = std::env::var_os("ASTRUM_DEM_ROOT")
+        .with_context(|| format!("relative source path {path} needs ASTRUM_DEM_ROOT"))?;
     Ok(PathBuf::from(root).join(p))
 }
 
@@ -1009,7 +1009,7 @@ mod tests {
         recipe.sources = vec![ExemplarSource {
             product: "TEST".into(),
             path: std::env::temp_dir()
-                .join("mundaris-no-such-dem.tif")
+                .join("astrum-no-such-dem.tif")
                 .to_string_lossy()
                 .into_owned(),
             sha256: "0".repeat(64),
@@ -1019,7 +1019,7 @@ mod tests {
         assert!(missing.contains("cannot read"), "{missing}");
         // A file that exists but hashes differently.
         let path =
-            std::env::temp_dir().join(format!("mundaris-exemplar-{}.tif", std::process::id()));
+            std::env::temp_dir().join(format!("astrum-exemplar-{}.tif", std::process::id()));
         std::fs::write(&path, b"not a tiff").unwrap();
         recipe.sources[0].path = path.to_string_lossy().into_owned();
         let mismatch = format!("{:#}", load_pyramids(&recipe).err().unwrap());

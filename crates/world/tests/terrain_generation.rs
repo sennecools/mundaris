@@ -1,9 +1,9 @@
 use glam::DVec3;
-use mundaris_math::{
+use astrum_math::{
     AngularVelocity3, Direction3, LinearVelocity3, LocalPosition, UnitRotation,
     surface::{CubeFace, CubePatchAddress, PatchEdge, SurfaceLocation},
 };
-use mundaris_world::{BodyProperties, BodyState, CelestialSystem, SimulationInstant, terrain::*};
+use astrum_world::{BodyProperties, BodyState, CelestialSystem, SimulationInstant, terrain::*};
 use std::num::NonZeroU64;
 
 fn definition(seed: u64, amplitude: f64) -> TerrainDefinition {

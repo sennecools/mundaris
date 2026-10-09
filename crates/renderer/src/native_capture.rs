@@ -110,7 +110,7 @@ impl NativeCapture {
             return;
         }
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Mundaris native capture readback"),
+            label: Some("Astrum native capture readback"),
             size: buffer_size,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,

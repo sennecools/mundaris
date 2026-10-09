@@ -1,9 +1,9 @@
 use glam::DVec3;
-use mundaris_math::{
+use astrum_math::{
     Direction3,
     surface::{CubeFace, SurfaceLocation},
 };
-use mundaris_world::terrain::{
+use astrum_world::terrain::{
     GeologicalControls, GeologicalParameters, SurfaceAlgorithm, SurfaceAtmosphere,
     SurfaceDefinition, SurfaceGenerator, SurfaceMaterialDefinition, SurfaceTerrainDefinition,
     TerrainIdentity, TerrainSeed,
@@ -472,7 +472,7 @@ fn process_controls_respond_to_activity_and_resurfacing_parameter_edits() {
             let definition = SurfaceDefinition::new(
                 TerrainIdentity(0x51_1b_01),
                 seed,
-                mundaris_world::terrain::ShapeDefinition::sphere(),
+                astrum_world::terrain::ShapeDefinition::sphere(),
                 SurfaceTerrainDefinition::new(algorithm, parameters).unwrap(),
                 base_definition.material(),
                 base_definition.atmosphere(),

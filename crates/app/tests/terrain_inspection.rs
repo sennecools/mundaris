@@ -1,10 +1,10 @@
 use glam::DVec3;
-use mundaris_app::{
+use astrum_app::{
     solar_system::{SolarBody, SolarSystemPreset},
     terrain_inspection::{clearance_at_position, terrain_clearance},
 };
-use mundaris_math::*;
-use mundaris_world::*;
+use astrum_math::*;
+use astrum_world::*;
 use std::{num::NonZeroU64, time::Duration};
 
 #[test]
@@ -38,12 +38,12 @@ fn terrain_clearance_is_complete_read_only_and_absent_for_gas_giants() {
                 let direct = clearance_at_position(terrain, radius, position, id).unwrap();
                 assert_eq!(measured.clearance_m, direct.clearance_m);
             } else {
-                let generator = mundaris_world::terrain::SurfaceGenerator::new(
+                let generator = astrum_world::terrain::SurfaceGenerator::new(
                     body.surface_definition().unwrap(),
                     radius,
                 )
                 .unwrap();
-                let location = mundaris_math::surface::SurfaceLocation::new(
+                let location = astrum_math::surface::SurfaceLocation::new(
                     Direction3::try_new(direction).unwrap(),
                 );
                 let oracle = generator.evaluate_point(location).unwrap();
@@ -79,7 +79,7 @@ fn terrain_clearance_is_complete_read_only_and_absent_for_gas_giants() {
 
 #[test]
 fn rocky_body_orbit_approach_smooths_clearance_above_complete_terrain() {
-    use mundaris_app::celestial_camera::{CelestialCamera, NavigationInput};
+    use astrum_app::celestial_camera::{CelestialCamera, NavigationInput};
     let world = SolarSystemPreset::gameplay()
         .create(NonZeroU64::new(582).unwrap())
         .unwrap();
@@ -123,7 +123,7 @@ fn rocky_body_orbit_approach_smooths_clearance_above_complete_terrain() {
 
 #[test]
 fn translating_orbit_queries_fixed_direction_and_guard_preserves_orientation() {
-    use mundaris_app::celestial_camera::{CelestialCamera, NavigationInput};
+    use astrum_app::celestial_camera::{CelestialCamera, NavigationInput};
     let world = SolarSystemPreset::gameplay()
         .create(NonZeroU64::new(583).unwrap())
         .unwrap();

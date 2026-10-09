@@ -5,7 +5,7 @@ use crate::{
     developer_snapshot::{DeveloperSnapshot, DevelopmentSnapshot},
 };
 use anyhow::{Context, Result, ensure};
-use mundaris_renderer::{RenderOutcome, Renderer, native_capture::NativeCaptureFrame};
+use astrum_renderer::{RenderOutcome, Renderer, native_capture::NativeCaptureFrame};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -90,10 +90,10 @@ fn refresh_freshness(
 
 impl DeveloperService {
     pub fn start(preset: &str, wake: impl Fn() + Send + Sync + 'static) -> Result<Self> {
-        let registry = std::env::var_os("MUNDARIS_DEV_REGISTRY")
+        let registry = std::env::var_os("ASTRUM_DEV_REGISTRY")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("target/developer-sessions"));
-        let output = std::env::var_os("MUNDARIS_DEV_OUTPUT")
+        let output = std::env::var_os("ASTRUM_DEV_OUTPUT")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("target/developer-evidence"));
         fs::create_dir_all(&registry)?;
@@ -107,7 +107,7 @@ impl DeveloperService {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;
         let binary_sha256 = hash_file(&executable)?;
-        let build_manifest = std::env::var_os("MUNDARIS_DEV_BUILD_MANIFEST")
+        let build_manifest = std::env::var_os("ASTRUM_DEV_BUILD_MANIFEST")
             .map(|p| -> Result<Value> { Ok(serde_json::from_slice(&fs::read(p)?)?) })
             .transpose()?
             .filter(|manifest| {
@@ -922,7 +922,7 @@ fn publish_bundle(mut job: Publish) -> Result<Value> {
     file.write_all(&serde_json::to_vec_pretty(&data)?)?;
     file.sync_all()?;
     if job.name.starts_with("bad-frame-") {
-        let root = std::env::var_os("MUNDARIS_CAPTURE_DIR")
+        let root = std::env::var_os("ASTRUM_CAPTURE_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("target/terrain-captures"));
         let destination = root
@@ -959,7 +959,7 @@ mod tests {
             requests,
             stopped: Arc::new(AtomicBool::new(false)),
             registry_file: std::env::temp_dir()
-                .join(format!("mundaris-test-{}-absent", std::process::id())),
+                .join(format!("astrum-test-{}-absent", std::process::id())),
             lease: None,
             sequence: 0,
             receipts: VecDeque::new(),

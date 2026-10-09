@@ -1,23 +1,23 @@
 [package]
-name = "mundaris_app"
+name = "astrum_app"
 version.workspace = true
 edition.workspace = true
 publish = false
-default-run = "mundaris_app"
+default-run = "astrum_app"
 
 [features]
-surface-profile = ["mundaris_renderer/surface-profile"]
-terrain-capture = ["mundaris_renderer/terrain-capture", "dep:png"]
-developer-tools = ["terrain-capture", "surface-profile", "mundaris_renderer/developer-tools", "dep:base64"]
+surface-profile = ["astrum_renderer/surface-profile"]
+terrain-capture = ["astrum_renderer/terrain-capture", "dep:png"]
+developer-tools = ["terrain-capture", "surface-profile", "astrum_renderer/developer-tools", "dep:base64"]
 
 [dependencies]
 anyhow.workspace = true
 glam.workspace = true
-mundaris_math = { path = "../math" }
-mundaris_renderer = { path = "../renderer" }
-mundaris_simulation = { path = "../simulation" }
-mundaris_terrain_fields = { path = "../terrain_fields" }
-mundaris_world = { path = "../world" }
+astrum_math = { path = "../math" }
+astrum_renderer = { path = "../renderer" }
+astrum_simulation = { path = "../simulation" }
+astrum_terrain_fields = { path = "../terrain_fields" }
+astrum_world = { path = "../world" }
 png = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
@@ -32,8 +32,8 @@ sha2 = "0.10"
 base64 = { version = "0.22", optional = true }
 
 [[bin]]
-name = "mundaris_dev"
-path = "src/bin/mundaris_dev.rs"
+name = "astrum_dev"
+path = "src/bin/astrum_dev.rs"
 required-features = ["developer-tools"]
 
 [dev-dependencies]

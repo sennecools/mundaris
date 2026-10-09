@@ -2,9 +2,9 @@
 //! Values use SI units; absent measurements are `None`, never inferred zero.
 
 use anyhow::{Result, ensure};
-use mundaris_math::FramePose;
-use mundaris_renderer::{CelestialProjection, GpuProfile};
-use mundaris_world::{BodyId, CoherentCelestialView};
+use astrum_math::FramePose;
+use astrum_renderer::{CelestialProjection, GpuProfile};
+use astrum_world::{BodyId, CoherentCelestialView};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -193,8 +193,8 @@ pub struct TimestampSamplingSnapshot {
     pub last_invalid_sample_source_submission_id: Option<u64>,
 }
 
-impl From<mundaris_renderer::TimestampProfilingMetrics> for TimestampSamplingSnapshot {
-    fn from(metrics: mundaris_renderer::TimestampProfilingMetrics) -> Self {
+impl From<astrum_renderer::TimestampProfilingMetrics> for TimestampSamplingSnapshot {
+    fn from(metrics: astrum_renderer::TimestampProfilingMetrics) -> Self {
         Self {
             explicit_requests: metrics.explicit_requests,
             eligible_frames: metrics.eligible_frames,

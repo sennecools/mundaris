@@ -1,5 +1,5 @@
 use glam::DVec3;
-use mundaris_math::{Direction3, surface::*};
+use astrum_math::{Direction3, surface::*};
 
 #[test]
 fn checked_addresses_and_nested_canonical_samples() {

@@ -1,8 +1,8 @@
 //! Fixed-input complete-query cost observations, separate from rendering.
 use anyhow::{Context, Result, bail};
 use glam::DVec3;
-use mundaris_math::{Direction3, surface::SurfaceLocation};
-use mundaris_world::terrain::{
+use astrum_math::{Direction3, surface::SurfaceLocation};
+use astrum_world::terrain::{
     ShapeDefinition, SurfaceAlgorithm, SurfaceAtmosphere, SurfaceDefinition, SurfaceGenerator,
     SurfaceMaterialDefinition, SurfaceTerrainDefinition, TerrainIdentity, TerrainSeed,
 };

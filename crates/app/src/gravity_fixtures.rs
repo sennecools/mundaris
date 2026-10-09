@@ -1,9 +1,9 @@
 //! Initial conditions only: all subsequent translation comes from mutual gravity.
 use anyhow::Result;
 use glam::DVec3;
-use mundaris_math::*;
-use mundaris_simulation::GRAVITATIONAL_CONSTANT_M3_KG_S2 as G;
-use mundaris_world::*;
+use astrum_math::*;
+use astrum_simulation::GRAVITATIONAL_CONSTANT_M3_KG_S2 as G;
+use astrum_world::*;
 use std::num::NonZeroU64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,7 +148,7 @@ pub fn body_color(index: usize) -> [f32; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mundaris_simulation::*;
+    use astrum_simulation::*;
     #[test]
     fn independent_initial_condition_answers_and_hill_sanity() {
         let world = GravityFixture::Circular

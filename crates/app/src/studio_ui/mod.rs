@@ -1,4 +1,4 @@
-//! Mundaris Studio window (docs/STUDIO_UI.md): winit owns the window and event
+//! Astrum Studio window (docs/STUDIO_UI.md): winit owns the window and event
 //! loop, egui draws the Studio chrome, and the engine renders the scene into an
 //! offscreen texture that the viewport shows. One wgpu device is shared.
 //!
@@ -19,12 +19,12 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use egui::{Frame, Margin};
-use mundaris_app::{
+use astrum_app::{
     GravityOrbitsDemo,
     engine_profile::span,
     studio::view::{StudioAction, StudioView},
 };
-use mundaris_renderer::{GpuContext, Renderer};
+use astrum_renderer::{GpuContext, Renderer};
 use tracing::info;
 use winit::{
     application::ApplicationHandler,
@@ -55,7 +55,7 @@ pub struct Engine {
     pub demo: GravityOrbitsDemo,
     pub renderer: Renderer,
     #[cfg(feature = "developer-tools")]
-    pub developer: Option<mundaris_app::developer_service::DeveloperService>,
+    pub developer: Option<astrum_app::developer_service::DeveloperService>,
     error: Option<anyhow::Error>,
     quit: bool,
     profiler_models: ProfilerModels,
@@ -246,7 +246,7 @@ impl StudioApp {
             event_loop
                 .create_window(
                     Window::default_attributes()
-                        .with_title("Mundaris Studio")
+                        .with_title("Astrum Studio")
                         .with_inner_size(LogicalSize::new(1600.0, 900.0)),
                 )
                 .context("creating the Studio window")?,
@@ -518,7 +518,7 @@ impl ApplicationHandler<AppEvent> for StudioApp {
         match self.create_presentation(event_loop) {
             Ok(presentation) => {
                 self.presentation = Some(presentation);
-                info!("Mundaris Studio window initialized");
+                info!("Astrum Studio window initialized");
             }
             Err(error) => self.fail(event_loop, error),
         }

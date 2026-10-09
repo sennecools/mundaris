@@ -1,7 +1,7 @@
 //! Deterministic province selection and complete-query evidence. Selection never
 //! changes the world field and its candidates are recorded for visual review.
 use super::*;
-use mundaris_world::terrain::GeologicalControls;
+use astrum_world::terrain::GeologicalControls;
 use std::{fs::File, io::BufWriter};
 
 const CANDIDATES: usize = 4096;
@@ -495,7 +495,7 @@ fn write_detail_maps(
     }))
 }
 
-pub(super) fn detail_json(diagnostics: mundaris_world::terrain::SurfaceDetailDiagnostics) -> Value {
+pub(super) fn detail_json(diagnostics: astrum_world::terrain::SurfaceDetailDiagnostics) -> Value {
     json!({
         "inherited_height_m":diagnostics.inherited_height_m,
         "parent_morphology":diagnostics.parent_morphology,

@@ -7,7 +7,7 @@
 //! [`SPECS`]; nothing else enumerates settings. Values are session state, not
 //! content.
 use anyhow::{Result, bail, ensure};
-use mundaris_renderer::{
+use astrum_renderer::{
     ExposureMode, RenderSettings, SHADOW_RESOLUTIONS, TerrainViewMode, Tonemapper,
 };
 use serde_json::{Value, json};

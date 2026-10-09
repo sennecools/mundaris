@@ -2,7 +2,7 @@
 """Exercise the MCP stdio bridge against an already-running native session.
 
 The session itself is launched by the caller. This script never starts or stops
-the engine; it only starts mundaris_dev in MCP mode and connects through the
+the engine; it only starts astrum_dev in MCP mode and connects through the
 session descriptor's registry.
 """
 
@@ -26,14 +26,14 @@ from typing import Any
 MODERN_PROTOCOL_VERSION = "2026-06-18"
 NEGOTIATED_PROTOCOL_VERSION = "2025-11-25"
 REQUIRED_TOOLS = {
-    "mundaris_sessions",
-    "mundaris_capabilities",
-    "mundaris_inspect",
-    "mundaris_control",
-    "mundaris_action",
-    "mundaris_receipt",
-    "mundaris_capture",
-    "mundaris_wait",
+    "astrum_sessions",
+    "astrum_capabilities",
+    "astrum_inspect",
+    "astrum_control",
+    "astrum_action",
+    "astrum_receipt",
+    "astrum_capture",
+    "astrum_wait",
 }
 
 
@@ -79,7 +79,7 @@ class McpProcess:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
-            env={**os.environ, "MUNDARIS_DEV_REGISTRY": str(registry)},
+            env={**os.environ, "ASTRUM_DEV_REGISTRY": str(registry)},
         )
         self.messages: queue.Queue[dict[str, Any] | None] = queue.Queue()
         self.stderr_lines: list[str] = []
@@ -216,7 +216,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         client = McpProcess(binary, output, registry)
         initialized = client.request(
             "initialize",
-            {"protocolVersion": MODERN_PROTOCOL_VERSION, "capabilities": {}, "clientInfo": {"name": "mundaris-mcp-check", "version": "1"}},
+            {"protocolVersion": MODERN_PROTOCOL_VERSION, "capabilities": {}, "clientInfo": {"name": "astrum-mcp-check", "version": "1"}},
         )
         negotiated = initialized.get("result", {}).get("protocolVersion")
         require(negotiated == NEGOTIATED_PROTOCOL_VERSION, f"unexpected negotiated protocol: {negotiated!r}")
@@ -229,14 +229,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             require(isinstance(tool.get("inputSchema"), dict), f"tool lacks inputSchema: {tool.get('name')}")
         result["checks"].append("initialize-2026-to-2025-negotiation-ping-tool-schemas")
 
-        sessions_data = tool_structured(client, "mundaris_sessions", {"registry": str(registry)})
+        sessions_data = tool_structured(client, "astrum_sessions", {"registry": str(registry)})
         sessions = sessions_data.get("sessions", [])
         live = next((s for s in sessions if isinstance(s, dict) and s.get("session_id") == session_id), None)
         require(live is not None, f"session {session_id!r} is not confirmed live by registry discovery")
         require(live.get("pid") == descriptor.get("pid") and live.get("endpoint") == descriptor.get("endpoint"), "live descriptor identity differs from selected descriptor")
         result["checks"].append("registry-session-is-live-and-matches-descriptor")
 
-        inspect = response_data(tool_structured(client, "mundaris_inspect", {"session": session_id}), {"ok"}, "inspect")
+        inspect = response_data(tool_structured(client, "astrum_inspect", {"session": session_id}), {"ok"}, "inspect")
         require(inspect.get("session", {}).get("session_id") == session_id, "inspect session identity mismatch")
         bodies = inspect.get("bodies")
         require(isinstance(bodies, list) and bodies, "inspect returned no body inventory")
@@ -245,7 +245,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         result["initial_snapshot"] = jsonable(inspect.get("snapshot"))
         result["checks"].append("inspect-session-snapshot-and-earth-handle")
 
-        control = tool_structured(client, "mundaris_control", {"session": session_id, "operation": "acquire", "owner": "mcp-integration-check"})
+        control = tool_structured(client, "astrum_control", {"session": session_id, "operation": "acquire", "owner": "mcp-integration-check"})
         control_data = response_data(control, {"ok"}, "acquire control")
         lease = control_data.get("lease")
         require(isinstance(lease, str) and lease, "acquire did not return lease")
@@ -256,22 +256,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             ("disable-clouds", {"action": "layer", "layer": "clouds", "enabled": False}),
             ("set-sky-intensity", {"action": "sky_setting", "setting": "intensity", "value": 0.8}),
         ]:
-            accepted = extract_structured(client.tool("mundaris_action", {"session": session_id, "lease": lease, "command": command}), label)
+            accepted = extract_structured(client.tool("astrum_action", {"session": session_id, "lease": lease, "command": command}), label)
             data = response_data(accepted, {"accepted"}, label)
             command_id = data.get("command_id")
             require(isinstance(command_id, str), f"{label} returned no command_id")
-            receipt = tool_structured(client, "mundaris_receipt", {"session": session_id, "command_id": command_id})
+            receipt = tool_structured(client, "astrum_receipt", {"session": session_id, "command_id": command_id})
             receipt_data = response_data(receipt, {"ok"}, f"{label} receipt")
             require(receipt_data.get("status") in {"applied", "completed"}, f"{label} did not apply: {receipt_data}")
             result.setdefault("actions", []).append({"name": label, "command_id": command_id, "receipt": jsonable(receipt_data)})
             result["checks"].append(label)
 
-        focused = tool_structured(client, "mundaris_wait", {"session": session_id, "timeout_s": 30, "predicate": {"path": "general.focused_body.name", "equals": "Earth"}})
+        focused = tool_structured(client, "astrum_wait", {"session": session_id, "timeout_s": 30, "predicate": {"path": "general.focused_body.name", "equals": "Earth"}})
         require(focused.get("snapshot", {}).get("general", {}).get("focused_body", {}).get("name") == "Earth", "focus did not reach Earth before capture")
-        tool_structured(client, "mundaris_wait", {"session": session_id, "timeout_s": 30, "predicate": {"path": "camera.navigation.transitioning", "equals": False}})
+        tool_structured(client, "astrum_wait", {"session": session_id, "timeout_s": 30, "predicate": {"path": "camera.navigation.transitioning", "equals": False}})
         result["checks"].append("focus-earth-checkpoint-before-capture")
 
-        captured = client.tool("mundaris_capture", {"session": session_id, "lease": lease, "name": "mcp-smoke"}, timeout=35.0)
+        captured = client.tool("astrum_capture", {"session": session_id, "lease": lease, "name": "mcp-smoke"}, timeout=35.0)
         capture = extract_structured(captured, "capture")
         receipt_envelope = capture.get("result")
         require(isinstance(receipt_envelope, dict), "capture omitted terminal receipt")
@@ -308,7 +308,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         result["capture"] = {"manifest": str(manifest_path), "snapshot": str(snapshot_path), "images": returned_images, "frame": receipt_payload.get("prepared_frame"), "submission_frame": receipt_payload.get("source_frame")}
         result["checks"].append("paired-capture-images-match-manifest-and-snapshot")
 
-        malformed = client.tool("mundaris_action", {"session": session_id, "lease": lease, "command": {"action": "definitely_not_an_action"}})
+        malformed = client.tool("astrum_action", {"session": session_id, "lease": lease, "command": {"action": "definitely_not_an_action"}})
         require(malformed.get("isError") is True, f"unknown action was not an MCP tool error: {malformed}")
         result["checks"].append("unknown-action-is-error")
 
@@ -318,14 +318,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             {"session": 123, "predicate": {"path": "general.paused", "equals": True}},
         ]:
             started = time.monotonic()
-            rejected = client.tool("mundaris_wait", {"session": session_id, **invalid})
+            rejected = client.tool("astrum_wait", {"session": session_id, **invalid})
             require(rejected.get("isError") is True, f"malformed wait arguments were accepted: {rejected}")
             require(time.monotonic() - started < 2, "malformed wait arguments did not fail immediately")
         result["checks"].append("malformed-unknown-typed-and-inverted-wait-arguments-rejected-immediately")
 
         cancel_id = client.next_id
         client.next_id += 1
-        wait_request = {"jsonrpc": "2.0", "id": cancel_id, "method": "tools/call", "params": {"name": "mundaris_wait", "arguments": {"session": session_id, "timeout_s": 30, "predicate": {"path": "general.frame_number", "at_least": 1e100}}}}
+        wait_request = {"jsonrpc": "2.0", "id": cancel_id, "method": "tools/call", "params": {"name": "astrum_wait", "arguments": {"session": session_id, "timeout_s": 30, "predicate": {"path": "general.frame_number", "at_least": 1e100}}}}
         client.send(wait_request)
         time.sleep(0.25)
         client.notify("notifications/cancelled", {"requestId": cancel_id, "reason": "integration check"})
@@ -337,14 +337,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         client.calls.append({"request": wait_request, "response": jsonable(cancelled), "cancellation": True})
         result["checks"].append("predicate-wait-cancelled-within-4-seconds")
 
-        released = tool_structured(client, "mundaris_control", {"session": session_id, "operation": "release", "lease": lease})
+        released = tool_structured(client, "astrum_control", {"session": session_id, "operation": "release", "lease": lease})
         response_data(released, {"ok"}, "release control")
         lease = None
         result["checks"].append("release-control")
         scenario_id = client.next_id
         client.next_id += 1
         scenario_request = {"jsonrpc":"2.0", "id":scenario_id, "method":"tools/call", "params":{
-            "name":"mundaris_scenarios", "arguments":{"session":session_id,
+            "name":"astrum_scenarios", "arguments":{"session":session_id,
                 "output_directory":str(output / "cancelled-scenario"),
                 "scenario":{"schema":1,"preset":descriptor["preset"],"initial_settings":[{"action":"pause","paused":True}],
                     "steps":[{"action":{"action":"overview"},"duration_s":10}, {"action":{"action":"seek","seconds":42}}]}}}}
@@ -354,7 +354,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         scenario_cancelled = client.receive(scenario_id, timeout=4)
         require(scenario_cancelled.get("result", {}).get("isError") is True, "cancelled scenario must report an error")
         client.calls.append({"request":scenario_request,"response":jsonable(scenario_cancelled),"cancellation":True})
-        after = response_data(tool_structured(client,"mundaris_inspect",{"session":session_id}), {"ok"}, "inspect after scenario cancellation")
+        after = response_data(tool_structured(client,"astrum_inspect",{"session":session_id}), {"ok"}, "inspect after scenario cancellation")
         require(after.get("control_owner") is None, "scenario cancellation did not release control")
         require(after.get("snapshot",{}).get("motion",{}).get("published_time_s") != 42, "scenario issued an action after cancellation")
         result["checks"].append("native-scenario-cancelled-within-4-seconds-releases-control-and-skips-later-actions")
@@ -366,7 +366,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     finally:
         if client is not None and lease is not None and client.process.poll() is None:
             try:
-                tool_structured(client, "mundaris_control", {"session": session_id, "operation": "release", "lease": lease}, "cleanup release")
+                tool_structured(client, "astrum_control", {"session": session_id, "operation": "release", "lease": lease}, "cleanup release")
             except Exception as exc:  # preserve primary failure; record cleanup evidence
                 failures.append(f"lease cleanup failed: {exc}")
         if client is not None:
@@ -390,7 +390,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--session", type=Path, required=True, help="path to the existing native session descriptor JSON")
     parser.add_argument("--output", type=Path, required=True, help="fresh directory for result JSON, RPC metadata, and returned PNGs")
-    parser.add_argument("--binary", type=Path, default=Path("../target/release/mundaris_dev.exe"), help="mundaris_dev executable (default: ../target/release/mundaris_dev.exe)")
+    parser.add_argument("--binary", type=Path, default=Path("../target/release/astrum_dev.exe"), help="astrum_dev executable (default: ../target/release/astrum_dev.exe)")
     parser.add_argument("--registry", type=Path, help="session registry directory (default: descriptor's parent directory)")
     args = parser.parse_args()
     try:

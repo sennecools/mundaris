@@ -1,7 +1,7 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use glam::DVec3;
-use mundaris_math::*;
-use mundaris_renderer::*;
+use astrum_math::*;
+use astrum_renderer::*;
 use std::{hint::black_box, num::NonZeroU64, time::Duration};
 fn benches(c: &mut Criterion) {
     let sphere = Icosphere::new();

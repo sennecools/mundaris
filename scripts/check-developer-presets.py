@@ -254,9 +254,9 @@ def start_app(
 ) -> tuple[subprocess.Popen[bytes], Path]:
     registry, evidence, logs = create_run_directories(root)
     env = os.environ.copy()
-    env["MUNDARIS_DEV_REGISTRY"] = str(registry)
-    env["MUNDARIS_DEV_OUTPUT"] = str(evidence)
-    env.pop("MUNDARIS_DEV_BUILD_MANIFEST", None)
+    env["ASTRUM_DEV_REGISTRY"] = str(registry)
+    env["ASTRUM_DEV_OUTPUT"] = str(evidence)
+    env.pop("ASTRUM_DEV_BUILD_MANIFEST", None)
     command = [str(binary), argument]
     if developer_interface:
         command.append("--dev-interface")
@@ -661,7 +661,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     require(not output.exists(), f"output directory must be fresh: {output}")
     binary = args.binary.expanduser().resolve(strict=True)
     require(binary.is_file(), f"application binary is not a file: {binary}")
-    bridge = (args.bridge_binary or binary.with_name("mundaris_dev.exe")).expanduser().resolve(strict=True)
+    bridge = (args.bridge_binary or binary.with_name("astrum_dev.exe")).expanduser().resolve(strict=True)
     require(bridge.is_file(), f"bridge binary is not a file: {bridge}")
     output.mkdir(parents=True)
     user32 = win_api()
@@ -716,11 +716,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, required=True, help="built mundaris_app.exe")
+    parser.add_argument("--binary", type=Path, required=True, help="built astrum_app.exe")
     parser.add_argument(
         "--bridge-binary",
         type=Path,
-        help="mundaris_dev.exe (defaults to the sibling of --binary)",
+        help="astrum_dev.exe (defaults to the sibling of --binary)",
     )
     parser.add_argument("--output", type=Path, required=True, help="fresh result directory")
     parser.add_argument(

@@ -14,5 +14,5 @@ pub mod terrain;
 pub use body::*;
 pub use celestial_motion::*;
 pub use frame_projection::*;
-pub use mundaris_math::SimulationInstant;
+pub use astrum_math::SimulationInstant;
 pub use system::*;

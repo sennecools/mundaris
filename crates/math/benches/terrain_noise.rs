@@ -1,6 +1,6 @@
 use criterion::{Criterion, SamplingMode, Throughput, criterion_group, criterion_main};
 use glam::DVec3;
-use mundaris_math::noise::{gradient_noise, gradient_noise_value};
+use astrum_math::noise::{gradient_noise, gradient_noise_value};
 
 fn noise(c: &mut Criterion) {
     let mut group = c.benchmark_group("terrain_noise");

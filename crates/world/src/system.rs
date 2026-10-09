@@ -240,7 +240,7 @@ impl CelestialSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mundaris_math::*;
+    use astrum_math::*;
     #[test]
     fn invalid_index_and_revision_overflow_preserve_state() {
         let mut system = CelestialSystem::new(NonZeroU64::new(1).unwrap(), SimulationInstant::ZERO);

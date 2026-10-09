@@ -1,9 +1,9 @@
 use glam::DVec3;
-use mundaris_math::{
+use astrum_math::{
     Direction3,
     surface::{CubeFace, SurfaceLocation},
 };
-use mundaris_world::terrain::*;
+use astrum_world::terrain::*;
 
 const ALGORITHMS: [SurfaceAlgorithm; 3] = [
     SurfaceAlgorithm::RockyV5,

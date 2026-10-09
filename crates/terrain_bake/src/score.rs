@@ -280,7 +280,7 @@ fn load(dir: &Path) -> Result<Entry> {
             .with_context(|| format!("reading {}/metrics.json", dir.display()))?,
     )?;
     ensure!(
-        metrics["schema"] == "mundaris.terrain-inspect.v1",
+        metrics["schema"] == "astrum.terrain-inspect.v1",
         "{} is not an inspect output",
         dir.display()
     );

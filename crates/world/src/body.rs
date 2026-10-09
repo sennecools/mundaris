@@ -1,4 +1,4 @@
-use mundaris_math::{AngularVelocity3, LinearVelocity3, LocalPosition, UnitRotation};
+use astrum_math::{AngularVelocity3, LinearVelocity3, LocalPosition, UnitRotation};
 use std::num::NonZeroU64;
 
 /// Opaque runtime identity, unrelated to names and reference frames.

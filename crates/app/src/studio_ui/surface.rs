@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
-use mundaris_renderer::GpuContext;
+use astrum_renderer::GpuContext;
 use tracing::{info, warn};
 use winit::window::Window;
 
@@ -40,7 +40,7 @@ impl WindowSurface {
             .copied()
             .context("the window surface offers no alpha mode")?;
         let uncapped = cfg!(feature = "developer-tools")
-            && std::env::var("MUNDARIS_UNCAPPED").is_ok_and(|value| value == "1");
+            && std::env::var("ASTRUM_UNCAPPED").is_ok_and(|value| value == "1");
         let present_mode = if uncapped {
             wgpu::PresentMode::AutoNoVsync
         } else {

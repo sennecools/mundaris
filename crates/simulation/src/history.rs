@@ -1,6 +1,6 @@
 //! Whole-snapshot preallocated ring. Baseline storage is separate from retention.
 use crate::SimulationError;
-use mundaris_world::BodyState;
+use astrum_world::BodyState;
 
 pub(crate) struct History {
     states: Box<[BodyState]>,

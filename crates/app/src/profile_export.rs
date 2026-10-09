@@ -27,9 +27,9 @@ impl TimelineExporter {
     /// One in-flight write plus one queued capture. No file work on the caller.
     pub fn request(&mut self, snapshot: Arc<DeveloperSnapshot>) -> Result<(), &'static str> {
         if self.sender.is_none() {
-            let root = std::env::var_os("MUNDARIS_DEV_OUTPUT")
+            let root = std::env::var_os("ASTRUM_DEV_OUTPUT")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("target/mundaris-diagnostics"));
+                .unwrap_or_else(|| PathBuf::from("target/astrum-diagnostics"));
             let (tx, rx) = mpsc::sync_channel::<Arc<DeveloperSnapshot>>(1);
             let (result_tx, result_rx) = mpsc::sync_channel(2);
             let mut sequence = self.sequence;
@@ -110,7 +110,7 @@ pub fn chrome_trace(profile: &Value, snapshot: Option<&DeveloperSnapshot>) -> Va
             }
         }
     }
-    json!({"traceEvents":events,"displayTimeUnit":"ms","mundaris":{
+    json!({"traceEvents":events,"displayTimeUnit":"ms","astrum":{
         "schema_version":1,"cpu_clock":"process_relative_monotonic_us","gpu_clock_calibrated":false,
         "gpu_absolute_timestamps":"unavailable","completed_spans_only":true,
         "profile_capture_id":profile["capture_id"],"generated_at_ns":profile["generated_at_ns"],
@@ -232,7 +232,7 @@ fn ai_analysis(profile: &Value, export_omitted: usize) -> Value {
         .collect::<Vec<_>>();
 
     json!({
-        "schema":"mundaris.performance.timeline-analysis.v1",
+        "schema":"astrum.performance.timeline-analysis.v1",
         "purpose":"Rank observed spans and typed waits for quick diagnostic review.",
         "capture_id":profile["capture_id"],
         "generated_at_ns":profile["generated_at_ns"],
@@ -324,8 +324,8 @@ mod tests {
         assert_eq!(span["tid"], 9);
         assert_eq!(span["args"]["job_identity"]["job_id"], 7);
         assert!(span["args"]["thread_cpu_ns"].is_null());
-        assert!(trace["mundaris"]["observation_gpu_measurements"].is_null());
-        assert_eq!(trace["mundaris"]["gpu_clock_calibrated"], false);
+        assert!(trace["astrum"]["observation_gpu_measurements"].is_null());
+        assert_eq!(trace["astrum"]["gpu_clock_calibrated"], false);
     }
     #[test]
     fn oversized_export_does_not_exceed_byte_bound() {
@@ -353,7 +353,7 @@ mod tests {
         let analysis = ai_analysis(&profile, 4);
         assert_eq!(
             analysis["schema"],
-            "mundaris.performance.timeline-analysis.v1"
+            "astrum.performance.timeline-analysis.v1"
         );
         assert_eq!(analysis["span_count"], 3);
         assert_eq!(

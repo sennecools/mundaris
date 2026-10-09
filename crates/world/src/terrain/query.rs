@@ -1,6 +1,6 @@
 use super::TerrainError;
 use glam::DVec3;
-use mundaris_math::{
+use astrum_math::{
     Direction3,
     surface::{DirectionalCap, SurfaceLocation},
 };

@@ -1,6 +1,6 @@
 use glam::DVec3;
-use mundaris_math::{Direction3, surface::SurfaceLocation};
-use mundaris_world::terrain::{
+use astrum_math::{Direction3, surface::SurfaceLocation};
+use astrum_world::terrain::{
     PreparedSurface, SurfaceDefinition, SurfaceGenerator, TerrainIdentity, TerrainSeed,
 };
 use std::{
@@ -82,7 +82,7 @@ fn prepared_identity_and_body_local_reuse() {
     let b = generator();
     assert_eq!(a.definition(), b.definition());
     let p = a.definition().prepared().unwrap();
-    assert!(p.resident_bytes() <= mundaris_world::terrain::PREPARED_SOURCE_CAP_BYTES);
+    assert!(p.resident_bytes() <= astrum_world::terrain::PREPARED_SOURCE_CAP_BYTES);
     assert_eq!(a.resident_heap_bytes(), b.resident_heap_bytes());
     let n = DVec3::new(0.00243, 0.00101, 1.).normalize();
     let location = SurfaceLocation::new(Direction3::try_new(n).unwrap());
@@ -123,7 +123,7 @@ struct Variant(PathBuf);
 impl Variant {
     fn new(name: &str, edit: impl FnOnce(&mut serde_json::Value)) -> Self {
         let root =
-            std::env::temp_dir().join(format!("mundaris-prepared-{}-{name}", std::process::id()));
+            std::env::temp_dir().join(format!("astrum-prepared-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let from = source().parent().unwrap().to_path_buf();
         copy_loader_files(&from, &root);

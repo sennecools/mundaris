@@ -1,7 +1,7 @@
 use glam::DVec3;
-use mundaris_app::{celestial_camera::*, gravity_fixtures::*};
-use mundaris_simulation::*;
-use mundaris_world::*;
+use astrum_app::{celestial_camera::*, gravity_fixtures::*};
+use astrum_simulation::*;
+use astrum_world::*;
 use std::{num::NonZeroU64, time::Duration};
 #[test]
 fn every_body_focus_interrupt_fps_precision_and_read_only_world() {

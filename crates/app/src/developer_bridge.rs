@@ -215,7 +215,7 @@ fn select_session(registry: &Path, explicit: Option<&str>) -> Result<SessionDesc
     match sessions.as_slice() {
         [only] => Ok(only.clone()),
         [] => bail!(
-            "no live Mundaris development sessions found in {}",
+            "no live Astrum development sessions found in {}",
             registry.display()
         ),
         many => bail!(
@@ -226,7 +226,7 @@ fn select_session(registry: &Path, explicit: Option<&str>) -> Result<SessionDesc
 }
 
 fn registry_default() -> PathBuf {
-    std::env::var_os("MUNDARIS_DEV_REGISTRY")
+    std::env::var_os("ASTRUM_DEV_REGISTRY")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("target/developer-sessions"))
 }
@@ -385,7 +385,7 @@ fn parse_cli(args: &[String]) -> Result<Value> {
                 owner: positional
                     .get(1)
                     .cloned()
-                    .unwrap_or_else(|| "mundaris-dev".into()),
+                    .unwrap_or_else(|| "astrum-dev".into()),
             })?,
             Some("renew") => client.request(DevOperation::RenewControl {
                 lease: required(&positional, 1, "lease")?,
@@ -436,7 +436,7 @@ fn parse_cli(args: &[String]) -> Result<Value> {
             );
             return wait_for_receipt(&client, command_id, wait_timeout_s, wait_predicate, None);
         }
-        other => bail!("unknown command {other:?}; run mundaris_dev --help"),
+        other => bail!("unknown command {other:?}; run astrum_dev --help"),
     };
     Ok(serde_json::to_value(response)?)
 }
@@ -448,7 +448,7 @@ fn required(values: &[String], index: usize, label: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("missing {label}"))
 }
 
-const CLI_HELP: &str = "mundaris_dev [--registry DIR] [--session ID] COMMAND\n\
+const CLI_HELP: &str = "astrum_dev [--registry DIR] [--session ID] COMMAND\n\
 sessions | inspect | control acquire [OWNER] | control renew LEASE | control release LEASE\n\
 capabilities | diagnostics [terrain|performance|errors]\n\
 request [JSON|-|@FILE]\n\
@@ -491,7 +491,7 @@ fn predicate_matches(snapshot: &Value, predicate: &Value) -> bool {
 fn validate_predicate(predicate: &Value) -> Result<()> {
     let schema = mcp_tools()
         .as_array()
-        .and_then(|tools| tools.iter().find(|tool| tool["name"] == "mundaris_wait"))
+        .and_then(|tools| tools.iter().find(|tool| tool["name"] == "astrum_wait"))
         .and_then(|tool| {
             tool["inputSchema"]["properties"]["predicate"]
                 .as_object()
@@ -738,7 +738,7 @@ fn validate_mcp_arguments(name: &str, args: &Value) -> Result<()> {
 }
 
 fn mcp_tools() -> Value {
-    let body_handle_description = "Opaque session-scoped handle copied from bodies[].handle in mundaris_inspect; do not pass semantic_identity or name.";
+    let body_handle_description = "Opaque session-scoped handle copied from bodies[].handle in astrum_inspect; do not pass semantic_identity or name.";
     let action_schema = json!({
         "oneOf": [
             {"type":"object","properties":{"action":{"const":"select"},"body":{"type":"string","description":body_handle_description}},"required":["action","body"],"additionalProperties":false},
@@ -756,24 +756,24 @@ fn mcp_tools() -> Value {
             {"type":"object","properties":{"action":{"const":"reset"}},"required":["action"],"additionalProperties":false},
             {"type":"object","properties":{"action":{"const":"resident_cover_hold"},"enabled":{"type":"boolean"}},"required":["action","enabled"],"additionalProperties":false},
             {"type":"object","properties":{"action":{"const":"render_mode"},"mode":{"enum":["lit","unlit","height","normals","grid","level","morph_fade","ao","shadows","luminance"]}},"required":["action","mode"],"additionalProperties":false},
-            {"type":"object","properties":{"action":{"const":"setting"},"id":{"type":"string","description":"Render registry id, e.g. render.shadows.softness; see render_settings.settings in mundaris_inspect."},"value":{"description":"Boolean, number, or option name per the setting kind."}},"required":["action","id","value"],"additionalProperties":false},
+            {"type":"object","properties":{"action":{"const":"setting"},"id":{"type":"string","description":"Render registry id, e.g. render.shadows.softness; see render_settings.settings in astrum_inspect."},"value":{"description":"Boolean, number, or option name per the setting kind."}},"required":["action","id","value"],"additionalProperties":false},
             {"type":"object","properties":{"action":{"const":"reset_render_settings"}},"required":["action"],"additionalProperties":false},
             {"type":"object","properties":{"action":{"const":"layer"},"layer":{"enum":["terrain","markers","labels","trails","guides"]},"enabled":{"type":"boolean"}},"required":["action","layer","enabled"],"additionalProperties":false}
         ]
     });
     let mut tools = json!([
-      {"name":"mundaris_sessions","description":"List live Mundaris development sessions.","inputSchema":{"type":"object","properties":{"registry":{"type":"string"}},"additionalProperties":false}},
-      {"name":"mundaris_capabilities","description":"Read protocol and action capabilities for a live session.","inputSchema":{"type":"object","properties":{"session":{"type":"string"}},"additionalProperties":false}},
-      {"name":"mundaris_inspect","description":"Read the current coherent developer snapshot.","inputSchema":{"type":"object","properties":{"session":{"type":"string"}},"additionalProperties":false}},
-      {"name":"mundaris_diagnostics","description":"Read bounded terrain, performance or errors.","inputSchema":{"type":"object","properties":{"session":{"type":"string"},"scope":{"enum":["terrain","performance","errors"]}},"additionalProperties":false}},
-      {"name":"mundaris_control","description":"Acquire, renew, release, or cancel the session control lease. A lease lasts 30 seconds; renew it before expiry to keep control.","inputSchema":{"type":"object","oneOf":[{"properties":{"session":{"type":"string"},"operation":{"const":"acquire"},"owner":{"type":"string"}},"required":["operation"],"additionalProperties":false},{"properties":{"session":{"type":"string"},"operation":{"enum":["renew","release","cancel"]},"lease":{"type":"string"}},"required":["operation","lease"],"additionalProperties":false}]}},
-      {"name":"mundaris_action","description":"Submit one typed engine action under a control lease.","inputSchema":{"type":"object","properties":{"session":{"type":"string"},"lease":{"type":"string"},"command":action_schema},"required":["lease","command"],"additionalProperties":false}},
-      {"name":"mundaris_receipt","description":"Read one command receipt by its command id.","inputSchema":{"type":"object","properties":{"session":{"type":"string"},"command_id":{"type":"string"}},"required":["command_id"],"additionalProperties":false}},
-      {"name":"mundaris_capture","description":"Request a paired native capture and return its image and evidence paths.","inputSchema":{"type":"object","properties":{"session":{"type":"string"},"lease":{"type":"string"},"name":{"type":"string"}},"required":["lease","name"],"additionalProperties":false}},
-      {"name":"mundaris_wait","description":"Wait up to 30 seconds for a command receipt and/or snapshot predicate.","inputSchema":{"type":"object","properties":{"session":{"type":"string"},"command_id":{"type":"string"},"timeout_s":{"type":"number","minimum":0,"maximum":30,"description":"Maximum wait duration in seconds (0 to 30)."},"predicate":{"type":"object","description":"Snapshot condition. Example: {\"path\":\"general.frame_number\",\"at_least\":3}.","properties":{"path":{"type":"string","description":"Nonempty dotted snapshot path, such as general.frame_number."},"equals":{},"not_equals":{},"at_least":{"type":"number"},"at_most":{"type":"number"}},"required":["path"],"additionalProperties":false}},"anyOf":[{"required":["command_id"]},{"required":["predicate"]}],"additionalProperties":false}},
-      {"name":"mundaris_events","description":"Read bounded recent command and diagnostic events.","inputSchema":{"type":"object","properties":{"session":{"type":"string"},"after":{"type":"integer","minimum":0}},"additionalProperties":false}},
-      {"name":"mundaris_scenarios","description":"Run a serialized scenario against the shared native test solar system or rebuild and replay it.","inputSchema":{"type":"object","properties":{"session":{"type":"string"},"scenario":{"type":"object"},"output_directory":{"type":"string"},"rebuild_replay":{"type":"boolean"}},"required":["scenario"],"additionalProperties":false}},
-      {"name":"mundaris_ownedlifecycle","description":"Launch the shared native test solar system or stop a selected owned session.","inputSchema":{"type":"object","properties":{"operation":{"enum":["launch","stop"]},"session":{"type":"string"},"output_directory":{"type":"string"},"registry":{"type":"string"}},"required":["operation"],"additionalProperties":false}}
+      {"name":"astrum_sessions","description":"List live Astrum development sessions.","inputSchema":{"type":"object","properties":{"registry":{"type":"string"}},"additionalProperties":false}},
+      {"name":"astrum_capabilities","description":"Read protocol and action capabilities for a live session.","inputSchema":{"type":"object","properties":{"session":{"type":"string"}},"additionalProperties":false}},
+      {"name":"astrum_inspect","description":"Read the current coherent developer snapshot.","inputSchema":{"type":"object","properties":{"session":{"type":"string"}},"additionalProperties":false}},
+      {"name":"astrum_diagnostics","description":"Read bounded terrain, performance or errors.","inputSchema":{"type":"object","properties":{"session":{"type":"string"},"scope":{"enum":["terrain","performance","errors"]}},"additionalProperties":false}},
+      {"name":"astrum_control","description":"Acquire, renew, release, or cancel the session control lease. A lease lasts 30 seconds; renew it before expiry to keep control.","inputSchema":{"type":"object","oneOf":[{"properties":{"session":{"type":"string"},"operation":{"const":"acquire"},"owner":{"type":"string"}},"required":["operation"],"additionalProperties":false},{"properties":{"session":{"type":"string"},"operation":{"enum":["renew","release","cancel"]},"lease":{"type":"string"}},"required":["operation","lease"],"additionalProperties":false}]}},
+      {"name":"astrum_action","description":"Submit one typed engine action under a control lease.","inputSchema":{"type":"object","properties":{"session":{"type":"string"},"lease":{"type":"string"},"command":action_schema},"required":["lease","command"],"additionalProperties":false}},
+      {"name":"astrum_receipt","description":"Read one command receipt by its command id.","inputSchema":{"type":"object","properties":{"session":{"type":"string"},"command_id":{"type":"string"}},"required":["command_id"],"additionalProperties":false}},
+      {"name":"astrum_capture","description":"Request a paired native capture and return its image and evidence paths.","inputSchema":{"type":"object","properties":{"session":{"type":"string"},"lease":{"type":"string"},"name":{"type":"string"}},"required":["lease","name"],"additionalProperties":false}},
+      {"name":"astrum_wait","description":"Wait up to 30 seconds for a command receipt and/or snapshot predicate.","inputSchema":{"type":"object","properties":{"session":{"type":"string"},"command_id":{"type":"string"},"timeout_s":{"type":"number","minimum":0,"maximum":30,"description":"Maximum wait duration in seconds (0 to 30)."},"predicate":{"type":"object","description":"Snapshot condition. Example: {\"path\":\"general.frame_number\",\"at_least\":3}.","properties":{"path":{"type":"string","description":"Nonempty dotted snapshot path, such as general.frame_number."},"equals":{},"not_equals":{},"at_least":{"type":"number"},"at_most":{"type":"number"}},"required":["path"],"additionalProperties":false}},"anyOf":[{"required":["command_id"]},{"required":["predicate"]}],"additionalProperties":false}},
+      {"name":"astrum_events","description":"Read bounded recent command and diagnostic events.","inputSchema":{"type":"object","properties":{"session":{"type":"string"},"after":{"type":"integer","minimum":0}},"additionalProperties":false}},
+      {"name":"astrum_scenarios","description":"Run a serialized scenario against the shared native test solar system or rebuild and replay it.","inputSchema":{"type":"object","properties":{"session":{"type":"string"},"scenario":{"type":"object"},"output_directory":{"type":"string"},"rebuild_replay":{"type":"boolean"}},"required":["scenario"],"additionalProperties":false}},
+      {"name":"astrum_ownedlifecycle","description":"Launch the shared native test solar system or stop a selected owned session.","inputSchema":{"type":"object","properties":{"operation":{"enum":["launch","stop"]},"session":{"type":"string"},"output_directory":{"type":"string"},"registry":{"type":"string"}},"required":["operation"],"additionalProperties":false}}
     ]);
     for tool in tools.as_array_mut().expect("tool list") {
         let schema = &mut tool["inputSchema"];
@@ -805,11 +805,11 @@ fn mcp_tool_call(
         .map(PathBuf::from)
         .unwrap_or_else(registry_default);
     let explicit = args.get("session").and_then(Value::as_str);
-    if name == "mundaris_sessions" {
+    if name == "astrum_sessions" {
         let sessions = discover(&registry)?;
         return Ok((json!({"sessions":sessions}), Vec::new()));
     }
-    if name == "mundaris_ownedlifecycle" {
+    if name == "astrum_ownedlifecycle" {
         let operation = args
             .get("operation")
             .and_then(Value::as_str)
@@ -835,7 +835,7 @@ fn mcp_tool_call(
         };
         return Ok((result, Vec::new()));
     }
-    if name == "mundaris_scenarios" {
+    if name == "astrum_scenarios" {
         let scenario: crate::developer_scenarios::Scenario = serde_json::from_value(
             args.get("scenario")
                 .cloned()
@@ -865,13 +865,13 @@ fn mcp_tool_call(
     }
     let session = select_session(&registry, explicit)?;
     let client = Client::new(session);
-    if name == "mundaris_capabilities" {
+    if name == "astrum_capabilities" {
         return Ok((
             serde_json::to_value(client.request(DevOperation::Capabilities)?)?,
             Vec::new(),
         ));
     }
-    if name == "mundaris_diagnostics" {
+    if name == "astrum_diagnostics" {
         let scope = args
             .get("scope")
             .and_then(Value::as_str)
@@ -882,7 +882,7 @@ fn mcp_tool_call(
             Vec::new(),
         ));
     }
-    if name == "mundaris_capture" {
+    if name == "astrum_capture" {
         let lease = args
             .get("lease")
             .and_then(Value::as_str)
@@ -928,22 +928,22 @@ fn mcp_tool_call(
         return Ok((structured, images));
     }
     let response = match name {
-        "mundaris_inspect" => client.request(DevOperation::Inspect)?,
-        "mundaris_receipt" => client.request(DevOperation::Receipt {
+        "astrum_inspect" => client.request(DevOperation::Inspect)?,
+        "astrum_receipt" => client.request(DevOperation::Receipt {
             command_id: args
                 .get("command_id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("missing command_id"))?
                 .into(),
         })?,
-        "mundaris_diagnostics" => client.request(DevOperation::Diagnostics {
+        "astrum_diagnostics" => client.request(DevOperation::Diagnostics {
             scope: args
                 .get("scope")
                 .and_then(Value::as_str)
                 .unwrap_or("errors")
                 .into(),
         })?,
-        "mundaris_control" => match args
+        "astrum_control" => match args
             .get("operation")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("missing operation"))?
@@ -978,7 +978,7 @@ fn mcp_tool_call(
             })?,
             _ => bail!("operation must be acquire, renew, release, or cancel"),
         },
-        "mundaris_action" => client.request(DevOperation::Action {
+        "astrum_action" => client.request(DevOperation::Action {
             lease: args
                 .get("lease")
                 .and_then(Value::as_str)
@@ -990,8 +990,8 @@ fn mcp_tool_call(
                     .ok_or_else(|| anyhow!("missing command"))?,
             )?,
         })?,
-        "mundaris_capture" => unreachable!("capture handled above"),
-        "mundaris_wait" => {
+        "astrum_capture" => unreachable!("capture handled above"),
+        "astrum_wait" => {
             let id = args
                 .get("command_id")
                 .and_then(Value::as_str)
@@ -1004,7 +1004,7 @@ fn mcp_tool_call(
             let value = wait_for_receipt(&client, id, timeout, predicate, cancelled)?;
             return Ok((value, Vec::new()));
         }
-        "mundaris_events" => client.request(DevOperation::Events {
+        "astrum_events" => client.request(DevOperation::Events {
             after: args.get("after").and_then(Value::as_u64).unwrap_or(0),
         })?,
         other => bail!("unknown MCP tool {other:?}"),
@@ -1122,7 +1122,7 @@ fn handle_mcp_message(
     match method {
         "initialize" => Some(mcp_response(
             id,
-            json!({"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"mundaris-dev","version":env!("CARGO_PKG_VERSION")}}),
+            json!({"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"astrum-dev","version":env!("CARGO_PKG_VERSION")}}),
         )),
         "ping" => Some(mcp_response(id, json!({}))),
         "tools/list" => Some(mcp_response(id, json!({"tools":mcp_tools()}))),
@@ -1366,41 +1366,41 @@ mod tests {
     #[test]
     fn mcp_schema_validation_rejects_bad_waits_and_commands_before_io() {
         assert!(validate_mcp_arguments(
-            "mundaris_wait",
+            "astrum_wait",
             &json!({"timeout_ms":30,"predicate":{"field":"general.frame_number","operator":"at_least","value":3}})
         )
         .is_err());
         assert!(
             validate_mcp_arguments(
-                "mundaris_wait",
+                "astrum_wait",
                 &json!({"session":123,"command_id":"command"})
             )
             .is_err()
         );
         assert!(
             validate_mcp_arguments(
-                "mundaris_wait",
+                "astrum_wait",
                 &json!({"predicate":{"path":"general.frame_number","at_least":3,"at_most":"bad"}})
             )
             .is_err()
         );
         assert!(
             validate_mcp_arguments(
-                "mundaris_action",
+                "astrum_action",
                 &json!({"lease":"lease","command":{"action":"navigation_mode","mode":"invalid"}})
             )
             .is_err()
         );
         assert!(
             validate_mcp_arguments(
-                "mundaris_control",
+                "astrum_control",
                 &json!({"operation":"acquire","owner":"test"})
             )
             .is_ok()
         );
         assert!(
             validate_mcp_arguments(
-                "mundaris_control",
+                "astrum_control",
                 &json!({"operation":"release","lease":"lease"})
             )
             .is_ok()
@@ -1436,7 +1436,7 @@ mod tests {
                 .all(|t| t["inputSchema"]["type"] == "object"
                     || t["inputSchema"]["oneOf"].is_array())
         );
-        assert!(tools.iter().any(|t| t["name"] == "mundaris_ownedlifecycle"));
+        assert!(tools.iter().any(|t| t["name"] == "astrum_ownedlifecycle"));
         for tool in &tools {
             let schema = &tool["inputSchema"];
             if let Some(branches) = schema["oneOf"].as_array() {

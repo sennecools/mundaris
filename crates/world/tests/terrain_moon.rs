@@ -1,9 +1,9 @@
 use glam::DVec3;
-use mundaris_math::{
+use astrum_math::{
     Direction3,
     surface::{CubeFace, CubePatchAddress, PatchEdge, SurfaceLocation},
 };
-use mundaris_world::terrain::{
+use astrum_world::terrain::{
     MoonTerrainConfig, MoonTerrainDefinition, MoonTerrainGenerator, MoonTerrainVersion,
     TerrainError, TerrainIdentity, TerrainSeed,
 };

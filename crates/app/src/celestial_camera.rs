@@ -1,8 +1,8 @@
 //! One observer; selection is independent of explicit focus/attachment.
 use anyhow::{Result, ensure};
 use glam::{DQuat, DVec3};
-use mundaris_math::*;
-use mundaris_world::*;
+use astrum_math::*;
+use astrum_world::*;
 use std::time::Duration;
 
 /// Observational controller state; wall-navigation speed is not a simulation derivative.
@@ -85,8 +85,8 @@ struct Transition {
 #[derive(Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)] // Retain value identity without changing camera/source behavior for this comparison.
 enum TerrainAuthority {
-    Legacy(mundaris_world::terrain::TerrainDefinition),
-    Compositional(mundaris_world::terrain::SurfaceDefinition),
+    Legacy(astrum_world::terrain::TerrainDefinition),
+    Compositional(astrum_world::terrain::SurfaceDefinition),
 }
 impl TerrainAuthority {
     fn for_body(body: &CelestialBody) -> Option<Self> {
@@ -220,7 +220,7 @@ impl CelestialCamera {
     /// Use the prepared content projection, not window dimensions or a guessed FOV.
     pub fn set_navigation_projection(
         &mut self,
-        projection: mundaris_renderer::CelestialProjection,
+        projection: astrum_renderer::CelestialProjection,
         pixels_per_logical_pixel: f64,
     ) -> Result<()> {
         ensure!(
@@ -384,7 +384,7 @@ impl CelestialCamera {
         Ok(sample.clearance_m)
     }
     /// The transported inspection basis also drives the local debug axes.
-    pub(crate) fn inspection_tangent(&self) -> Option<mundaris_math::surface::SurfaceTangentBasis> {
+    pub(crate) fn inspection_tangent(&self) -> Option<astrum_math::surface::SurfaceTangentBasis> {
         self.inspection.map(|anchor| anchor.tangent)
     }
     /// Explicit co-rotating attachment; orientation/position are re-expressed first.
@@ -1400,7 +1400,7 @@ impl CelestialCamera {
                 // Legacy terrain is constrained to a 10% radial envelope.
                 // Compositional shapes have their own validated bound.
                 let outside_surface = if let Some(definition) = body.surface_definition() {
-                    let outer = mundaris_world::terrain::SurfaceGenerator::new(definition, radius)?
+                    let outer = astrum_world::terrain::SurfaceGenerator::new(definition, radius)?
                         .conservative_radius_envelope_m()[1];
                     p.length() > (outer + 1.0).next_up()
                 } else {
@@ -2004,7 +2004,7 @@ mod tests {
             )
             .unwrap();
         let tangent = camera.inspection_tangent().unwrap();
-        let static_basis = mundaris_math::surface::SurfaceTangentBasis::new(tangent.up());
+        let static_basis = astrum_math::surface::SurfaceTangentBasis::new(tangent.up());
         assert!((tangent.east().unit() - static_basis.east().unit()).length() > 1e-6);
         camera.look_surface_horizon().unwrap();
         let rotation = camera.pose().orientation().quaternion();

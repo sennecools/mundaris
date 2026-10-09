@@ -425,7 +425,7 @@ mod tests {
     use crate::terrain::{
         SurfaceAlgorithm, SurfaceDefinition, TerrainHeightProfile, TerrainIdentity, TerrainSeed,
     };
-    use mundaris_math::{Direction3, surface::SurfaceLocation};
+    use astrum_math::{Direction3, surface::SurfaceLocation};
 
     fn profile_generator() -> SurfaceGenerator {
         let side = 64_u32;

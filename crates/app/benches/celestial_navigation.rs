@@ -1,12 +1,12 @@
 mod common;
 use criterion::{Criterion, criterion_group, criterion_main};
 use glam::DVec3;
-use mundaris_app::{
+use astrum_app::{
     celestial_camera::*, celestial_labels::*, celestial_selection::*, orbit_guides::*,
     system_view::*,
 };
-use mundaris_renderer::*;
-use mundaris_world::*;
+use astrum_renderer::*;
+use astrum_world::*;
 use std::{hint::black_box, num::NonZeroU64, time::Duration};
 fn benches(c: &mut Criterion) {
     let projection = CelestialProjection::try_new(960, 662, 60.0_f64.to_radians(), 0.1)

@@ -1,8 +1,8 @@
 //! CPU-only end-to-end tests of the exemplar synthesis pipeline filter and the
 //! `public-domain-derived` bundle provenance, on a synthetic GeoTIFF.
 
-use mundaris_terrain_bake::bake_and_publish;
-use mundaris_terrain_bake::bundle;
+use astrum_terrain_bake::bake_and_publish;
+use astrum_terrain_bake::bundle;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 fn scratch_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "mundaris-exemplar-test-{name}-{}",
+        "astrum-exemplar-test-{name}-{}",
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&dir);

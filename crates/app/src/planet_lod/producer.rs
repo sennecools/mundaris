@@ -3,12 +3,12 @@
 use super::select::NodeChart;
 use anyhow::{Result, ensure};
 use glam::DVec3;
-use mundaris_math::surface::CubePatchAddress;
-use mundaris_renderer::{
+use astrum_math::surface::CubePatchAddress;
+use astrum_renderer::{
     AtlasChart, AtlasFieldsConstants, AtlasImageLevel, AtlasProfileLayer, AtlasSource,
     AtlasTileKind,
 };
-use mundaris_world::terrain::producer::{
+use astrum_world::terrain::producer::{
     FieldsRecipe, MOON_FIELD_JITTER, MOON_FIELD_LAYOUT_SHIFTS, MOON_FIELD_SHELL,
     MOON_FIELD_SUPPORT, ProducerRecipe, ProfileLayer, ProfilePyramid, ProfileRecipe,
 };
@@ -227,7 +227,7 @@ pub fn tile_kind(
     cells: u32,
 ) -> Result<AtlasTileKind> {
     let texel_m =
-        mundaris_world::terrain::producer::tile_texel_m(recipe.radius_m(), address.level(), cells);
+        astrum_world::terrain::producer::tile_texel_m(recipe.radius_m(), address.level(), cells);
     match recipe {
         ProducerRecipe::Profile(profile) => Ok(profile_kind(profile, chart.n0, texel_m)),
         ProducerRecipe::Fields(fields) => fields_kind(fields, chart.n0, texel_m),

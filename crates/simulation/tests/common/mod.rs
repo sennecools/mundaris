@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 use glam::DVec3;
-use mundaris_math::*;
-use mundaris_world::*;
+use astrum_math::*;
+use astrum_world::*;
 use std::num::NonZeroU64;
 pub const G: f64 = 6.67430e-11;
 pub const R: f64 = 1e7;

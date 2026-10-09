@@ -1,4 +1,4 @@
-use mundaris_app::{interactive_clock::*, playback_metrics::*};
+use astrum_app::{interactive_clock::*, playback_metrics::*};
 use std::time::Duration;
 #[test]
 fn lifecycle_gaps_boundary_and_once_only_capture() {

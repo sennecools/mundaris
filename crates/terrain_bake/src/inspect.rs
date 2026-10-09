@@ -838,7 +838,7 @@ fn metrics(grid: &Grid, a: &Analysis, label: &str) -> Value {
     }
 
     json!({
-        "schema": "mundaris.terrain-inspect.v1",
+        "schema": "astrum.terrain-inspect.v1",
         "label": label,
         "width": w, "height": h, "cell_m": cell, "periodic": grid.periodic,
         "protocol": grid.protocol,

@@ -5,9 +5,9 @@
 
 use anyhow::{Context, ensure};
 use glam::{DQuat, DVec3};
-use mundaris_app::shared_system::SharedTestSystem;
-use mundaris_math::{Direction3, surface::SurfaceLocation};
-use mundaris_world::terrain::SurfaceGenerator;
+use astrum_app::shared_system::SharedTestSystem;
+use astrum_math::{Direction3, surface::SurfaceLocation};
+use astrum_world::terrain::SurfaceGenerator;
 use serde::Serialize;
 use std::{
     fs::{self, OpenOptions},
@@ -329,7 +329,7 @@ fn add_same_scene_traversal(
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args_os().skip(1);
     let output_directory = args.next().map(PathBuf::from).context(
-        "usage: cargo run -p mundaris_app --example generation_route -- <new-output-directory>",
+        "usage: cargo run -p astrum_app --example generation_route -- <new-output-directory>",
     )?;
     ensure!(
         args.next().is_none(),

@@ -1,7 +1,7 @@
 //! Immutable, radial body-shape definitions used by the redesigned surface path.
 
 use glam::{DQuat, DVec3, EulerRot};
-use mundaris_math::Direction3;
+use astrum_math::Direction3;
 
 use super::TerrainError;
 

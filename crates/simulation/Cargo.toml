@@ -1,13 +1,13 @@
 [package]
-name = "mundaris_simulation"
+name = "astrum_simulation"
 version.workspace = true
 edition.workspace = true
 publish = false
 
 [dependencies]
 glam.workspace = true
-mundaris_math = { path = "../math" }
-mundaris_world = { path = "../world" }
+astrum_math = { path = "../math" }
+astrum_world = { path = "../world" }
 thiserror.workspace = true
 
 [dev-dependencies]

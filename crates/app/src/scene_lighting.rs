@@ -5,7 +5,7 @@
 //! falls off with the inverse square, so the scaled test system stays
 //! physically ordered without real solar luminosity.
 use anyhow::{Context, Result, ensure};
-use mundaris_renderer::{Brdf, SurfaceMaterial};
+use astrum_renderer::{Brdf, SurfaceMaterial};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, path::Path};

@@ -36,12 +36,12 @@ pub(crate) fn arithmetic(value: DVec3) -> Result<DVec3, MathError> {
 ///
 /// A velocity cannot be used as a displacement.
 /// ```compile_fail
-/// use mundaris_math::{LocalPosition, LinearVelocity3};
+/// use astrum_math::{LocalPosition, LinearVelocity3};
 /// LocalPosition::origin().displaced(LinearVelocity3::zero());
 /// ```
 /// Points cannot be added to points.
 /// ```compile_fail
-/// use mundaris_math::LocalPosition;
+/// use astrum_math::LocalPosition;
 /// let invalid = LocalPosition::origin() + LocalPosition::origin();
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -112,7 +112,7 @@ impl Direction3 {
 
 /// Derivative of point components relative to their frame, in metres/second.
 /// ```compile_fail
-/// use mundaris_math::{Displacement3, LinearVelocity3};
+/// use astrum_math::{Displacement3, LinearVelocity3};
 /// let velocity: LinearVelocity3 = Displacement3::zero();
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq)]

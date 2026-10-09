@@ -1,8 +1,8 @@
 //! App-session failure safety beyond the default circular content.
 use glam::DVec3;
-use mundaris_app::{motion_session::AnalyticSession, solar_system::SolarSystemPreset};
-use mundaris_math::*;
-use mundaris_world::*;
+use astrum_app::{motion_session::AnalyticSession, solar_system::SolarSystemPreset};
+use astrum_math::*;
+use astrum_world::*;
 use std::num::NonZeroU64;
 
 fn authority(world: &CelestialSystem) -> (u64, SimulationInstant, Vec<CelestialBody>) {

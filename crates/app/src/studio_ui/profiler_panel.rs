@@ -2,7 +2,7 @@
 //! lane, and stat cards, painted from the cached [`ProfilerData`].
 
 use egui::{Align, Align2, CornerRadius, Layout, Rect, RichText, Sense, Stroke, Ui};
-use mundaris_app::studio::{profiler_view::SpanKind, view::StudioAction};
+use astrum_app::studio::{profiler_view::SpanKind, view::StudioAction};
 
 use super::{panels, theme::*};
 use crate::profiler_ui::ProfilerData;

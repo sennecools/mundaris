@@ -78,5 +78,5 @@ pub fn write_pair(output: &Path, capture: &DeveloperCapture) -> Result<()> {
 }
 
 pub fn default_output_directory() -> PathBuf {
-    PathBuf::from("target/mundaris-diagnostics")
+    PathBuf::from("target/astrum-diagnostics")
 }

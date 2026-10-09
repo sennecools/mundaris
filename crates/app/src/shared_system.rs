@@ -2,8 +2,8 @@
 //! Parsing, asset verification and generator validation happen before worker demand.
 use anyhow::{Context, Result, ensure};
 use glam::{DQuat, DVec3};
-use mundaris_math::*;
-use mundaris_world::{terrain::*, *};
+use astrum_math::*;
+use astrum_world::{terrain::*, *};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{

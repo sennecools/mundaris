@@ -7,7 +7,7 @@ does not infer or claim that the developer interface is faster or slower.
 
 Example (release executable built with the developer-tools feature)::
 
-    py -3 scripts/measure-developer-interface.py --binary ../target/release/mundaris_app.exe --output ../target/developer-interface-measurement
+    py -3 scripts/measure-developer-interface.py --binary ../target/release/astrum_app.exe --output ../target/developer-interface-measurement
 """
 
 from __future__ import annotations
@@ -190,14 +190,14 @@ def fresh_directory(path: Path) -> None:
 
 def isolated_environment(run_dir: Path) -> dict[str, str]:
     env = os.environ.copy()
-    for key in ("MUNDARIS_DEV_REGISTRY", "MUNDARIS_DEV_OUTPUT", "MUNDARIS_DEV_BUILD_MANIFEST"):
+    for key in ("ASTRUM_DEV_REGISTRY", "ASTRUM_DEV_OUTPUT", "ASTRUM_DEV_BUILD_MANIFEST"):
         env.pop(key, None)
     registry = run_dir / "registry"
     evidence = run_dir / "developer-evidence"
     registry.mkdir()
     evidence.mkdir()
-    env["MUNDARIS_DEV_REGISTRY"] = str(registry.resolve())
-    env["MUNDARIS_DEV_OUTPUT"] = str(evidence.resolve())
+    env["ASTRUM_DEV_REGISTRY"] = str(registry.resolve())
+    env["ASTRUM_DEV_OUTPUT"] = str(evidence.resolve())
     return env
 
 
@@ -335,7 +335,7 @@ def main_window(child: subprocess.Popen[bytes], user32: Any) -> int:
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
         if process_id.value != child.pid or not user32.IsWindowVisible(hwnd):
             return True
-        if window_title(hwnd, user32) != "Mundaris":
+        if window_title(hwnd, user32) != "Astrum":
             return True
         rect = RECT()
         if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
@@ -349,7 +349,7 @@ def main_window(child: subprocess.Popen[bytes], user32: Any) -> int:
     user32.EnumWindows(enum_callback, 0)
     if not windows:
         raise RuntimeError(
-            f"owned PID {child.pid} has no visible top-level window titled exactly 'Mundaris'"
+            f"owned PID {child.pid} has no visible top-level window titled exactly 'Astrum'"
         )
     # Require the app's source-defined main title; area only resolves duplicate
     # owned windows with that title and excludes console/IME/helper windows.
@@ -609,7 +609,7 @@ def run_measurement(args: argparse.Namespace) -> dict[str, Any]:
     binary = args.binary.expanduser().resolve(strict=True)
     if not binary.is_file():
         raise RuntimeError(f"binary is not a file: {binary}")
-    bridge_binary = (args.bridge_binary or binary.with_name("mundaris_dev.exe")).expanduser().resolve(strict=True)
+    bridge_binary = (args.bridge_binary or binary.with_name("astrum_dev.exe")).expanduser().resolve(strict=True)
     if not bridge_binary.is_file():
         raise RuntimeError(f"bridge binary is not a file: {bridge_binary}")
     output = args.output.expanduser().resolve()
@@ -625,7 +625,7 @@ def run_measurement(args: argparse.Namespace) -> dict[str, Any]:
         "binary_sha256": digest,
         "bridge_binary": str(bridge_binary),
         "bridge_binary_sha256": sha256_file(bridge_binary),
-        "bridge_transport": "mundaris_dev request JSON over CLI subprocess",
+        "bridge_transport": "astrum_dev request JSON over CLI subprocess",
         "bridge_request_timeout_s": BRIDGE_TIMEOUT_SECONDS,
         "preset": PRESET,
         "target_client_size_px": WINDOW_SIZE,
@@ -741,11 +741,11 @@ def run_measurement(args: argparse.Namespace) -> dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", required=True, type=Path, help="developer-tools mundaris_app executable")
+    parser.add_argument("--binary", required=True, type=Path, help="developer-tools astrum_app executable")
     parser.add_argument(
         "--bridge-binary",
         type=Path,
-        help="mundaris_dev executable (defaults to mundaris_dev.exe beside --binary)",
+        help="astrum_dev executable (defaults to astrum_dev.exe beside --binary)",
     )
     parser.add_argument("--output", required=True, type=Path, help="new or empty measurement directory")
     parser.add_argument("--samples", type=int, default=3, help="measurement intervals per mode (default: 3)")

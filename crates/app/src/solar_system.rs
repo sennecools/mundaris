@@ -1,8 +1,8 @@
 //! Deterministic real-Solar-System content and initial conditions.
 use glam::DVec3;
-use mundaris_math::*;
-use mundaris_simulation::GRAVITATIONAL_CONSTANT_M3_KG_S2 as G;
-use mundaris_world::{terrain::*, *};
+use astrum_math::*;
+use astrum_simulation::GRAVITATIONAL_CONSTANT_M3_KG_S2 as G;
+use astrum_world::{terrain::*, *};
 use std::{f64::consts::TAU, num::NonZeroU64};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

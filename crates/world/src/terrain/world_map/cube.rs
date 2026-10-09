@@ -1,5 +1,5 @@
 //! Cube-map storage for world-map fields, on the normalized radial charts of
-//! `mundaris_math::surface::CubeFace` (direction = normalize(N + u·U + v·V),
+//! `astrum_math::surface::CubeFace` (direction = normalize(N + u·U + v·V),
 //! u, v ∈ [−1, 1]).
 //!
 //! Layout: faces in `CubeFace::ALL` order, each `n × n` row-major with rows
@@ -7,7 +7,7 @@
 //! u ∈ [−1 + 2i/n, −1 + 2(i+1)/n] and its value is taken at the centre.
 
 use glam::DVec3;
-use mundaris_math::surface::CubeFace;
+use astrum_math::surface::CubeFace;
 
 /// One value per texel of a six-face cube map.
 #[derive(Debug, Clone, PartialEq)]

@@ -6,7 +6,7 @@
 
 use super::{GeologicalParameters, SurfaceAlgorithm, SurfaceQueryWork, TerrainError};
 use glam::{DMat3, DVec3};
-use mundaris_math::noise::gradient_noise;
+use astrum_math::noise::gradient_noise;
 
 const MIN_EDGE_M: f64 = 8.0;
 const CELL_JITTER: f64 = 0.2;

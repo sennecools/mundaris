@@ -15,7 +15,7 @@ pub use analytic_motion::*;
 pub use diagnostics::*;
 pub use gravity::*;
 pub use integrator::*;
-pub use mundaris_math::SimulationInstant;
+pub use astrum_math::SimulationInstant;
 pub use orbital_elements::*;
 pub use runner::*;
 pub use time::*;
