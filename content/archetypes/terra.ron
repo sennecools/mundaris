@@ -1,0 +1,75 @@
+// Terra: temperate world with oceans and continents
+// (docs/ASTRUM_TERRAIN_PIPELINE.md §5.2–5.3).
+//
+// Ranges are sampled per body with per-stage seeds (§5.1). M1 (World map and
+// planet editor) runs continents, sea level, shelf, temperature, wind and
+// moisture without a rain shadow; tectonics and landforms arrive in M2.
+(
+    schema: 1,
+    name: "terra",
+    stages: [Continents, SeaLevel, Shelf, Temperature, Wind, Moisture],
+    // Face cells per body radius (§6.2); never depends on viewing distance.
+    resolution: [
+        (max_radius_km: 60.0, face_cells: 256),
+        (max_radius_km: 400.0, face_cells: 512),
+        (max_radius_km: 600.0, face_cells: 1024),
+    ],
+    ocean_coverage: (0.5, 0.7),
+    continents: (
+        // A 339 km body has a 2130 km circumference: a few continents.
+        wavelength_km: (700.0, 1100.0),
+        octaves: 6,
+        lacunarity: 2.0,
+        gain: 0.5,
+        warp_wavelength_km: (500.0, 900.0),
+        warp_strength: (0.25, 0.45),
+        land_height_m: (1800.0, 3200.0),
+        // Above 1, most land stays low and only interiors rise high.
+        land_exponent: 1.7,
+        ocean_depth_m: (3200.0, 4800.0),
+        shelf_depth_m: 140.0,
+        shelf_fraction: 0.08,
+    ),
+    temperature: (
+        equator_c: (24.0, 31.0),
+        pole_c: (-38.0, -18.0),
+        axial_tilt_deg: (12.0, 30.0),
+        lapse_c_per_km: 6.5,
+        ocean_moderation: 0.35,
+        // Ocean influence reaches this far inland.
+        ocean_blur_km: 120.0,
+        noise_c: 1.5,
+        noise_wavelength_km: 250.0,
+    ),
+    wind: (
+        cells_per_hemisphere: 3,
+        meridional_fraction: 0.3,
+    ),
+    moisture: (
+        // 96 steps of 25 km reach 2400 km, more than once around a 339 km body.
+        iterations: 96,
+        step_km: 25.0,
+        spread: 0.5,
+        evaporation: (0.05, 0.07),
+        // Rain-out per step: moisture falls to 1/e over about 25-40 steps inland.
+        rain: (0.025, 0.04),
+        precipitation_scale: 1.2,
+    ),
+    // Surface colour (§10): tint from the biome LUT by temperature × moisture.
+    biome_lut: "lut/terra_whittaker.ron",
+    // Snow where the climate is below freezing, except on steep slopes.
+    snow: (
+        material: "materials/snow/material.ron",
+        temperature_c: -4.0,
+        blend_c: 3.0,
+        slope_deg: (35.0, 55.0),
+    ),
+    // Flat water below sea level until M3 (Water).
+    water: (
+        shallow_linear: (0.025, 0.075, 0.085),
+        deep_linear: (0.004, 0.014, 0.035),
+        depth_scale_m: 120.0,
+    ),
+    // Measured for the canonical seed by gpu_terrain_colour.rs (within 0.02).
+    average_colour: (0.103, 0.113, 0.105),
+)

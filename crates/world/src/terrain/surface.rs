@@ -7,7 +7,6 @@ use super::{
 use astrum_math::{Direction3, noise::gradient_noise, surface::SurfaceLocation};
 use glam::{DMat3, DVec3};
 mod authoring;
-use astrum_terrain_fields::graph::{CompiledGraph, Graph};
 pub use authoring::{
     AffineRandomRange, GeologicalAffineControl, GeologicalDistribution,
     MoonCraterProfileDefinition, MoonFieldBandDefinition, MoonFieldDefinition,
@@ -23,6 +22,7 @@ mod moon_fields;
 mod moon_profile;
 pub mod noise;
 pub mod producer;
+pub mod world_field;
 mod provinces;
 mod query_context;
 pub use hierarchy::SurfaceDetailDiagnostics;
@@ -44,8 +44,9 @@ pub use query_context::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SurfaceAlgorithm {
     PreparedV1,
-    /// Authoritative output of a versioned terrain-field graph.
-    GraphV1,
+    /// Tier A world map (archetype, GPU bake) plus band-limited detail
+    /// (`docs/ASTRUM_TERRAIN_PIPELINE.md` §6, M1).
+    WorldV1,
     RockyV3,
     RockyV4,
     RockyV5,
@@ -64,7 +65,7 @@ impl SurfaceAlgorithm {
     pub const fn code(self) -> u64 {
         match self {
             Self::PreparedV1 => 0x5052_4550_0000_0001,
-            Self::GraphV1 => 0x4752_4150_0000_0001,
+            Self::WorldV1 => 0x574f_524c_0000_0001,
             Self::RockyV3 => 0x524f_434b_0000_0003,
             Self::RockyV4 => 0x524f_434b_0000_0004,
             Self::RockyV5 => 0x524f_434b_0000_0005,
@@ -81,7 +82,7 @@ impl SurfaceAlgorithm {
     pub const fn name(self) -> &'static str {
         match self {
             Self::PreparedV1 => "PreparedV1",
-            Self::GraphV1 => "GraphV1",
+            Self::WorldV1 => "WorldV1",
             Self::RockyV3 => "RockyV3",
             Self::RockyV4 => "RockyV4",
             Self::RockyV5 => "RockyV5",
@@ -98,7 +99,7 @@ impl SurfaceAlgorithm {
 
     pub const fn province_names(self) -> [&'static str; 4] {
         match self {
-            Self::PreparedV1 | Self::GraphV1 => ["flat", "crater", "overlap", "inactive"],
+            Self::PreparedV1 | Self::WorldV1 => ["flat", "crater", "overlap", "inactive"],
             Self::RockyV3 | Self::RockyV4 | Self::RockyV5 => [
                 "ancient_highlands",
                 "basin_margin",
@@ -134,7 +135,7 @@ impl SurfaceAlgorithm {
 
     pub const fn process_names(self) -> [&'static str; 4] {
         match self {
-            Self::PreparedV1 | Self::GraphV1 => {
+            Self::PreparedV1 | Self::WorldV1 => {
                 ["base_field", "profile_lookup", "selector_blend", "inactive"]
             }
             Self::RockyV3 | Self::RockyV4 | Self::RockyV5 => [
@@ -298,90 +299,11 @@ impl SurfaceTerrainDefinition {
 pub(super) const PREPARATION_STORE_OWNER_BYTES: usize =
     std::mem::size_of::<OnceLock<Option<Arc<query_context::SurfacePreparationStore>>>>() + 32;
 
-/// Compiled immutable graph authority shared by native authoring and world queries.
-#[derive(Debug, Clone)]
-pub struct GraphSurface {
-    compiled: CompiledGraph,
-    exact_definition_words: Vec<u64>,
-    reference_radius_m: f64,
-    height_bounds_m: [f64; 2],
-    retained_payload_estimate_bytes: usize,
-}
-impl GraphSurface {
-    pub fn compile(graph: Graph) -> Result<Self, TerrainError> {
-        let reference_radius_m = graph.reference_radius_m;
-        let compiled = CompiledGraph::compile(graph).map_err(|_| TerrainError::InvalidConfig)?;
-        let semantic_bytes = compiled
-            .semantic_definition_bytes()
-            .map_err(|_| TerrainError::InvalidConfig)?;
-        let mut exact_definition_words = Vec::with_capacity(1 + semantic_bytes.len().div_ceil(8));
-        exact_definition_words.push(semantic_bytes.len() as u64);
-        for chunk in semantic_bytes.chunks(8) {
-            let mut word = [0u8; 8];
-            word[..chunk.len()].copy_from_slice(chunk);
-            exact_definition_words.push(u64::from_le_bytes(word));
-        }
-        let height_bounds_m = compiled.height_bounds_m();
-        let retained_payload_estimate_bytes = std::mem::size_of::<Self>()
-            .saturating_add(semantic_bytes.len().saturating_mul(3))
-            .saturating_add(exact_definition_words.capacity() * std::mem::size_of::<u64>());
-        Ok(Self {
-            compiled,
-            exact_definition_words,
-            reference_radius_m,
-            height_bounds_m,
-            retained_payload_estimate_bytes,
-        })
-    }
-    pub fn compiled(&self) -> &CompiledGraph {
-        &self.compiled
-    }
-    pub fn graph(&self) -> &Graph {
-        self.compiled.graph()
-    }
-    pub fn palette(&self) -> [[f64; 3]; 3] {
-        self.compiled.palette()
-    }
-    pub fn exact_definition_words(&self) -> Vec<u64> {
-        self.exact_definition_words.clone()
-    }
-    pub fn reference_radius_m(&self) -> f64 {
-        self.reference_radius_m
-    }
-    pub fn height_bounds_m(&self) -> [f64; 2] {
-        self.height_bounds_m
-    }
-    pub fn retained_payload_estimate_bytes(&self) -> usize {
-        self.retained_payload_estimate_bytes
-    }
-    pub fn query_stack_bytes(&self) -> usize {
-        self.compiled.query_stack_bytes()
-    }
-    fn validate_radius(&self, radius_m: f64) -> Result<(), TerrainError> {
-        if !radius_m.is_finite() || radius_m.to_bits() != self.reference_radius_m.to_bits() {
-            return Err(TerrainError::InvalidRadius);
-        }
-        let bound = self.height_bounds_m[0]
-            .abs()
-            .max(self.height_bounds_m[1].abs());
-        if !bound.is_finite() || bound > radius_m * 0.1 || radius_m - bound <= 0.001 {
-            return Err(TerrainError::InvalidRadius);
-        }
-        Ok(())
-    }
-}
-impl PartialEq for GraphSurface {
-    fn eq(&self, other: &Self) -> bool {
-        self.exact_definition_words == other.exact_definition_words
-    }
-}
-
 /// Material semantics are separately versioned from geology. A definition must
 /// select the channel semantics compatible with its geological algorithm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SurfaceMaterialVersion {
     PreparedV1,
-    GraphV1,
     RockyV1,
     RockyV2,
     IcyV1,
@@ -392,8 +314,7 @@ pub enum SurfaceMaterialVersion {
 impl SurfaceMaterialVersion {
     fn for_algorithm(algorithm: SurfaceAlgorithm) -> Self {
         match algorithm {
-            SurfaceAlgorithm::PreparedV1 => Self::PreparedV1,
-            SurfaceAlgorithm::GraphV1 => Self::GraphV1,
+            SurfaceAlgorithm::PreparedV1 | SurfaceAlgorithm::WorldV1 => Self::PreparedV1,
             SurfaceAlgorithm::RockyV3 => Self::RockyV1,
             SurfaceAlgorithm::RockyV4
             | SurfaceAlgorithm::RockyV5
@@ -408,7 +329,6 @@ impl SurfaceMaterialVersion {
     pub const fn code(self) -> u64 {
         match self {
             Self::PreparedV1 => 0x4d41_5450_0000_0001,
-            Self::GraphV1 => 0x4d41_5447_0000_0001,
             Self::RockyV1 => 0x4d41_5452_0000_0001,
             Self::RockyV2 => 0x4d41_5452_0000_0002,
             Self::IcyV1 => 0x4d41_5449_0000_0001,
@@ -424,12 +344,6 @@ impl SurfaceMaterialVersion {
                 "exposed_substrate",
                 "resurfaced_basalt",
                 "disturbed_ejecta",
-            ],
-            Self::GraphV1 => [
-                "graph_material_0",
-                "graph_material_1",
-                "graph_material_2",
-                "unused",
             ],
             Self::RockyV1 => [
                 "regolith",
@@ -540,7 +454,6 @@ impl SurfaceAtmosphere {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SurfaceDefinition {
     prepared: Option<Arc<PreparedSurface>>,
-    graph_surface: Option<Arc<GraphSurface>>,
     identity: TerrainIdentity,
     seed: TerrainSeed,
     shape: ShapeDefinition,
@@ -551,6 +464,7 @@ pub struct SurfaceDefinition {
     height_profile: Option<TerrainHeightProfile>,
     moon_fields: Option<MoonFieldDefinition>,
     detail_noise: Option<noise::DetailNoiseDefinition>,
+    world: Option<world_field::WorldDefinition>,
 }
 impl SurfaceDefinition {
     pub fn new(
@@ -570,7 +484,6 @@ impl SurfaceDefinition {
         }
         Ok(Self {
             prepared: None,
-            graph_surface: None,
             identity,
             seed,
             shape,
@@ -581,6 +494,7 @@ impl SurfaceDefinition {
             height_profile: None,
             moon_fields: None,
             detail_noise: None,
+            world: None,
         })
     }
     pub fn generated(
@@ -592,7 +506,6 @@ impl SurfaceDefinition {
         let version = SurfaceMaterialVersion::for_algorithm(algorithm);
         Self {
             prepared: None,
-            graph_surface: None,
             identity,
             seed,
             shape: ShapeDefinition::sphere(),
@@ -607,6 +520,7 @@ impl SurfaceDefinition {
             height_profile: None,
             moon_fields: None,
             detail_noise: None,
+            world: None,
         }
     }
     pub fn with_height_profile(
@@ -640,6 +554,18 @@ impl SurfaceDefinition {
             distribution,
         )?;
         Ok(self)
+    }
+    /// The Tier A world map of a `WorldV1` surface (M1).
+    pub fn with_world(mut self, world: world_field::WorldDefinition) -> Result<Self, TerrainError> {
+        if self.terrain.algorithm != SurfaceAlgorithm::WorldV1 {
+            return Err(TerrainError::InvalidConfig);
+        }
+        world.archetype.validate()?;
+        self.world = Some(world);
+        Ok(self)
+    }
+    pub fn world(&self) -> Option<&world_field::WorldDefinition> {
+        self.world.as_ref()
     }
     /// Add the band-limited fBm detail layer (pipeline §9.3) to any algorithm.
     pub fn with_detail_noise(
@@ -675,22 +601,8 @@ impl SurfaceDefinition {
         definition.prepared = Some(prepared);
         definition
     }
-    pub fn from_graph(
-        identity: TerrainIdentity,
-        seed: TerrainSeed,
-        graph_surface: Arc<GraphSurface>,
-    ) -> Self {
-        let mut definition = Self::generated(identity, seed, SurfaceAlgorithm::GraphV1);
-        definition.material.composition = 0.5;
-        definition.material.regional_contrast = 0.0;
-        definition.graph_surface = Some(graph_surface);
-        definition
-    }
     pub fn prepared(&self) -> Option<&Arc<PreparedSurface>> {
         self.prepared.as_ref()
-    }
-    pub fn graph_surface(&self) -> Option<&Arc<GraphSurface>> {
-        self.graph_surface.as_ref()
     }
     pub fn seed(&self) -> TerrainSeed {
         self.seed
@@ -722,10 +634,6 @@ impl SurfaceDefinition {
             bytes.copy_from_slice(&p.content_identity()[..8]);
             u64::from_le_bytes(bytes)
         });
-        let graph = self.graph_surface.as_ref().map_or(0, |surface| {
-            let identities = surface.compiled().identities();
-            hash_identity_string(&identities.geometry)
-        });
         mix(self.terrain_seed()
             ^ self.terrain.configuration_identity()
             ^ profile_identity
@@ -733,33 +641,19 @@ impl SurfaceDefinition {
                 .moon_fields
                 .map_or(0, MoonFieldDefinition::configuration_identity)
             ^ self.detail_noise.map_or(0, |d| d.configuration_identity())
-            ^ prepared
-            ^ graph)
+            ^ self.world.as_ref().map_or(0, world_field::WorldDefinition::identity)
+            ^ prepared)
     }
     pub fn geometry_identity(&self) -> u64 {
         mix(self.terrain_identity() ^ self.shape.configuration_identity())
     }
     pub fn material_identity(&self) -> u64 {
-        let graph_palette = self.graph_surface.as_ref().map_or(0, |surface| {
-            let identities = surface.compiled().identities();
-            hash_identity_string(&identities.material) ^ hash_identity_string(&identities.palette)
-        });
         mix(self.terrain_identity()
             ^ self.material.configuration_identity()
-            ^ mix(self.seed.0 ^ 0x4d41_5445_5249_0001)
-            ^ graph_palette)
+            ^ mix(self.seed.0 ^ 0x4d41_5445_5249_0001))
     }
     pub fn configuration_identity(&self) -> u64 {
-        let complete_graph_identity = self.graph_surface.as_ref().map_or(0, |surface| {
-            surface
-                .exact_definition_words
-                .iter()
-                .fold(0x4752_4150_485f_4655, |identity, word| mix(identity ^ word))
-        });
-        mix(self.geometry_identity()
-            ^ self.material_identity()
-            ^ self.atmosphere_identity
-            ^ complete_graph_identity)
+        mix(self.geometry_identity() ^ self.material_identity() ^ self.atmosphere_identity)
     }
     pub fn validate_radius(&self, radius_m: f64) -> Result<(), TerrainError> {
         SurfaceGenerator::new(self, radius_m).map(|_| ())
@@ -821,13 +715,13 @@ impl SurfaceSample {
 #[allow(clippy::large_enum_variant)] // Keep existing compiled source storage unchanged in the rendering comparison.
 enum GeologicalField {
     Prepared(Arc<PreparedSurface>),
-    Graph(Arc<GraphSurface>),
     Rocky(Box<MoonTerrainGenerator>),
     Other(geology::GeologyField),
     Province(provinces::ProvinceField),
     Hierarchical(Box<hierarchy::HierarchicalField>),
     MoonFields(moon_fields::MoonFieldsV1),
     MoonProfile(moon_profile::MoonProfileField),
+    World(world_field::WorldField),
 }
 /// Immutable compiled query adapter shared by reference and production callers.
 #[derive(Debug, Clone)]
@@ -858,16 +752,6 @@ impl SurfaceGenerator {
                     GeologicalField::Prepared(Arc::clone(g)),
                     bounds[0].abs().max(bounds[1].abs()).next_up(),
                 )
-            }
-            SurfaceAlgorithm::GraphV1 => {
-                let graph = definition
-                    .graph_surface
-                    .as_ref()
-                    .ok_or(TerrainError::InvalidConfig)?;
-                graph.validate_radius(radius_m)?;
-                let bounds = graph.height_bounds_m;
-                let bound = bounds[0].abs().max(bounds[1].abs()).next_up();
-                (GeologicalField::Graph(Arc::clone(graph)), bound)
             }
             SurfaceAlgorithm::RockyV3 => {
                 let scale = p.relief_fraction / 0.006;
@@ -927,6 +811,11 @@ impl SurfaceGenerator {
                 let bound = g.absolute_height_bound_m();
                 (GeologicalField::MoonFields(g), bound)
             }
+            SurfaceAlgorithm::WorldV1 => {
+                let world = definition.world.as_ref().ok_or(TerrainError::InvalidConfig)?;
+                let g = world_field::WorldField::new(world, radius_m)?;
+                (GeologicalField::World(g), world.height_bound_m().next_up())
+            }
             SurfaceAlgorithm::MoonProfileV1 => {
                 let profile = definition
                     .height_profile
@@ -984,18 +873,17 @@ impl SurfaceGenerator {
     /// Profile allocations shared between the inline definition and compiled
     /// field are counted once through the field. Other geological state is inline.
     /// Includes immutable prepared-source payloads when selected. Shared Arc
-    /// ownership is counted conservatively once per logical generator. Graph
-    /// definitions use a serialized-payload estimate, not allocator-exact bytes.
+    /// ownership is counted conservatively once per logical generator.
     pub fn resident_heap_bytes(&self) -> usize {
         let compiled = match &self.field {
             GeologicalField::Prepared(field) => field.resident_bytes(),
-            GeologicalField::Graph(field) => field.retained_payload_estimate_bytes(),
             GeologicalField::Rocky(_) => std::mem::size_of::<MoonTerrainGenerator>(),
             GeologicalField::Other(_) => 0,
             GeologicalField::Province(field) => field.resident_heap_bytes(),
             GeologicalField::Hierarchical(field) => field.resident_heap_bytes(),
             GeologicalField::MoonFields(_) => 0,
             GeologicalField::MoonProfile(field) => field.resident_heap_bytes(),
+            GeologicalField::World(field) => field.resident_heap_bytes(),
         };
         let store_bytes = self
             .preparation_store
@@ -1015,12 +903,9 @@ impl SurfaceGenerator {
         0
     }
 
-    /// Fixed graph-evaluator stack cache size; heap query workspace remains zero.
-    pub fn query_stack_bytes(&self) -> usize {
-        match &self.field {
-            GeologicalField::Graph(graph) => graph.query_stack_bytes(),
-            _ => 0,
-        }
+    /// Fixed evaluator stack cache size; no current algorithm keeps one.
+    pub const fn query_stack_bytes(&self) -> usize {
+        0
     }
 
     /// Upper bound, in heap payload bytes, for a compiled surface generator
@@ -1083,8 +968,8 @@ impl SurfaceGenerator {
             GeologicalField::Rocky(_)
             | GeologicalField::Other(_)
             | GeologicalField::MoonFields(_)
-            | GeologicalField::Prepared(_)
-            | GeologicalField::Graph(_) => Ok(None),
+            | GeologicalField::World(_)
+            | GeologicalField::Prepared(_) => Ok(None),
             GeologicalField::MoonProfile(_) => Ok(None),
         }
     }
@@ -1167,7 +1052,7 @@ impl SurfaceGenerator {
     ) -> Result<Vec<SurfaceBoundaryProbe>, TerrainError> {
         let mut output = Vec::new();
         match &self.field {
-            GeologicalField::Prepared(_) | GeologicalField::Graph(_) => {}
+            GeologicalField::Prepared(_) => {}
             GeologicalField::Other(field) => {
                 for (label, n) in field.diagnostic_boundary_probes(near.direction().unit())? {
                     output.push(SurfaceBoundaryProbe {
@@ -1198,7 +1083,9 @@ impl SurfaceGenerator {
                     });
                 }
             }
-            GeologicalField::MoonFields(_) | GeologicalField::MoonProfile(_) => {}
+            GeologicalField::MoonFields(_)
+            | GeologicalField::MoonProfile(_)
+            | GeologicalField::World(_) => {}
             GeologicalField::Rocky(_) => {
                 let p = self.definition.terrain.parameters;
                 let frequency = 2.2 + 3.0 * p.activity;
@@ -1407,18 +1294,6 @@ impl SurfaceGenerator {
                     SurfaceQueryWork::default(),
                 )
             }
-            GeologicalField::Graph(field) => {
-                let (sample, differential) = field
-                    .compiled()
-                    .evaluate_surface_with_differential(n.to_array())
-                    .map_err(|_| TerrainError::NonFiniteResult)?;
-                (
-                    sample.height_m,
-                    DVec3::from_array(differential.height_gradient_tangent_m_per_radian),
-                    [sample.weights[0], sample.weights[1], sample.weights[2], 0.0],
-                    SurfaceQueryWork::default(),
-                )
-            }
             GeologicalField::Rocky(g) => {
                 let p = self.definition.terrain.parameters;
                 let rotation = DMat3::from_rotation_z(p.orientation_radians);
@@ -1487,6 +1362,10 @@ impl SurfaceGenerator {
                 (s.height_m, s.gradient_m, s.weights, s.work)
             }
             GeologicalField::MoonFields(g) => g.evaluate(n, context.as_deref_mut())?,
+            GeologicalField::World(field) => {
+                let (h, gradient) = field.maps()?.sample(0, n);
+                (h, gradient, [1.0, 0.0, 0.0, 0.0], SurfaceQueryWork::default())
+            }
             GeologicalField::MoonProfile(g) => {
                 let s = g.evaluate_observed(n, observer)?;
                 (
@@ -1507,9 +1386,7 @@ impl SurfaceGenerator {
         };
         let material_noise = match &self.field {
             GeologicalField::MoonFields(field) => field.material_modulation(n),
-            GeologicalField::MoonProfile(_)
-            | GeologicalField::Prepared(_)
-            | GeologicalField::Graph(_) => 0.0,
+            GeologicalField::MoonProfile(_) | GeologicalField::Prepared(_) => 0.0,
             _ => {
                 gradient_noise(mix(self.definition.seed.0 ^ 0x4d41_5445_5249_0001), n * 7.0)
                     .map_err(|_| TerrainError::NonFiniteResult)?
@@ -1518,10 +1395,7 @@ impl SurfaceGenerator {
         };
         let geology_ns = geology_started.map_or(0, duration_ns);
         let material_started = profiling.then(Instant::now);
-        if !matches!(
-            self.field,
-            GeologicalField::Prepared(_) | GeologicalField::Graph(_)
-        ) {
+        if !matches!(self.field, GeologicalField::Prepared(_)) {
             let m = self.definition.material;
             for (index, w) in weights.iter_mut().enumerate() {
                 let emphasis = (index as f64 - 1.5) / 1.5;
@@ -1590,11 +1464,6 @@ fn hash_values(mut salt: u64, values: &[f64]) -> u64 {
     salt
 }
 
-fn hash_identity_string(value: &str) -> u64 {
-    value.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
-    })
-}
 fn unit(seed: u64) -> f64 {
     (mix(seed) >> 11) as f64 / ((1u64 << 53) as f64)
 }
@@ -1645,7 +1514,7 @@ mod landmark_probe_tests {
                         probe.label.starts_with("volcanic-epoch2-")
                     }
                     SurfaceAlgorithm::PreparedV1
-                    | SurfaceAlgorithm::GraphV1
+                    | SurfaceAlgorithm::WorldV1
                     | SurfaceAlgorithm::RockyV3
                     | SurfaceAlgorithm::RockyV4
                     | SurfaceAlgorithm::IcyV2

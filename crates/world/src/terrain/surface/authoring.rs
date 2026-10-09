@@ -177,7 +177,7 @@ impl GeologicalDistribution {
             },
             // Compatibility fields are unused by prepared and graph producers; their
             // authored controls live entirely in the validated source definition.
-            SurfaceAlgorithm::PreparedV1 | SurfaceAlgorithm::GraphV1 => Self {
+            SurfaceAlgorithm::PreparedV1 | SurfaceAlgorithm::WorldV1 => Self {
                 resurfacing: GeologicalAffineControl {
                     base: 0.0,
                     age_complement: false,
@@ -665,7 +665,7 @@ mod tests {
                 0.20 + 0.16 * unit(salt ^ 3),
             ),
             SurfaceAlgorithm::MoonProfileV1 => (0.0, 1.0, 0.00685, 0.20 + 0.16 * unit(salt ^ 3)),
-            SurfaceAlgorithm::PreparedV1 | SurfaceAlgorithm::GraphV1 => (0.0, 0.0, 0.0, 0.05),
+            SurfaceAlgorithm::PreparedV1 | SurfaceAlgorithm::WorldV1 => (0.0, 0.0, 0.0, 0.05),
             SurfaceAlgorithm::IcyV1 | SurfaceAlgorithm::IcyV2 | SurfaceAlgorithm::IcyV3 => (
                 0.15 + 0.75 * activity,
                 0.10 + 0.65 * age,
@@ -725,7 +725,7 @@ mod tests {
             SurfaceAlgorithm::MoonFieldsV1,
             SurfaceAlgorithm::MoonProfileV1,
             SurfaceAlgorithm::PreparedV1,
-            SurfaceAlgorithm::GraphV1,
+            SurfaceAlgorithm::WorldV1,
             SurfaceAlgorithm::IcyV1,
             SurfaceAlgorithm::IcyV2,
             SurfaceAlgorithm::IcyV3,
@@ -821,8 +821,8 @@ mod tests {
         use super::super::super::{TerrainIdentity, TerrainSeed};
         use super::super::SurfaceGenerator;
         use super::super::{SurfaceAlgorithm, SurfaceDefinition};
-        use glam::DVec3;
         use astrum_math::{Direction3, surface::SurfaceLocation};
+        use glam::DVec3;
 
         let definition = SurfaceDefinition::generated(
             TerrainIdentity(55),

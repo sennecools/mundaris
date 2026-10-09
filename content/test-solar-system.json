@@ -98,7 +98,7 @@
         1
       ],
       "spin_radians_per_second": 0.000007309,
-      "terrain": "terrain/moon.json"
+      "terrain": "terrain/moon.ron"
     },
     {
       "id": "rust",
@@ -134,7 +134,7 @@
         1
       ],
       "spin_radians_per_second": 0.00007088,
-      "terrain": "terrain/rust.json"
+      "terrain": "terrain/rust.ron"
     }
   ]
 }

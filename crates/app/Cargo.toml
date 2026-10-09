@@ -16,11 +16,11 @@ glam.workspace = true
 astrum_math = { path = "../math" }
 astrum_renderer = { path = "../renderer" }
 astrum_simulation = { path = "../simulation" }
-astrum_terrain_fields = { path = "../terrain_fields" }
 astrum_world = { path = "../world" }
 png = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
+ron.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 egui.workspace = true
@@ -39,10 +39,6 @@ required-features = ["developer-tools"]
 [dev-dependencies]
 criterion.workspace = true
 pollster.workspace = true
-
-[[example]]
-name = "phase2g_vista"
-required-features = ["developer-tools"]
 
 [[bench]]
 name = "trail_history"

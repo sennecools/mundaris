@@ -71,6 +71,7 @@ fn neighbouring_gpu_tiles_agree_along_shared_edges() {
             .unwrap()
             .producer_recipe()
             .unwrap();
+        common::provide_gpu_world(&context, &recipe);
         let tiles = common::produce(&context, config, &recipe, radius, &nodes);
         let side = config.height_side() as usize;
         let (mut worst, mut worst_ratio, mut cross_face) = (0.0f64, 0.0f64, 0);

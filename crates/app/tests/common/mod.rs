@@ -24,6 +24,40 @@ pub fn gpu() -> Option<GpuContext> {
     None
 }
 
+/// For a world-map recipe, bake Tier A on the GPU and hand the read-back fields
+/// to the CPU oracle, so tile tests compare Tier B on identical Tier A input
+/// (Tier A itself is compared in `gpu_tier_a.rs`). No-op for other recipes.
+pub fn provide_gpu_world(context: &GpuContext, recipe: &ProducerRecipe) {
+    use astrum_world::terrain::{tier_a::TierAFields, world_map::CubeMap};
+    let ProducerRecipe::World(world) = recipe else {
+        return;
+    };
+    let inputs = world.field.inputs();
+    let gpu = astrum_renderer::tier_a::tier_a_for_validation(
+        &context.device,
+        &context.queue,
+        &astrum_app::planet_lod::tier_a::bake_inputs(inputs),
+    )
+    .unwrap();
+    let n = inputs.face_cells;
+    let map = |run: usize| {
+        let mut map = CubeMap::new(n, 0.0f32);
+        map.data_mut().copy_from_slice(gpu.run(run));
+        map
+    };
+    world.field.provide(TierAFields {
+        elevation: map(0),
+        temperature: map(1),
+        moisture: map(2),
+        wind_east: map(3),
+        wind_north: map(4),
+        sea_level: f64::from(gpu.sea_level),
+        noise_low: f64::from(gpu.noise_low),
+        noise_high: f64::from(gpu.noise_high),
+        ocean_fraction: f64::NAN,
+    });
+}
+
 /// Producer jobs for `nodes` exactly as the runtime builds them.
 pub fn jobs(
     recipe: &ProducerRecipe,

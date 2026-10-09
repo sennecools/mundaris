@@ -21,6 +21,7 @@ mod render_settings;
 mod shadows;
 pub mod sky;
 pub mod terrain_atlas;
+pub mod tier_a;
 #[cfg(feature = "terrain-capture")]
 pub mod terrain_capture;
 mod view;
@@ -46,7 +47,7 @@ pub use render_settings::{
 pub use terrain_atlas::{
     ATLAS_BOUNDS_GRID, AtlasBounds, AtlasChart, AtlasCollisionPage, AtlasFieldsConstants,
     AtlasImageLevel, AtlasInstance, AtlasOctave, AtlasProduceJob, AtlasProfileLayer,
-    AtlasSampleSource, AtlasShadowFrame, AtlasSource, AtlasTileKind, MAX_ATLAS_JOBS_PER_FRAME,
+    AtlasSampleSource, AtlasShadowFrame, AtlasSource, AtlasTileKind, AtlasWorldSource, AtlasWorldSurface, MAX_ATLAS_JOBS_PER_FRAME,
     MAX_ATLAS_OCTAVES, MAX_COLLISION_CELLS, MAX_COLLISION_JOBS_PER_FRAME, ProducedTileReadback,
     TerrainAtlasConfig, TerrainAtlasFrame, TerrainAtlasReport, TerrainViewMode,
     collision_for_validation, lattice_hash_for_validation, produce_for_validation,
@@ -348,6 +349,13 @@ impl Renderer {
         true
     }
 
+    /// Atlas sources (keys) whose Tier A world-map bake completed in the last
+    /// recorded frame.
+    pub fn take_terrain_ready_sources(&mut self) -> Vec<u64> {
+        self.celestial
+            .as_mut()
+            .map_or_else(Vec::new, |c| c.take_ready_sources())
+    }
     /// Collision pages read back since the last call (pipeline §15.1).
     pub fn take_terrain_collision_pages(&mut self) -> Vec<AtlasCollisionPage> {
         self.celestial

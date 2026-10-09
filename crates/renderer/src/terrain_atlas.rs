@@ -18,16 +18,18 @@ const DRAW_SHADER: &str = concat!(
     include_str!("shaders/lighting.wgsl"),
     include_str!("shaders/terrain_atlas.wgsl")
 );
-/// Producer shader: shared split-lattice noise followed by the atlas producer.
+/// Producer shader: shared split-lattice noise and cube-map sampling followed by
+/// the atlas producer.
 const PRODUCE_SHADER: &str = concat!(
     include_str!("shaders/terrain_noise.wgsl"),
+    include_str!("shaders/cube_map.wgsl"),
     include_str!("shaders/terrain_atlas_produce.wgsl")
 );
 
 /// Largest number of producer jobs accepted in one frame.
 pub const MAX_ATLAS_JOBS_PER_FRAME: usize = 256;
 const TILE_BYTES: u64 = 464;
-const INSTANCE_BYTES: u64 = 176;
+const INSTANCE_BYTES: u64 = 192;
 const DISPATCH_STRIDE: u64 = 256;
 /// Largest number of collision pages produced in one frame.
 pub const MAX_COLLISION_JOBS_PER_FRAME: usize = 32;
@@ -41,6 +43,8 @@ const COLLISION_BYTES: u64 = COLLISION_SAMPLE_BYTES
 const MAX_TILE_SLOTS: usize = MAX_ATLAS_JOBS_PER_FRAME + MAX_COLLISION_JOBS_PER_FRAME;
 const MAX_DISPATCHES: u64 = (2 * MAX_ATLAS_JOBS_PER_FRAME + MAX_COLLISION_JOBS_PER_FRAME) as u64;
 const READBACK_SLOTS: usize = 4;
+/// Tier A bake passes encoded per frame for a world source nobody waits on.
+const TIER_A_PASSES_PER_FRAME: usize = 24;
 /// Detail-noise octave origins per producer job (`OctaveOrigin` in the shader).
 pub const MAX_ATLAS_OCTAVES: usize = 16;
 const OCTAVE_BYTES: u64 = 48;
@@ -190,6 +194,82 @@ pub enum AtlasSource {
         sample_range: [u16; 2],
     },
     Fields(Box<AtlasFieldsConstants>),
+    /// Tier A world map baked on the GPU when the source is first bound
+    /// (`crate::tier_a`); tiles become available once it reports ready.
+    World(Box<AtlasWorldSource>),
+}
+
+/// World-map source: Tier A bake inputs and the surface colour constants.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AtlasWorldSource {
+    pub bake: crate::tier_a::TierABakeInputs,
+    pub surface: AtlasWorldSurface,
+}
+
+/// Colour of a world-map body (pipeline §10, M1): biome LUT (temperature ×
+/// moisture, sRGB texels, texel centres spanning the axes), snow rule and
+/// flat water. Colours are linear unless named sRGB.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AtlasWorldSurface {
+    pub lut_size: u32,
+    /// Row-major, y = moisture.
+    pub lut_srgb: Vec<[u8; 3]>,
+    pub temperature_c: [f32; 2],
+    pub moisture: [f32; 2],
+    pub snow_temperature_c: f32,
+    pub snow_blend_c: f32,
+    pub snow_slope_rad: [f32; 2],
+    pub snow_albedo: [f32; 3],
+    pub water_shallow: [f32; 3],
+    pub water_deep: [f32; 3],
+    pub water_depth_scale_m: f32,
+}
+
+/// Words before the LUT texels in the packed surface buffer.
+const WORLD_SURFACE_HEADER_WORDS: usize = 24;
+
+impl AtlasWorldSurface {
+    /// Packed storage words (`world_surface` in the producer shader).
+    fn packed(&self) -> Result<Vec<u8>, String> {
+        let n = self.lut_size;
+        if !(2..=512).contains(&n) || self.lut_srgb.len() != (n * n) as usize {
+            return Err("world surface LUT must be square, 2..=512 texels".into());
+        }
+        let f = |v: f32| v.to_bits();
+        let mut words: Vec<u32> = vec![
+            n,
+            0,
+            0,
+            0,
+            f(self.temperature_c[0]),
+            f(self.temperature_c[1]),
+            f(self.moisture[0]),
+            f(self.moisture[1]),
+            f(self.snow_temperature_c),
+            f(self.snow_blend_c),
+            f(self.snow_slope_rad[0]),
+            f(self.snow_slope_rad[1]),
+            f(self.snow_albedo[0]),
+            f(self.snow_albedo[1]),
+            f(self.snow_albedo[2]),
+            0,
+            f(self.water_shallow[0]),
+            f(self.water_shallow[1]),
+            f(self.water_shallow[2]),
+            f(self.water_depth_scale_m),
+            f(self.water_deep[0]),
+            f(self.water_deep[1]),
+            f(self.water_deep[2]),
+            0,
+        ];
+        debug_assert_eq!(words.len(), WORLD_SURFACE_HEADER_WORDS);
+        words.extend(
+            self.lut_srgb
+                .iter()
+                .map(|c| u32::from(c[0]) | u32::from(c[1]) << 8 | u32::from(c[2]) << 16),
+        );
+        Ok(words.into_iter().flat_map(u32::to_le_bytes).collect())
+    }
 }
 
 /// MoonFieldsV1 constants mirrored by the GPU producer.
@@ -252,6 +332,11 @@ pub enum AtlasTileKind {
         fractions: [[f32; 3]; 6],
         band_weights: [f32; 3],
     },
+    /// Tier A macro elevation from one mip level (bicubic) of the source's
+    /// world fields: offset in f32 values and face cells
+    /// (`tier_a::field_mip_layout`; climate mips follow at +6·cells² and
+    /// +12·cells²).
+    World { mip_offset: u32, mip_cells: u32 },
 }
 
 /// Lattice origin of one detail-noise octave for one job, split on the CPU in
@@ -303,6 +388,9 @@ pub struct AtlasInstance {
     pub arrival: f32,
     pub skirt_m: f32,
     pub material: crate::SurfaceMaterial,
+    /// Flat water at the reference radius over ground below it (world maps
+    /// with oceans, M1): drawn at height 0 with the sphere normal.
+    pub ocean: bool,
     pub mode: u32,
     /// Edges (`PatchEdge::bit`: s=0, s=1, t=0, t=1) bordering a coarser node;
     /// their vertices are drawn fully morphed (pipeline §9.8).
@@ -380,9 +468,12 @@ pub struct TerrainAtlasReport {
 
 struct SourceGpu {
     _textures: [wgpu::Texture; 2],
-    _constants: [wgpu::Buffer; 2],
+    _constants: [wgpu::Buffer; 3],
     group: wgpu::BindGroup,
     last_used: u64,
+    /// World sources: the Tier A bake and its result buffer (bound in `group`).
+    bake: Option<crate::tier_a::TierABake>,
+    _world: wgpu::Buffer,
 }
 
 struct Readback {
@@ -396,8 +487,12 @@ struct Readback {
 
 pub(crate) struct TerrainAtlasRenderer {
     config: TerrainAtlasConfig,
+    tier_a: crate::tier_a::TierAPipelines,
+    /// World sources whose Tier A bake finished in a recorded frame.
+    ready_sources: Vec<u64>,
     _height: wgpu::Texture,
     _normal: wgpu::Texture,
+    _albedo: wgpu::Texture,
     produce_heights: wgpu::ComputePipeline,
     produce_normals: wgpu::ComputePipeline,
     produce_collision: wgpu::ComputePipeline,
@@ -425,6 +520,7 @@ pub(crate) struct TerrainAtlasRenderer {
     draw_layout: wgpu::BindGroupLayout,
     height_view: wgpu::TextureView,
     normal_view: wgpu::TextureView,
+    albedo_view: wgpu::TextureView,
     sampler: wgpu::Sampler,
     grid_uniform: wgpu::Buffer,
     vertices: wgpu::Buffer,
@@ -474,6 +570,13 @@ impl TerrainAtlasRenderer {
             wgpu::TextureFormat::Rgba8Snorm,
             "Terrain atlas normals",
         );
+        // sRGB-encoded linear albedo, alpha 1 where the page owns its colour
+        // (world maps), 0 where the instance material applies.
+        let albedo = array(
+            config.normal_side(),
+            wgpu::TextureFormat::Rgba8Unorm,
+            "Terrain atlas albedo",
+        );
         let array_view = |texture: &wgpu::Texture| {
             texture.create_view(&wgpu::TextureViewDescriptor {
                 dimension: Some(wgpu::TextureViewDimension::D2Array),
@@ -482,6 +585,7 @@ impl TerrainAtlasRenderer {
         };
         let height_view = array_view(&height);
         let normal_view = array_view(&normal);
+        let albedo_view = array_view(&albedo);
 
         let produce_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Terrain atlas producer"),
@@ -526,6 +630,7 @@ impl TerrainAtlasRenderer {
                 },
                 storage(5, true),
                 storage(6, false),
+                storage_texture(7, wgpu::TextureFormat::Rgba8Unorm),
             ],
         });
         let image = |binding| wgpu::BindGroupLayoutEntry {
@@ -550,7 +655,14 @@ impl TerrainAtlasRenderer {
         };
         let source_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Terrain atlas producer source"),
-            entries: &[image(0), image(1), uniform(2), uniform(3)],
+            entries: &[
+                image(0),
+                image(1),
+                uniform(2),
+                uniform(3),
+                storage(4, true),
+                storage(5, true),
+            ],
         });
         let produce_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -671,6 +783,10 @@ impl TerrainAtlasRenderer {
                     binding: 6,
                     resource: collision_out.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&storage_view(&albedo)),
+                },
             ],
         });
 
@@ -729,6 +845,16 @@ impl TerrainAtlasRenderer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -750,8 +876,7 @@ impl TerrainAtlasRenderer {
         let draw_group = draw_group(
             device,
             &draw_layout,
-            &height_view,
-            &normal_view,
+            [&height_view, &normal_view, &albedo_view],
             &sampler,
             &instances,
             &grid_uniform,
@@ -857,8 +982,7 @@ impl TerrainAtlasRenderer {
         let shadow_group = self::draw_group(
             device,
             &draw_layout,
-            &height_view,
-            &normal_view,
+            [&height_view, &normal_view, &albedo_view],
             &sampler,
             &shadow_instances,
             &grid_uniform,
@@ -879,8 +1003,11 @@ impl TerrainAtlasRenderer {
         });
         Ok(Self {
             config,
+            tier_a: crate::tier_a::TierAPipelines::new(device),
+            ready_sources: Vec::new(),
             _height: height,
             _normal: normal,
+            _albedo: albedo,
             produce_heights,
             produce_normals,
             produce_collision,
@@ -907,6 +1034,7 @@ impl TerrainAtlasRenderer {
             draw_layout,
             height_view,
             normal_view,
+            albedo_view,
             sampler,
             grid_uniform,
             vertices,
@@ -933,6 +1061,12 @@ impl TerrainAtlasRenderer {
 
     pub(crate) fn take_collision_pages(&mut self) -> Vec<AtlasCollisionPage> {
         std::mem::take(&mut self.collision_results)
+    }
+
+    /// World sources whose Tier A fields are complete as of the last recorded
+    /// frame; tiles for them may be requested from the next frame on.
+    pub(crate) fn take_ready_sources(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.ready_sources)
     }
 
     fn collect_collision_readbacks(&mut self) {
@@ -1061,7 +1195,7 @@ impl TerrainAtlasRenderer {
             if let Some(existing) = self.sources.get_mut(key) {
                 existing.last_used = self.frame;
             } else {
-                let gpu = upload_source(device, queue, &self.source_layout, source)?;
+                let gpu = upload_source(device, queue, &self.source_layout, &self.tier_a, source)?;
                 self.sources.insert(
                     *key,
                     SourceGpu {
@@ -1074,6 +1208,27 @@ impl TerrainAtlasRenderer {
         let frame_number = self.frame;
         self.sources
             .retain(|_, source| frame_number - source.last_used < 600);
+        // Advance Tier A bakes. A source with jobs this frame is finished now so
+        // its jobs read complete fields; the app normally waits for readiness.
+        let needed: std::collections::HashSet<u64> = frame
+            .jobs
+            .iter()
+            .chain(&frame.collision_jobs)
+            .map(|job| job.source)
+            .collect();
+        for (key, source) in self.sources.iter_mut() {
+            if let Some(bake) = source.bake.as_mut().filter(|bake| !bake.done()) {
+                let budget = if needed.contains(key) {
+                    usize::MAX
+                } else {
+                    TIER_A_PASSES_PER_FRAME
+                };
+                bake.encode(encoder, &self.tier_a, budget);
+                if bake.done() {
+                    self.ready_sources.push(*key);
+                }
+            }
+        }
 
         self.report = TerrainAtlasReport {
             jobs: frame.jobs.len() as u32,
@@ -1289,8 +1444,7 @@ impl TerrainAtlasRenderer {
             self.draw_group = draw_group(
                 device,
                 &self.draw_layout,
-                &self.height_view,
-                &self.normal_view,
+                [&self.height_view, &self.normal_view, &self.albedo_view],
                 &self.sampler,
                 &self.instances,
                 &self.grid_uniform,
@@ -1309,6 +1463,11 @@ impl TerrainAtlasRenderer {
     /// Start mapping bounds and collision pages copied in the just-submitted
     /// command buffer.
     pub(crate) fn on_submitted(&mut self) {
+        for source in self.sources.values_mut() {
+            if let Some(bake) = source.bake.as_mut() {
+                bake.release_scratch();
+            }
+        }
         for readback in self
             .readbacks
             .iter_mut()
@@ -1360,8 +1519,7 @@ impl TerrainAtlasRenderer {
             self.shadow_group = draw_group(
                 device,
                 &self.draw_layout,
-                &self.height_view,
-                &self.normal_view,
+                [&self.height_view, &self.normal_view, &self.albedo_view],
                 &self.sampler,
                 &self.shadow_instances,
                 &self.grid_uniform,
@@ -1411,6 +1569,9 @@ impl TerrainAtlasRenderer {
 pub struct ProducedTileReadback {
     pub heights: Vec<f32>,
     pub normals: Vec<[f32; 3]>,
+    /// Page albedo per normal texel: linear rgb (decoded from sRGB) and the
+    /// ownership alpha.
+    pub albedo: Vec<[f32; 4]>,
     pub bounds: Option<(f32, f32)>,
 }
 
@@ -1505,13 +1666,19 @@ pub fn produce_for_validation(
             config.normal_side(),
             job.layer,
         );
-        buffers.push((heights, normals));
+        let albedo = read_layer(
+            &mut encoder,
+            &atlas._albedo,
+            config.normal_side(),
+            job.layer,
+        );
+        buffers.push((heights, normals, albedo));
     }
     queue.submit([encoder.finish()]);
     atlas.on_submitted();
     let mut output = Vec::new();
-    for ((heights, height_row), (normals, normal_row)) in &buffers {
-        for buffer in [heights, normals] {
+    for ((heights, height_row), (normals, normal_row), (albedo, albedo_row)) in &buffers {
+        for buffer in [heights, normals, albedo] {
             buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
         }
         device
@@ -1544,9 +1711,35 @@ pub fn produce_for_validation(
             }
         }
         drop(view);
+        let view = albedo
+            .slice(..)
+            .get_mapped_range()
+            .map_err(|error| error.to_string())?;
+        let mut albedo_values = Vec::with_capacity(side * side);
+        for y in 0..side {
+            for x in 0..side {
+                let at = y * *albedo_row as usize + x * 4;
+                let linear = |b: u8| {
+                    let c = f32::from(b) / 255.0;
+                    if c <= 0.04045 {
+                        c / 12.92
+                    } else {
+                        ((c + 0.055) / 1.055).powf(2.4)
+                    }
+                };
+                albedo_values.push([
+                    linear(view[at]),
+                    linear(view[at + 1]),
+                    linear(view[at + 2]),
+                    f32::from(view[at + 3]) / 255.0,
+                ]);
+            }
+        }
+        drop(view);
         output.push(ProducedTileReadback {
             heights: height_values,
             normals: normal_values,
+            albedo: albedo_values,
             bounds: None,
         });
     }
@@ -1743,8 +1936,8 @@ fn instance_buffer(device: &wgpu::Device, capacity: u64) -> wgpu::Buffer {
 fn draw_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
-    height: &wgpu::TextureView,
-    normal: &wgpu::TextureView,
+    // Height, normal and albedo atlas views.
+    [height, normal, albedo]: [&wgpu::TextureView; 3],
     sampler: &wgpu::Sampler,
     instances: &wgpu::Buffer,
     grid: &wgpu::Buffer,
@@ -1773,6 +1966,10 @@ fn draw_group(
                 binding: 4,
                 resource: grid.as_entire_binding(),
             },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(albedo),
+            },
         ],
     })
 }
@@ -1781,6 +1978,7 @@ fn upload_source(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     layout: &wgpu::BindGroupLayout,
+    tier_a: &crate::tier_a::TierAPipelines,
     source: &AtlasSource,
 ) -> Result<SourceGpu, String> {
     let image = |levels: &[AtlasImageLevel], label| -> Result<wgpu::Texture, String> {
@@ -1879,7 +2077,46 @@ fn upload_source(
             f32_bytes(&[0.0; 4]),
             pack_fields(constants),
         ),
+        AtlasSource::World(_) => (
+            placeholder()?,
+            placeholder()?,
+            f32_bytes(&[0.0; 4]),
+            vec![0u8; FIELDS_CONSTANT_BYTES],
+        ),
     };
+    // World sources bake their Tier A fields over the next frames; other
+    // sources bind a small unused buffer.
+    let bake = match source {
+        AtlasSource::World(world) => Some(crate::tier_a::TierABake::new(
+            device,
+            queue,
+            tier_a,
+            &world.bake,
+        )?),
+        _ => None,
+    };
+    let world = bake.as_ref().map_or_else(
+        || {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Terrain atlas unused world fields"),
+                size: 16,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            })
+        },
+        |bake| bake.result().clone(),
+    );
+    let surface_bytes = match source {
+        AtlasSource::World(world) => world.surface.packed()?,
+        _ => vec![0u8; 16],
+    };
+    let surface = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Terrain atlas world surface"),
+        size: surface_bytes.len() as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&surface, 0, &surface_bytes);
     let profile_buffer = uniform(&profile_bytes, "Terrain atlas profile constants");
     let fields_buffer = uniform(&fields_bytes, "Terrain atlas field constants");
     let view =
@@ -1904,13 +2141,23 @@ fn upload_source(
                 binding: 3,
                 resource: fields_buffer.as_entire_binding(),
             },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: world.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: surface.as_entire_binding(),
+            },
         ],
     });
     Ok(SourceGpu {
         _textures: [macro_texture, detail_texture],
-        _constants: [profile_buffer, fields_buffer],
+        _constants: [profile_buffer, fields_buffer, surface],
         group,
         last_used: 0,
+        bake,
+        _world: world,
     })
 }
 
@@ -1981,6 +2228,7 @@ fn pack_tile(out: &mut Vec<u8>, job: &AtlasProduceJob) {
             detail_layers,
         } => (0u32, macro_layers.len() as u32, detail_layers.len() as u32),
         AtlasTileKind::Fields { .. } => (1, 0, 0),
+        AtlasTileKind::World { .. } => (2, 0, 0),
     };
     for value in [job.layer, kind, macro_count, detail_count] {
         out.extend_from_slice(&value.to_le_bytes());
@@ -2022,6 +2270,7 @@ fn pack_tile(out: &mut Vec<u8>, job: &AtlasProduceJob) {
             }
             weights = [band_weights[0], band_weights[1], band_weights[2], 0.0];
         }
+        AtlasTileKind::World { .. } => {}
     }
     for value in origins.iter().chain(&infos) {
         out.extend(f32_bytes(value));
@@ -2035,7 +2284,14 @@ fn pack_tile(out: &mut Vec<u8>, job: &AtlasProduceJob) {
         out.extend(f32_bytes(value));
     }
     out.extend(f32_bytes(&weights));
-    for value in [job.octaves.len() as u32, 0, 0, 0] {
+    let (mip_offset, mip_cells) = match job.kind {
+        AtlasTileKind::World {
+            mip_offset,
+            mip_cells,
+        } => (mip_offset, mip_cells),
+        _ => (0, 0),
+    };
+    for value in [job.octaves.len() as u32, 0, mip_offset, mip_cells] {
         out.extend_from_slice(&value.to_le_bytes());
     }
     debug_assert_eq!((out.len() - start) as u64, TILE_BYTES);
@@ -2064,7 +2320,7 @@ fn pack_octaves(octaves: &[AtlasOctave]) -> Vec<u8> {
 fn pack_instance(out: &mut Vec<u8>, instance: &AtlasInstance) {
     let c = instance.chart;
     let b = instance.body_to_view;
-    let rows: [[f32; 4]; 11] = [
+    let rows: [[f32; 4]; 12] = [
         [
             instance.anchor_view_m[0],
             instance.anchor_view_m[1],
@@ -2106,6 +2362,7 @@ fn pack_instance(out: &mut Vec<u8>, instance: &AtlasInstance) {
             instance.material.albedo[2],
             instance.material.brdf.shader_index(),
         ],
+        [if instance.ocean { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
     ];
     for row in &rows {
         out.extend(f32_bytes(row));

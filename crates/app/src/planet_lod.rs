@@ -14,6 +14,7 @@
 pub mod collision;
 pub mod producer;
 pub mod select;
+pub mod tier_a;
 
 use anyhow::{Context, Result, ensure};
 use astrum_math::{Direction3, FrameId, surface::CubePatchAddress};
@@ -183,6 +184,8 @@ struct BodyLod {
     stats: BodyStats,
     /// Read-back colliders; `None` without a collision policy.
     collision: Option<collision::BodyCollision>,
+    /// False while a world-map source's Tier A bake is still running.
+    world_ready: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, Serialize)]
@@ -373,6 +376,15 @@ impl PlanetLod {
         &self.drawn_bodies
     }
 
+    /// Mark world-map sources whose Tier A bake has completed (renderer keys).
+    pub fn receive_ready_sources(&mut self, ready: Vec<u64>) {
+        for lod in self.bodies.values_mut() {
+            if ready.contains(&lod.source_key) {
+                lod.world_ready = true;
+            }
+        }
+    }
+
     pub fn receive_bounds(&mut self, bounds: Vec<AtlasBounds>) {
         for result in bounds {
             let Some((body, slot, address)) = self.tokens.remove(&result.token) else {
@@ -463,6 +475,7 @@ impl PlanetLod {
         };
         let slot = self.next_slot;
         self.next_slot += 1;
+        let world_ready = !matches!(recipe, ProducerRecipe::World(_));
         self.bodies.insert(
             input.body,
             BodyLod {
@@ -481,6 +494,7 @@ impl PlanetLod {
                 first_complete_s: None,
                 last_active: self.frame,
                 stats: BodyStats::default(),
+                world_ready,
                 collision: self.collision_policy.map(|policy| {
                     collision::BodyCollision::new(collision::BodyColliders::new(
                         policy.physics_level(input.radius_m),
@@ -579,6 +593,11 @@ impl PlanetLod {
             frame
                 .sources
                 .push((lod.source_key, Arc::clone(&lod.source)));
+            // A world-map body draws as a plain sphere until its Tier A bake is
+            // complete; pushing its source above keeps the bake advancing.
+            if !lod.world_ready {
+                continue;
+            }
             let radius = input.radius_m;
             let data_offset = policy.data_level_offset();
             let ranges = lod_ranges(&policy, radius, focal);
@@ -720,6 +739,7 @@ impl PlanetLod {
                         radius,
                         now,
                         material: input.material,
+                        ocean: producer::has_ocean(&lod.recipe),
                         mode,
                         morph: true,
                     },
@@ -822,6 +842,7 @@ impl PlanetLod {
                             radius,
                             now,
                             material: input.material,
+                            ocean: producer::has_ocean(&lod.recipe),
                             mode,
                             morph: false,
                         };
@@ -1057,6 +1078,8 @@ struct NodeContext<'a> {
     radius: f64,
     now: Instant,
     material: SurfaceMaterial,
+    /// Flat water over ground below the reference radius.
+    ocean: bool,
     mode: u32,
     /// CDLOD morphing; uniform-detail shadow casters do not morph.
     morph: bool,
@@ -1140,6 +1163,7 @@ fn build_instance(
             arrival: arrival as f32,
             skirt_m: (c.policy.skirt_cells * cell) as f32,
             material: c.material,
+            ocean: c.ocean,
             mode: c.mode,
             // Shadow casters do not morph, so they need no edge snap.
             coarser_edges: if c.morph { selected.coarser_edges } else { 0 },
@@ -1388,6 +1412,7 @@ mod tests {
             last_active: 0,
             stats: BodyStats::default(),
             collision: None,
+            world_ready: true,
         }
     }
 
@@ -1630,6 +1655,7 @@ mod tests {
             radius,
             now: Instant::now(),
             material: Default::default(),
+            ocean: false,
             mode: 0,
             morph: true,
         };

@@ -1,0 +1,10 @@
+// Snow surface material (docs/ASTRUM_TERRAIN_PIPELINE.md §10.1, App. C.2).
+//
+// M1 (World map and planet editor) has no detail texture sets yet (M4, Surface),
+// so a material is its declared linear mean albedo; the snow rule paints it
+// directly. When textures arrive, astrum-cook verifies them against this mean.
+(
+    schema: 1,
+    name: "snow",
+    mean_albedo_linear: (0.80, 0.82, 0.86),
+)

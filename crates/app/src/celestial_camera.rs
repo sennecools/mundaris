@@ -114,6 +114,19 @@ impl TerrainAuthority {
     }
 }
 
+/// Lowest radius the body's surface can reach: the definition's conservative
+/// envelope (a bound, not a surface evaluation). Legacy terrain is constrained
+/// to a 10% radial envelope.
+fn lowest_surface_radius_m(definition: &TerrainAuthority, radius_m: f64) -> Result<f64> {
+    Ok(match definition {
+        TerrainAuthority::Compositional(definition) => {
+            astrum_world::terrain::SurfaceGenerator::new(definition, radius_m)?
+                .conservative_radius_envelope_m()[0]
+        }
+        TerrainAuthority::Legacy(_) => radius_m * 0.9,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CameraAttachment {
     System,
@@ -406,16 +419,11 @@ impl CelestialCamera {
             self.terrain_query_us += start.elapsed().as_secs_f64() * 1e6;
             self.terrain_query_count += 1;
             let Some(s) = queried else {
-                // Pending: keep this body's last surface for continuity, never
-                // below the far-field collider's lowest surface; with neither,
-                // the reference sphere stands in until the page arrives.
-                let last = self
-                    .clearance_sample
-                    .filter(|s| {
-                        s.body == body && self.sampled_definition.as_ref() == Some(&definition)
-                    })
-                    .map(|s| s.surface_radius_m);
-                let floor = match &self.surface {
+                // Pending: assume the lowest surface that can exist here (the
+                // far-field collider's minimum, else the definition's radius
+                // envelope), so a pending query never lifts the observer; the
+                // real surface takes over when its page arrives.
+                let far_field = match &self.surface {
                     SurfaceSource::Colliders(view) => {
                         astrum_world::terrain::surface_query::SurfaceQuery::far_field_bounds_m(
                             view, body, direction,
@@ -424,11 +432,9 @@ impl CelestialCamera {
                     }
                     SurfaceSource::CpuOracle => None,
                 };
-                let surface = match (last, floor) {
-                    (Some(last), Some(floor)) => last.max(floor),
-                    (Some(last), None) => last,
-                    (None, Some(floor)) => floor,
-                    (None, None) => radius,
+                let surface = match far_field {
+                    Some(floor) => floor,
+                    None => lowest_surface_radius_m(&definition, radius)?,
                 };
                 self.base_source = "terrain_pending";
                 return Ok(distance - surface);

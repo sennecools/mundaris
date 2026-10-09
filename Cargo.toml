@@ -6,8 +6,6 @@ members = [
     "crates/world",
     "crates/simulation",
     "crates/renderer",
-    "crates/terrain_bake",
-    "crates/terrain_fields",
 ]
 resolver = "3"
 
@@ -23,6 +21,7 @@ glam = "0.30"
 naga = { version = "30", features = ["wgsl-in"] }
 pollster = "0.4"
 png = "0.18"
+ron = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 thiserror = "2"

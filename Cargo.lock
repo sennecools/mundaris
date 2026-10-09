@@ -157,7 +157,6 @@ dependencies = [
  "astrum_math",
  "astrum_renderer",
  "astrum_simulation",
- "astrum_terrain_fields",
  "astrum_world",
  "base64",
  "criterion",
@@ -167,6 +166,7 @@ dependencies = [
  "glam",
  "png",
  "pollster",
+ "ron",
  "serde",
  "serde_json",
  "sha2",
@@ -217,36 +217,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "astrum_terrain_bake"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "png",
- "pollster",
- "serde",
- "serde_json",
- "sha2",
- "wgpu",
-]
-
-[[package]]
-name = "astrum_terrain_fields"
-version = "0.0.1"
-dependencies = [
- "serde",
- "serde_json",
- "sha2",
-]
-
-[[package]]
 name = "astrum_world"
 version = "0.0.1"
 dependencies = [
  "astrum_math",
- "astrum_terrain_fields",
  "criterion",
  "glam",
  "png",
+ "ron",
  "serde",
  "serde_json",
  "sha2",
@@ -297,6 +275,9 @@ name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "block-buffer"
@@ -2113,6 +2094,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
+name = "ron"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81116b9531d61eabc41aeb228e4b6b2435bcca3233b98cf3b3077d4e6e9debb3"
+dependencies = [
+ "bitflags 2.13.2",
+ "once_cell",
+ "serde",
+ "serde_derive",
+ "typeid",
+ "unicode-ident",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2617,6 +2612,12 @@ checksum = "cb30dbbd9036155e74adad6812e9898d03ec374946234fbcebd5dfc7b9187b90"
 dependencies = [
  "rustc-hash 2.1.3",
 ]
+
+[[package]]
+name = "typeid"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc7d623258602320d5c55d1bc22793b57daff0ec7efc270ea7d55ce1d5f5471c"
 
 [[package]]
 name = "typenum"

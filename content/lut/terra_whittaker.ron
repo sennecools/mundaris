@@ -1,0 +1,37 @@
+// Terra biome LUT metadata (docs/ASTRUM_TERRAIN_PIPELINE.md §10.3): the axes of
+// lut/terra_whittaker.png and the recipe it is generated from. Whittaker-style
+// anchors in temperature × moisture, blended with Gaussian weights in linear
+// colour. Regenerate the PNG with
+//   cargo run -p astrum_world --example biome_lut
+// A test checks the PNG still matches the recipe; once the PNG is painted by
+// hand, drop the recipe (set it to None) and the test skips the comparison.
+//
+// Colours are sRGB as seen from orbit (ground and vegetation together).
+#![enable(implicit_some)]
+(
+    schema: 1,
+    image: "lut/terra_whittaker.png",
+    // x axis; texel centres span this range.
+    temperature_c: (-40.0, 35.0),
+    // y axis, dry (0) to wet (1).
+    moisture: (0.0, 1.0),
+    recipe: (
+        size: 64,
+        sigma_temperature_c: 4.5,
+        sigma_moisture: 0.12,
+        anchors: [
+            (name: "polar_barren",         temperature_c: -25.0, moisture: 0.15, srgb: (0.50, 0.47, 0.42)),
+            (name: "tundra",               temperature_c: -10.0, moisture: 0.55, srgb: (0.42, 0.40, 0.32)),
+            (name: "cold_steppe",          temperature_c:   2.0, moisture: 0.10, srgb: (0.60, 0.55, 0.45)),
+            (name: "boreal_forest",        temperature_c:   0.0, moisture: 0.75, srgb: (0.17, 0.24, 0.15)),
+            (name: "temperate_grassland",  temperature_c:  12.0, moisture: 0.30, srgb: (0.50, 0.52, 0.30)),
+            (name: "temperate_forest",     temperature_c:  12.0, moisture: 0.65, srgb: (0.20, 0.32, 0.15)),
+            (name: "temperate_rainforest", temperature_c:  12.0, moisture: 0.95, srgb: (0.14, 0.27, 0.12)),
+            (name: "scrubland",            temperature_c:  19.0, moisture: 0.18, srgb: (0.66, 0.56, 0.38)),
+            (name: "hot_desert",           temperature_c:  27.0, moisture: 0.04, srgb: (0.80, 0.66, 0.45)),
+            (name: "savanna",              temperature_c:  26.0, moisture: 0.35, srgb: (0.58, 0.52, 0.28)),
+            (name: "tropical_seasonal",    temperature_c:  26.0, moisture: 0.65, srgb: (0.27, 0.36, 0.14)),
+            (name: "tropical_rainforest",  temperature_c:  26.0, moisture: 0.95, srgb: (0.11, 0.24, 0.08)),
+        ],
+    ),
+)

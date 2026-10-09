@@ -16,6 +16,7 @@ use super::{
         triplanar_weights,
     },
     noise::DetailNoise,
+    world_field::WorldField,
 };
 use glam::{DMat3, DVec3};
 use std::sync::Arc;
@@ -227,10 +228,21 @@ impl FieldsRecipe {
     }
 }
 
+/// WorldV1 production recipe: Tier A macro elevation from the mip matching the
+/// footprint (bicubic, slopes by central differences), plus detail noise.
+/// Holds the lazily baked oracle field; building it never bakes.
+#[derive(Debug, Clone)]
+pub struct WorldRecipe {
+    pub field: WorldField,
+    pub radius_m: f64,
+    pub detail_noise: Option<DetailNoise>,
+}
+
 #[derive(Debug, Clone)]
 pub enum ProducerRecipe {
     Profile(ProfileRecipe),
     Fields(Box<FieldsRecipe>),
+    World(Box<WorldRecipe>),
 }
 
 /// Band-limited derived sample. Height is the radial offset from the reference
@@ -247,6 +259,7 @@ impl ProducerRecipe {
         match self {
             Self::Profile(recipe) => recipe.radius_m,
             Self::Fields(recipe) => recipe.radius_m(),
+            Self::World(recipe) => recipe.radius_m,
         }
     }
 
@@ -255,6 +268,7 @@ impl ProducerRecipe {
         match self {
             Self::Profile(recipe) => recipe.detail_noise.as_ref(),
             Self::Fields(recipe) => recipe.detail_noise.as_ref(),
+            Self::World(recipe) => recipe.detail_noise.as_ref(),
         }
     }
 
@@ -280,6 +294,10 @@ impl ProducerRecipe {
                         .evaluate_weighted(n, None, Some(recipe.band_weights(texel_m)))?;
                 (height, gradient)
             }
+            Self::World(recipe) => {
+                let maps = recipe.field.maps()?;
+                maps.sample(maps.mip_for(texel_m, recipe.radius_m), n)
+            }
         };
         let (height_m, gradient) = match self.detail_noise() {
             Some(detail) => {
@@ -299,6 +317,25 @@ impl ProducerRecipe {
             gradient_m: gradient,
             normal,
         })
+    }
+
+    /// CPU reference for the albedo page (linear colour) at `texel_m`, for
+    /// recipes that own their colour (world maps); `None` otherwise. Water
+    /// below sea level (height < 0), else the biome tint with snow, from
+    /// the climate mips matching the footprint.
+    pub fn albedo(&self, direction: DVec3, texel_m: f64) -> Result<Option<[f64; 3]>, TerrainError> {
+        let Self::World(recipe) = self else {
+            return Ok(None);
+        };
+        let sample = self.evaluate(direction, texel_m)?;
+        let look = recipe.field.look();
+        if sample.height_m < 0.0 {
+            return Ok(Some(look.water(sample.height_m)));
+        }
+        let maps = recipe.field.maps()?;
+        let n = direction.normalize();
+        let (temperature, moisture) = maps.climate(maps.mip_for(texel_m, recipe.radius_m), n);
+        Ok(Some(look.land(temperature, moisture, n, sample.normal)))
     }
 }
 
@@ -438,6 +475,11 @@ impl SurfaceGenerator {
                     detail_noise: self.detail.clone(),
                 }))
             }
+            GeologicalField::World(field) => Ok(ProducerRecipe::World(Box::new(WorldRecipe {
+                field: field.clone(),
+                radius_m,
+                detail_noise: self.detail.clone(),
+            }))),
             _ => Err(TerrainError::InvalidConfig),
         }
     }

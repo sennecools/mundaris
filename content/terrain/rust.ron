@@ -1,0 +1,44 @@
+// Rust surface definition (shared test system).
+//
+// M1 (World map and planet editor), 2026-10-10: a Terra world-map body. Tier A
+// (continents, sea level, temperature, moisture) is baked on the GPU from the
+// archetype with this seed; band-limited detail noise adds ground texture.
+// Mountains and landforms arrive in M2 (Shape).
+#![enable(implicit_some)]
+(
+    schema: 1,
+    id: "terra-world-map",
+    revision: 3,
+    identity: 1381323604,
+    seed: 7,
+    algorithm: "WorldV1",
+    // Unused by WorldV1; kept because every surface definition carries one.
+    geology: (
+        version: 1,
+        age: (start: 0.12, span: 0.86),
+        activity_factor: (start: 0.55, span: 0.45),
+        resurfacing: (base: 0.08, age: 0.0, activity: 0.34, random: 0.0, age_complement: false),
+        impact_retention: (base: 0.52, age: 0.46, activity: 0.0, random: 0.0, age_complement: false),
+        relief_fraction: (base: 0.005, age: 0.003, activity: 0.0, random: 0.0, age_complement: false),
+        feature_scale_fraction: (start: 0.2, span: 0.16),
+        orientation_turns: (start: 0.0, span: 1.0),
+    ),
+    procedural: None,
+    profile: None,
+    material_composition: (0.1, 0.6),
+    material_contrast: 0.5,
+    detail_noise: (
+        version: 1,
+        seed_salt: 1,
+        base_wavelength_m: 32.0,
+        min_wavelength_m: 0.5,
+        lacunarity: 2.0,
+        gain: 0.5,
+        amplitude_m: 1.0,
+    ),
+    world: (
+        archetype: "archetypes/terra.ron",
+        // Planet editor overrides of sampled parameters, by name.
+        overrides: [],
+    ),
+)

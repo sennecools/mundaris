@@ -5,8 +5,8 @@
 //! tangent gradient describes the complete composed height field.
 
 use super::{GeologicalParameters, SurfaceAlgorithm, SurfaceQueryWork, TerrainError};
-use glam::{DMat3, DVec3};
 use astrum_math::noise::gradient_noise;
+use glam::{DMat3, DVec3};
 
 const MIN_EDGE_M: f64 = 8.0;
 const CELL_JITTER: f64 = 0.2;
@@ -81,7 +81,7 @@ impl GeologyField {
             // <= .84*(.07+.045+.025+.015)=.131. Total < 1.32.
             SurfaceAlgorithm::VolcanicV1 => 1.62,
             SurfaceAlgorithm::PreparedV1
-            | SurfaceAlgorithm::GraphV1
+            | SurfaceAlgorithm::WorldV1
             | SurfaceAlgorithm::RockyV3
             | SurfaceAlgorithm::RockyV4
             | SurfaceAlgorithm::RockyV5
@@ -182,7 +182,7 @@ impl GeologyField {
             SurfaceAlgorithm::IcyV1 => &icy_labels,
             SurfaceAlgorithm::VolcanicV1 => &volcanic_labels,
             SurfaceAlgorithm::PreparedV1
-            | SurfaceAlgorithm::GraphV1
+            | SurfaceAlgorithm::WorldV1
             | SurfaceAlgorithm::RockyV3
             | SurfaceAlgorithm::RockyV4
             | SurfaceAlgorithm::RockyV5
@@ -212,7 +212,7 @@ impl GeologyField {
                             edge * (0.13 + 0.06 * unit(key ^ 0x4943_595f_5241_4401)) * 1.75
                         }
                         SurfaceAlgorithm::PreparedV1
-                        | SurfaceAlgorithm::GraphV1
+                        | SurfaceAlgorithm::WorldV1
                         | SurfaceAlgorithm::RockyV3
                         | SurfaceAlgorithm::RockyV4
                         | SurfaceAlgorithm::RockyV5
@@ -231,7 +231,7 @@ impl GeologyField {
                     }
                     SurfaceAlgorithm::VolcanicV1 => true,
                     SurfaceAlgorithm::PreparedV1
-                    | SurfaceAlgorithm::GraphV1
+                    | SurfaceAlgorithm::WorldV1
                     | SurfaceAlgorithm::RockyV3
                     | SurfaceAlgorithm::RockyV4
                     | SurfaceAlgorithm::RockyV5
@@ -302,7 +302,7 @@ impl GeologyField {
             SurfaceAlgorithm::IcyV1 => 3,
             SurfaceAlgorithm::VolcanicV1 => 2,
             SurfaceAlgorithm::PreparedV1
-            | SurfaceAlgorithm::GraphV1
+            | SurfaceAlgorithm::WorldV1
             | SurfaceAlgorithm::RockyV3
             | SurfaceAlgorithm::RockyV4
             | SurfaceAlgorithm::RockyV5
@@ -373,7 +373,7 @@ impl GeologyField {
                     ]);
                 }
                 SurfaceAlgorithm::PreparedV1
-                | SurfaceAlgorithm::GraphV1
+                | SurfaceAlgorithm::WorldV1
                 | SurfaceAlgorithm::RockyV3
                 | SurfaceAlgorithm::RockyV4
                 | SurfaceAlgorithm::RockyV5
@@ -408,7 +408,7 @@ impl GeologyField {
             SurfaceAlgorithm::IcyV1 => self.icy(n, halo)?,
             SurfaceAlgorithm::VolcanicV1 => self.volcanic(n, halo)?,
             SurfaceAlgorithm::PreparedV1
-            | SurfaceAlgorithm::GraphV1
+            | SurfaceAlgorithm::WorldV1
             | SurfaceAlgorithm::RockyV3
             | SurfaceAlgorithm::RockyV4
             | SurfaceAlgorithm::RockyV5
@@ -1193,9 +1193,7 @@ fn algorithm_tag(algorithm: SurfaceAlgorithm) -> u64 {
     match algorithm {
         SurfaceAlgorithm::IcyV1 => 0x4943_595f_5631_0001,
         SurfaceAlgorithm::VolcanicV1 => 0x564f_4c43_5631_0001,
-        SurfaceAlgorithm::PreparedV1 | SurfaceAlgorithm::GraphV1 | SurfaceAlgorithm::RockyV3 => {
-            0x524f_434b_5900_0003
-        }
+        SurfaceAlgorithm::PreparedV1 | SurfaceAlgorithm::WorldV1 | SurfaceAlgorithm::RockyV3 => 0x524f_434b_5900_0003,
         SurfaceAlgorithm::RockyV4
         | SurfaceAlgorithm::RockyV5
         | SurfaceAlgorithm::IcyV2
@@ -1378,7 +1376,7 @@ mod tests {
                     SurfaceAlgorithm::IcyV1 => label.starts_with("icy-fracture-epoch3-"),
                     SurfaceAlgorithm::VolcanicV1 => label.starts_with("volcanic-epoch2-"),
                     SurfaceAlgorithm::PreparedV1
-                    | SurfaceAlgorithm::GraphV1
+                    | SurfaceAlgorithm::WorldV1
                     | SurfaceAlgorithm::RockyV3
                     | SurfaceAlgorithm::RockyV4
                     | SurfaceAlgorithm::RockyV5

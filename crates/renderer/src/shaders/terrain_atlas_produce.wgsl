@@ -15,7 +15,7 @@ struct Tile {
     band_cell: array<vec4<i32>, 6>,    // fields: base cell per band * 2 + layout
     band_frac: array<vec4<f32>, 6>,    // fields: base cell fraction, w = edge
     band_weight: vec4<f32>,            // fields: band footprint weights
-    noise: vec4<u32>,                  // x = detail octave count (origins in `octaves`)
+    noise: vec4<u32>,                  // x = detail octave count (origins in `octaves`); world: z = elevation mip offset, w = mip cells
 }
 
 struct Dispatch {
@@ -55,12 +55,29 @@ struct FieldsConstants {
 @group(0) @binding(5) var<storage, read> octaves: array<OctaveOrigin>;
 // Collision pages: (height, normal xyz) per sample (pipeline §15.1).
 @group(0) @binding(6) var<storage, read_write> collision_out: array<vec4<f32>>;
+// Page albedo: sRGB-encoded linear colour; alpha 1 where the page owns its
+// colour (world maps), 0 where the draw uses the instance material.
+@group(0) @binding(7) var albedo_out: texture_storage_2d_array<rgba8unorm, write>;
 @group(1) @binding(0) var macro_image: texture_2d<u32>;
 @group(1) @binding(1) var detail_image: texture_2d<u32>;
 @group(1) @binding(2) var<uniform> profile: ProfileConstants;
 @group(1) @binding(3) var<uniform> fields: FieldsConstants;
+// World sources: Tier A result fields (elevation mips; see tier_a.rs).
+@group(1) @binding(4) var<storage, read> world_fields: array<f32>;
+// World sources: surface colour constants and biome LUT (AtlasWorldSurface).
+@group(1) @binding(5) var<storage, read> world_surface: array<u32>;
 
 var<private> tile: Tile;
+// Face cells of the elevation mip sampled through cube_map.wgsl.
+var<private> cube_level_n: u32;
+
+fn cube_field(index: u32) -> f32 {
+    return world_fields[index];
+}
+
+fn cube_n() -> u32 {
+    return cube_level_n;
+}
 // Index of `tile` in the job list; its octave origins start at slot * MAX_OCTAVES.
 var<private> tile_slot: u32;
 const MAX_OCTAVES: u32 = 16u;
@@ -465,6 +482,32 @@ fn evaluate_fields(p: ChartPoint) -> HeightSample {
     return out;
 }
 
+// ---------------------------------------------------------------- world (Tier A)
+
+// glam's any_orthonormal_vector, as the CPU oracle (WorldMaps::sample) uses.
+fn any_orthonormal(d: vec3<f32>) -> vec3<f32> {
+    let sign = select(-1.0, 1.0, d.z >= 0.0);
+    let a = -1.0 / (sign + d.z);
+    return vec3<f32>(d.x * d.y * a, sign + d.y * d.y * a, -d.y);
+}
+
+// Bicubic macro elevation of the tile's mip and its tangent gradient (central
+// differences over a quarter texel), mirroring WorldMaps::sample.
+fn evaluate_world(p: ChartPoint) -> HeightSample {
+    cube_level_n = tile.noise.w;
+    let base = tile.noise.z;
+    let d = normalize(p.n);
+    let delta = 0.5 / f32(cube_level_n);
+    let e1 = any_orthonormal(d);
+    let e2 = cross(d, e1);
+    var out: HeightSample;
+    out.height = cube_sample(base, d, true);
+    let g1 = cube_sample(base, normalize(d + e1 * delta), true) - cube_sample(base, normalize(d - e1 * delta), true);
+    let g2 = cube_sample(base, normalize(d + e2 * delta), true) - cube_sample(base, normalize(d - e2 * delta), true);
+    out.gradient = (e1 * g1 + e2 * g2) / (2.0 * delta);
+    return out;
+}
+
 // ---------------------------------------------------------------- detail fBm
 
 // Band-limited fBm (pipeline §9.3, App. A.3). Band-limit weights are folded into
@@ -481,6 +524,74 @@ fn detail_fbm(local: vec3<f32>) -> vec4<f32> {
     return sum;
 }
 
+// ---------------------------------------------------------------- surface colour
+
+// World-map colour (pipeline §10, M1): biome LUT tint by temperature ×
+// moisture from the climate mips matching the node, snow by temperature and
+// slope, flat water below sea level. Mirrors `ProducerRecipe::albedo`.
+const SURFACE_LUT: u32 = 24u;
+
+fn surface_f32(i: u32) -> f32 {
+    return bitcast<f32>(world_surface[i]);
+}
+
+fn surface_vec3(i: u32) -> vec3<f32> {
+    return vec3<f32>(surface_f32(i), surface_f32(i + 1u), surface_f32(i + 2u));
+}
+
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    return select(pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)), c / 12.92, c <= vec3<f32>(0.04045));
+}
+
+fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
+    let x = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+    return select(1.055 * pow(x, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055), x * 12.92, x <= vec3<f32>(0.0031308));
+}
+
+fn lut_texel(i: u32, j: u32, n: u32) -> vec3<f32> {
+    let w = world_surface[SURFACE_LUT + j * n + i];
+    let c = vec3<f32>(f32(w & 255u), f32((w >> 8u) & 255u), f32((w >> 16u) & 255u)) / 255.0;
+    return srgb_to_linear(c);
+}
+
+fn biome_colour(t: f32, m: f32) -> vec3<f32> {
+    let n = world_surface[0];
+    let span = f32(n - 1u);
+    let x = clamp((t - surface_f32(4u)) / (surface_f32(5u) - surface_f32(4u)) * span, 0.0, span);
+    let y = clamp((m - surface_f32(6u)) / (surface_f32(7u) - surface_f32(6u)) * span, 0.0, span);
+    let x0 = min(u32(floor(x)), n - 2u);
+    let y0 = min(u32(floor(y)), n - 2u);
+    let fx = x - f32(x0);
+    let fy = y - f32(y0);
+    let top = mix(lut_texel(x0, y0, n), lut_texel(x0 + 1u, y0, n), fx);
+    let bottom = mix(lut_texel(x0, y0 + 1u, n), lut_texel(x0 + 1u, y0 + 1u, n), fx);
+    return mix(top, bottom, fy);
+}
+
+fn world_albedo(d: vec3<f32>, height: f32, normal: vec3<f32>) -> vec3<f32> {
+    if height < 0.0 {
+        let deep = 1.0 - exp(height / surface_f32(19u));
+        return mix(surface_vec3(16u), surface_vec3(20u), deep);
+    }
+    cube_level_n = tile.noise.w;
+    let stride = 6u * cube_level_n * cube_level_n;
+    let t = cube_sample(tile.noise.z + stride, d, false);
+    let m = cube_sample(tile.noise.z + 2u * stride, d, false);
+    let slope = acos(clamp(dot(normal, d), -1.0, 1.0));
+    let snow = (1.0 - smoothstep(surface_f32(8u) - surface_f32(9u), surface_f32(8u) + surface_f32(9u), t))
+        * (1.0 - smoothstep(surface_f32(10u), surface_f32(11u), slope));
+    return mix(biome_colour(t, m), surface_vec3(12u), snow);
+}
+
+// Page albedo texel for an evaluated sample `value` (normal, height) at `st`.
+fn page_albedo(st: vec2<f32>, value: vec4<f32>) -> vec4<f32> {
+    if tile.info.y != 2u {
+        return vec4<f32>(0.0);
+    }
+    let d = normalize(chart_point(st).n);
+    return vec4<f32>(linear_to_srgb(world_albedo(d, value.w, value.xyz)), 1.0);
+}
+
 // ---------------------------------------------------------------- entry points
 
 fn evaluate(st: vec2<f32>) -> vec4<f32> {
@@ -488,8 +599,10 @@ fn evaluate(st: vec2<f32>) -> vec4<f32> {
     var sample_value: HeightSample;
     if tile.info.y == 0u {
         sample_value = evaluate_profile(p);
-    } else {
+    } else if tile.info.y == 1u {
         sample_value = evaluate_fields(p);
+    } else {
+        sample_value = evaluate_world(p);
     }
     if tile.noise.x > 0u {
         // Split lattice: the CPU origin is the exact f64 chart centre n0 * R, so
@@ -526,6 +639,7 @@ fn produce_heights(@builtin(global_invocation_id) id: vec3<u32>) {
     if dispatch.side == dispatch.cells + 3u {
         // Normal map at geometry resolution shares this evaluation.
         textureStore(normal_out, vec2<i32>(id.xy), layer, vec4<f32>(value.xyz, 0.0));
+        textureStore(albedo_out, vec2<i32>(id.xy), layer, page_albedo(st, value));
     }
     // 4x4 min/max grid over the chart; samples on shared cell edges and the
     // border apron count towards every adjacent cell.
@@ -553,6 +667,7 @@ fn produce_normals(@builtin(global_invocation_id) id: vec3<u32>) {
     let st = (vec2<f32>(id.xy) - vec2<f32>(1.0)) / f32(dispatch.cells);
     let value = evaluate(st);
     textureStore(normal_out, vec2<i32>(id.xy), i32(tile.info.x), vec4<f32>(value.xyz, 0.0));
+    textureStore(albedo_out, vec2<i32>(id.xy), i32(tile.info.x), page_albedo(st, value));
 }
 
 // Collision page: (cells + 1)^2 samples at st = id / cells, read back to the

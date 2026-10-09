@@ -1498,7 +1498,18 @@ impl GravityOrbitsDemo {
                 color: presentation.color,
                 unlit: presentation.unlit,
                 selected: index == selected_index,
-                material: self.lighting.material(&presentation.semantic_id),
+                // A world-map body seen as a plain sphere shows its archetype's
+                // average colour (pipeline §6.1).
+                material: match body.surface_definition().and_then(|d| d.world()) {
+                    Some(world) => {
+                        let c = world.archetype.average_colour;
+                        astrum_renderer::SurfaceMaterial {
+                            albedo: [c.0, c.1, c.2],
+                            ..self.lighting.material(&presentation.semantic_id)
+                        }
+                    }
+                    None => self.lighting.material(&presentation.semantic_id),
+                },
                 emission_nits: if index == self.sun_index {
                     sun_disk_nits as f32
                 } else {
@@ -1585,6 +1596,8 @@ impl GravityOrbitsDemo {
             let _span = crate::engine_profile::span("Atlas terrain preparation");
             self.atlas
                 .receive_bounds(renderer.take_terrain_atlas_bounds());
+            self.atlas
+                .receive_ready_sources(renderer.take_terrain_ready_sources());
             // Read-back colliders (ADR 0023): store arrived pages and schedule
             // the pages under last frame's camera query misses.
             self.atlas
@@ -2018,7 +2031,11 @@ mod analytic_publication_tests {
             crate::celestial_camera::SurfaceSource::Colliders(_)
         ));
         let expected = DVec3::from_array(loaded.camera.position_body_m);
-        assert!((demo.camera.pose().position().local().metres() - expected).length() < 1e-8);
+        assert!(
+            (demo.camera.pose().position().local().metres() - expected).length() < 1e-8,
+            "{} vs {expected}",
+            demo.camera.pose().position().local().metres()
+        );
         let orientation = glam::DQuat::from_array(loaded.camera.orientation_xyzw);
         assert!(
             demo.camera
@@ -2037,7 +2054,11 @@ mod analytic_publication_tests {
             .cloned();
         demo.seek_seconds(15.0).unwrap();
         demo.update(Duration::from_millis(16));
-        assert!((demo.camera.pose().position().local().metres() - expected).length() < 1e-8);
+        assert!(
+            (demo.camera.pose().position().local().metres() - expected).length() < 1e-8,
+            "{} vs {expected}",
+            demo.camera.pose().position().local().metres()
+        );
         assert_eq!(
             demo.system
                 .body(demo.ids[loaded.initial_body_index])

@@ -6,16 +6,16 @@ publish = false
 
 [dependencies]
 astrum_math = { path = "../math" }
-astrum_terrain_fields = { path = "../terrain_fields" }
 thiserror.workspace = true
 glam.workspace = true
 sha2 = "=0.10.9"
 serde.workspace = true
 serde_json.workspace = true
+png.workspace = true
 
 [dev-dependencies]
+ron.workspace = true
 criterion.workspace = true
-png.workspace = true
 
 [[bench]]
 name = "celestial_system"

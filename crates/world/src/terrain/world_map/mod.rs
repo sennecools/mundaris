@@ -1,23 +1,15 @@
-//! L1 world map (`docs/PLANET_DATA_PIPELINE.md` §2, §5): per-body cube-map fields
-//! of macro elevation and biome weights at about 1 km/texel. The world map
-//! carries all relief above the 1–2 km band; library tiles only add detail.
+//! Cube-map world-map storage and the parked W1 Moon world-map bake.
 //!
-//! Generation is a deterministic CPU bake (`ai/tasks/stage2-world-map/PLAN.md`,
-//! W1 Moon world-map generation). Runtime composition (W3) is not implemented.
+//! `cube` is the shared cube-face field storage used by the Tier A world map
+//! (`docs/ASTRUM_TERRAIN_PIPELINE.md` §6). `moon` and `neukum` are the parked W1
+//! Moon bake (`ai/tasks/stage2-world-map/PLAN.md`), kept as starting material for
+//! M8 (Variety) crater and maria work.
 
-mod catalog;
-mod compose;
 mod cube;
-mod detail;
 mod moon;
 mod neukum;
 
-pub use catalog::{
-    BiomeCatalog, CATALOG_FORMAT, CatalogBiome, FieldRange, SubBiome, Variant, WorldField,
-};
-pub use compose::ComposedSurface;
 pub use cube::{CubeMap, locate, neighbours, texel_direction, texel_directions};
-pub use detail::{BUNDLE_FORMAT, DetailTile};
 pub use moon::{
     BIOMES as MOON_BIOMES, BakeStats, BasinRecipe, BiomeRecipe, CraterRecipe, CrustRecipe,
     DegradationRecipe, LavaRecipe, MareRecipe, MoonWorldMap, MoonWorldMapRecipe, MorphologyRecipe,

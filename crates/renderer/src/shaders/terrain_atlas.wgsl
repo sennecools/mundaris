@@ -16,6 +16,7 @@ struct Instance {
     parent: vec4<f32>,      // layer, rect origin xy, rect scale
     morph: vec4<f32>,       // morph start, morph end (view distance m), arrival fade, skirt depth m
     material: vec4<f32>,    // linear albedo rgb, w = BRDF (0 Lambert, 1 lunar-Lambert)
+    surface: vec4<f32>,     // x = flat ocean at height 0 (M1)
 }
 
 @group(0) @binding(0) var<uniform> projection: Projection;
@@ -28,6 +29,8 @@ struct Grid {
     draw: vec4<f32>, // draw grid cells
 }
 @group(1) @binding(4) var<uniform> grid: Grid;
+// Page albedo (sRGB-encoded; alpha 1 where the page owns its colour).
+@group(1) @binding(5) var albedo_atlas: texture_2d_array<f32>;
 
 fn height_at(layer: i32, st: vec2<f32>) -> f32 {
     let cells = grid.data.x;
@@ -89,6 +92,7 @@ struct VertexOut {
     @location(5) height: f32,
     @location(6) grid_st: vec2<f32>,
     @location(7) view_pos: vec3<f32>,
+    @location(8) ground: f32, // terrain height before the water clamp
 }
 
 @vertex
@@ -115,6 +119,11 @@ fn vs_main(@location(0) vertex: vec3<f32>, @builtin(instance_index) index: u32) 
     }
     let morphed = st - fract(g * 0.5) * (2.0 / cells) * morph;
     var height = blended_height(inst, morphed, morph);
+    let ground = height;
+    if inst.surface.x > 0.5 {
+        // Flat water: the drawn surface never dips below the reference radius.
+        height = max(height, 0.0);
+    }
     if vertex.z > 0.5 {
         height -= inst.morph.w;
     }
@@ -127,9 +136,14 @@ fn vs_main(@location(0) vertex: vec3<f32>, @builtin(instance_index) index: u32) 
     out.blend = vec2<f32>(inst.morph.z, morph);
     out.instance = index;
     out.height = height;
+    out.ground = ground;
     out.grid_st = morphed;
     out.view_pos = view_position;
     return out;
+}
+
+fn atlas_srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    return select(pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)), c / 12.92, c <= vec3<f32>(0.04045));
 }
 
 fn level_color(level: f32) -> vec3<f32> {
@@ -143,12 +157,24 @@ fn fs_main(input: VertexOut) -> SceneOut {
     let own_n = textureSampleLevel(normal_atlas, normal_sampler, input.own_uv, input.layers.x, 0.0).xyz;
     let parent_n = textureSampleLevel(normal_atlas, normal_sampler, input.parent_uv, input.layers.y, 0.0).xyz;
     let arrived = mix(parent_n, own_n, input.blend.x);
-    let normal = normalize(mix(arrived, parent_n, input.blend.y));
-    let n_view = normalize(inst.b2v_x.xyz * normal.x + inst.b2v_y.xyz * normal.y + inst.b2v_z.xyz * normal.z);
+    var normal = normalize(mix(arrived, parent_n, input.blend.y));
+    let own_a = textureSampleLevel(albedo_atlas, normal_sampler, input.own_uv, input.layers.x, 0.0);
+    let parent_a = textureSampleLevel(albedo_atlas, normal_sampler, input.parent_uv, input.layers.y, 0.0);
+    let page = mix(mix(parent_a, own_a, input.blend.x), parent_a, input.blend.y);
+    let albedo = mix(inst.material.rgb, atlas_srgb_to_linear(page.rgb), page.a);
+    let n0_view = inst.b2v_x.xyz * inst.n0.x + inst.b2v_y.xyz * inst.n0.y + inst.b2v_z.xyz * inst.n0.z;
+    let up = normalize(input.view_pos - (inst.anchor.xyz - n0_view * inst.anchor.w));
+    let water = inst.surface.x > 0.5 && input.ground < 0.0;
+    var n_view = normalize(inst.b2v_x.xyz * normal.x + inst.b2v_y.xyz * normal.y + inst.b2v_z.xyz * normal.z);
+    if water {
+        // Flat water surface: the sphere normal.
+        n_view = up;
+        normal = vec3<f32>(dot(inst.b2v_x.xyz, up), dot(inst.b2v_y.xyz, up), dot(inst.b2v_z.xyz, up));
+    }
     let mode = u32(inst.b2v_x.w + 0.5);
     var debug_color = vec3<f32>(-1.0);
     if mode == 1u {
-        debug_color = vec3<f32>(clamp(0.5 + input.height / 600.0, 0.0, 1.0));
+        debug_color = vec3<f32>(clamp(0.5 + input.ground / 600.0, 0.0, 1.0));
     } else if mode == 2u {
         debug_color = normal * 0.5 + vec3<f32>(0.5);
     } else if mode == 5u {
@@ -169,7 +195,5 @@ fn fs_main(input: VertexOut) -> SceneOut {
         out.ambient = vec4<f32>(0.0);
         return out;
     }
-    let n0_view = inst.b2v_x.xyz * inst.n0.x + inst.b2v_y.xyz * inst.n0.y + inst.b2v_z.xyz * inst.n0.z;
-    let up = normalize(input.view_pos - (inst.anchor.xyz - n0_view * inst.anchor.w));
-    return shade(input.view_pos, n_view, up, inst.material.rgb, inst.material.w, true);
+    return shade(input.view_pos, n_view, up, albedo, inst.material.w, true);
 }

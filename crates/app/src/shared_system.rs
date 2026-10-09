@@ -103,7 +103,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(clearance.clearance_m >= 1.0);
-        assert!(clearance.clearance_m < 10.0);
+        assert!(
+            clearance.clearance_m < 10.0,
+            "canonical clearance {clearance:?}"
+        );
         assert!(
             loaded
                 .presentation
@@ -125,7 +128,7 @@ mod tests {
         ] {
             assert!(local_path(root, invalid).is_err(), "{invalid}");
         }
-        assert!(local_path(root, "terrain/moon.json").is_ok());
+        assert!(local_path(root, "terrain/moon.ron").is_ok());
     }
 }
 #[derive(Debug, Deserialize)]
@@ -174,9 +177,22 @@ struct TerrainContent {
     /// Optional band-limited fBm detail layer (pipeline §9.3).
     #[serde(default)]
     detail_noise: Option<astrum_world::terrain::noise::DetailNoiseDefinition>,
+    /// Tier A world map of a `WorldV1` surface (pipeline §6, M1).
+    #[serde(default)]
+    world: Option<WorldContent>,
     material_composition: [f64; 2],
     material_contrast: f64,
 }
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorldContent {
+    /// Archetype RON file relative to the content root.
+    archetype: String,
+    /// Named `PlanetParams` overrides (planet editor saves).
+    #[serde(default)]
+    overrides: Vec<(String, f64)>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProfileContent {
@@ -249,14 +265,37 @@ fn bounded_bytes(path: &Path) -> Result<Vec<u8>> {
     );
     Ok(bytes)
 }
+/// Parse an authored definition: RON for `.ron` files (hand-authored data with
+/// comments), JSON otherwise. The hash covers the exact bytes read.
 fn parse<T: serde::de::DeserializeOwned>(path: &Path) -> Result<(T, String)> {
     let bytes = bounded_bytes(path)?;
     let hash = format!("{:x}", Sha256::digest(&bytes));
-    Ok((
-        serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?,
-        hash,
-    ))
+    let value = if path.extension().is_some_and(|e| e == "ron") {
+        ron::de::from_bytes(&bytes).with_context(|| format!("parsing {}", path.display()))?
+    } else {
+        serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?
+    };
+    Ok((value, hash))
 }
+/// Resolve an archetype's colour references: biome LUT metadata and image,
+/// snow material.
+fn world_look(
+    root: &Path,
+    archetype: &astrum_world::terrain::archetype::PlanetArchetype,
+) -> Result<astrum_world::terrain::world_field::WorldLook> {
+    use astrum_world::terrain::{
+        archetype::MaterialAsset,
+        biome_lut::{BiomeLut, LutMetadata},
+    };
+    let (metadata, _): (LutMetadata, _) = parse(&local_path(root, &archetype.biome_lut)?)?;
+    let image = bounded_bytes(&local_path(root, &metadata.image)?)?;
+    let lut = BiomeLut::from_png(&metadata, &image)
+        .with_context(|| format!("invalid biome LUT {}", metadata.image))?;
+    let (snow, _): (MaterialAsset, _) = parse(&local_path(root, &archetype.snow.material)?)?;
+    astrum_world::terrain::world_field::WorldLook::new(archetype, lut, &snow)
+        .context("invalid world colour")
+}
+
 fn local_path(root: &Path, relative: &str) -> Result<PathBuf> {
     let path = Path::new(relative);
     ensure!(
@@ -278,10 +317,22 @@ fn local_path(root: &Path, relative: &str) -> Result<PathBuf> {
     Ok(result)
 }
 
+/// Body-fixed rotation axis: the spin axis expressed in the body's rest frame.
+fn body_pole(body: &BodyContent) -> Result<glam::DVec3> {
+    let q = glam::DQuat::from_array(body.spin_orientation_xyzw);
+    let axis = glam::DVec3::from_array(body.spin_axis);
+    ensure!(
+        q.is_finite() && q.length() > 0.0 && axis.is_finite() && axis.length() > 0.0,
+        "invalid spin axis or orientation"
+    );
+    Ok((q.normalize().inverse() * axis).normalize())
+}
+
 fn terrain_definition(
     root: &Path,
     name: &str,
     radius_m: f64,
+    pole: glam::DVec3,
 ) -> Result<(SurfaceDefinition, String, u32)> {
     let (content, hash): (TerrainContent, _) = parse(&local_path(root, name)?)?;
     ensure!(
@@ -291,6 +342,7 @@ fn terrain_definition(
     let algorithm = match content.algorithm.as_str() {
         "MoonProfileV1" => SurfaceAlgorithm::MoonProfileV1,
         "MoonFieldsV1" => SurfaceAlgorithm::MoonFieldsV1,
+        "WorldV1" => SurfaceAlgorithm::WorldV1,
         _ => anyhow::bail!(
             "unsupported authored terrain algorithm {}",
             content.algorithm
@@ -327,6 +379,20 @@ fn terrain_definition(
     }
     if let Some(detail) = content.detail_noise {
         definition = definition.with_detail_noise(detail)?;
+    }
+    if let Some(world) = content.world {
+        let (archetype, _): (astrum_world::terrain::archetype::PlanetArchetype, _) =
+            parse(&local_path(root, &world.archetype)?)?;
+        let look = world_look(root, &archetype)?;
+        let world = astrum_world::terrain::world_field::WorldDefinition::new(
+            archetype,
+            look,
+            content.seed,
+            &world.overrides,
+            pole,
+        )
+        .context("invalid world map")?;
+        definition = definition.with_world(world)?;
     }
     if let Some(profile) = content.profile {
         let asset = local_path(root, &profile.asset)?;
@@ -432,7 +498,7 @@ impl SharedTestSystem {
             };
             if let Some(terrain) = &body.terrain {
                 let (definition, hash, revision) =
-                    terrain_definition(root, terrain, body.radius_m)?;
+                    terrain_definition(root, terrain, body.radius_m, body_pole(body)?)?;
                 system.edit_surface_definition(id, Some(definition))?;
                 style.definition_sha256 = Some(hash);
                 style.definition_revision = Some(revision);

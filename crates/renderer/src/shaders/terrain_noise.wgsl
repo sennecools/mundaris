@@ -63,3 +63,20 @@ fn split_gradient_noise(o: OctaveOrigin, local: vec3<f32>) -> vec4<f32> {
     }
     return vec4<f32>(value, gradient * o.freq);
 }
+
+// Quintic gradient noise at small absolute lattice coordinates `q` (planet-scale
+// fields, where |q| stays within a few hundred so f32 needs no lattice split).
+fn gradient_noise(q: vec3<f32>, seed: u32) -> f32 {
+    let fl = floor(q);
+    let cell = vec3<i32>(fl);
+    let t = q - fl;
+    let u = t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+    var value = 0.0;
+    for (var corner = 0u; corner < 8u; corner = corner + 1u) {
+        let c = vec3<u32>(corner & 1u, (corner >> 1u) & 1u, (corner >> 2u) & 1u);
+        let g = lattice_gradient(cell + vec3<i32>(c), seed);
+        let picked = select(vec3<f32>(1.0) - u, u, c == vec3<u32>(1u));
+        value += picked.x * picked.y * picked.z * dot(g, t - vec3<f32>(c));
+    }
+    return value;
+}

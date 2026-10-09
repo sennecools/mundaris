@@ -5,7 +5,7 @@ use anyhow::{Result, ensure};
 use astrum_math::surface::CubePatchAddress;
 use astrum_renderer::{
     AtlasChart, AtlasFieldsConstants, AtlasImageLevel, AtlasOctave, AtlasProfileLayer, AtlasSource,
-    AtlasTileKind, MAX_ATLAS_OCTAVES,
+    AtlasTileKind, AtlasWorldSource, MAX_ATLAS_OCTAVES,
 };
 use astrum_world::terrain::producer::{
     FieldsRecipe, MOON_FIELD_JITTER, MOON_FIELD_LAYOUT_SHIFTS, MOON_FIELD_SHELL,
@@ -60,6 +60,10 @@ pub fn atlas_source(recipe: &ProducerRecipe) -> Result<AtlasSource> {
             }
         }
         ProducerRecipe::Fields(fields) => AtlasSource::Fields(Box::new(fields_constants(fields))),
+        ProducerRecipe::World(world) => AtlasSource::World(Box::new(AtlasWorldSource {
+            bake: super::tier_a::bake_inputs(world.field.inputs()),
+            surface: super::tier_a::surface(world.field.look()),
+        })),
     })
 }
 
@@ -219,6 +223,15 @@ fn fields_kind(recipe: &FieldsRecipe, n0: DVec3, texel_m: f64) -> Result<AtlasTi
     })
 }
 
+/// World maps with a sea level draw flat water over ground below it.
+pub fn has_ocean(recipe: &ProducerRecipe) -> bool {
+    matches!(recipe, ProducerRecipe::World(world) if world
+        .field
+        .inputs()
+        .stages
+        .contains(&astrum_world::terrain::archetype::TierAStage::SeaLevel))
+}
+
 /// Producer parameters of one node at its nominal texel footprint.
 pub fn tile_kind(
     recipe: &ProducerRecipe,
@@ -231,6 +244,18 @@ pub fn tile_kind(
     match recipe {
         ProducerRecipe::Profile(profile) => Ok(profile_kind(profile, chart.n0, texel_m)),
         ProducerRecipe::Fields(fields) => fields_kind(fields, chart.n0, texel_m),
+        ProducerRecipe::World(world) => {
+            let cells = world.field.inputs().face_cells as u32;
+            let layout = astrum_renderer::tier_a::field_mip_layout(cells);
+            let base_texel = 2.0 * world.radius_m / f64::from(cells);
+            let level =
+                astrum_world::terrain::world_field::mip_for(texel_m, base_texel, layout.len());
+            let (mip_offset, mip_cells) = layout[level];
+            Ok(AtlasTileKind::World {
+                mip_offset,
+                mip_cells,
+            })
+        }
     }
 }
 
@@ -288,6 +313,6 @@ pub fn recipe_height_bound(recipe: &ProducerRecipe, generator_bound_m: f64) -> f
                 .map_or(0.0, astrum_world::terrain::noise::DetailNoise::bound_m);
             (macro_bound + detail_bound + noise_bound).min(generator_bound_m)
         }
-        ProducerRecipe::Fields(_) => generator_bound_m,
+        ProducerRecipe::Fields(_) | ProducerRecipe::World(_) => generator_bound_m,
     }
 }
