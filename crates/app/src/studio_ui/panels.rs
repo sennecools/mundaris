@@ -240,7 +240,7 @@ pub fn outliner(ui: &mut Ui, view: &StudioView, actions: &mut Vec<StudioAction>)
         });
     ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
         ui.label(
-            RichText::new("Click selects · double-click focuses")
+            RichText::new("Click selects · double-click focuses · Alt+click flies to a point")
                 .font(small())
                 .color(TEXT_DISABLED),
         );

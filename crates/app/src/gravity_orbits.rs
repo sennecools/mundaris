@@ -708,22 +708,14 @@ impl GravityOrbitsDemo {
         self.controls.gesture_dragged = false;
         let scale = self.controls.pixels_per_point;
         let pixels = [f64::from(pos[0]) * scale, f64::from(pos[1]) * scale];
-        let log = match self.fly_to(pixels) {
-            Ok(Some(text)) => (crate::studio::view::Tone::Normal, text),
-            Ok(None) => return,
-            Err(error) => (
+        match self.fly_to(pixels) {
+            Ok(Some(text)) => self.log(crate::studio::view::Tone::Normal, text),
+            Ok(None) => {}
+            Err(error) => self.log(
                 crate::studio::view::Tone::Warn,
                 format!("Fly to point failed: {error:#}"),
             ),
-        };
-        if self.controls.log.len() >= 200 {
-            self.controls.log.pop_front();
         }
-        self.controls.log.push_back(crate::studio::view::LogItem {
-            time: format!("{:>8.1} s", self.system.sample_time().seconds_since_epoch()),
-            text: log.1,
-            tone: log.0,
-        });
     }
 
     /// `None` when the pointer is not over a body with a surface.

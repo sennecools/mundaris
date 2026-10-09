@@ -88,6 +88,12 @@ const VIEW_MODES: &[&str] = &[
     "ao",
     "shadows",
     "luminance",
+    "elevation",
+    "ocean",
+    "temperature",
+    "moisture",
+    "wind",
+    "biome",
 ];
 const TONEMAPPERS: &[&str] = &["agx", "aces", "clamp"];
 const EXPOSURE_MODES: &[&str] = &["auto", "manual"];

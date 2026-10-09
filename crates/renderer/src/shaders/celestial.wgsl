@@ -20,7 +20,8 @@ struct VertexOutput {
 @fragment fn fs_main(input: VertexOutput) -> SceneOut {
     let n = normalize(input.normal);
     let mode = view_mode();
-    let debug = mode != VIEW_LIT && mode != VIEW_SHADOWS && mode != VIEW_UNLIT && mode < 10u;
+    // Modes 13.. are terrain field overlays (M1); spheres show flat colour.
+    let debug = (mode != VIEW_LIT && mode != VIEW_SHADOWS && mode != VIEW_UNLIT && mode < 10u) || mode >= 13u;
     if debug || draw.flags.x != 0u {
         var out: SceneOut;
         out.normal = encode_normal(n);
