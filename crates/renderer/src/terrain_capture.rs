@@ -32,10 +32,48 @@ pub struct TerrainCaptureRenderer {
 impl TerrainCaptureRenderer {
     /// Creates a fixed-size offscreen renderer, requesting a headless adapter/device.
     pub fn new(width: u32, height: u32) -> Result<Self, RenderPreparationError> {
-        pollster::block_on(Self::new_async(width, height))
+        pollster::block_on(Self::new_async(width, height, false))
     }
 
-    async fn new_async(width: u32, height: u32) -> Result<Self, RenderPreparationError> {
+    /// Same production path on the platform's software fallback adapter
+    /// (WARP on Windows): validation without occupying the GPU.
+    pub fn new_software(width: u32, height: u32) -> Result<Self, RenderPreparationError> {
+        pollster::block_on(Self::new_async(width, height, true))
+    }
+
+    /// Applies render settings to the capture renderer.
+    pub fn set_render_settings(
+        &mut self,
+        settings: crate::RenderSettings,
+    ) -> Result<(), RenderPreparationError> {
+        settings
+            .validate()
+            .map_err(|_| RenderPreparationError::InvalidBudget)?;
+        self.renderer.set_settings(&self.device, settings);
+        Ok(())
+    }
+
+    /// Builds the terrain atlas draw and shadow-caster pipelines without
+    /// drawing, so pipeline/layout validation runs on this device.
+    pub fn validate_terrain_pipelines(
+        &self,
+        config: crate::TerrainAtlasConfig,
+    ) -> Result<(), RenderPreparationError> {
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let result = crate::produce_for_validation(&self.device, &self.queue, config, &[], &[]);
+        if let Some(error) = pollster::block_on(scope.pop()) {
+            return Err(RenderPreparationError::GpuProgress(error.to_string()));
+        }
+        result
+            .map(|_| ())
+            .map_err(RenderPreparationError::GpuProgress)
+    }
+
+    async fn new_async(
+        width: u32,
+        height: u32,
+        fallback: bool,
+    ) -> Result<Self, RenderPreparationError> {
         if width == 0 || height == 0 {
             return Err(RenderPreparationError::InvalidBudget);
         }
@@ -43,7 +81,7 @@ impl TerrainCaptureRenderer {
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
-                force_fallback_adapter: false,
+                force_fallback_adapter: fallback,
                 compatible_surface: None,
                 apply_limit_buckets: false,
             })

@@ -30,7 +30,10 @@ pub(crate) struct SkyRenderer {
 }
 
 impl SkyRenderer {
-    pub(crate) fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+    /// `targets` are the main-pass colour attachments; the sky writes radiance
+    /// into the first and leaves the others untouched.
+    pub(crate) fn new(device: &wgpu::Device, targets: &[wgpu::TextureFormat]) -> Self {
+        let format = targets[0];
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Distant sky"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/sky.wgsl").into()),
@@ -196,7 +199,7 @@ impl SkyRenderer {
                         "background_fragment"
                     }),
                     compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
+                    targets: &std::iter::once(Some(wgpu::ColorTargetState {
                         format,
                         blend: if star {
                             Some(wgpu::BlendState {
@@ -215,7 +218,15 @@ impl SkyRenderer {
                             None
                         },
                         write_mask: wgpu::ColorWrites::ALL,
-                    })],
+                    }))
+                    .chain(targets[1..].iter().map(|&format| {
+                        Some(wgpu::ColorTargetState {
+                            format,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::empty(),
+                        })
+                    }))
+                    .collect::<Vec<_>>(),
                 }),
                 primitive: wgpu::PrimitiveState::default(),
                 depth_stencil: Some(wgpu::DepthStencilState {
@@ -252,7 +263,8 @@ impl SkyRenderer {
             texture_capacity_bytes: 8,
             sampler,
             resident: None,
-            target_srgb: format.is_srgb(),
+            // Float HDR targets hold linear radiance, like an sRGB view.
+            target_srgb: format.is_srgb() || format == wgpu::TextureFormat::Rgba16Float,
             report: SkyResourceReport::default(),
             resource_growth_events: 0,
             catalogue_upload_count: 0,

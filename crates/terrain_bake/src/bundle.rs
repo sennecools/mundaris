@@ -3,7 +3,9 @@
 
 use crate::bake::{BakeOutput, StageReport};
 use crate::derive::{DerivedFields, downsample};
+use crate::exemplar::{CREDIT, ExemplarRecipe};
 use crate::gpu::AdapterIdentity;
+use crate::pipeline::PipelineRecipe;
 use crate::preview;
 use crate::recipe::Recipe;
 use anyhow::{Context, Result, bail, ensure};
@@ -16,6 +18,11 @@ pub const FORMAT: &str = "mundaris.terrain-bundle.v1";
 pub const GENERATOR: &str = "mundaris_terrain_bake";
 pub const GENERATOR_VERSION: &str = "erosion-pipes-1";
 const METADATA_FILE: &str = "bundle.json";
+
+/// Provenance of bundles baked entirely from the recipe.
+pub const ORIGINAL: &str = "original-bake";
+/// Provenance of bundles whose heights derive from public-domain external data.
+pub const DERIVED: &str = "public-domain-derived";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -75,6 +82,9 @@ pub struct Metadata {
     pub generator_version: String,
     pub provenance: String,
     pub external_asset_dependencies: Vec<String>,
+    /// Attribution line required by `public-domain-derived` bundles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credit: Option<String>,
     pub seed: u64,
     pub recipe_sha256: String,
     pub recipe: serde_json::Value,
@@ -140,8 +150,95 @@ fn write_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     fs::write(dir.join(name), bytes).with_context(|| format!("writing {name}"))
 }
 
+/// What the bundle writer needs from either recipe schema (1: layered stages,
+/// 2: filter pipeline).
+pub struct RecipeInfo {
+    pub id: String,
+    pub seed: u64,
+    pub footprint_m: f64,
+    pub channel_resolution: u32,
+    /// `original-bake` or `public-domain-derived`.
+    pub provenance: String,
+    pub external_asset_dependencies: Vec<String>,
+    pub credit: Option<String>,
+    /// The recipe embedded verbatim in `bundle.json`.
+    pub value: serde_json::Value,
+}
+
+impl RecipeInfo {
+    pub fn layered(recipe: &Recipe) -> Result<Self> {
+        Ok(Self {
+            id: recipe.id.clone(),
+            seed: recipe.seed,
+            footprint_m: recipe.footprint_m,
+            channel_resolution: recipe.derived.channel_resolution,
+            provenance: ORIGINAL.into(),
+            external_asset_dependencies: Vec::new(),
+            credit: None,
+            value: serde_json::to_value(recipe)?,
+        })
+    }
+
+    pub fn pipeline(recipe: &PipelineRecipe) -> Result<Self> {
+        Ok(Self {
+            id: recipe.id.clone(),
+            seed: recipe.seed,
+            footprint_m: recipe.footprint_m,
+            channel_resolution: recipe.derived.channel_resolution,
+            provenance: if recipe.exemplar().is_some() {
+                DERIVED
+            } else {
+                ORIGINAL
+            }
+            .into(),
+            external_asset_dependencies: recipe
+                .exemplar()
+                .map(ExemplarRecipe::dependencies)
+                .unwrap_or_default(),
+            credit: recipe.exemplar().map(|_| CREDIT.to_string()),
+            value: serde_json::to_value(recipe)?,
+        })
+    }
+}
+
+/// What an embedded recipe implies for its bundle.
+struct Embedded {
+    output_resolution: u32,
+    channel_resolution: u32,
+    /// External dependencies the recipe declares (empty for original bakes).
+    dependencies: Vec<String>,
+}
+
+/// Validate an embedded recipe of either schema.
+fn embedded_recipe(value: &serde_json::Value) -> Result<Embedded> {
+    if value.get("schema").and_then(serde_json::Value::as_u64)
+        == Some(u64::from(crate::pipeline::PIPELINE_SCHEMA))
+    {
+        let recipe: PipelineRecipe = serde_json::from_value(value.clone())
+            .context("embedded pipeline recipe does not parse")?;
+        recipe.validate()?;
+        Ok(Embedded {
+            output_resolution: recipe.output_resolution(),
+            channel_resolution: recipe.derived.channel_resolution,
+            dependencies: recipe
+                .exemplar()
+                .map(ExemplarRecipe::dependencies)
+                .unwrap_or_default(),
+        })
+    } else {
+        let recipe: Recipe =
+            serde_json::from_value(value.clone()).context("embedded recipe does not parse")?;
+        recipe.validate()?;
+        Ok(Embedded {
+            output_resolution: recipe.output_resolution(),
+            channel_resolution: recipe.derived.channel_resolution,
+            dependencies: Vec::new(),
+        })
+    }
+}
+
 pub struct PublishInputs<'a> {
-    pub recipe: &'a Recipe,
+    pub recipe: &'a RecipeInfo,
     pub recipe_bytes: &'a [u8],
     pub output: &'a BakeOutput,
     pub derived: &'a DerivedFields,
@@ -171,6 +268,10 @@ pub fn publish(library_dir: &Path, inputs: &PublishInputs<'_>) -> Result<PathBuf
     let n = output.resolution as usize;
     let (min_m, max_m) = extrema(&output.height_m);
     let range_m = (max_m - min_m).max(1.0e-9);
+    // Library tiles are published about their relief midpoint (centred ±range/2),
+    // the datum the runtime profile sampler assumes (§3).
+    let midpoint_m = 0.5 * (min_m + max_m);
+    let offset_m = -0.5 * range_m;
     let mut height_bytes = Vec::with_capacity(n * n * 2);
     let mut max_error = 0.0f64;
     let mut decoded_min = f64::INFINITY;
@@ -179,15 +280,15 @@ pub fn publish(library_dir: &Path, inputs: &PublishInputs<'_>) -> Result<PathBuf
         let value = ((h - min_m) / range_m * 65535.0)
             .round()
             .clamp(0.0, 65535.0) as u16;
-        let decoded = min_m + f64::from(value) / 65535.0 * range_m;
-        max_error = max_error.max((decoded - h).abs());
+        let decoded = offset_m + f64::from(value) / 65535.0 * range_m;
+        max_error = max_error.max((decoded - (h - midpoint_m)).abs());
         decoded_min = decoded_min.min(decoded);
         decoded_max = decoded_max.max(decoded);
         height_bytes.extend_from_slice(&value.to_le_bytes());
     }
     write_file(&staging, "height.r16", &height_bytes)?;
 
-    let channel_n = inputs.recipe.derived.channel_resolution as usize;
+    let channel_n = inputs.recipe.channel_resolution as usize;
     let factor = n / channel_n;
     let wetness = downsample(&inputs.derived.wetness, n, factor);
     let exposure = downsample(&inputs.derived.exposure, n, factor);
@@ -202,7 +303,7 @@ pub fn publish(library_dir: &Path, inputs: &PublishInputs<'_>) -> Result<PathBuf
     write_file(&staging, "spawn.r8", &spawn_bytes)?;
 
     let side = output.resolution;
-    let channel_side = inputs.recipe.derived.channel_resolution;
+    let channel_side = inputs.recipe.channel_resolution;
     let channels = vec![
         Channel {
             file: "height.r16".into(),
@@ -251,11 +352,12 @@ pub fn publish(library_dir: &Path, inputs: &PublishInputs<'_>) -> Result<PathBuf
         bundle_id: recipe.id.clone(),
         generator: GENERATOR.into(),
         generator_version: GENERATOR_VERSION.into(),
-        provenance: "original-bake".into(),
-        external_asset_dependencies: Vec::new(),
+        provenance: recipe.provenance.clone(),
+        external_asset_dependencies: recipe.external_asset_dependencies.clone(),
+        credit: recipe.credit.clone(),
         seed: recipe.seed,
         recipe_sha256: Recipe::sha256(inputs.recipe_bytes),
-        recipe: serde_json::to_value(recipe)?,
+        recipe: recipe.value.clone(),
         footprint_m: recipe.footprint_m,
         resolution: side,
         spacing_m: output.cell_size_m,
@@ -263,7 +365,7 @@ pub fn publish(library_dir: &Path, inputs: &PublishInputs<'_>) -> Result<PathBuf
         row_order: "row-major; first row is v = 0; x increases with u".into(),
         wrap: "periodic".into(),
         height: HeightEncoding {
-            offset_m: min_m,
+            offset_m,
             range_m,
             decoded_min_m: decoded_min,
             decoded_max_m: decoded_max,
@@ -276,7 +378,10 @@ pub fn publish(library_dir: &Path, inputs: &PublishInputs<'_>) -> Result<PathBuf
             total_seconds: inputs.total_seconds,
             derive_seconds: inputs.derive_seconds,
             peak_gpu_allocated_bytes: inputs.peak_gpu_allocated_bytes,
-            stages: serde_json::to_value::<&[StageReport]>(&output.stages)?,
+            stages: match &output.reports {
+                Some(reports) => reports.clone(),
+                None => serde_json::to_value::<&[StageReport]>(&output.stages)?,
+            },
         },
     };
     write_file(
@@ -305,18 +410,55 @@ pub fn validate(dir: &Path) -> Result<Metadata> {
         metadata.wrap == "periodic",
         "library bundles must be periodic"
     );
+    let embedded = embedded_recipe(&metadata.recipe)?;
+    match metadata.provenance.as_str() {
+        ORIGINAL => ensure!(
+            metadata.external_asset_dependencies.is_empty() && embedded.dependencies.is_empty(),
+            "an original bake must not declare or use external assets"
+        ),
+        DERIVED => {
+            ensure!(
+                !metadata.external_asset_dependencies.is_empty(),
+                "a public-domain-derived bundle must list its external asset dependencies"
+            );
+            ensure!(
+                metadata
+                    .credit
+                    .as_deref()
+                    .is_some_and(|c| !c.trim().is_empty()),
+                "a public-domain-derived bundle must carry a credit"
+            );
+            ensure!(
+                metadata.external_asset_dependencies == embedded.dependencies,
+                "external_asset_dependencies do not match the sources of the embedded recipe"
+            );
+        }
+        other => bail!("unsupported provenance {other}"),
+    }
+    let (output_resolution, channel_side) =
+        (embedded.output_resolution, embedded.channel_resolution);
     ensure!(
-        metadata.provenance == "original-bake" && metadata.external_asset_dependencies.is_empty(),
-        "bundle must be an original bake without external assets"
-    );
-    let recipe: Recipe = serde_json::from_value(metadata.recipe.clone())
-        .context("embedded recipe does not parse")?;
-    recipe.validate()?;
-    ensure!(
-        recipe.output_resolution() == metadata.resolution,
+        output_resolution == metadata.resolution,
         "resolution mismatch"
     );
 
+    let expected_channels = [
+        ("height.r16", metadata.resolution, 1),
+        ("clim.rg8", channel_side, 2),
+        ("spawn.r8", channel_side, 1),
+    ];
+    ensure!(
+        metadata.channels.len() == expected_channels.len()
+            && metadata.channels.iter().zip(expected_channels).all(
+                |(c, (file, side, components))| {
+                    c.file == file
+                        && c.width == side
+                        && c.height == side
+                        && c.components == components
+                }
+            ),
+        "channels must be exactly height.r16, clim.rg8, spawn.r8 at the recipe resolutions"
+    );
     let mut height = None;
     for channel in &metadata.channels {
         let bytes = fs::read(dir.join(&channel.file))
@@ -351,6 +493,10 @@ pub fn validate(dir: &Path) -> Result<Metadata> {
     }
     let bytes = height.context("bundle has no height.r16 channel")?;
     let encoding = &metadata.height;
+    ensure!(
+        encoding.range_m > 0.0 && (encoding.offset_m + 0.5 * encoding.range_m).abs() < 1e-9,
+        "height encoding must be centred (offset_m = -range_m / 2)"
+    );
     let decoded: Vec<f64> = bytes
         .as_chunks::<2>()
         .0

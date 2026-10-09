@@ -3,6 +3,7 @@
 //! report interactions as [`StudioAction`]s; they hold no engine state.
 
 use egui::{Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, Stroke, Ui};
+use mundaris_app::render_settings::{SPECS, SettingKind, SettingValue};
 use mundaris_app::studio::view::{
     CAMERA_MODES, Overlay, RATE_PRESETS, StatItem, StudioAction, StudioView,
 };
@@ -22,6 +23,10 @@ fn view_mode_name(mode: TerrainViewMode) -> &'static str {
         TerrainViewMode::Grid => "Grid",
         TerrainViewMode::Level => "LOD level",
         TerrainViewMode::MorphFade => "Morph / fade",
+        TerrainViewMode::Unlit => "Unlit (albedo)",
+        TerrainViewMode::AoOnly => "AO only",
+        TerrainViewMode::Shadows => "Shadow cascades",
+        TerrainViewMode::Luminance => "Luminance (stops)",
     }
 }
 
@@ -312,7 +317,105 @@ pub fn inspector(
                     }
                 });
             });
+            render_card(ui, view, panel, actions);
         });
+}
+
+/// Render settings generated from the registry, grouped, plus per-pass GPU
+/// times. The view mode lives in the toolbar.
+fn render_card(
+    ui: &mut Ui,
+    view: &StudioView,
+    panel: &StudioView,
+    actions: &mut Vec<StudioAction>,
+) {
+    card(ui, "RENDER", |ui| {
+        for stat in &panel.render_stats {
+            stat_row(ui, stat);
+        }
+        let mut groups: Vec<&str> = Vec::new();
+        for spec in SPECS.iter().filter(|spec| spec.id != "render.view_mode") {
+            if !groups.contains(&spec.group) {
+                groups.push(spec.group);
+            }
+        }
+        for group in groups {
+            egui::CollapsingHeader::new(RichText::new(group).color(TEXT_SECONDARY))
+                .id_salt(("render-group", group))
+                .default_open(false)
+                .show(ui, |ui| {
+                    for (index, spec) in SPECS.iter().enumerate() {
+                        if spec.group != group || spec.id == "render.view_mode" {
+                            continue;
+                        }
+                        let Some(value) = view.render_settings.get(index).copied() else {
+                            continue;
+                        };
+                        if let Some(value) =
+                            setting_widget(ui, spec.id, spec.label, spec.kind, value)
+                        {
+                            actions.push(StudioAction::SetSetting(index, value));
+                        }
+                    }
+                });
+        }
+        if tool_button(ui, "Reset render settings", false).clicked() {
+            actions.push(StudioAction::ResetRenderSettings);
+        }
+    });
+}
+
+/// One registry widget; returns the new value when the user changed it.
+fn setting_widget(
+    ui: &mut Ui,
+    id: &str,
+    label: &str,
+    kind: SettingKind,
+    value: SettingValue,
+) -> Option<SettingValue> {
+    match (kind, value) {
+        (SettingKind::Bool, SettingValue::Bool(mut on)) => ui
+            .checkbox(&mut on, RichText::new(label).color(TEXT_PRIMARY))
+            .changed()
+            .then_some(SettingValue::Bool(on)),
+        (
+            SettingKind::Float {
+                min,
+                max,
+                logarithmic,
+                unit,
+            },
+            SettingValue::Float(mut x),
+        ) => {
+            ui.label(RichText::new(label).font(small()).color(TEXT_SECONDARY));
+            ui.spacing_mut().slider_width = (ui.available_width() - 70.0).max(60.0);
+            let slider = egui::Slider::new(&mut x, min..=max)
+                .logarithmic(logarithmic)
+                .suffix(if unit.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {unit}")
+                });
+            ui.add(slider).changed().then_some(SettingValue::Float(x))
+        }
+        (SettingKind::Choice(options), SettingValue::Choice(selected)) => {
+            let mut chosen = None;
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(label).color(TEXT_SECONDARY));
+                egui::ComboBox::from_id_salt(id)
+                    .selected_text(options.get(selected).copied().unwrap_or("—"))
+                    .show_ui(ui, |ui| {
+                        for (index, option) in options.iter().enumerate() {
+                            if ui.selectable_label(index == selected, *option).clicked() {
+                                chosen = Some(SettingValue::Choice(index));
+                            }
+                        }
+                    });
+            });
+            chosen
+        }
+        _ => None,
+    }
 }
 
 /// Status bar; returns true when the user stops an automation lease.

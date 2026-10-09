@@ -543,7 +543,7 @@ impl DeveloperService {
         let (status, data) = match &request.operation {
             DevOperation::Capabilities => (
                 "ok",
-                json!({"protocol_version":PROTOCOL_VERSION,"queue_capacity":REQUEST_CAPACITY,"applications_per_turn":COMMANDS_PER_TURN,"history_capacity":HISTORY_CAPACITY,"lease_seconds":LEASE_SECONDS,"native_capture":"on_demand_surface_copy","presets":["test-solar-system"],"actions":["profiler","select","focus","overview","look_at","navigation_mode","navigation","clearance","surface_pose","pause","rate","seek","single_step","reset","render_mode","layer","resident_cover_hold"]}),
+                json!({"protocol_version":PROTOCOL_VERSION,"queue_capacity":REQUEST_CAPACITY,"applications_per_turn":COMMANDS_PER_TURN,"history_capacity":HISTORY_CAPACITY,"lease_seconds":LEASE_SECONDS,"native_capture":"on_demand_surface_copy","presets":["test-solar-system"],"actions":["profiler","select","focus","overview","look_at","navigation_mode","navigation","clearance","surface_pose","pause","rate","seek","single_step","reset","render_mode","setting","reset_render_settings","layer","resident_cover_hold"]}),
             ),
             DevOperation::Inspect => {
                 let mut snapshot = self.current_observation(drawable, demo.world().revision());

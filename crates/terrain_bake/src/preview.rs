@@ -40,7 +40,9 @@ fn unit_u8(v: f64) -> u8 {
 
 /// Lambert shading of the height field lit from the north-west at 45 degrees.
 fn hillshade(height_m: &[f64], n: usize, cell_m: f64) -> Vec<f64> {
-    let light = [-0.5f64, 0.5, std::f64::consts::FRAC_1_SQRT_2];
+    // Light from the top-left of the image (north-west, rows grow southward):
+    // the cartographic convention, which avoids the crater/dome illusion.
+    let light = [-0.5f64, -0.5, std::f64::consts::FRAC_1_SQRT_2];
     let at = |x: usize, y: usize| height_m[(y % n) * n + (x % n)];
     let mut out = vec![0.0; n * n];
     for y in 0..n {
@@ -109,5 +111,44 @@ pub fn write_all(dir: &Path, output: &BakeOutput, derived: &DerivedFields) -> Re
         side,
         png::ColorType::Grayscale,
         &normalized_u8(&reduce(&output.erosion_delta_m)),
+    )
+}
+
+/// Hillshade and normalized height of a base field only (no erosion), for fast
+/// recipe authoring: `<stem>_hillshade.png` and `<stem>_height.png` in `dir`.
+pub fn write_base(dir: &Path, stem: &str, height_m: &[f64], n: usize, cell_m: f64) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let factor = (n / MAX_PREVIEW).max(1);
+    let side = n / factor;
+    let shade = hillshade(height_m, n, cell_m);
+    write_png(
+        &dir.join(format!("{stem}_hillshade.png")),
+        side,
+        png::ColorType::Grayscale,
+        &downsample(&shade, n, factor)
+            .iter()
+            .map(|&v| unit_u8(v))
+            .collect::<Vec<_>>(),
+    )?;
+    write_png(
+        &dir.join(format!("{stem}_height.png")),
+        side,
+        png::ColorType::Grayscale,
+        &normalized_u8(&downsample(height_m, n, factor)),
+    )
+}
+
+/// Hillshade of a height field to `path` (at most 1024² pixels).
+pub fn write_hillshade(path: &Path, height_m: &[f64], n: usize, cell_m: f64) -> Result<()> {
+    let factor = (n / MAX_PREVIEW).max(1);
+    let shade = hillshade(height_m, n, cell_m);
+    write_png(
+        path,
+        n / factor,
+        png::ColorType::Grayscale,
+        &downsample(&shade, n, factor)
+            .iter()
+            .map(|&v| unit_u8(v))
+            .collect::<Vec<_>>(),
     )
 }

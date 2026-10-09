@@ -31,13 +31,16 @@ fn topology_chordal_bound_reverse_depth_and_shaders() {
     }
     assert_eq!(projection.gpu_bytes().len(), 64);
     for shader in [
-        include_str!("../src/shaders/celestial.wgsl"),
-        include_str!("../src/shaders/celestial_trails.wgsl"),
+        concat!(
+            include_str!("../src/shaders/lighting.wgsl"),
+            include_str!("../src/shaders/celestial.wgsl")
+        ),
+        include_str!("../src/shaders/celestial_lines.wgsl"),
     ] {
         let module = naga::front::wgsl::parse_str(shader).unwrap();
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::empty(),
+            naga::valid::Capabilities::default(),
         )
         .validate(&module)
         .unwrap();
@@ -83,6 +86,8 @@ fn observer_relative_sphere_precision_markers_and_poison() {
                 color: [0.2, 0.6, 1.0, 1.0],
                 unlit: false,
                 selected: true,
+                material: Default::default(),
+                emission_nits: 0.0,
             };
             output.append_bodies(&[body]).unwrap();
             assert_eq!(output.report().triangles, 1280);

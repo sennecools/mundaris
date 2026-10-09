@@ -280,24 +280,27 @@ fn analytic_playback_trails_guides_and_selection_remain_separate_from_authority(
         before_hidden + 0.1
     );
 
-    demo.set_guide_reference(OrbitGuideReference::Explicit(rust))
+    // The Moon's authored orbit is around Rust (1/10 world-scale test system,
+    // GAME_AND_SYSTEM_DIRECTION.md); a guide relative to Sol is a non-authored
+    // alternate reference with a diagnostic instead of elements.
+    demo.set_guide_reference(OrbitGuideReference::Explicit(sol))
         .unwrap();
     let alternate = demo.guides().iter().find(|g| g.body == selected).unwrap();
-    assert_eq!(alternate.reference, Some(rust));
+    assert_eq!(alternate.reference, Some(sol));
     assert!(alternate.authored_orbit.is_none());
     assert!(alternate.elements.is_none());
     assert!(alternate.diagnostic.is_some());
-    demo.set_guide_reference(OrbitGuideReference::Explicit(sol))
+    demo.set_guide_reference(OrbitGuideReference::Explicit(rust))
         .unwrap();
     assert!(
         demo.guides()
             .iter()
-            .any(|g| g.body == selected && g.reference == Some(sol))
+            .any(|g| g.body == selected && g.reference == Some(rust))
     );
     let guide = demo
         .guides()
         .iter()
-        .find(|g| g.body == selected && g.reference == Some(sol))
+        .find(|g| g.body == selected && g.reference == Some(rust))
         .unwrap();
     let orbit = guide.authored_orbit.unwrap();
     let mut vertices = Vec::new();

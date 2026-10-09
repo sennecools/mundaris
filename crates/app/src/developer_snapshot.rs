@@ -351,6 +351,10 @@ pub struct DeveloperSnapshot {
     /// Atlas terrain runtime (ADR 0016).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terrain_atlas: Option<Value>,
+    /// Render registry listing and shadow cascade state
+    /// (docs/RENDER_PIPELINE_HDR.md §4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_settings: Option<Value>,
     /// Prepared authority identity; no sampling or generation during collection.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prepared_sources: Vec<Value>,
@@ -526,6 +530,7 @@ impl DeveloperSnapshot {
             motion: input.motion,
             development: None,
             terrain_atlas: None,
+            render_settings: None,
             prepared_sources: world
                 .bodies()
                 .enumerate()

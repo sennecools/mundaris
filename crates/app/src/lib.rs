@@ -26,6 +26,8 @@ pub mod planet_lod;
 pub mod playback_metrics;
 pub mod profile_export;
 pub mod profiler;
+pub mod render_settings;
+pub mod scene_lighting;
 pub mod shared_system;
 pub mod sky_definition;
 pub mod solar_system;

@@ -11,6 +11,7 @@ pub use crater::{CraterFeature, CraterFieldConfig};
 pub use moon::*;
 mod prepared;
 mod surface;
+pub mod world_map;
 pub use prepared::{PREPARED_SOURCE_CAP_BYTES, PreparedError, PreparedSample, PreparedSurface};
 pub(crate) use surface::PreparedPageKey;
 pub use surface::*;

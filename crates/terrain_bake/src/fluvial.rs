@@ -10,7 +10,7 @@
 //! drains to the fixed base-level outlet. Drainage-organized relief grows where
 //! the uplift field is high (Cordonnier et al. 2016).
 
-use crate::drainage::fill_from_outlets;
+use crate::drainage::{breach_from_outlets, fill_from_outlets};
 use crate::noise::pcg;
 use crate::recipe::FluvialRecipe;
 
@@ -39,6 +39,9 @@ pub struct FluvialInputs<'a> {
     /// Per-cell erodibility multiplier.
     pub erodibility_scale: &'a [f64],
     pub fill_slope: f64,
+    /// Drain depressions by breaching (carving the spill path) instead of
+    /// filling them, so no flat lake floors form.
+    pub breach: bool,
     pub seed: u32,
 }
 
@@ -121,6 +124,7 @@ pub fn erode(height: &mut [f64], inputs: &FluvialInputs<'_>, recipe: &FluvialRec
     let n = inputs.n;
     let cell_area = inputs.cell_m * inputs.cell_m;
     let mut area = vec![0.0; n * n];
+    let mut order = Vec::new();
     for _ in 0..inputs.iterations {
         // Base-level cells keep their height; all others receive uplift.
         for ((h, &outlet), &uplift) in height.iter_mut().zip(inputs.outlet).zip(inputs.uplift) {
@@ -128,18 +132,34 @@ pub fn erode(height: &mut [f64], inputs: &FluvialInputs<'_>, recipe: &FluvialRec
                 *h += recipe.dt * recipe.uplift_m_per_step * uplift;
             }
         }
-        fill_from_outlets(height, n, inputs.outlet, inputs.fill_slope * inputs.cell_m);
+        if inputs.breach {
+            breach_from_outlets(height, n, inputs.outlet, inputs.fill_slope * inputs.cell_m);
+        } else {
+            fill_from_outlets(height, n, inputs.outlet, inputs.fill_slope * inputs.cell_m);
+        }
         let (receiver, distance) =
             receivers(height, n, inputs.outlet, inputs.seed, recipe.routing_jitter);
         let stack = stack_order(&receiver);
         area.fill(cell_area);
-        for &cell in stack.iter().rev() {
-            let i = cell as usize;
-            let r = receiver[i] as usize;
-            if r != i {
-                area[r] += area[i];
+        if recipe.mfd_exponent > 0.0 {
+            mfd_area(
+                height,
+                n,
+                inputs.outlet,
+                recipe.mfd_exponent,
+                &mut area,
+                &mut order,
+            );
+        } else {
+            for &cell in stack.iter().rev() {
+                let i = cell as usize;
+                let r = receiver[i] as usize;
+                if r != i {
+                    area[r] += area[i];
+                }
             }
         }
+        let threshold_m = recipe.threshold_m_per_step * recipe.dt;
         for &cell in &stack {
             let i = cell as usize;
             let r = receiver[i] as usize;
@@ -153,7 +173,8 @@ pub fn erode(height: &mut [f64], inputs: &FluvialInputs<'_>, recipe: &FluvialRec
                 * area[i].powf(recipe.area_exponent)
                 / run_m;
             let solved = (height[i] + factor * height[r]) / (1.0 + factor);
-            height[i] = solved.min(height[r] + inputs.talus[i] * run_m);
+            let incision = (height[i] - solved - threshold_m).max(0.0);
+            height[i] = (height[i] - incision).min(height[r] + inputs.talus[i] * run_m);
         }
         diffuse(
             height,
@@ -161,6 +182,57 @@ pub fn erode(height: &mut [f64], inputs: &FluvialInputs<'_>, recipe: &FluvialRec
             inputs.outlet,
             recipe.dt * recipe.diffusion_m2_per_step / cell_area,
         );
+    }
+}
+
+/// Multiple-flow-direction drainage area (Freeman 1991 FD8): cells are visited
+/// from high to low and pass their area to every lower neighbour in proportion
+/// to tanβᵖ·L (L = contour length: 1/2 cardinal, √2/4 diagonal). `area` holds
+/// each cell's own area on entry. Depression filling guarantees every non-outlet
+/// cell has a lower neighbour.
+fn mfd_area(
+    height: &[f64],
+    n: usize,
+    outlet: &[bool],
+    exponent: f64,
+    area: &mut [f64],
+    order: &mut Vec<u32>,
+) {
+    order.clear();
+    order.extend(0..(n * n) as u32);
+    order.sort_unstable_by(|&a, &b| {
+        height[b as usize]
+            .total_cmp(&height[a as usize])
+            .then(a.cmp(&b))
+    });
+    let mut targets = [(0usize, 0.0f64); 8];
+    for &cell in order.iter() {
+        let i = cell as usize;
+        if outlet[i] {
+            continue;
+        }
+        let (x, y) = ((i % n) as i64, (i / n) as i64);
+        let mut count = 0;
+        let mut total = 0.0;
+        for &(dx, dy, d) in &OFFSETS {
+            let j =
+                (y + dy).rem_euclid(n as i64) as usize * n + (x + dx).rem_euclid(n as i64) as usize;
+            let drop = height[i] - height[j];
+            if drop > 0.0 {
+                let contour = if d > 1.0 { SQRT2 * 0.25 } else { 0.5 };
+                let w = (drop / d).powf(exponent) * contour;
+                targets[count] = (j, w);
+                count += 1;
+                total += w;
+            }
+        }
+        if total <= 0.0 {
+            continue;
+        }
+        let share = area[i] / total;
+        for &(j, w) in &targets[..count] {
+            area[j] += share * w;
+        }
     }
 }
 

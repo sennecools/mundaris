@@ -755,7 +755,9 @@ fn mcp_tools() -> Value {
             {"type":"object","properties":{"action":{"const":"single_step"},"forward":{"type":"boolean"}},"required":["action"],"additionalProperties":false},
             {"type":"object","properties":{"action":{"const":"reset"}},"required":["action"],"additionalProperties":false},
             {"type":"object","properties":{"action":{"const":"resident_cover_hold"},"enabled":{"type":"boolean"}},"required":["action","enabled"],"additionalProperties":false},
-            {"type":"object","properties":{"action":{"const":"render_mode"},"mode":{"enum":["lit","height","normals","grid","level","morph_fade"]}},"required":["action","mode"],"additionalProperties":false},
+            {"type":"object","properties":{"action":{"const":"render_mode"},"mode":{"enum":["lit","unlit","height","normals","grid","level","morph_fade","ao","shadows","luminance"]}},"required":["action","mode"],"additionalProperties":false},
+            {"type":"object","properties":{"action":{"const":"setting"},"id":{"type":"string","description":"Render registry id, e.g. render.shadows.softness; see render_settings.settings in mundaris_inspect."},"value":{"description":"Boolean, number, or option name per the setting kind."}},"required":["action","id","value"],"additionalProperties":false},
+            {"type":"object","properties":{"action":{"const":"reset_render_settings"}},"required":["action"],"additionalProperties":false},
             {"type":"object","properties":{"action":{"const":"layer"},"layer":{"enum":["terrain","markers","labels","trails","guides"]},"enabled":{"type":"boolean"}},"required":["action","layer","enabled"],"additionalProperties":false}
         ]
     });

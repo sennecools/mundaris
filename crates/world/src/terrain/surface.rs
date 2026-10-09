@@ -1797,8 +1797,24 @@ mod prepared_surface_tests {
                 let measured = profiled.evaluate_point(location).unwrap();
                 assert_bitwise_equal(reference, measured);
             }
+            // Exact counters: each sample is recorded only after its final
+            // material/normal stage completes.
+            assert_eq!(profiled.profile_stats().samples, 4);
+            assert_eq!(profiled.stats().sample_evaluations, 4);
+
+            // Single spans (notably material/normal, a few float ops) can be
+            // shorter than one timer tick, so assert accumulated time over
+            // enough distinct samples instead of four.
+            const TIMING_SAMPLES: u64 = 256;
+            for index in 0..TIMING_SAMPLES {
+                let location = SurfaceLocation::new(
+                    Direction3::try_new(fibonacci_direction(index, TIMING_SAMPLES)).unwrap(),
+                );
+                profiled.evaluate_point(location).unwrap();
+            }
             let profile = profiled.profile_stats();
-            assert_eq!(profile.samples, 4);
+            assert_eq!(profile.samples, 4 + TIMING_SAMPLES);
+            assert_eq!(profiled.stats().sample_evaluations, 4 + TIMING_SAMPLES);
             assert!(profile.surface_total_ns > 0);
             assert!(profile.legacy_history_ns > 0);
             assert!(profile.legacy_discovery_and_profile_ns > 0);
@@ -1806,7 +1822,13 @@ mod prepared_surface_tests {
             assert!(profile.province_exclusive_ns > 0);
             assert!(profile.hierarchy_exclusive_ns > 0);
             assert!(profile.final_material_normal_ns > 0);
-            assert_eq!(profiled.stats().sample_evaluations, 4);
         }
+    }
+
+    fn fibonacci_direction(index: u64, count: u64) -> DVec3 {
+        let z = 1.0 - (2.0 * index as f64 + 1.0) / count as f64;
+        let ring = (1.0 - z * z).sqrt();
+        let azimuth = index as f64 * std::f64::consts::PI * (3.0 - 5.0_f64.sqrt());
+        DVec3::new(ring * azimuth.cos(), ring * azimuth.sin(), z)
     }
 }

@@ -23,6 +23,7 @@ wgpu.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+png.workspace = true
 
 [[bench]]
 name = "view_preparation"

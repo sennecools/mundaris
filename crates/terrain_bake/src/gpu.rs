@@ -524,6 +524,7 @@ fn push_layer(bytes: &mut Vec<u8>, layer: &NoiseLayer, role: u32) {
     let kind = match layer.kind {
         NoiseKind::Fbm => 0u32,
         NoiseKind::Ridged => 1,
+        NoiseKind::Billow => 2,
     };
     for word in [kind, layer.frequency, layer.octaves, layer.lacunarity] {
         bytes.extend_from_slice(&word.to_le_bytes());
@@ -532,6 +533,11 @@ fn push_layer(bytes: &mut Vec<u8>, layer: &NoiseLayer, role: u32) {
         bytes.extend_from_slice(&(value as f32).to_le_bytes());
     }
     bytes.extend_from_slice(&role.to_le_bytes());
+    bytes.extend_from_slice(&u32::from(layer.rotate_octaves).to_le_bytes());
+    bytes.extend_from_slice(&(layer.slope_damping as f32).to_le_bytes());
+    for value in layer.domain.unwrap_or([[1, 0], [0, 1]]).as_flattened() {
+        bytes.extend_from_slice(&(*value as f32).to_le_bytes());
+    }
 }
 
 fn f32_bytes(values: &[f32]) -> Vec<u8> {

@@ -13,15 +13,21 @@ mod celestial_view;
 mod cpu_profile;
 mod debug;
 mod gpu_profile;
+mod lighting;
 #[cfg(feature = "developer-tools")]
 pub mod native_capture;
+mod post;
+mod render_settings;
+mod shadows;
 pub mod sky;
 pub mod terrain_atlas;
 #[cfg(feature = "terrain-capture")]
 pub mod terrain_capture;
 mod view;
 pub use celestial::*;
-pub use celestial_lines::{CelestialLineStyle, CelestialPolyline, PolylinePreparationReport};
+pub use celestial_lines::{
+    CelestialLineStyle, CelestialPolyline, LineStyleScale, PolylinePreparationReport,
+};
 pub use celestial_view::*;
 #[cfg(feature = "surface-profile")]
 pub use cpu_profile::CpuStageTimer;
@@ -29,10 +35,18 @@ pub use debug::{DebugFrame, DebugLine, DebugProjection, DebugStaging};
 pub use gpu_profile::{
     CpuUploadProfile, GpuProfile, GpuScopeSpan, TimestampAvailability, TimestampProfilingMetrics,
 };
+pub use lighting::{
+    Brdf, Cascades, FrameLighting, MAX_OCCLUDERS, ShadowView, SurfaceMaterial,
+    disk_visible_fraction, fit_cascades, shadow_range, slice_sphere,
+};
+pub use render_settings::{
+    AoSettings, BloomSettings, ExposureMode, ExposureSettings, LightingSettings, MAX_CASCADES,
+    OverlaySettings, RenderSettings, SHADOW_RESOLUTIONS, ShadowSettings, Tonemapper,
+};
 pub use terrain_atlas::{
     ATLAS_BOUNDS_GRID, AtlasBounds, AtlasChart, AtlasFieldsConstants, AtlasImageLevel,
-    AtlasInstance, AtlasProduceJob, AtlasProfileLayer, AtlasSampleSource, AtlasSource,
-    AtlasTileKind, MAX_ATLAS_JOBS_PER_FRAME, ProducedTileReadback, TerrainAtlasConfig,
+    AtlasInstance, AtlasProduceJob, AtlasProfileLayer, AtlasSampleSource, AtlasShadowFrame,
+    AtlasSource, AtlasTileKind, MAX_ATLAS_JOBS_PER_FRAME, ProducedTileReadback, TerrainAtlasConfig,
     TerrainAtlasFrame, TerrainAtlasReport, TerrainViewMode, produce_for_validation,
 };
 pub use view::*;
@@ -105,17 +119,23 @@ impl GpuContext {
     /// scene renderer needs (texture-array layers for the terrain atlas,
     /// timestamp queries when available).
     pub fn new() -> Result<Self, RendererError> {
-        pollster::block_on(Self::new_async())
+        pollster::block_on(Self::new_async(false))
     }
 
-    async fn new_async() -> Result<Self, RendererError> {
+    /// The platform's software fallback adapter (WARP on Windows): the full
+    /// production path for validation runs that must not occupy the GPU.
+    pub fn new_software() -> Result<Self, RendererError> {
+        pollster::block_on(Self::new_async(true))
+    }
+
+    async fn new_async(fallback: bool) -> Result<Self, RendererError> {
         // WGPU_BACKEND and related variables may select a backend for diagnosis.
         let instance =
             wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
-                force_fallback_adapter: false,
+                force_fallback_adapter: fallback,
                 compatible_surface: None,
                 apply_limit_buckets: false,
             })
@@ -210,6 +230,7 @@ pub struct Renderer {
     last_render_outcome: RenderOutcome,
     submission_id: u64,
     native_render_timings: NativeRenderTimings,
+    settings: RenderSettings,
     #[cfg(feature = "developer-tools")]
     native_capture: native_capture::NativeCapture,
     #[cfg(feature = "developer-tools")]
@@ -231,6 +252,7 @@ impl Renderer {
             last_render_outcome: RenderOutcome::default(),
             submission_id: 0,
             native_render_timings: NativeRenderTimings::default(),
+            settings: RenderSettings::default(),
             #[cfg(feature = "developer-tools")]
             native_capture: native_capture::NativeCapture::new(
                 adapter_info.name,
@@ -239,6 +261,30 @@ impl Renderer {
             #[cfg(feature = "developer-tools")]
             developer_timestamp_gate: gpu_profile::DeveloperTimestampGate::default(),
         }
+    }
+
+    /// Applies render settings from the next frame on. Invalid settings are
+    /// rejected and the previous settings stay in effect.
+    pub fn set_render_settings(&mut self, settings: RenderSettings) -> Result<(), String> {
+        settings.validate()?;
+        if settings != self.settings {
+            self.settings = settings;
+            if let Some(celestial) = &mut self.celestial {
+                celestial.set_settings(&self.device, settings);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn render_settings(&self) -> RenderSettings {
+        self.settings
+    }
+
+    /// Cascades and caster counts of the latest celestial frame.
+    pub fn shadow_report(&self) -> ShadowReport {
+        self.celestial
+            .as_ref()
+            .map_or_else(Default::default, |c| c.shadow_report())
     }
 
     /// CPU wall scopes for the latest submitted scene frame; GPU times are separate.
@@ -535,14 +581,17 @@ impl Renderer {
         }
         let mut scope_mask = 0;
         if let Some(frame) = celestial_frame {
+            let settings = self.settings;
             let celestial = self.celestial.get_or_insert_with(|| {
-                celestial::CelestialRenderer::new(
+                let mut renderer = celestial::CelestialRenderer::new(
                     &self.device,
                     &self.queue,
                     SCENE_RENDER_FORMAT,
                     width,
                     height,
-                )
+                );
+                renderer.set_settings(&self.device, settings);
+                renderer
             });
             let draw_result = celestial.draw(
                 &self.device,

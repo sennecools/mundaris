@@ -9,6 +9,8 @@ use crate::recipe::{Process, Recipe};
 
 /// Seed role for fluvial routing jitter (distinct from noise roles).
 const ROUTING_ROLE: u32 = 32;
+/// Seed role for gully filter pivots.
+const GULLY_ROLE: u32 = 33;
 use anyhow::{Result, anyhow, ensure};
 use serde::Serialize;
 use std::time::Instant;
@@ -41,6 +43,8 @@ pub struct BakeOutput {
     /// Final stage output minus final stage input (positive = deposition).
     pub erosion_delta_m: Vec<f64>,
     pub stages: Vec<StageReport>,
+    /// Per-stage reports of a filter pipeline (schema 2); `None` for schema 1.
+    pub reports: Option<serde_json::Value>,
 }
 
 fn relief(values: &[f64]) -> f64 {
@@ -50,6 +54,62 @@ fn relief(values: &[f64]) -> f64 {
             (lo.min(v), hi.max(v))
         });
     hi - lo
+}
+
+/// Base height (m), hardness and optional uplift at one stage resolution: the
+/// node graph on the CPU, or the layered recipe on the GPU.
+type BaseStage = (Vec<f64>, Vec<f32>, Option<Vec<f64>>);
+
+fn evaluate_base(recipe: &Recipe, gpu: &mut Gpu, resolution: u32) -> Result<BaseStage> {
+    if let Some(graph) = &recipe.graph {
+        let program = crate::graph::Program::compile(graph, recipe.footprint_m, recipe.seed)?;
+        let fields = program.evaluate(resolution as usize);
+        return Ok((fields.height_m, fields.hardness, fields.uplift));
+    }
+    let base = recipe
+        .base
+        .as_ref()
+        .ok_or_else(|| anyhow!("recipe has neither base nor graph"))?;
+    let (height, hardness) = gpu.base(base, recipe.seed, resolution)?;
+    Ok((
+        height.iter().map(|&v| f64::from(v)).collect(),
+        hardness,
+        None,
+    ))
+}
+
+/// Base-level cells. With `points == 0`, every cell at or below the level; else
+/// the `points` lowest 8-neighbour local minima at or below it (ties broken by
+/// index), so the outlet is a set of point sinks rather than a flat floor.
+pub fn outlet_mask(height: &[f64], n: usize, level: Option<f64>, points: u32) -> Vec<bool> {
+    let Some(level) = level else {
+        return vec![false; n * n];
+    };
+    if points == 0 {
+        return height.iter().map(|&h| h <= level).collect();
+    }
+    let wrap = |v: i64| v.rem_euclid(n as i64) as usize;
+    let mut minima: Vec<usize> = (0..n * n)
+        .filter(|&i| {
+            let h = height[i];
+            if h > level {
+                return false;
+            }
+            let (x, y) = ((i % n) as i64, (i / n) as i64);
+            (-1..=1i64).all(|dy| {
+                (-1..=1i64).all(|dx| {
+                    let j = wrap(y + dy) * n + wrap(x + dx);
+                    j == i || h < height[j] || (h == height[j] && i < j)
+                })
+            })
+        })
+        .collect();
+    minima.sort_unstable_by(|&a, &b| height[a].total_cmp(&height[b]).then(a.cmp(&b)));
+    let mut mask = vec![false; n * n];
+    for &i in minima.iter().take(points as usize) {
+        mask[i] = true;
+    }
+    mask
 }
 
 /// Periodic Catmull-Rom upsample of an `n²` grid to `2n²` at pixel centres.
@@ -103,8 +163,7 @@ pub fn bake(recipe: &Recipe, gpu: &mut Gpu) -> Result<BakeOutput> {
         let n = stage.resolution as usize;
         let cell_m = recipe.cell_size_m(stage.resolution);
         let started = Instant::now();
-        let (base_f32, hardness) = gpu.base(&recipe.base, recipe.seed, stage.resolution)?;
-        let base: Vec<f64> = base_f32.iter().map(|&v| f64::from(v)).collect();
+        let (base, hardness, graph_uplift) = evaluate_base(recipe, gpu, stage.resolution)?;
         let base_seconds = started.elapsed().as_secs_f64();
 
         let mut input_m: Vec<f64> = match &previous {
@@ -125,15 +184,29 @@ pub fn bake(recipe: &Recipe, gpu: &mut Gpu) -> Result<BakeOutput> {
                     .collect()
             }
         };
+        if stage.gullies
+            && let Some(gully_recipe) = &recipe.gullies
+        {
+            crate::gullies::apply(
+                &mut input_m,
+                n,
+                cell_m,
+                gully_recipe,
+                crate::noise::layer_seed(recipe.seed, GULLY_ROLE, stage.resolution),
+            );
+        }
         let input_min_m = input_m.iter().copied().fold(f64::INFINITY, f64::min);
         let outlet_level_m = (recipe.hydraulic.outlet_fraction > 0.0)
             .then(|| input_min_m + recipe.hydraulic.outlet_fraction * relief(&input_m));
-        let outlet: Vec<bool> = input_m
-            .iter()
-            .map(|&h| outlet_level_m.is_some_and(|level| h <= level))
-            .collect();
+        let outlet = outlet_mask(&input_m, n, outlet_level_m, recipe.hydraulic.outlet_points);
         let mut filled_cells = 0;
-        if outlet_level_m.is_some() && recipe.hydraulic.fill_slope > 0.0 {
+        // Only stream-power routing needs depression-free ground; hydraulic water
+        // ponds and evaporates on its own, and filling there floods basins
+        // dammed by re-injected detail into flat lake floors.
+        if stage.process == Process::Fluvial
+            && outlet_level_m.is_some()
+            && recipe.hydraulic.fill_slope > 0.0
+        {
             filled_cells = fill_from_outlets(
                 &mut input_m,
                 n,
@@ -153,7 +226,8 @@ pub fn bake(recipe: &Recipe, gpu: &mut Gpu) -> Result<BakeOutput> {
                         (lo.min(v), hi.max(v))
                     });
                 let span = (hi - lo).max(1.0e-12);
-                let uplift: Vec<f64> = base.iter().map(|b| (b - lo) / span).collect();
+                let uplift: Vec<f64> =
+                    graph_uplift.unwrap_or_else(|| base.iter().map(|b| (b - lo) / span).collect());
                 let (hlo, hhi) = hardness
                     .iter()
                     .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &v| {
@@ -184,6 +258,7 @@ pub fn bake(recipe: &Recipe, gpu: &mut Gpu) -> Result<BakeOutput> {
                         talus: &talus,
                         erodibility_scale: &erodibility_scale,
                         fill_slope: recipe.hydraulic.fill_slope,
+                        breach: false,
                         seed: crate::noise::layer_seed(recipe.seed, ROUTING_ROLE, stage.resolution),
                     },
                     &recipe.fluvial,
@@ -266,6 +341,7 @@ pub fn bake(recipe: &Recipe, gpu: &mut Gpu) -> Result<BakeOutput> {
         height_m,
         erosion_delta_m,
         stages,
+        reports: None,
     })
 }
 

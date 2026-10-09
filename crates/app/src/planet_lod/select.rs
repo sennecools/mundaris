@@ -94,6 +94,10 @@ pub fn angular_radius(chart: &NodeChart) -> f64 {
 #[derive(Debug, Clone, Copy)]
 pub struct Frustum {
     planes: [DVec3; 4],
+    /// Accept every direction.
+    all: bool,
+    /// Cull against one sun shadow cascade's light-space box instead.
+    cascade: Option<(mundaris_renderer::Cascades, usize)>,
 }
 
 impl Frustum {
@@ -108,10 +112,37 @@ impl Frustum {
                 plane(DVec3::new(0.0, 1.0, ty)),
                 plane(DVec3::new(0.0, -1.0, ty)),
             ],
+            all: false,
+            cascade: None,
+        }
+    }
+
+    /// Frustum that culls nothing.
+    pub fn everything() -> Self {
+        Self {
+            planes: [DVec3::ZERO; 4],
+            all: true,
+            cascade: None,
+        }
+    }
+
+    /// Casters of one shadow cascade: inside its light-space box, including
+    /// off-screen terrain between receivers and the sun.
+    pub fn cascade(cascades: mundaris_renderer::Cascades, index: usize) -> Self {
+        Self {
+            planes: [DVec3::ZERO; 4],
+            all: false,
+            cascade: Some((cascades, index)),
         }
     }
 
     pub fn intersects(&self, centre_view: DVec3, radius: f64) -> bool {
+        if self.all {
+            return true;
+        }
+        if let Some((cascades, index)) = &self.cascade {
+            return cascades.may_cast(*index, centre_view, radius);
+        }
         if centre_view.z - radius > 0.0 {
             return false;
         }

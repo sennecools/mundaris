@@ -19,8 +19,8 @@ use glam::{DMat3, DVec3};
 use mundaris_math::{Direction3, FrameId, surface::CubePatchAddress};
 use mundaris_renderer::{
     AtlasBounds, AtlasInstance, AtlasProduceJob, AtlasSampleSource, AtlasSource,
-    CelestialProjection, MAX_ATLAS_JOBS_PER_FRAME, PreparedView, TerrainAtlasConfig,
-    TerrainAtlasFrame,
+    CelestialProjection, MAX_ATLAS_JOBS_PER_FRAME, PreparedView, ShadowView, SurfaceMaterial,
+    TerrainAtlasConfig, TerrainAtlasFrame,
 };
 use mundaris_world::{
     BodyId,
@@ -198,6 +198,8 @@ pub struct BodyStats {
     pub fading: usize,
     /// Distinct data tiles sampled by drawn nodes (own and parent sources).
     pub data_tiles_in_use: usize,
+    /// Sun shadow caster instances drawn from resident data.
+    pub shadow_casters: usize,
 }
 
 /// One body to consider this frame.
@@ -207,7 +209,15 @@ pub struct AtlasBodyInput<'a> {
     pub definition: &'a SurfaceDefinition,
     pub radius_m: f64,
     pub revision: u64,
-    pub sun_body: DVec3,
+    pub material: SurfaceMaterial,
+}
+
+/// Sun shadow inputs of one frame: render settings and the sun position.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShadowCasterPolicy {
+    pub settings: mundaris_renderer::ShadowSettings,
+    /// Sun centre in view metres (the effective light, studio or star).
+    pub sun_centre_view_m: DVec3,
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -221,7 +231,6 @@ pub struct FrameSample {
 
 pub struct PlanetLod {
     pub enabled: bool,
-    pub debug_mode: Option<u32>,
     pub hold: bool,
     policy: Option<LodPolicy>,
     bodies: HashMap<BodyId, BodyLod>,
@@ -250,11 +259,6 @@ impl PlanetLod {
     pub fn new(policy: Option<LodPolicy>) -> Self {
         Self {
             enabled: policy.is_some(),
-            // Developer diagnostic: force an atlas debug view (1 height, 2 normals,
-            // 5 grid, 6 levels, 8 morph/fade) for every frame.
-            debug_mode: std::env::var("MUNDARIS_ATLAS_DEBUG")
-                .ok()
-                .and_then(|value| value.parse().ok()),
             hold: false,
             policy,
             bodies: HashMap::new(),
@@ -412,6 +416,7 @@ impl PlanetLod {
         bodies: &[AtlasBodyInput<'_>],
         render_mode: u32,
         layer_limit: u32,
+        shadows: Option<ShadowCasterPolicy>,
     ) -> Result<TerrainAtlasFrame> {
         let started = Instant::now();
         self.frame += 1;
@@ -424,7 +429,24 @@ impl PlanetLod {
         let viewport = projection.viewport();
         let focal = projection.focal_pixels();
         let frustum = select::Frustum::new(focal, [f64::from(viewport[0]), f64::from(viewport[1])]);
-        let mode = self.debug_mode.unwrap_or(render_mode);
+        let mode = render_mode;
+        // Cascaded shadows go to the drawable surface nearest the camera.
+        let shadow_body = if shadows.is_some() {
+            bodies
+                .iter()
+                .filter_map(|input| {
+                    let observer = view
+                        .prepare_source(input.body_fixed_frame)
+                        .ok()?
+                        .observer_in_source()
+                        .metres();
+                    Some((input.body, observer.length() - input.radius_m))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(body, _)| body)
+        } else {
+            None
+        };
         let mut frame = TerrainAtlasFrame {
             config: Some(config),
             ..Default::default()
@@ -592,91 +614,128 @@ impl PlanetLod {
                 ..BodyStats::default()
             };
             for selected in &selection.selected {
-                let address = selected.address;
-                let data = data_address(address, data_offset);
-                let Some((owner, owner_node)) = finest_resident(&lod.nodes, data) else {
+                let Some(built) = build_instance(
+                    &lod.nodes,
+                    selected.address,
+                    &NodeContext {
+                        data_offset,
+                        policy: &policy,
+                        ranges: &ranges,
+                        body_to_view,
+                        observer,
+                        radius,
+                        now,
+                        material: input.material,
+                        mode,
+                        morph: true,
+                    },
+                ) else {
                     stats.missing_visible += 1;
                     continue;
                 };
-                let (own_origin, own_scale) = select::rect_within(address, owner);
-                let own_is_self = owner == data;
-                // The parent draw node's data tile supplies morph and arrival
-                // endpoints; it is `data`'s parent unless both clamp to a root.
-                let parent_data = address
-                    .parent()
-                    .map_or(data, |parent| data_address(parent, data_offset));
-                let mut parent_owner = owner;
-                let (parent_source, arrival) = if own_is_self && parent_data != data {
-                    match finest_resident(&lod.nodes, parent_data) {
-                        Some((parent, node)) => {
-                            parent_owner = parent;
-                            let (origin, scale) = select::rect_within(address, parent);
-                            let arrival = if policy.arrival_seconds > 0.0 {
-                                (now.duration_since(owner_node.produced).as_secs_f64()
-                                    / policy.arrival_seconds)
-                                    .clamp(0.0, 1.0)
-                            } else {
-                                1.0
-                            };
-                            (sample(node.layer, origin, scale), arrival)
-                        }
-                        None => (sample(owner_node.layer, own_origin, own_scale), 1.0),
-                    }
-                } else {
-                    if !own_is_self {
-                        // Ancestor data stands in for both endpoints; only the
-                        // grid morph applies until the node's own data arrives.
-                        stats.virtual_nodes += 1;
-                        stats.missing_visible += 1;
-                    }
-                    (sample(owner_node.layer, own_origin, own_scale), 1.0)
-                };
-                if arrival < 1.0 {
+                if built.virtual_node {
+                    stats.virtual_nodes += 1;
+                    stats.missing_visible += 1;
+                }
+                if built.arrival < 1.0 {
                     stats.fading += 1;
                 }
-                let level = address.level();
-                let chart = select::chart(address);
-                let anchor_body = chart.n0 * radius;
-                let anchor_view = body_to_view * (anchor_body - observer);
-                let (morph_start, morph_end) = if level == 0 {
-                    (f32::MAX, f32::MAX)
-                } else {
-                    let end = ranges[level as usize - 1];
-                    let start = end - policy.morph_fraction * (end - ranges[level as usize]);
-                    (start as f32, end as f32)
-                };
-                let cell = mundaris_world::terrain::producer::tile_texel_m(
-                    radius,
-                    level,
-                    policy.draw_cells,
-                );
-                frame.instances.push(AtlasInstance {
-                    anchor_view_m: anchor_view.as_vec3().to_array(),
-                    radius_m: radius as f32,
-                    body_to_view: [
-                        body_to_view.x_axis.as_vec3().to_array(),
-                        body_to_view.y_axis.as_vec3().to_array(),
-                        body_to_view.z_axis.as_vec3().to_array(),
-                    ],
-                    chart: producer::atlas_chart(&chart),
-                    level,
-                    own: sample(owner_node.layer, own_origin, own_scale),
-                    parent: parent_source,
-                    morph_start_m: morph_start,
-                    morph_end_m: morph_end,
-                    arrival: arrival as f32,
-                    skirt_m: (policy.skirt_cells * cell) as f32,
-                    sun_body: input.sun_body.as_vec3().to_array(),
-                    mode,
-                });
+                frame.instances.push(built.instance);
                 stats.drawn += 1;
-                stats.finest_level = stats.finest_level.max(level);
+                stats.finest_level = stats.finest_level.max(selected.address.level());
                 // Mark data sources as used for LRU.
-                if let Some(node) = lod.nodes.get_mut(&owner) {
-                    node.last_used = frame_number;
+                for owner in [built.owner, built.parent_owner] {
+                    if let Some(node) = lod.nodes.get_mut(&owner) {
+                        node.last_used = frame_number;
+                    }
                 }
-                if let Some(node) = lod.nodes.get_mut(&parent_owner) {
-                    node.last_used = frame_number;
+            }
+            if let Some(shadow_policy) = shadows.filter(|_| shadow_body == Some(input.body)) {
+                let _span = crate::engine_profile::span("Atlas shadow casters");
+                let view = ShadowView {
+                    body_to_view,
+                    observer_body_m: observer,
+                    reference_radius_m: radius,
+                    relief_m: lod.height_bound_m,
+                };
+                let body_centre = body_to_view * (-observer);
+                let sun_view = (shadow_policy.sun_centre_view_m - body_centre).normalize();
+                if let Some(cascades) = mundaris_renderer::fit_cascades(
+                    &view,
+                    sun_view,
+                    projection,
+                    &shadow_policy.settings,
+                ) {
+                    let mut shadow = mundaris_renderer::AtlasShadowFrame {
+                        cascades,
+                        ..Default::default()
+                    };
+                    let detail = f64::from(shadow_policy.settings.caster_detail).max(0.05);
+                    for c in 0..cascades.count as usize {
+                        // Cells of four texels near the cascade, growing linearly
+                        // with distance beyond its radius: distant sunward
+                        // casters only need coarse silhouettes.
+                        let texel = f64::from(cascades.texel_m[c]);
+                        let target = 4.0 * texel / detail;
+                        let reach = 0.5 * texel * f64::from(shadow_policy.settings.resolution);
+                        let caster_ranges: Vec<f64> = (0..=policy.max_level)
+                            .map(|level| {
+                                let cell = mundaris_world::terrain::producer::tile_texel_m(
+                                    radius,
+                                    level,
+                                    policy.draw_cells,
+                                );
+                                if cell > target {
+                                    reach * cell / target
+                                } else {
+                                    0.0
+                                }
+                            })
+                            .collect();
+                        let measured = &lod.bounds;
+                        let bound = lod.height_bound_m;
+                        let casters = select::select(
+                            &select::SelectionInput {
+                                observer_body: observer,
+                                body_to_view,
+                                frustum: select::Frustum::cascade(cascades, c),
+                                radius_m: radius,
+                                occluder_radius_m: radius - lod.height_bound_m,
+                                ranges: &caster_ranges,
+                                max_level: policy.max_level,
+                                visit_limit: VISIT_LIMIT,
+                            },
+                            |address| {
+                                node_bounds(
+                                    measured,
+                                    address,
+                                    bound,
+                                    policy.base_resident_level,
+                                    data_offset + MEASURED_LOOKAHEAD,
+                                )
+                            },
+                        );
+                        let context = NodeContext {
+                            data_offset,
+                            policy: &policy,
+                            ranges: &caster_ranges,
+                            body_to_view,
+                            observer,
+                            radius,
+                            now,
+                            material: input.material,
+                            mode,
+                            morph: false,
+                        };
+                        shadow.casters[c] = casters
+                            .selected
+                            .iter()
+                            .filter_map(|s| build_instance(&lod.nodes, s.address, &context))
+                            .map(|built| built.instance)
+                            .collect();
+                    }
+                    stats.shadow_casters = shadow.casters.iter().map(Vec::len).sum();
+                    frame.shadow = Some(shadow);
                 }
             }
             stats.resident = lod.nodes.len();
@@ -843,6 +902,108 @@ fn prepare_recipe(
     let bound =
         producer::recipe_height_bound(&recipe, generator.conservative_absolute_height_bound_m());
     Ok((recipe, source, bound))
+}
+
+/// Shared inputs for turning a selected node into a draw instance.
+struct NodeContext<'a> {
+    data_offset: u8,
+    policy: &'a LodPolicy,
+    ranges: &'a [f64],
+    body_to_view: DMat3,
+    observer: DVec3,
+    radius: f64,
+    now: Instant,
+    material: SurfaceMaterial,
+    mode: u32,
+    /// CDLOD morphing; uniform-detail shadow casters do not morph.
+    morph: bool,
+}
+
+struct BuiltInstance {
+    instance: AtlasInstance,
+    owner: CubePatchAddress,
+    parent_owner: CubePatchAddress,
+    arrival: f64,
+    /// Drawn from ancestor data while its own data is missing.
+    virtual_node: bool,
+}
+
+/// Instance of a selected node from its own data or its finest resident
+/// ancestor; `None` when nothing resident covers it.
+fn build_instance(
+    nodes: &HashMap<CubePatchAddress, Resident>,
+    address: CubePatchAddress,
+    c: &NodeContext<'_>,
+) -> Option<BuiltInstance> {
+    let data = data_address(address, c.data_offset);
+    let (owner, owner_node) = finest_resident(nodes, data)?;
+    let (own_origin, own_scale) = select::rect_within(address, owner);
+    let own_is_self = owner == data;
+    // The parent draw node's data tile supplies morph and arrival
+    // endpoints; it is `data`'s parent unless both clamp to a root.
+    let parent_data = address
+        .parent()
+        .map_or(data, |parent| data_address(parent, c.data_offset));
+    let mut parent_owner = owner;
+    let (parent_source, arrival) = if own_is_self && parent_data != data {
+        match finest_resident(nodes, parent_data) {
+            Some((parent, node)) => {
+                parent_owner = parent;
+                let (origin, scale) = select::rect_within(address, parent);
+                let arrival = if c.policy.arrival_seconds > 0.0 {
+                    (c.now.duration_since(owner_node.produced).as_secs_f64()
+                        / c.policy.arrival_seconds)
+                        .clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                (sample(node.layer, origin, scale), arrival)
+            }
+            None => (sample(owner_node.layer, own_origin, own_scale), 1.0),
+        }
+    } else {
+        // Ancestor data stands in for both endpoints; only the grid morph
+        // applies until the node's own data arrives.
+        (sample(owner_node.layer, own_origin, own_scale), 1.0)
+    };
+    let level = address.level();
+    let chart = select::chart(address);
+    let anchor_body = chart.n0 * c.radius;
+    let anchor_view = c.body_to_view * (anchor_body - c.observer);
+    let (morph_start, morph_end) = if level == 0 || !c.morph {
+        (f32::MAX, f32::MAX)
+    } else {
+        let end = c.ranges[level as usize - 1];
+        let start = end - c.policy.morph_fraction * (end - c.ranges[level as usize]);
+        (start as f32, end as f32)
+    };
+    let cell =
+        mundaris_world::terrain::producer::tile_texel_m(c.radius, level, c.policy.draw_cells);
+    Some(BuiltInstance {
+        instance: AtlasInstance {
+            anchor_view_m: anchor_view.as_vec3().to_array(),
+            radius_m: c.radius as f32,
+            body_to_view: [
+                c.body_to_view.x_axis.as_vec3().to_array(),
+                c.body_to_view.y_axis.as_vec3().to_array(),
+                c.body_to_view.z_axis.as_vec3().to_array(),
+            ],
+            chart: producer::atlas_chart(&chart),
+            level,
+            own: sample(owner_node.layer, own_origin, own_scale),
+            parent: parent_source,
+            morph_start_m: morph_start,
+            morph_end_m: morph_end,
+            arrival: arrival as f32,
+            skirt_m: (c.policy.skirt_cells * cell) as f32,
+            material: c.material,
+            mode: c.mode,
+        },
+        owner,
+        parent_owner,
+        arrival,
+        virtual_node: !own_is_self,
+    })
 }
 
 fn sample(layer: u32, origin: [f64; 2], scale: f64) -> AtlasSampleSource {

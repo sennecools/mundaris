@@ -1,0 +1,831 @@
+{
+  "format": "mundaris.terrain-bundle.v1",
+  "schema_version": 1,
+  "bundle_id": "mountain_ridges_a",
+  "generator": "mundaris_terrain_bake",
+  "generator_version": "erosion-pipes-1",
+  "provenance": "original-bake",
+  "external_asset_dependencies": [],
+  "seed": 4111,
+  "recipe_sha256": "bcd5e4d3954bbbafebab3264ed7bbd2977f4b13d9f2d9dcff62b4ac6e7aaf11e",
+  "recipe": {
+    "derived": {
+      "channel_resolution": 1024,
+      "exposure": {
+        "bias": 0.5,
+        "convexity": 0.4,
+        "relief": 0.8
+      },
+      "flow_exponent": 1.1,
+      "relief_radius_m": 120.0,
+      "spawn": {
+        "bias": -0.2,
+        "flow": 0.5,
+        "incision": 0.5,
+        "steep_tangent": 1.0,
+        "steepness": 0.4
+      },
+      "wetness": {
+        "bias": 0.0,
+        "deposition": 0.4,
+        "flow": 0.8,
+        "shelter": 0.3
+      }
+    },
+    "footprint_m": 4000.0,
+    "graph": {
+      "hardness": "hardness",
+      "height": "height",
+      "nodes": [
+        {
+          "id": "fine_warp_x",
+          "op": {
+            "domain": null,
+            "frequency": 6,
+            "gain": 0.5,
+            "kind": "fbm",
+            "lacunarity": 2,
+            "octaves": 3,
+            "rotate_octaves": true,
+            "seed": 3,
+            "sharpness": 2.0,
+            "slope_damping": 0.0,
+            "warp": null
+          }
+        },
+        {
+          "id": "fine_warp_y",
+          "op": {
+            "domain": null,
+            "frequency": 6,
+            "gain": 0.5,
+            "kind": "fbm",
+            "lacunarity": 2,
+            "octaves": 3,
+            "rotate_octaves": true,
+            "seed": 4,
+            "sharpness": 2.0,
+            "slope_damping": 0.0,
+            "warp": null
+          }
+        },
+        {
+          "id": "warp_x",
+          "op": {
+            "domain": null,
+            "frequency": 2,
+            "gain": 0.5,
+            "kind": "fbm",
+            "lacunarity": 2,
+            "octaves": 3,
+            "rotate_octaves": true,
+            "seed": 1,
+            "sharpness": 2.0,
+            "slope_damping": 0.0,
+            "warp": {
+              "amplitude": 0.03,
+              "x": "fine_warp_x",
+              "y": "fine_warp_y"
+            }
+          }
+        },
+        {
+          "id": "warp_y",
+          "op": {
+            "domain": null,
+            "frequency": 2,
+            "gain": 0.5,
+            "kind": "fbm",
+            "lacunarity": 2,
+            "octaves": 3,
+            "rotate_octaves": true,
+            "seed": 2,
+            "sharpness": 2.0,
+            "slope_damping": 0.0,
+            "warp": {
+              "amplitude": 0.03,
+              "x": "fine_warp_x",
+              "y": "fine_warp_y"
+            }
+          }
+        },
+        {
+          "id": "massif_noise",
+          "op": {
+            "domain": [
+              [
+                2,
+                -1
+              ],
+              [
+                1,
+                1
+              ]
+            ],
+            "frequency": 1,
+            "gain": 0.45,
+            "kind": "fbm",
+            "lacunarity": 2,
+            "octaves": 3,
+            "rotate_octaves": false,
+            "seed": 10,
+            "sharpness": 2.0,
+            "slope_damping": 0.0,
+            "warp": {
+              "amplitude": 0.08,
+              "x": "warp_x",
+              "y": "warp_y"
+            }
+          }
+        },
+        {
+          "id": "massif",
+          "op": {
+            "input": "massif_noise",
+            "kind": "curve",
+            "points": [
+              [
+                -0.5,
+                0.4
+              ],
+              [
+                0.0,
+                0.75
+              ],
+              [
+                0.5,
+                1.0
+              ]
+            ]
+          }
+        },
+        {
+          "id": "range_main",
+          "op": {
+            "domain": [
+              [
+                2,
+                -2
+              ],
+              [
+                1,
+                1
+              ]
+            ],
+            "frequency": 1,
+            "gain": 0.45,
+            "kind": "ridged",
+            "lacunarity": 2,
+            "octaves": 3,
+            "rotate_octaves": false,
+            "seed": 20,
+            "sharpness": 2.2,
+            "slope_damping": 0.0,
+            "warp": {
+              "amplitude": 0.12,
+              "x": "warp_x",
+              "y": "warp_y"
+            }
+          }
+        },
+        {
+          "id": "range_second",
+          "op": {
+            "domain": [
+              [
+                2,
+                -1
+              ],
+              [
+                1,
+                1
+              ]
+            ],
+            "frequency": 2,
+            "gain": 0.45,
+            "kind": "ridged",
+            "lacunarity": 2,
+            "octaves": 3,
+            "rotate_octaves": false,
+            "seed": 22,
+            "sharpness": 1.6,
+            "slope_damping": 0.0,
+            "warp": {
+              "amplitude": 0.09,
+              "x": "warp_x",
+              "y": "warp_y"
+            }
+          }
+        },
+        {
+          "id": "range_second_low",
+          "op": {
+            "factor": 0.5,
+            "input": "range_second",
+            "kind": "scale",
+            "offset": 0.0
+          }
+        },
+        {
+          "id": "range_cross",
+          "op": {
+            "domain": null,
+            "frequency": 3,
+            "gain": 0.45,
+            "kind": "ridged",
+            "lacunarity": 2,
+            "octaves": 3,
+            "rotate_octaves": true,
+            "seed": 21,
+            "sharpness": 1.6,
+            "slope_damping": 0.0,
+            "warp": {
+              "amplitude": 0.04,
+              "x": "warp_x",
+              "y": "warp_y"
+            }
+          }
+        },
+        {
+          "id": "range_cross_low",
+          "op": {
+            "factor": 0.3,
+            "input": "range_cross",
+            "kind": "scale",
+            "offset": 0.0
+          }
+        },
+        {
+          "id": "range_pair",
+          "op": {
+            "a": "range_main",
+            "b": "range_second_low",
+            "kind": "max"
+          }
+        },
+        {
+          "id": "ranges",
+          "op": {
+            "a": "range_pair",
+            "b": "range_cross_low",
+            "kind": "max"
+          }
+        },
+        {
+          "id": "ranges_shaped",
+          "op": {
+            "input": "ranges",
+            "kind": "curve",
+            "points": [
+              [
+                0.0,
+                0.0
+              ],
+              [
+                0.3,
+                0.1
+              ],
+              [
+                0.65,
+                0.5
+              ],
+              [
+                1.0,
+                1.0
+              ]
+            ]
+          }
+        },
+        {
+          "id": "peaks",
+          "op": {
+            "a": "ranges_shaped",
+            "b": "massif",
+            "kind": "mul"
+          }
+        },
+        {
+          "id": "height",
+          "op": {
+            "factor": 1000.0,
+            "input": "peaks",
+            "kind": "scale",
+            "offset": 0.0
+          }
+        },
+        {
+          "id": "bands",
+          "op": {
+            "domain": [
+              [
+                3,
+                -3
+              ],
+              [
+                1,
+                1
+              ]
+            ],
+            "frequency": 2,
+            "gain": 0.5,
+            "kind": "fbm",
+            "lacunarity": 2,
+            "octaves": 3,
+            "rotate_octaves": false,
+            "seed": 70,
+            "sharpness": 2.0,
+            "slope_damping": 0.0,
+            "warp": {
+              "amplitude": 0.015,
+              "x": "fine_warp_x",
+              "y": "fine_warp_y"
+            }
+          }
+        },
+        {
+          "id": "hardness",
+          "op": {
+            "clamp": true,
+            "from": [
+              -0.5,
+              0.5
+            ],
+            "input": "bands",
+            "kind": "remap",
+            "to": [
+              0.15,
+              0.85
+            ]
+          }
+        },
+        {
+          "id": "uplift",
+          "op": {
+            "clamp": true,
+            "from": [
+              0.0,
+              0.8
+            ],
+            "input": "peaks",
+            "kind": "remap",
+            "to": [
+              0.0,
+              1.0
+            ]
+          }
+        }
+      ],
+      "uplift": "uplift"
+    },
+    "id": "mountain_ridges_a",
+    "output_relief_m": 520.0,
+    "pipeline": [
+      {
+        "filter": {
+          "kind": "base",
+          "resolution": 512
+        },
+        "mask": null,
+        "name": "base"
+      },
+      {
+        "filter": {
+          "amplitude_m": 60.0,
+          "kind": "warp",
+          "noise": {
+            "frequency": 4,
+            "gain": 0.5,
+            "kind": "fbm",
+            "octaves": 3,
+            "rotate_octaves": true,
+            "seed": 8,
+            "sharpness": 2.0
+          }
+        },
+        "mask": null,
+        "name": "warp"
+      },
+      {
+        "filter": {
+          "breach": true,
+          "fill_slope": 0.01,
+          "fluvial": {
+            "area_exponent": 0.5,
+            "diffusion_m2_per_step": 1.0,
+            "dt": 1.0,
+            "erodibility": 0.008,
+            "erodibility_hardness": 0.6,
+            "initial_scale": 1.0,
+            "mfd_exponent": 1.1,
+            "routing_jitter": 0.3,
+            "threshold_m_per_step": 0.1,
+            "uplift_m_per_step": 0.5
+          },
+          "iterations": 800,
+          "kind": "stream_power",
+          "outlet_fraction": 0.02,
+          "outlet_points": 0,
+          "talus": 1.6,
+          "talus_hardness": 0.5
+        },
+        "mask": null,
+        "name": "drainage"
+      },
+      {
+        "filter": {
+          "kind": "resample",
+          "resolution": 1024
+        },
+        "mask": null,
+        "name": null
+      },
+      {
+        "filter": {
+          "breach": true,
+          "fill_slope": 0.01,
+          "fluvial": {
+            "area_exponent": 0.5,
+            "diffusion_m2_per_step": 1.0,
+            "dt": 1.0,
+            "erodibility": 0.008,
+            "erodibility_hardness": 0.6,
+            "initial_scale": 1.0,
+            "mfd_exponent": 1.1,
+            "routing_jitter": 0.3,
+            "threshold_m_per_step": 0.1,
+            "uplift_m_per_step": 0.5
+          },
+          "iterations": 200,
+          "kind": "stream_power",
+          "outlet_fraction": 0.02,
+          "outlet_points": 0,
+          "talus": 1.6,
+          "talus_hardness": 0.5
+        },
+        "mask": null,
+        "name": "drainage_1024"
+      },
+      {
+        "filter": {
+          "capacity": 8.0,
+          "deposit": 0.1,
+          "droplets_per_cell": 1.0,
+          "erode": 0.3,
+          "evaporate": 0.01,
+          "gravity": 4.0,
+          "hardness_factor": 0.5,
+          "inertia": 0.05,
+          "kind": "droplets",
+          "max_steps": 64,
+          "min_slope": 0.01,
+          "radius_cells": 6.0,
+          "seed": 1,
+          "slope_scale": 0.01
+        },
+        "mask": null,
+        "name": "droplets_coarse"
+      },
+      {
+        "filter": {
+          "gullies": {
+            "amplitude_m": 3.0,
+            "cell_ratio": 1.0,
+            "detail": 1.0,
+            "fade_radius_m": 240.0,
+            "gain": 0.5,
+            "lacunarity": 2.0,
+            "octaves": 3,
+            "slope_full": 0.3,
+            "wavelength_m": 120.0
+          },
+          "kind": "gullies",
+          "seed": 1
+        },
+        "mask": null,
+        "name": "gullies_1"
+      },
+      {
+        "filter": {
+          "kind": "resample",
+          "resolution": 2048
+        },
+        "mask": null,
+        "name": null
+      },
+      {
+        "filter": {
+          "capacity": 4.0,
+          "deposit": 0.1,
+          "droplets_per_cell": 0.5,
+          "erode": 0.3,
+          "evaporate": 0.01,
+          "gravity": 4.0,
+          "hardness_factor": 0.5,
+          "inertia": 0.05,
+          "kind": "droplets",
+          "max_steps": 48,
+          "min_slope": 0.01,
+          "radius_cells": 4.0,
+          "seed": 2,
+          "slope_scale": 0.01
+        },
+        "mask": null,
+        "name": "droplets_fine"
+      },
+      {
+        "filter": {
+          "gullies": {
+            "amplitude_m": 1.2,
+            "cell_ratio": 1.0,
+            "detail": 1.0,
+            "fade_radius_m": 96.0,
+            "gain": 0.5,
+            "lacunarity": 2.0,
+            "octaves": 3,
+            "slope_full": 0.3,
+            "wavelength_m": 48.0
+          },
+          "kind": "gullies",
+          "seed": 2
+        },
+        "mask": null,
+        "name": "gullies_2"
+      },
+      {
+        "filter": {
+          "amount": 0.6,
+          "kind": "ridge_sharpen",
+          "radius_m": 15.0
+        },
+        "mask": {
+          "flow": null,
+          "height": [
+            0.5,
+            0.9
+          ],
+          "invert": false,
+          "noise": null,
+          "slope": null
+        },
+        "name": "crest_sharpen"
+      },
+      {
+        "filter": {
+          "amplitude_m": 1.5,
+          "kind": "detail",
+          "noise": {
+            "frequency": 96,
+            "gain": 0.5,
+            "kind": "ridged",
+            "octaves": 3,
+            "rotate_octaves": true,
+            "seed": 5,
+            "sharpness": 2.0
+          }
+        },
+        "mask": {
+          "flow": null,
+          "height": null,
+          "invert": false,
+          "noise": null,
+          "slope": [
+            0.8,
+            1.5
+          ]
+        },
+        "name": "rock_detail"
+      },
+      {
+        "filter": {
+          "amplitude_m": 2.0,
+          "kind": "detail",
+          "noise": {
+            "frequency": 128,
+            "gain": 0.5,
+            "kind": "ridged",
+            "octaves": 4,
+            "rotate_octaves": true,
+            "seed": 6,
+            "sharpness": 2.0
+          }
+        },
+        "mask": {
+          "flow": null,
+          "height": [
+            0.55,
+            0.9
+          ],
+          "invert": false,
+          "noise": null,
+          "slope": null
+        },
+        "name": "crest_rough"
+      },
+      {
+        "filter": {
+          "kind": "relief",
+          "relief_m": 520.0
+        },
+        "mask": null,
+        "name": "final_relief"
+      }
+    ],
+    "schema": 2,
+    "seed": 4111,
+    "version": 1
+  },
+  "footprint_m": 4000.0,
+  "resolution": 2048,
+  "spacing_m": 1.953125,
+  "sample_location": "pixel_centres",
+  "row_order": "row-major; first row is v = 0; x increases with u",
+  "wrap": "periodic",
+  "height": {
+    "offset_m": -260.0,
+    "range_m": 520.0,
+    "decoded_min_m": -260.0,
+    "decoded_max_m": 260.0,
+    "max_quantization_error_m": 0.00396734442927027
+  },
+  "seam": {
+    "wrap_max_step_m": 10.093958734602893,
+    "interior_max_step_m": 14.809007126286474
+  },
+  "channels": [
+    {
+      "file": "height.r16",
+      "width": 2048,
+      "height": 2048,
+      "components": 1,
+      "sample_type": "u16",
+      "byte_order": "little-endian",
+      "meaning": "physical surface height; height_m = offset_m + value / 65535 * range_m",
+      "units": "m",
+      "decoded_range": [
+        -260.0,
+        260.0
+      ],
+      "sha256": "8ad85e1e9d94979ae04461049f9d17a9667821a58f9b46492186e3fd439b66c7",
+      "bytes": 8388608
+    },
+    {
+      "file": "clim.rg8",
+      "width": 1024,
+      "height": 1024,
+      "components": 2,
+      "sample_type": "u8",
+      "byte_order": "none",
+      "meaning": "R = wetness (flow accumulation, deposition, shelter); G = exposure (local relief, convexity); local modifiers of global humidity/temperature",
+      "units": "unit interval (value / 255)",
+      "decoded_range": [
+        0.0,
+        1.0
+      ],
+      "sha256": "db58cecdd96cf94553bf1f2225d8b94c6247dc34a97ae2a9dcf12b0964e4d457",
+      "bytes": 2097152
+    },
+    {
+      "file": "spawn.r8",
+      "width": 1024,
+      "height": 1024,
+      "components": 1,
+      "sample_type": "u8",
+      "byte_order": "none",
+      "meaning": "object spawn support (flow, incision, steepness)",
+      "units": "unit interval (value / 255)",
+      "decoded_range": [
+        0.0,
+        1.0
+      ],
+      "sha256": "0a345085ada0639f99847e118cd77211ab2df26af3054ddf6e5c1ff037a58614",
+      "bytes": 1048576
+    }
+  ],
+  "bake": {
+    "adapter": {
+      "backend": "none",
+      "device": 0,
+      "driver": "",
+      "driver_info": "",
+      "name": "none (CPU-only pipeline)",
+      "vendor": 0
+    },
+    "total_seconds": 144.0052225,
+    "derive_seconds": 0.6147914,
+    "peak_gpu_allocated_bytes": 0,
+    "stages": [
+      {
+        "kind": "base",
+        "name": "base",
+        "relief_m": 644.6204062995799,
+        "resolution": 512,
+        "seconds": 0.0760979,
+        "stage": 0
+      },
+      {
+        "kind": "warp",
+        "name": "warp",
+        "relief_m": 641.1863504457216,
+        "resolution": 512,
+        "seconds": 0.0083188,
+        "stage": 1
+      },
+      {
+        "kind": "stream_power",
+        "name": "drainage",
+        "relief_m": 573.0491686015562,
+        "resolution": 512,
+        "seconds": 51.7259377,
+        "stage": 2
+      },
+      {
+        "kind": "resample",
+        "name": "resample",
+        "relief_m": 573.0531246968249,
+        "resolution": 1024,
+        "seconds": 0.1553232,
+        "stage": 3
+      },
+      {
+        "kind": "stream_power",
+        "name": "drainage_1024",
+        "relief_m": 596.9552326857804,
+        "resolution": 1024,
+        "seconds": 55.4340924,
+        "stage": 4
+      },
+      {
+        "kind": "droplets",
+        "name": "droplets_coarse",
+        "relief_m": 545.8370271014571,
+        "resolution": 1024,
+        "seconds": 15.9667812,
+        "stage": 5
+      },
+      {
+        "kind": "gullies",
+        "name": "gullies_1",
+        "relief_m": 542.9668362327318,
+        "resolution": 1024,
+        "seconds": 0.9249188,
+        "stage": 6
+      },
+      {
+        "kind": "resample",
+        "name": "resample",
+        "relief_m": 542.3701531111496,
+        "resolution": 2048,
+        "seconds": 0.6091003,
+        "stage": 7
+      },
+      {
+        "kind": "droplets",
+        "name": "droplets_fine",
+        "relief_m": 535.5443867706497,
+        "resolution": 2048,
+        "seconds": 13.6756982,
+        "stage": 8
+      },
+      {
+        "kind": "gullies",
+        "name": "gullies_2",
+        "relief_m": 534.980628847882,
+        "resolution": 2048,
+        "seconds": 3.7202199,
+        "stage": 9
+      },
+      {
+        "kind": "ridge_sharpen",
+        "name": "crest_sharpen",
+        "relief_m": 547.0568610550491,
+        "resolution": 2048,
+        "seconds": 0.1876944,
+        "stage": 10
+      },
+      {
+        "kind": "detail",
+        "name": "rock_detail",
+        "relief_m": 547.0568610550491,
+        "resolution": 2048,
+        "seconds": 0.1222327,
+        "stage": 11
+      },
+      {
+        "kind": "detail",
+        "name": "crest_rough",
+        "relief_m": 548.6010264310545,
+        "resolution": 2048,
+        "seconds": 0.1519251,
+        "stage": 12
+      },
+      {
+        "kind": "relief",
+        "name": "final_relief",
+        "relief_m": 520.0,
+        "resolution": 2048,
+        "seconds": 0.005625,
+        "stage": 13
+      }
+    ]
+  }
+}

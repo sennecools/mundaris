@@ -6,7 +6,7 @@ struct Projection { matrix: mat4x4<f32> }
 
 struct Instance {
     anchor: vec4<f32>,      // camera-relative chart-centre anchor (view axes), w = radius
-    b2v_x: vec4<f32>,       // body-to-view rotation columns
+    b2v_x: vec4<f32>,       // body-to-view rotation columns; x.w = render mode
     b2v_y: vec4<f32>,
     b2v_z: vec4<f32>,
     n0: vec4<f32>,          // chart-centre direction (body axes), w = |q0|
@@ -15,7 +15,7 @@ struct Instance {
     own: vec4<f32>,         // layer, rect origin xy, rect scale
     parent: vec4<f32>,      // layer, rect origin xy, rect scale
     morph: vec4<f32>,       // morph start, morph end (view distance m), arrival fade, skirt depth m
-    sun: vec4<f32>,         // sun direction (body axes), w = render mode
+    material: vec4<f32>,    // linear albedo rgb, w = BRDF (0 Lambert, 1 lunar-Lambert)
 }
 
 @group(0) @binding(0) var<uniform> projection: Projection;
@@ -88,6 +88,7 @@ struct VertexOut {
     @location(4) @interpolate(flat) instance: u32,
     @location(5) height: f32,
     @location(6) grid_st: vec2<f32>,
+    @location(7) view_pos: vec3<f32>,
 }
 
 @vertex
@@ -115,6 +116,7 @@ fn vs_main(@location(0) vertex: vec3<f32>, @builtin(instance_index) index: u32) 
     out.instance = index;
     out.height = height;
     out.grid_st = morphed;
+    out.view_pos = view_position;
     return out;
 }
 
@@ -124,31 +126,38 @@ fn level_color(level: f32) -> vec3<f32> {
 }
 
 @fragment
-fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
+fn fs_main(input: VertexOut) -> SceneOut {
     let inst = instances[input.instance];
     let own_n = textureSampleLevel(normal_atlas, normal_sampler, input.own_uv, input.layers.x, 0.0).xyz;
     let parent_n = textureSampleLevel(normal_atlas, normal_sampler, input.parent_uv, input.layers.y, 0.0).xyz;
     let arrived = mix(parent_n, own_n, input.blend.x);
     let normal = normalize(mix(arrived, parent_n, input.blend.y));
-    let mode = u32(inst.sun.w + 0.5);
-    var color = vec3<f32>(0.42, 0.42, 0.42);
+    let n_view = normalize(inst.b2v_x.xyz * normal.x + inst.b2v_y.xyz * normal.y + inst.b2v_z.xyz * normal.z);
+    let mode = u32(inst.b2v_x.w + 0.5);
+    var debug_color = vec3<f32>(-1.0);
     if mode == 1u {
-        color = vec3<f32>(clamp(0.5 + input.height / 600.0, 0.0, 1.0));
+        debug_color = vec3<f32>(clamp(0.5 + input.height / 600.0, 0.0, 1.0));
     } else if mode == 2u {
-        color = normal * 0.5 + vec3<f32>(0.5);
+        debug_color = normal * 0.5 + vec3<f32>(0.5);
     } else if mode == 5u {
         let g = input.grid_st * grid.draw.x;
         let line = min(fract(g), vec2<f32>(1.0) - fract(g));
-        color = select(vec3<f32>(0.12, 0.14, 0.18), vec3<f32>(0.85, 0.88, 0.8), min(line.x, line.y) < 0.04);
+        debug_color = select(vec3<f32>(0.12, 0.14, 0.18), vec3<f32>(0.85, 0.88, 0.8), min(line.x, line.y) < 0.04);
     } else if mode == 6u {
-        color = level_color(inst.face_v.w);
-        let diffuse = max(dot(normal, normalize(inst.sun.xyz)), 0.0);
-        color *= 0.35 + 0.65 * diffuse;
+        let l = normalize(lighting.sun.xyz - input.view_pos);
+        debug_color = level_color(inst.face_v.w) * (0.35 + 0.65 * max(dot(n_view, l), 0.0));
     } else if mode == 8u {
-        color = vec3<f32>(input.blend.y, 1.0 - input.blend.x, 0.25);
-    } else {
-        let diffuse = max(dot(normal, normalize(inst.sun.xyz)), 0.0);
-        color *= 0.2 + 0.8 * diffuse;
+        debug_color = vec3<f32>(input.blend.y, 1.0 - input.blend.x, 0.25);
     }
-    return vec4<f32>(color, 1.0);
+    if debug_color.x >= 0.0 {
+        // Debug views bypass exposure and tonemapping (post pass clamps them).
+        var out: SceneOut;
+        out.direct = vec4<f32>(debug_color, 1.0);
+        out.normal = encode_normal(n_view);
+        out.ambient = vec4<f32>(0.0);
+        return out;
+    }
+    let n0_view = inst.b2v_x.xyz * inst.n0.x + inst.b2v_y.xyz * inst.n0.y + inst.b2v_z.xyz * inst.n0.z;
+    let up = normalize(input.view_pos - (inst.anchor.xyz - n0_view * inst.anchor.w));
+    return shade(input.view_pos, n_view, up, inst.material.rgb, inst.material.w, true);
 }

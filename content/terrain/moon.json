@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "id": "eroded-profile-test",
-  "revision": 1,
+  "revision": 2,
   "identity": 1297043278,
   "seed": 2,
   "algorithm": "MoonProfileV1",
@@ -47,14 +47,15 @@
   },
   "procedural": null,
   "profile": {
-    "asset": "test-inputs/mountain-eroded.r16",
-    "sha256": "43129546fd677d48a8ea3844475ab9aa258c6215929d5bda004ec218bb3cc89e",
-    "provenance": "temporary-reference-input",
+    "asset": "terrain/library/moon_highlands_a/height.r16",
+    "sha256": "a1458c08b8052c29796dcc12a39753caaf8a79bd09648dcccd02fa83755247f1",
+    "provenance": "original-bake",
+    "byte_order": "little-endian",
     "width": 2048,
     "height": 2048,
     "kernel": "bspline",
     "footprint_m": 4000.0,
-    "amplitude_m": 600.0,
+    "amplitude_m": 433.2274455570072,
     "detail_layers": [
       {
         "footprint_m": 64.0,

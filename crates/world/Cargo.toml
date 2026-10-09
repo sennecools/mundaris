@@ -15,6 +15,7 @@ serde_json.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+png.workspace = true
 
 [[bench]]
 name = "celestial_system"

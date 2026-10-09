@@ -101,6 +101,10 @@ pub struct StudioView {
     pub log: Vec<LogItem>,
     /// Latest completed GPU timings in ms: main scene pass, terrain, overlays.
     pub gpu_passes: [Option<f64>; 3],
+    /// Render registry values in `render_settings::SPECS` order.
+    pub render_settings: Vec<crate::render_settings::SettingValue>,
+    /// Per-pass GPU times and shadow cascade state for the render inspector.
+    pub render_stats: Vec<StatItem>,
 }
 
 /// Playback-rate presets shown in the toolbar.
@@ -132,6 +136,9 @@ pub enum StudioAction {
     /// Starts or stops the bad-frame capture bundle writer.
     CaptureBadFrames,
     Capture,
+    /// Sets render registry entry `index` (`render_settings::SPECS`).
+    SetSetting(usize, crate::render_settings::SettingValue),
+    ResetRenderSettings,
 }
 
 /// Keyboard shortcuts handled by the viewport.

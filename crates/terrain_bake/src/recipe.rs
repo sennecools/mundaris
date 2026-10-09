@@ -23,7 +23,12 @@ pub struct Recipe {
     pub seed: u64,
     /// Physical edge length of the periodic tile.
     pub footprint_m: f64,
-    pub base: BaseRecipe,
+    /// Layered base noise (GPU). Exactly one of `base` and `graph` is set.
+    #[serde(default)]
+    pub base: Option<BaseRecipe>,
+    /// Node-graph base terrain (CPU f64, `graph.rs`).
+    #[serde(default)]
+    pub graph: Option<crate::graph::GraphRecipe>,
     /// Coarse-to-fine erosion stages. The last stage defines the output resolution.
     pub stages: Vec<StageRecipe>,
     pub fluvial: FluvialRecipe,
@@ -33,6 +38,9 @@ pub struct Recipe {
     /// Optional final relief: heights are scaled about their minimum so the
     /// published tile spans exactly this many metres.
     pub output_relief_m: Option<f64>,
+    /// Gully filter parameters; required when any stage sets `gullies`.
+    #[serde(default)]
+    pub gullies: Option<GullyRecipe>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -40,6 +48,8 @@ pub struct Recipe {
 pub enum NoiseKind {
     Fbm,
     Ridged,
+    /// |n| folded: rounded hills and sharp creases.
+    Billow,
 }
 
 /// One periodic noise sum. Frequencies are whole cycles per tile and the
@@ -57,6 +67,23 @@ pub struct NoiseLayer {
     /// Ridge exponent; ignored by fBm.
     #[serde(default = "default_sharpness")]
     pub sharpness: f64,
+    /// Transform each octave's domain by the integer similarity 2 + i (×√5,
+    /// rotated 26.57°) instead of scaling by `lacunarity`, which must then be 2.
+    /// Integer matrices keep every octave periodic while breaking the lattice's
+    /// axis alignment between octaves.
+    #[serde(default)]
+    pub rotate_octaves: bool,
+    /// Derivative damping (Quilez): each octave is divided by
+    /// 1 + slope_damping · |Σ ∇n|², with ∇n the octave-local noise gradient
+    /// accumulated over the octaves so far, so steep areas gather less detail.
+    #[serde(default)]
+    pub slope_damping: f64,
+    /// Integer domain matrix D (rows) applied before the octaves: q = D·p.
+    /// Integer entries keep the layer periodic; unequal or oblique rows give
+    /// features a structural grain (e.g. `[[1, 0], [0, 3]]` stretches them
+    /// threefold along x).
+    #[serde(default)]
+    pub domain: Option<[[i32; 2]; 2]>,
 }
 
 fn default_sharpness() -> f64 {
@@ -107,6 +134,9 @@ pub struct StageRecipe {
     /// Fraction of the base-noise detail newly resolvable at this resolution
     /// that is added to the upsampled previous stage (ignored on stage 0).
     pub detail_scale: f64,
+    /// Apply the recipe's gully filter to this stage's input before erosion.
+    #[serde(default)]
+    pub gullies: bool,
 }
 
 /// Stream-power law dh/dt = U·uplift − K·A^m·S (n = 1), A in m².
@@ -126,6 +156,15 @@ pub struct FluvialRecipe {
     pub routing_jitter: f64,
     /// Erodibility multiplier is 1 − erodibility_hardness × hardness.
     pub erodibility_hardness: f64,
+    /// Drainage area routing: 0 accumulates along the single steepest receiver
+    /// (D8); p > 0 spreads it over all lower neighbours with Freeman FD8 weights
+    /// tanβᵖ·L, which keeps divergent hillslopes from incising one gully per cell.
+    #[serde(default)]
+    pub mfd_exponent: f64,
+    /// Erosion threshold θ in metres per unit time: incision is reduced by θ·dt
+    /// and never negative, so weak flow (hillslopes) does not channelize.
+    #[serde(default)]
+    pub threshold_m_per_step: f64,
 }
 
 /// Virtual-pipe parameters in grid units (cell length 1, heights in cells).
@@ -153,6 +192,34 @@ pub struct HydraulicRecipe {
     pub fill_slope: f64,
     /// Rain-free steps appended to every hydraulic stage.
     pub settle_iterations: u32,
+    /// 0: every cell at or below the outlet level is fixed base level. N > 0:
+    /// only the N lowest local minima below the outlet level are base level
+    /// (point sinks), so low ground keeps eroding instead of staying flat.
+    #[serde(default)]
+    pub outlet_points: u32,
+}
+
+/// Branching gully filter applied to the input of stages with `gullies: true`
+/// (see `gullies.rs`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct GullyRecipe {
+    /// Stripe wavelength of the first (coarsest) octave.
+    pub wavelength_m: f64,
+    pub octaves: u32,
+    /// Wavelength ratio between successive octaves.
+    pub lacunarity: f64,
+    /// Height amplitude of the first octave; later octaves scale by `gain`.
+    pub amplitude_m: f64,
+    pub gain: f64,
+    /// Pivot cell size relative to the octave wavelength.
+    pub cell_ratio: f64,
+    /// Slope (rise over run) at which gullies reach full strength.
+    pub slope_full: f64,
+    /// Exponent keeping finer octaves off coarser ridges and creases (0 = off).
+    pub detail: f64,
+    /// Window radius of the local relief that sets the ridge/valley fade target.
+    pub fade_radius_m: f64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -248,31 +315,39 @@ impl Recipe {
             self.footprint_m.is_finite() && (16.0..=1.0e6).contains(&self.footprint_m),
             "footprint_m outside 16..=1e6"
         );
-        let base = &self.base;
         ensure!(
-            finite_in(base.amplitude_m, 0.0, 10_000.0),
-            "base.amplitude_m outside 0..=10000"
+            self.base.is_some() != self.graph.is_some(),
+            "set exactly one of base and graph"
         );
-        ensure!(
-            !base.layers.is_empty() && base.layers.len() <= MAX_LAYERS,
-            "base needs 1..={MAX_LAYERS} layers"
-        );
-        for layer in &base.layers {
-            validate_layer(layer)?;
+        if let Some(graph) = &self.graph {
+            crate::graph::check(graph, self.footprint_m)?;
         }
-        if let Some(warp) = &base.warp {
-            validate_layer(&warp.layer)?;
+        if let Some(base) = &self.base {
             ensure!(
-                finite_in(warp.amplitude, 0.0, 1.0),
-                "warp.amplitude outside 0..=1"
+                finite_in(base.amplitude_m, 0.0, 10_000.0),
+                "base.amplitude_m outside 0..=10000"
+            );
+            ensure!(
+                !base.layers.is_empty() && base.layers.len() <= MAX_LAYERS,
+                "base needs 1..={MAX_LAYERS} layers"
+            );
+            for layer in &base.layers {
+                validate_layer(layer)?;
+            }
+            if let Some(warp) = &base.warp {
+                validate_layer(&warp.layer)?;
+                ensure!(
+                    finite_in(warp.amplitude, 0.0, 1.0),
+                    "warp.amplitude outside 0..=1"
+                );
+            }
+            validate_layer(&base.hardness.layer)?;
+            ensure!(
+                finite_in(base.hardness.base, 0.0, 0.95)
+                    && finite_in(base.hardness.variation, 0.0, 0.95),
+                "hardness base/variation outside 0..=0.95"
             );
         }
-        validate_layer(&base.hardness.layer)?;
-        ensure!(
-            finite_in(base.hardness.base, 0.0, 0.95)
-                && finite_in(base.hardness.variation, 0.0, 0.95),
-            "hardness base/variation outside 0..=0.95"
-        );
 
         ensure!(
             !self.stages.is_empty() && self.stages.len() <= 6,
@@ -310,6 +385,8 @@ impl Recipe {
             ("diffusion_m2_per_step", f.diffusion_m2_per_step, 0.0, 1.0e4),
             ("erodibility_hardness", f.erodibility_hardness, 0.0, 1.0),
             ("routing_jitter", f.routing_jitter, 0.0, 1.0),
+            ("mfd_exponent", f.mfd_exponent, 0.0, 10.0),
+            ("threshold_m_per_step", f.threshold_m_per_step, 0.0, 100.0),
         ] {
             ensure!(
                 finite_in(value, lo, hi),
@@ -317,6 +394,36 @@ impl Recipe {
             );
         }
         let fluvial_used = self.stages.iter().any(|s| s.process == Process::Fluvial);
+        if self.stages.iter().any(|s| s.gullies) {
+            let g = self
+                .gullies
+                .as_ref()
+                .context("stages use gullies but the recipe has no gullies section")?;
+            ensure!(
+                (1..=8).contains(&g.octaves),
+                "gullies.octaves outside 1..=8"
+            );
+            for (name, value, lo, hi) in [
+                ("wavelength_m", g.wavelength_m, 1.0, self.footprint_m),
+                ("lacunarity", g.lacunarity, 1.2, 4.0),
+                ("amplitude_m", g.amplitude_m, 0.0, 1000.0),
+                ("gain", g.gain, 0.0, 1.0),
+                ("cell_ratio", g.cell_ratio, 0.25, 4.0),
+                ("slope_full", g.slope_full, 0.001, 10.0),
+                ("detail", g.detail, 0.0, 10.0),
+                (
+                    "fade_radius_m",
+                    g.fade_radius_m,
+                    1.0,
+                    self.footprint_m * 0.25,
+                ),
+            ] {
+                ensure!(
+                    finite_in(value, lo, hi),
+                    "gullies.{name} outside {lo}..={hi}"
+                );
+            }
+        }
         if let Some(relief) = self.output_relief_m {
             ensure!(
                 finite_in(relief, 1.0, 10_000.0),
@@ -344,6 +451,7 @@ impl Recipe {
                 "hydraulic.{name} outside {lo}..={hi}"
             );
         }
+        ensure!(h.outlet_points <= 4096, "outlet_points > 4096");
         ensure!(
             h.settle_iterations <= MAX_ITERATIONS,
             "settle_iterations > {MAX_ITERATIONS}"
@@ -413,7 +521,7 @@ fn finite_in(value: f64, lo: f64, hi: f64) -> bool {
     value.is_finite() && (lo..=hi).contains(&value)
 }
 
-fn validate_layer(layer: &NoiseLayer) -> Result<()> {
+pub(crate) fn validate_layer(layer: &NoiseLayer) -> Result<()> {
     ensure!(
         (1..=1024).contains(&layer.frequency),
         "noise frequency outside 1..=1024"
@@ -426,12 +534,30 @@ fn validate_layer(layer: &NoiseLayer) -> Result<()> {
         (2..=4).contains(&layer.lacunarity),
         "lacunarity outside 2..=4"
     );
-    let top = u64::from(layer.frequency)
-        * u64::from(layer.lacunarity).pow(layer.octaves.saturating_sub(1));
+    let per_octave = if layer.rotate_octaves {
+        ensure!(
+            layer.lacunarity == 2,
+            "rotate_octaves requires lacunarity 2"
+        );
+        5f64.sqrt()
+    } else {
+        f64::from(layer.lacunarity)
+    };
+    let top = f64::from(layer.frequency) * per_octave.powi(layer.octaves as i32 - 1);
     ensure!(
-        top <= 65_536,
+        top <= 65_536.0,
         "highest octave frequency exceeds 65536 cycles per tile"
     );
+    ensure!(
+        finite_in(layer.slope_damping, 0.0, 100.0),
+        "slope_damping outside 0..=100"
+    );
+    if let Some([[a, b], [c, d]]) = layer.domain {
+        ensure!(
+            [a, b, c, d].iter().all(|v| v.abs() <= 16) && a * d - b * c != 0,
+            "domain must be a non-singular integer matrix with entries in -16..=16"
+        );
+    }
     ensure!(finite_in(layer.gain, 0.0, 1.0), "gain outside 0..=1");
     ensure!(
         finite_in(layer.weight, -10.0, 10.0),

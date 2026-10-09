@@ -39,6 +39,18 @@ pub struct GpuProfile {
     pub remaining_celestial: Option<std::time::Duration>,
     /// Distant background and finite-star draws only, excluding upload/readback.
     pub sky: Option<std::time::Duration>,
+    /// All sun shadow cascade passes.
+    pub shadows: Option<std::time::Duration>,
+    /// Ground-truth ambient occlusion pass.
+    pub ao: Option<std::time::Duration>,
+    /// Ambient × AO composite into the HDR target.
+    pub ao_composite: Option<std::time::Duration>,
+    /// Luminance histogram and adaptation.
+    pub exposure: Option<std::time::Duration>,
+    /// Bloom down/upsample chain.
+    pub bloom: Option<std::time::Duration>,
+    /// Exposure, tonemap and dither into the scene texture.
+    pub tonemap: Option<std::time::Duration>,
     /// Measured scopes placed relative to the start of the sampled GPU frame
     /// (the frame scope when present, else the earliest scope), in nesting order.
     pub scopes: [Option<GpuScopeSpan>; GPU_SCOPE_SLOTS],
@@ -54,27 +66,50 @@ pub struct GpuScopeSpan {
     pub end: std::time::Duration,
 }
 
-pub const GPU_SCOPE_SLOTS: usize = 6;
+pub const GPU_SCOPE_SLOTS: usize = 12;
 
-/// (mask bit and query pair, name, depth) of every scope the timeline shows.
+/// Query pair (and mask bit) of each timed pass or scope. Pairs 1, 5 and 6 are
+/// unassigned; 4 is the retired transition-fallback scope.
+pub(crate) mod pair {
+    pub const SCENE: usize = 0;
+    pub const OVERLAY: usize = 2;
+    pub const TERRAIN: usize = 3;
+    pub const SPHERES: usize = 7;
+    pub const SKY: usize = 8;
+    pub const SHADOWS: usize = 10;
+    pub const AO: usize = 11;
+    pub const AO_COMPOSITE: usize = 12;
+    pub const EXPOSURE: usize = 13;
+    pub const BLOOM: usize = 14;
+    pub const TONEMAP: usize = 15;
+}
+
+/// (mask bit and query pair, name, depth) of every scope the timeline shows,
+/// in submission order.
 const TIMELINE_SCOPES: [(usize, &str, u8); GPU_SCOPE_SLOTS] = [
     (FRAME_QUERY_PAIR, "GPU frame", 0),
-    (0, "Scene pass", 1),
-    (8, "Sky", 2),
-    (7, "Body spheres", 2),
-    (3, "Terrain", 2),
-    (2, "Overlay pass", 1),
+    (pair::SHADOWS, "Shadows", 1),
+    (pair::SCENE, "Scene pass", 1),
+    (pair::SKY, "Sky", 2),
+    (pair::SPHERES, "Body spheres", 2),
+    (pair::TERRAIN, "Terrain", 2),
+    (pair::AO, "GTAO", 1),
+    (pair::AO_COMPOSITE, "AO composite", 1),
+    (pair::EXPOSURE, "Exposure", 1),
+    (pair::BLOOM, "Bloom", 1),
+    (pair::TONEMAP, "Tonemap", 1),
+    (pair::OVERLAY, "Overlay pass", 1),
 ];
 
 fn scope_spans(
     ticks: &[u64],
     period_nanoseconds: f32,
-    scope_mask: u16,
+    scope_mask: u32,
 ) -> [Option<GpuScopeSpan>; GPU_SCOPE_SLOTS] {
     let pair = |pair: usize| {
         let start = *ticks.get(pair * 2)?;
         let end = *ticks.get(pair * 2 + 1)?;
-        (scope_mask & (1u16 << pair) != 0 && end >= start).then_some((start, end))
+        (scope_mask & (1u32 << pair) != 0 && end >= start).then_some((start, end))
     };
     let origin = pair(FRAME_QUERY_PAIR).map(|(start, _)| start).or_else(|| {
         TIMELINE_SCOPES
@@ -174,10 +209,10 @@ impl TimestampProfilingMetrics {
     }
 }
 
-fn scope_decode_status(ticks: &[u64], period_nanoseconds: f32, scope_mask: u16) -> (bool, bool) {
+fn scope_decode_status(ticks: &[u64], period_nanoseconds: f32, scope_mask: u32) -> (bool, bool) {
     let mut has_valid_scope = false;
     let mut has_invalid_scope = false;
-    for pair in 0..10 {
+    for pair in 0..QUERY_PAIRS {
         if scope_mask & (1 << pair) == 0 {
             continue;
         }
@@ -205,7 +240,7 @@ fn scope_decode_status(ticks: &[u64], period_nanoseconds: f32, scope_mask: u16) 
     (has_valid_scope, has_invalid_scope)
 }
 
-pub(crate) fn decode(ticks: &[u64], period_nanoseconds: f32, scope_mask: u16) -> GpuProfile {
+pub(crate) fn decode(ticks: &[u64], period_nanoseconds: f32, scope_mask: u32) -> GpuProfile {
     let duration = |pair: usize| {
         let start = *ticks.get(pair * 2)?;
         let end = *ticks.get(pair * 2 + 1)?;
@@ -213,21 +248,27 @@ pub(crate) fn decode(ticks: &[u64], period_nanoseconds: f32, scope_mask: u16) ->
         (elapsed.is_finite() && elapsed >= 0.0)
             .then(|| std::time::Duration::from_nanos(elapsed.round() as u64))
     };
-    let scoped = |bit, pair| {
-        (scope_mask & (1u16 << bit) != 0u16)
+    let scoped = |pair: usize| {
+        (scope_mask & (1u32 << pair) != 0)
             .then(|| duration(pair))
             .flatten()
     };
     GpuProfile {
-        frame: scoped(9, 9),
-        celestial_pass: scoped(0, 0),
-        overlay_pass: scoped(2, 2),
-        terrain: scoped(3, 3),
-        transition_fallback: scoped(4, 4),
-        remaining_celestial: scoped(7, 7),
+        frame: scoped(FRAME_QUERY_PAIR),
+        celestial_pass: scoped(pair::SCENE),
+        overlay_pass: scoped(pair::OVERLAY),
+        terrain: scoped(pair::TERRAIN),
+        transition_fallback: scoped(4),
+        remaining_celestial: scoped(pair::SPHERES),
         // A zero elapsed interval cannot establish sky work on the cold query;
         // retain unavailable semantics rather than publishing a fabricated win.
-        sky: scoped(8, 8).filter(|elapsed| !elapsed.is_zero()),
+        sky: scoped(pair::SKY).filter(|elapsed| !elapsed.is_zero()),
+        shadows: scoped(pair::SHADOWS),
+        ao: scoped(pair::AO),
+        ao_composite: scoped(pair::AO_COMPOSITE),
+        exposure: scoped(pair::EXPOSURE),
+        bloom: scoped(pair::BLOOM),
+        tonemap: scoped(pair::TONEMAP),
         scopes: scope_spans(ticks, period_nanoseconds, scope_mask),
     }
 }
@@ -294,6 +335,33 @@ impl CelestialQueries {
         }
     }
 
+    /// Begin-only or end-only writes let one scope span several passes.
+    pub fn pass_writes_partial(
+        &self,
+        pass: usize,
+        begin: bool,
+        end: bool,
+    ) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
+        (begin || end).then(|| wgpu::RenderPassTimestampWrites {
+            query_set: &self.set,
+            beginning_of_pass_write_index: begin.then_some((pass * 2) as u32),
+            end_of_pass_write_index: end.then_some((pass * 2 + 1) as u32),
+        })
+    }
+
+    pub fn compute_writes(
+        &self,
+        pass: usize,
+        begin: bool,
+        end: bool,
+    ) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+        (begin || end).then(|| wgpu::ComputePassTimestampWrites {
+            query_set: &self.set,
+            beginning_of_pass_write_index: begin.then_some((pass * 2) as u32),
+            end_of_pass_write_index: end.then_some((pass * 2 + 1) as u32),
+        })
+    }
+
     pub fn inside_passes(&self) -> bool {
         self.inside_passes
     }
@@ -316,8 +384,9 @@ impl CelestialQueries {
 }
 
 pub(crate) const FRAME_QUERY_PAIR: usize = 9;
-pub(crate) const FRAME_SCOPE_BIT: u16 = 1 << FRAME_QUERY_PAIR;
-pub(crate) const QUERY_COUNT: u32 = 20;
+pub(crate) const FRAME_SCOPE_BIT: u32 = 1 << FRAME_QUERY_PAIR;
+const QUERY_PAIRS: usize = 16;
+pub(crate) const QUERY_COUNT: u32 = (QUERY_PAIRS * 2) as u32;
 
 /// Controls automatic timestamp sampling while developer observation is active.
 /// Ordinary renderer use remains continuously sampled as before.
@@ -369,7 +438,7 @@ pub(crate) struct AsyncTimestampSlot {
     latest_submission_id: Option<u64>,
     pending_submission_id: Option<u64>,
     period_nanoseconds: f32,
-    scope_mask: u16,
+    scope_mask: u32,
     metrics: TimestampProfilingMetrics,
 }
 
@@ -464,7 +533,7 @@ impl AsyncTimestampSlot {
         );
     }
 
-    pub fn map(&mut self, period_nanoseconds: f32, scope_mask: u16, submission_id: u64) {
+    pub fn map(&mut self, period_nanoseconds: f32, scope_mask: u32, submission_id: u64) {
         self.period_nanoseconds = period_nanoseconds;
         self.scope_mask = scope_mask;
         self.pending_submission_id = Some(submission_id);
@@ -548,8 +617,9 @@ mod tests {
 
         // Without the frame scope the earliest scope is the origin.
         let scopes = decode(&ticks, 1.0, 1 | (1 << 3)).scopes;
-        assert_eq!(scopes[1].map(|s| s.start), Some(ns(0)));
-        assert_eq!(scopes[4].map(|s| s.start), Some(ns(90)));
+        let get = |name| scopes.iter().flatten().find(|s| s.name == name).copied();
+        assert_eq!(get("Scene pass").map(|s| s.start), Some(ns(0)));
+        assert_eq!(get("Terrain").map(|s| s.start), Some(ns(90)));
     }
 
     #[test]

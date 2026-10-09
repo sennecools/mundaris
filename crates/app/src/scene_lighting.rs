@@ -1,0 +1,160 @@
+//! Authored scene light and surface reflectance (docs/RENDER_PIPELINE_HDR.md §3).
+//!
+//! Loaded from `content/lighting.json` beside the system content. The sun is a
+//! body of the system; its illuminance is authored at a reference distance and
+//! falls off with the inverse square, so the scaled test system stays
+//! physically ordered without real solar luminosity.
+use anyhow::{Context, Result, ensure};
+use mundaris_renderer::{Brdf, SurfaceMaterial};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::{collections::BTreeMap, path::Path};
+
+pub const LIGHTING_FILE: &str = "lighting.json";
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LightingContent {
+    schema: u32,
+    sun: SunContent,
+    ambient: AmbientContent,
+    bodies: BTreeMap<String, MaterialContent>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SunContent {
+    body: String,
+    illuminance_lux: f64,
+    reference_distance_m: f64,
+    color: [f32; 3],
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AmbientContent {
+    illuminance_lux: f64,
+    color: [f32; 3],
+    bounce_fraction: f64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaterialContent {
+    albedo: [f32; 3],
+    brdf: String,
+}
+
+/// Validated scene light; colours are normalised chromaticities.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SceneLighting {
+    pub sun_body: String,
+    pub illuminance_lux: f64,
+    pub reference_distance_m: f64,
+    pub sun_color: [f32; 3],
+    pub ambient_lux: f64,
+    pub ambient_color: [f32; 3],
+    pub bounce_fraction: f64,
+    materials: BTreeMap<String, SurfaceMaterial>,
+    pub sha256: String,
+}
+
+fn chromaticity(color: [f32; 3], what: &str) -> Result<[f32; 3]> {
+    let max = color.iter().copied().fold(0.0f32, f32::max);
+    ensure!(
+        color.iter().all(|c| c.is_finite() && *c >= 0.0) && max > 0.0,
+        "{what} colour must be finite, non-negative and non-black"
+    );
+    Ok(color.map(|c| c / max))
+}
+
+impl SceneLighting {
+    pub fn load_canonical() -> Result<Self> {
+        Self::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content"))
+    }
+
+    pub fn load(root: &Path) -> Result<Self> {
+        let path = root.join(LIGHTING_FILE);
+        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        Self::parse(&bytes).with_context(|| format!("parsing {}", path.display()))
+    }
+
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        let content: LightingContent = serde_json::from_slice(bytes)?;
+        ensure!(content.schema == 1, "unsupported lighting schema");
+        let sun = &content.sun;
+        ensure!(
+            sun.illuminance_lux.is_finite() && sun.illuminance_lux >= 0.0,
+            "sun illuminance must be finite and non-negative"
+        );
+        ensure!(
+            sun.reference_distance_m.is_finite() && sun.reference_distance_m > 0.0,
+            "sun reference distance must be positive"
+        );
+        let ambient = &content.ambient;
+        ensure!(
+            ambient.illuminance_lux.is_finite() && ambient.illuminance_lux >= 0.0,
+            "ambient illuminance must be finite and non-negative"
+        );
+        ensure!(
+            (0.0..=1.0).contains(&ambient.bounce_fraction),
+            "bounce fraction must be within 0..1"
+        );
+        let mut materials = BTreeMap::new();
+        for (body, material) in &content.bodies {
+            let brdf = Brdf::from_name(&material.brdf)
+                .with_context(|| format!("{body}: unknown BRDF {}", material.brdf))?;
+            let material = SurfaceMaterial {
+                albedo: material.albedo,
+                brdf,
+            };
+            ensure!(material.validate(), "{body}: albedo must be within 0..1");
+            materials.insert(body.clone(), material);
+        }
+        Ok(Self {
+            sun_body: sun.body.clone(),
+            illuminance_lux: sun.illuminance_lux,
+            reference_distance_m: sun.reference_distance_m,
+            sun_color: chromaticity(sun.color, "sun")?,
+            ambient_lux: ambient.illuminance_lux,
+            ambient_color: chromaticity(ambient.color, "ambient")?,
+            bounce_fraction: ambient.bounce_fraction,
+            materials,
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+        })
+    }
+
+    /// Authored material of a body, or a neutral 18 % grey.
+    pub fn material(&self, semantic_id: &str) -> SurfaceMaterial {
+        self.materials.get(semantic_id).copied().unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_lighting_loads_and_names_the_star() {
+        let lighting = SceneLighting::load_canonical().unwrap();
+        assert_eq!(lighting.sun_body, "sol");
+        assert!(lighting.illuminance_lux > 1000.0);
+        assert_eq!(lighting.material("moon").brdf, Brdf::LunarLambert);
+        assert_eq!(lighting.material("unknown"), SurfaceMaterial::default());
+        assert!(lighting.sun_color.contains(&1.0));
+    }
+
+    #[test]
+    fn invalid_lighting_is_rejected() {
+        let base = r#"{"schema":1,"sun":{"body":"sol","illuminance_lux":1.0,"reference_distance_m":1.0,"color":[1,1,1]},
+            "ambient":{"illuminance_lux":0.0,"color":[1,1,1],"bounce_fraction":0.0},"bodies":{BODIES}}"#;
+        assert!(SceneLighting::parse(base.replace("BODIES", "").as_bytes()).is_ok());
+        for bodies in [
+            r#""moon":{"albedo":[2,0,0],"brdf":"lambert"}"#,
+            r#""moon":{"albedo":[0.1,0.1,0.1],"brdf":"phong"}"#,
+        ] {
+            assert!(SceneLighting::parse(base.replace("BODIES", bodies).as_bytes()).is_err());
+        }
+        assert!(SceneLighting::parse(br#"{"schema":2}"#).is_err());
+    }
+}

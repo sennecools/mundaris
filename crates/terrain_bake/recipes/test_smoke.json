@@ -1,0 +1,111 @@
+{
+  "schema": 1,
+  "id": "test_smoke",
+  "version": 1,
+  "seed": 4111,
+  "footprint_m": 4000,
+  "base": {
+    "amplitude_m": 900,
+    "layers": [
+      {
+        "kind": "ridged",
+        "frequency": 3,
+        "octaves": 7,
+        "lacunarity": 2,
+        "gain": 0.5,
+        "weight": 0.75,
+        "sharpness": 2
+      },
+      {
+        "kind": "fbm",
+        "frequency": 2,
+        "octaves": 5,
+        "lacunarity": 2,
+        "gain": 0.5,
+        "weight": 0.5
+      }
+    ],
+    "warp": {
+      "layer": {
+        "kind": "fbm",
+        "frequency": 2,
+        "octaves": 3,
+        "lacunarity": 2,
+        "gain": 0.5,
+        "weight": 1
+      },
+      "amplitude": 0.08
+    },
+    "hardness": {
+      "layer": {
+        "kind": "fbm",
+        "frequency": 6,
+        "octaves": 3,
+        "lacunarity": 2,
+        "gain": 0.5,
+        "weight": 1
+      },
+      "base": 0.3,
+      "variation": 0.4
+    }
+  },
+  "stages": [
+    { "resolution": 128, "iterations": 200, "process": "fluvial", "detail_scale": 0 },
+    { "resolution": 256, "iterations": 200, "process": "hydraulic", "detail_scale": 0.15 }
+  ],
+  "fluvial": {
+    "dt": 1,
+    "erodibility": 0.004,
+    "area_exponent": 0.5,
+    "uplift_m_per_step": 0.5,
+    "initial_scale": 0.1,
+    "diffusion_m2_per_step": 1,
+    "erodibility_hardness": 0.8,
+    "routing_jitter": 0.3
+  },
+  "hydraulic": {
+    "dt": 0.02,
+    "gravity": 9.81,
+    "rain": 0.04,
+    "evaporation": 1,
+    "capacity": 4,
+    "dissolve": 1,
+    "deposit": 0.3,
+    "min_tilt": 0.05,
+    "depth_reference": 0.05,
+    "max_speed": 2,
+    "max_erosion_per_step": 0.05,
+    "outlet_fraction": 0.05,
+    "fill_slope": 0.01,
+    "settle_iterations": 50
+  },
+  "thermal": {
+    "talus_tangent": 0.9,
+    "rate": 5,
+    "talus_hardness": 0.35
+  },
+  "derived": {
+    "channel_resolution": 128,
+    "flow_exponent": 1.1,
+    "relief_radius_m": 120,
+    "wetness": {
+      "flow": 0.8,
+      "deposition": 0.4,
+      "shelter": 0.3,
+      "bias": 0
+    },
+    "exposure": {
+      "relief": 0.8,
+      "convexity": 0.4,
+      "bias": 0.5
+    },
+    "spawn": {
+      "flow": 0.5,
+      "incision": 0.5,
+      "steepness": 0.4,
+      "steep_tangent": 1,
+      "bias": -0.2
+    }
+  },
+  "output_relief_m": 800
+}

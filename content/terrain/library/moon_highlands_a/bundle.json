@@ -1,0 +1,338 @@
+{
+  "format": "mundaris.terrain-bundle.v1",
+  "schema_version": 1,
+  "bundle_id": "moon_highlands_a",
+  "generator": "mundaris_terrain_bake",
+  "generator_version": "erosion-pipes-1",
+  "provenance": "original-bake",
+  "external_asset_dependencies": [],
+  "seed": 1969,
+  "recipe_sha256": "46080038dca76f25040d1e1fe3eceac8a506531e8df396ae86d21cb6af9efae4",
+  "recipe": {
+    "derived": {
+      "channel_resolution": 1024,
+      "exposure": {
+        "bias": 0.5,
+        "convexity": 0.4,
+        "relief": 0.8
+      },
+      "flow_exponent": 1.1,
+      "relief_radius_m": 120.0,
+      "spawn": {
+        "bias": -0.2,
+        "flow": 0.5,
+        "incision": 0.5,
+        "steep_tangent": 1.0,
+        "steepness": 0.4
+      },
+      "wetness": {
+        "bias": 0.0,
+        "deposition": 0.4,
+        "flow": 0.8,
+        "shelter": 0.3
+      }
+    },
+    "footprint_m": 4000.0,
+    "graph": {
+      "hardness": "hardness",
+      "height": "cratered",
+      "nodes": [
+        {
+          "id": "wx2",
+          "op": {
+            "domain": null,
+            "frequency": 3,
+            "gain": 0.5,
+            "kind": "fbm",
+            "lacunarity": 2,
+            "octaves": 3,
+            "rotate_octaves": true,
+            "seed": 11,
+            "sharpness": 2.0,
+            "slope_damping": 0.0,
+            "warp": null
+          }
+        },
+        {
+          "id": "wy2",
+          "op": {
+            "domain": null,
+            "frequency": 3,
+            "gain": 0.5,
+            "kind": "fbm",
+            "lacunarity": 2,
+            "octaves": 3,
+            "rotate_octaves": true,
+            "seed": 12,
+            "sharpness": 2.0,
+            "slope_damping": 0.0,
+            "warp": null
+          }
+        },
+        {
+          "id": "wx",
+          "op": {
+            "domain": null,
+            "frequency": 2,
+            "gain": 0.5,
+            "kind": "fbm",
+            "lacunarity": 2,
+            "octaves": 4,
+            "rotate_octaves": true,
+            "seed": 1,
+            "sharpness": 2.0,
+            "slope_damping": 0.0,
+            "warp": {
+              "amplitude": 0.08,
+              "x": "wx2",
+              "y": "wy2"
+            }
+          }
+        },
+        {
+          "id": "wy",
+          "op": {
+            "domain": null,
+            "frequency": 2,
+            "gain": 0.5,
+            "kind": "fbm",
+            "lacunarity": 2,
+            "octaves": 4,
+            "rotate_octaves": true,
+            "seed": 2,
+            "sharpness": 2.0,
+            "slope_damping": 0.0,
+            "warp": {
+              "amplitude": 0.08,
+              "x": "wx2",
+              "y": "wy2"
+            }
+          }
+        },
+        {
+          "id": "swell",
+          "op": {
+            "domain": null,
+            "frequency": 1,
+            "gain": 0.5,
+            "kind": "fbm",
+            "lacunarity": 2,
+            "octaves": 6,
+            "rotate_octaves": true,
+            "seed": 3,
+            "sharpness": 2.0,
+            "slope_damping": 0.4,
+            "warp": {
+              "amplitude": 0.15,
+              "x": "wx",
+              "y": "wy"
+            }
+          }
+        },
+        {
+          "id": "folds",
+          "op": {
+            "domain": null,
+            "frequency": 2,
+            "gain": 0.45,
+            "kind": "ridged",
+            "lacunarity": 2,
+            "octaves": 2,
+            "rotate_octaves": true,
+            "seed": 4,
+            "sharpness": 1.6,
+            "slope_damping": 0.0,
+            "warp": {
+              "amplitude": 0.12,
+              "x": "wx",
+              "y": "wy"
+            }
+          }
+        },
+        {
+          "id": "folds_low",
+          "op": {
+            "factor": 0.5,
+            "input": "folds",
+            "kind": "scale",
+            "offset": 0.0
+          }
+        },
+        {
+          "id": "relief",
+          "op": {
+            "inputs": [
+              "swell",
+              "folds_low"
+            ],
+            "kind": "add"
+          }
+        },
+        {
+          "id": "terrain",
+          "op": {
+            "factor": 650.0,
+            "input": "relief",
+            "kind": "scale",
+            "offset": 0.0
+          }
+        },
+        {
+          "id": "big",
+          "op": {
+            "complex_d_m": 17000.0,
+            "coverage": 0.22,
+            "d_max_m": 1400.0,
+            "d_min_m": 200.0,
+            "degradation": 1.2,
+            "depth_ratio": 0.2,
+            "ejecta_exponent": 3.0,
+            "ejecta_extent": 2.5,
+            "inheritance": 0.15,
+            "input": "terrain",
+            "irregularity": 0.06,
+            "kind": "crater_field",
+            "rim_ratio": 0.06,
+            "seed": 2,
+            "sfd_exponent": 1.6,
+            "slump": 0.01
+          }
+        },
+        {
+          "id": "cratered",
+          "op": {
+            "complex_d_m": 17000.0,
+            "coverage": 0.05,
+            "d_max_m": 200.0,
+            "d_min_m": 14.0,
+            "degradation": 1.2,
+            "depth_ratio": 0.2,
+            "ejecta_exponent": 3.0,
+            "ejecta_extent": 2.5,
+            "inheritance": 0.15,
+            "input": "big",
+            "irregularity": 0.06,
+            "kind": "crater_field",
+            "rim_ratio": 0.06,
+            "seed": 3,
+            "sfd_exponent": 2.0,
+            "slump": 0.01
+          }
+        },
+        {
+          "id": "hardness",
+          "op": {
+            "kind": "constant",
+            "value": 0.5
+          }
+        }
+      ],
+      "uplift": null
+    },
+    "id": "moon_highlands_a",
+    "output_relief_m": null,
+    "pipeline": [
+      {
+        "filter": {
+          "kind": "base",
+          "resolution": 2048
+        },
+        "mask": null,
+        "name": "base"
+      }
+    ],
+    "schema": 2,
+    "seed": 1969,
+    "version": 1
+  },
+  "footprint_m": 4000.0,
+  "resolution": 2048,
+  "spacing_m": 1.953125,
+  "sample_location": "pixel_centres",
+  "row_order": "row-major; first row is v = 0; x increases with u",
+  "wrap": "periodic",
+  "height": {
+    "offset_m": -216.6137227785036,
+    "range_m": 433.2274455570072,
+    "decoded_min_m": -216.6137227785036,
+    "decoded_max_m": 216.6137227785036,
+    "max_quantization_error_m": 0.003305313154413625
+  },
+  "seam": {
+    "wrap_max_step_m": 4.13818908679383,
+    "interior_max_step_m": 15.504143758009192
+  },
+  "channels": [
+    {
+      "file": "height.r16",
+      "width": 2048,
+      "height": 2048,
+      "components": 1,
+      "sample_type": "u16",
+      "byte_order": "little-endian",
+      "meaning": "physical surface height; height_m = offset_m + value / 65535 * range_m",
+      "units": "m",
+      "decoded_range": [
+        -216.6137227785036,
+        216.6137227785036
+      ],
+      "sha256": "a1458c08b8052c29796dcc12a39753caaf8a79bd09648dcccd02fa83755247f1",
+      "bytes": 8388608
+    },
+    {
+      "file": "clim.rg8",
+      "width": 1024,
+      "height": 1024,
+      "components": 2,
+      "sample_type": "u8",
+      "byte_order": "none",
+      "meaning": "R = wetness (flow accumulation, deposition, shelter); G = exposure (local relief, convexity); local modifiers of global humidity/temperature",
+      "units": "unit interval (value / 255)",
+      "decoded_range": [
+        0.0,
+        1.0
+      ],
+      "sha256": "8d09b58af674ea4ddad1d33d1d002459a25f0fa24714f972618af2abdf8f6d28",
+      "bytes": 2097152
+    },
+    {
+      "file": "spawn.r8",
+      "width": 1024,
+      "height": 1024,
+      "components": 1,
+      "sample_type": "u8",
+      "byte_order": "none",
+      "meaning": "object spawn support (flow, incision, steepness)",
+      "units": "unit interval (value / 255)",
+      "decoded_range": [
+        0.0,
+        1.0
+      ],
+      "sha256": "b39f7f940d8e2572cefd48139f5cea6bb4f0c693ae72179635b183e5a1cfc12b",
+      "bytes": 1048576
+    }
+  ],
+  "bake": {
+    "adapter": {
+      "backend": "none",
+      "device": 0,
+      "driver": "",
+      "driver_info": "",
+      "name": "none (CPU-only pipeline)",
+      "vendor": 0
+    },
+    "total_seconds": 9.4194548,
+    "derive_seconds": 0.6014189,
+    "peak_gpu_allocated_bytes": 0,
+    "stages": [
+      {
+        "kind": "base",
+        "name": "base",
+        "relief_m": 433.2274455570072,
+        "resolution": 2048,
+        "seconds": 5.8515761,
+        "stage": 0
+      }
+    ]
+  }
+}

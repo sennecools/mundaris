@@ -123,6 +123,13 @@ pub enum DevCommand {
     RenderMode {
         mode: String,
     },
+    /// Sets one render registry entry by id (`render.*`); value is a boolean,
+    /// number or option name. The snapshot's `render_settings` lists them all.
+    Setting {
+        id: String,
+        value: serde_json::Value,
+    },
+    ResetRenderSettings,
     Layer {
         layer: String,
         enabled: bool,

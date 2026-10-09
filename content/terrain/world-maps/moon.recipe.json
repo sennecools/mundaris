@@ -1,0 +1,23 @@
+{
+  "schema": "mundaris.world-map-recipe.moon.v1",
+  "id": "moon_world_map_v1",
+  "seed": 1969,
+  "radius_m": 109081.7768,
+  "world_scale": 0.1,
+  "face_resolution": 512,
+  "crust": { "amplitude_m": 2000.0, "wavelength_m": 600000.0, "octaves": 6, "gain": 0.5 },
+  "craters": {
+    "surface_age_ga": 4.1,
+    "d_min_m": 8000.0,
+    "d_max_m": 300000.0,
+    "simple_complex_m": 15000.0,
+    "ejecta_extent": 2.5,
+    "inheritance": 0.1,
+    "irregularity": 0.08,
+    "max_count": 60000
+  },
+  "basins": { "count": 4, "d_min_m": 300000.0, "d_max_m": 900000.0, "depth_scale": 0.4, "age_min_ga": 3.85, "age_max_ga": 4.05 },
+  "degradation": { "kappa_1km_m2_per_myr": 5.5, "exponent": 0.9 },
+  "mare": { "age_ga": 3.6, "flooded": 3, "fill_fraction": 0.7, "shore_depth_m": 300.0 },
+  "biomes": { "crater_min_d_m": 30000.0, "degraded_ratio": 0.3, "ejecta_biome_extent": 1.8, "ejecta_max_age_ga": 3.3 }
+}

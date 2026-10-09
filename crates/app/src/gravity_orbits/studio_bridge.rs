@@ -58,6 +58,16 @@ impl GravityOrbitsDemo {
                 };
                 push(&mut self.controls, command);
             }
+            StudioAction::SetSetting(index, value) => {
+                if let Err(error) = self.apply_render_setting(index, value) {
+                    self.log(Tone::Warn, format!("Setting rejected: {error:#}"));
+                }
+            }
+            StudioAction::ResetRenderSettings => {
+                self.controls.render_settings = Default::default();
+                self.controls.terrain_view = TerrainViewMode::Lit;
+                self.log(Tone::Normal, "Render settings reset to defaults".into());
+            }
             StudioAction::SetView(index) => {
                 if let Some(mode) = TerrainViewMode::ALL.get(index) {
                     push(
@@ -439,6 +449,69 @@ impl GravityOrbitsDemo {
                 self.scene_sha256.get(..8).unwrap_or_default()
             ),
             log: self.controls.log.iter().rev().cloned().collect(),
+            render_settings: {
+                let state = self.render_state();
+                (0..crate::render_settings::SPECS.len())
+                    .map(|index| crate::render_settings::get(&state, index))
+                    .collect()
+            },
+            render_stats: snapshot.map_or_else(Vec::new, |snapshot| {
+                let mut stats: Vec<StatItem> = self
+                    .sun_elevation
+                    .map(|(_, elevation)| {
+                        StatItem::new(
+                            "Sun elevation",
+                            if elevation < 0.0 {
+                                format!("{elevation:.1}° (night)")
+                            } else {
+                                format!("{elevation:.1}°")
+                            },
+                        )
+                        .tone(if elevation < 0.0 {
+                            Tone::Warn
+                        } else {
+                            Tone::Normal
+                        })
+                    })
+                    .into_iter()
+                    .collect();
+                stats.extend(
+                    snapshot
+                        .performance
+                        .gpu_scopes
+                        .iter()
+                        .filter(|scope| scope.depth > 0)
+                        .map(|scope| {
+                            StatItem::new(
+                                &scope.name,
+                                format!("{:.2} ms", scope.end_ms - scope.start_ms),
+                            )
+                        }),
+                );
+                if let Some(shadows) = snapshot.render_settings.as_ref().map(|r| &r["shadows"])
+                    && let Some(count) = shadows["cascades"].as_u64().filter(|c| *c > 0)
+                {
+                    {
+                        let splits: Vec<String> = shadows["splits_m"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .take(count as usize)
+                            .filter_map(|v| v.as_f64())
+                            .map(compact_distance)
+                            .collect();
+                        stats.push(StatItem::new("Cascades", splits.join(" / ")));
+                        let casters: u64 = shadows["casters"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|v| v.as_u64())
+                            .sum();
+                        stats.push(StatItem::new("Caster draws", casters.to_string()));
+                    }
+                }
+                stats
+            }),
             gpu_passes: snapshot.map_or([None; 3], |snapshot| {
                 [
                     snapshot.performance.gpu_main_pass_ms,
@@ -447,6 +520,26 @@ impl GravityOrbitsDemo {
                 ]
             }),
         };
+    }
+
+    pub(super) fn render_state(&self) -> crate::render_settings::RenderState {
+        crate::render_settings::RenderState {
+            settings: self.controls.render_settings,
+            view_mode: self.controls.terrain_view,
+        }
+    }
+
+    /// Applies one registry value to the session render state.
+    pub(super) fn apply_render_setting(
+        &mut self,
+        index: usize,
+        value: crate::render_settings::SettingValue,
+    ) -> Result<()> {
+        let mut state = self.render_state();
+        crate::render_settings::set(&mut state, index, value)?;
+        self.controls.render_settings = state.settings;
+        self.controls.terrain_view = state.view_mode;
+        Ok(())
     }
 
     /// Places body labels with the shared collision-avoiding layout and returns

@@ -207,6 +207,8 @@ fn rendered_centers_cache_toggle_occlusion_and_invalid_state() {
         color: [0.1, 0.3, 0.5, 1.0],
         unlit: true,
         selected: false,
+        material: Default::default(),
+        emission_nits: 0.0,
     };
     let sphere = Icosphere::new();
     let mut staging = CelestialStaging::default();

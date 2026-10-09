@@ -217,6 +217,17 @@ impl GravityOrbitsDemo {
                     mode,
                 )))
             }
+            DevCommand::Setting { id, value } => {
+                let index = crate::render_settings::index_of(id)
+                    .ok_or_else(|| anyhow::anyhow!("unknown setting {id}"))?;
+                let value = crate::render_settings::value_from_json(index, value)?;
+                self.apply_render_setting(index, value)
+            }
+            DevCommand::ResetRenderSettings => {
+                self.controls.render_settings = Default::default();
+                self.controls.terrain_view = TerrainViewMode::Lit;
+                Ok(())
+            }
             DevCommand::Layer { layer, enabled } => {
                 self.command(Command::Visual(visual_controls::VisualCommand::Layer(
                     visual_controls::Layer::named(layer)?,

@@ -47,6 +47,8 @@ fn benches(c: &mut Criterion) {
                 color: [0.2, 0.5, 1.0, 1.0],
                 unlit: false,
                 selected: false,
+                material: Default::default(),
+                emission_nits: 0.0,
             })
             .collect();
         let mut storage = CelestialStaging::default();

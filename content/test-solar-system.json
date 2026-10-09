@@ -9,121 +9,122 @@
     "draw_cells": 32,
     "atlas_layers": 512,
     "normal_scale": 2,
-    "pixel_error": 4.0,
-    "min_range_factor": 3.0,
+    "pixel_error": 4,
+    "min_range_factor": 3,
     "morph_fraction": 0.3,
     "base_resident_level": 1,
     "max_level": 22,
     "jobs_per_frame": 24,
     "arrival_seconds": 0.25,
-    "skirt_cells": 2.0,
-    "min_body_pixels": 6.0
+    "skirt_cells": 2,
+    "min_body_pixels": 6
   },
   "bodies": [
     {
       "id": "sol",
       "name": "Sol",
       "identity": 1,
-      "mass_kg": 1.98847e+26,
-      "radius_m": 800000.0,
+      "mass_kg": 1.987e+28,
+      "radius_m": 69570000,
       "color": [
-        1.0,
+        1,
         0.83,
         0.48,
-        1.0
+        1
       ],
       "unlit": true,
       "translation": {
         "kind": "Stationary",
         "position_m": [
-          0.0,
-          0.0,
-          0.0
+          0,
+          0,
+          0
         ]
       },
       "spin_axis": [
-        0.0,
-        1.0,
-        0.0
+        0,
+        1,
+        0
       ],
       "spin_orientation_xyzw": [
-        0.0,
-        0.0,
-        0.0,
-        1.0
+        0,
+        0,
+        0,
+        1
       ],
-      "spin_radians_per_second": 0.0,
+      "spin_radians_per_second": 0,
       "terrain": null
     },
     {
       "id": "moon",
       "name": "Moon",
       "identity": 2,
-      "mass_kg": 7.342e+20,
+      "mass_kg": 288820000000000000000,
       "radius_m": 109081.77680113012,
       "color": [
         0.52,
         0.52,
         0.52,
-        1.0
+        1
       ],
       "unlit": false,
       "translation": {
         "kind": "Elliptic",
-        "reference": "sol",
-        "semi_major_axis_m": 24000000.0,
-        "eccentricity": 0.0,
-        "period_s": 120000.0,
+        "reference": "rust",
+        "semi_major_axis_m": 20000000,
+        "eccentricity": 0,
+        "period_s": 859640,
         "inclination_radians": 0.089,
         "phase_radians": 1.2
       },
       "spin_axis": [
-        0.0,
-        1.0,
-        0.0
+        0,
+        1,
+        0
       ],
       "spin_orientation_xyzw": [
-        0.0,
-        0.0,
-        0.0,
-        1.0
+        0,
+        0,
+        0,
+        1
       ],
-      "spin_radians_per_second": 0.0002,
+      "spin_radians_per_second": 0.000007309,
       "terrain": "terrain/moon.json"
     },
     {
       "id": "rust",
       "name": "Rust",
       "identity": 3,
-      "mass_kg": 8e+20,
-      "radius_m": 140000.0,
+      "mass_kg": 6.4037e+21,
+      "radius_m": 338950,
       "color": [
         0.6,
         0.3,
         0.16,
-        1.0
+        1
       ],
       "unlit": false,
       "translation": {
-        "kind": "Stationary",
-        "position_m": [
-          50000000.0,
-          12000000.0,
-          0.0
-        ]
+        "kind": "Elliptic",
+        "reference": "sol",
+        "semi_major_axis_m": 22790000000,
+        "eccentricity": 0.0934,
+        "period_s": 18772000,
+        "inclination_radians": 0.032,
+        "phase_radians": 0.4
       },
       "spin_axis": [
-        0.0,
-        1.0,
-        0.0
+        0,
+        1,
+        0
       ],
       "spin_orientation_xyzw": [
-        0.0,
-        0.0,
-        0.0,
-        1.0
+        0,
+        0,
+        0,
+        1
       ],
-      "spin_radians_per_second": -0.00015,
+      "spin_radians_per_second": 0.00007088,
       "terrain": "terrain/rust.json"
     }
   ]

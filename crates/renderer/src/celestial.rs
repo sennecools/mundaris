@@ -126,6 +126,8 @@ mod tests {
                 color: [0.1, 0.2, 0.3, 1.0],
                 unlit: true,
                 selected: true,
+                material: crate::SurfaceMaterial::default(),
+                emission_nits: 0.0,
             }])
             .unwrap();
         assert_eq!(frame.staging.vertices.len(), 642 * 32);
@@ -147,6 +149,7 @@ mod tests {
             1
         );
         assert!(frame.staging.uniforms[24..].iter().all(|&b| b == 0));
+        assert_eq!(super::DRAW_UNIFORM_BYTES, 48);
     }
 }
 
@@ -154,9 +157,15 @@ mod tests {
 pub struct CelestialRenderBody {
     pub body_fixed_frame: FrameId,
     pub reference_radius_m: f64,
+    /// Presentation colour; for emitters, the emission chromaticity.
     pub color: [f32; 4],
+    /// Emitters (stars) are drawn with `emission_nits` and receive no light.
     pub unlit: bool,
     pub selected: bool,
+    /// Reflectance of lit bodies.
+    pub material: crate::SurfaceMaterial,
+    /// Emitter disk luminance in cd/m².
+    pub emission_nits: f32,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SphereRepresentation {
@@ -204,12 +213,15 @@ pub struct CelestialStaging {
     sky: Option<crate::sky::SkyPrepared>,
     vertices: Vec<u8>,
     uniforms: Vec<u8>,
-    lines: Vec<u8>,
     polylines: Vec<u8>,
     draws: Vec<u32>,
     markers: Vec<CelestialMarker>,
     centers: Vec<(DVec3, f64)>,
     terrain_atlas: Option<crate::TerrainAtlasFrame>,
+    lighting: Option<crate::FrameLighting>,
+    view_mode: u32,
+    passthrough: bool,
+    line_style: crate::LineStyleScale,
 }
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CelestialPreparationReport {
@@ -242,8 +254,11 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
     ) -> Self {
         staging.vertices.clear();
         staging.uniforms.clear();
-        staging.lines.clear();
         staging.polylines.clear();
+        staging.lighting = None;
+        staging.view_mode = crate::TerrainViewMode::Lit.shader_mode();
+        staging.passthrough = false;
+        staging.line_style = crate::LineStyleScale::default();
         staging.draws.clear();
         staging.markers.clear();
         staging.centers.clear();
@@ -269,6 +284,30 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
         }
         self.range_m = range_m;
         Ok(())
+    }
+
+    /// Physically ordered light of this frame (docs/RENDER_PIPELINE_HDR.md §3).
+    pub fn set_lighting(
+        &mut self,
+        lighting: crate::FrameLighting,
+    ) -> Result<(), RenderPreparationError> {
+        if lighting.validate().is_err() {
+            self.failed = true;
+            return Err(RenderPreparationError::InvalidDebugGeometry);
+        }
+        self.staging.lighting = Some(lighting);
+        Ok(())
+    }
+
+    /// Debug view applied to every surface and the post chain.
+    pub fn set_view_mode(&mut self, mode: crate::TerrainViewMode) {
+        self.staging.view_mode = mode.shader_mode();
+        self.staging.passthrough = mode.passthrough();
+    }
+
+    /// Session width/opacity scale for guide lines prepared after this call.
+    pub fn set_line_style(&mut self, style: crate::LineStyleScale) {
+        self.staging.line_style = style;
     }
 
     /// Stages atlas producer jobs and instanced terrain draws (ADR 0016).
@@ -335,6 +374,9 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
             if !body.reference_radius_m.is_finite()
                 || body.reference_radius_m <= 0.0
                 || !body.color.iter().all(|c| c.is_finite())
+                || !body.material.validate()
+                || !body.emission_nits.is_finite()
+                || body.emission_nits < 0.0
             {
                 return Err(RenderPreparationError::InvalidDebugGeometry);
             }
@@ -418,22 +460,35 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
                     self.staging.draws.push((start / 32) as u32);
                     let offset = self.staging.uniforms.len();
                     self.staging.uniforms.resize(offset + 256, 0);
-                    for (v, out) in body.color.iter().zip(
-                        self.staging.uniforms[offset..offset + 16]
+                    let albedo = body.material.albedo;
+                    let color = if body.unlit {
+                        body.color
+                    } else {
+                        [albedo[0], albedo[1], albedo[2], 1.0]
+                    };
+                    let emission = if body.unlit {
+                        [
+                            body.color[0] * body.emission_nits,
+                            body.color[1] * body.emission_nits,
+                            body.color[2] * body.emission_nits,
+                            0.0,
+                        ]
+                    } else {
+                        [0.0; 4]
+                    };
+                    let brdf = body.material.brdf.shader_index() as u32;
+                    let flags = [u32::from(body.unlit), u32::from(body.selected), brdf, 0];
+                    let words = color
+                        .iter()
+                        .map(|v| v.to_le_bytes())
+                        .chain(flags.iter().map(|v| v.to_le_bytes()))
+                        .chain(emission.iter().map(|v| v.to_le_bytes()));
+                    for (bytes, out) in words.zip(
+                        self.staging.uniforms[offset..offset + 48]
                             .as_chunks_mut::<4>()
                             .0,
                     ) {
-                        out.copy_from_slice(&v.to_le_bytes());
-                    }
-                    for (v, out) in [u32::from(body.unlit), u32::from(body.selected), 0, 0]
-                        .iter()
-                        .zip(
-                            self.staging.uniforms[offset + 16..offset + 32]
-                                .as_chunks_mut::<4>()
-                                .0,
-                        )
-                    {
-                        out.copy_from_slice(&v.to_le_bytes());
+                        out.copy_from_slice(&bytes);
                     }
                     self.report.triangles += 1280;
                 }
@@ -508,6 +563,7 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
                 self.view,
                 self.projection,
                 lines,
+                self.staging.line_style,
                 &mut self.staging.polylines,
             )
         })();
@@ -533,42 +589,31 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
     ) -> Result<(), RenderPreparationError> {
         self.validate()?;
         let prepared = self.view.prepare_source(source)?;
+        let style = self.staging.line_style;
         for line in lines {
             if !line.color.iter().all(|c| c.is_finite()) {
                 return Err(RenderPreparationError::InvalidDebugGeometry);
             }
-            let a = prepared.view_displacement(line.endpoints[0])?.metres();
-            let b = prepared.view_displacement(line.endpoints[1])?.metres();
-            if let Some(clipped) = self.projection.clip_segment([a, b])? {
-                let start = self.staging.lines.len();
-                let mut outside = false;
-                for point in clipped {
-                    match self.projection.narrow(point, f64::MAX, self.range_m) {
-                        Ok((position, error, pixels)) => {
-                            for v in [position[0], position[1], position[2], 1.0]
-                                .into_iter()
-                                .chain(line.color)
-                            {
-                                self.staging.lines.extend_from_slice(&v.to_le_bytes());
-                            }
-                            self.report.max_narrowing_error_m =
-                                self.report.max_narrowing_error_m.max(error);
-                            self.report.max_projected_error_pixels =
-                                self.report.max_projected_error_pixels.max(pixels);
-                        }
-                        Err(RenderPreparationError::OutsideRenderRange { .. }) => {
-                            outside = true;
-                            break;
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-                if outside {
-                    self.staging.lines.truncate(start);
-                } else {
-                    self.report.trail_segments += 1;
-                }
-            }
+            let points = [
+                prepared.view_displacement(line.endpoints[0])?.metres(),
+                prepared.view_displacement(line.endpoints[1])?.metres(),
+            ];
+            let mut report = crate::PolylinePreparationReport::default();
+            crate::celestial_lines::emit_polyline(
+                self.projection,
+                &points,
+                &[line.color; 2],
+                AXIS_LINE_WIDTH_PX * style.width,
+                style.opacity,
+                crate::CelestialLineStyle::Solid,
+                &mut self.staging.polylines,
+                &mut report,
+            )?;
+            self.report.trail_segments += report.segments;
+            self.report.max_projected_error_pixels = self
+                .report
+                .max_projected_error_pixels
+                .max(report.max_projected_error_pixels);
         }
         Ok(())
     }
@@ -580,6 +625,8 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
         }
     }
 }
+/// Width of axis and history lines in physical pixels.
+const AXIS_LINE_WIDTH_PX: f32 = 1.5;
 fn pack(position: [f32; 3], normal: [f32; 3], bytes: &mut Vec<u8>, normal_w: f32) {
     for v in [
         position[0],
@@ -595,14 +642,21 @@ fn pack(position: [f32; 3], normal: [f32; 3], bytes: &mut Vec<u8>, normal_w: f32
     }
 }
 
+/// Shadow cascade state of the latest frame, for snapshots and the Studio.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ShadowReport {
+    pub cascades: u32,
+    pub casters: [u32; 4],
+    pub splits_m: [f32; 4],
+    pub texel_m: [f32; 4],
+}
+
 pub(crate) struct CelestialRenderer {
     sky: crate::sky::SkyRenderer,
     sphere_pipeline: wgpu::RenderPipeline,
-    line_pipeline: wgpu::RenderPipeline,
     polyline_pipeline: wgpu::RenderPipeline,
     projection: wgpu::Buffer,
     projection_layout: wgpu::BindGroupLayout,
-    target_format: wgpu::TextureFormat,
     projection_group: wgpu::BindGroup,
     uniform_layout: wgpu::BindGroupLayout,
     uniforms: wgpu::Buffer,
@@ -610,18 +664,25 @@ pub(crate) struct CelestialRenderer {
     uniform_capacity: u64,
     vertices: wgpu::Buffer,
     vertex_capacity: u64,
-    lines: wgpu::Buffer,
-    line_capacity: u64,
     polylines: wgpu::Buffer,
     polyline_capacity: u64,
     indices: wgpu::Buffer,
     terrain_atlas: Option<crate::terrain_atlas::TerrainAtlasRenderer>,
-    _depth_texture: wgpu::Texture,
-    depth: wgpu::TextureView,
+    post: crate::post::PostProcess,
+    shadows: crate::shadows::ShadowMaps,
+    lighting_layout: wgpu::BindGroupLayout,
+    lighting: wgpu::Buffer,
+    lighting_group: wgpu::BindGroup,
+    settings: crate::RenderSettings,
+    size: [u32; 2],
+    shadow_report: ShadowReport,
 }
 impl CelestialRenderer {
     pub(crate) fn last_sky_resource_report(&self) -> crate::sky::SkyResourceReport {
         self.sky.report()
+    }
+    pub(crate) fn shadow_report(&self) -> ShadowReport {
+        self.shadow_report
     }
     pub(crate) fn on_submitted(&mut self) {
         if let Some(atlas) = &mut self.terrain_atlas {
@@ -641,10 +702,11 @@ impl CelestialRenderer {
     pub(crate) fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        format: wgpu::TextureFormat,
+        output_format: wgpu::TextureFormat,
         width: u32,
         height: u32,
     ) -> Self {
+        let settings = crate::RenderSettings::default();
         let projection = buffer(
             device,
             64,
@@ -653,38 +715,38 @@ impl CelestialRenderer {
         );
         let projection_layout = layout(device, 64, false, wgpu::ShaderStages::VERTEX);
         let projection_group = binding(device, &projection_layout, &projection, 64);
-        let uniform_layout = layout(device, 32, true, wgpu::ShaderStages::FRAGMENT);
+        let uniform_layout = layout(
+            device,
+            DRAW_UNIFORM_BYTES,
+            true,
+            wgpu::ShaderStages::FRAGMENT,
+        );
         let uniforms = buffer(
             device,
             256,
             wgpu::BufferUsages::UNIFORM,
-            "Celestial per-draw color/flags",
+            "Celestial per-draw material",
         );
-        let uniform_group = binding(device, &uniform_layout, &uniforms, 32);
-        let sphere_pipeline = pipeline(
+        let uniform_group = binding(device, &uniform_layout, &uniforms, DRAW_UNIFORM_BYTES);
+        let lighting_layout = lighting_layout(device);
+        let lighting = buffer(
             device,
-            format,
-            &[&projection_layout, &uniform_layout],
-            include_str!("shaders/celestial.wgsl"),
-            false,
-            "Celestial spheres reverse-Z pipeline",
+            crate::lighting::LIGHTING_BYTES as u64,
+            wgpu::BufferUsages::UNIFORM,
+            "Scene lighting",
         );
-        let line_pipeline = pipeline(
+        let post = crate::post::PostProcess::new(device, queue, output_format);
+        let shadows = crate::shadows::ShadowMaps::new(device, settings.shadows.resolution);
+        let lighting_group = lighting_group(device, &lighting_layout, &lighting, &post, &shadows);
+        let sphere_pipeline = scene_pipeline(
             device,
-            format,
-            &[&projection_layout],
-            include_str!("shaders/celestial_trails.wgsl"),
-            true,
-            "Celestial history reverse-Z pipeline",
+            &[&projection_layout, &uniform_layout, &lighting_layout],
+            concat!(
+                include_str!("shaders/lighting.wgsl"),
+                include_str!("shaders/celestial.wgsl")
+            ),
         );
-        let polyline_pipeline = pipeline(
-            device,
-            format,
-            &[],
-            include_str!("shaders/celestial_lines.wgsl"),
-            true,
-            "Celestial styled curves reverse-Z pipeline",
-        );
+        let polyline_pipeline = overlay_pipeline(device, output_format);
         let indices = buffer(
             device,
             1280 * 3 * 4,
@@ -696,15 +758,12 @@ impl CelestialRenderer {
             bytes.extend_from_slice(&index.to_le_bytes());
         }
         queue.write_buffer(&indices, 0, &bytes);
-        let (depth_texture, depth) = depth(device, width, height);
-        Self {
-            sky: crate::sky::SkyRenderer::new(device, format),
+        let mut renderer = Self {
+            sky: crate::sky::SkyRenderer::new(device, &crate::post::SCENE_TARGETS),
             sphere_pipeline,
-            line_pipeline,
             polyline_pipeline,
             projection,
             projection_layout,
-            target_format: format,
             projection_group,
             uniform_layout,
             uniforms,
@@ -712,25 +771,48 @@ impl CelestialRenderer {
             uniform_capacity: 256,
             vertices: buffer(device, 32, wgpu::BufferUsages::VERTEX, "Celestial vertices"),
             vertex_capacity: 32,
-            lines: buffer(device, 32, wgpu::BufferUsages::VERTEX, "Historical lines"),
-            line_capacity: 32,
             polylines: buffer(
                 device,
-                32,
+                48,
                 wgpu::BufferUsages::VERTEX,
                 "Celestial styled curves",
             ),
-            polyline_capacity: 32,
+            polyline_capacity: 48,
             indices,
             terrain_atlas: None,
-            _depth_texture: depth_texture,
-            depth,
-        }
+            post,
+            shadows,
+            lighting_layout,
+            lighting,
+            lighting_group,
+            settings,
+            size: [width.max(1), height.max(1)],
+            shadow_report: ShadowReport::default(),
+        };
+        renderer
+            .post
+            .ensure(device, renderer.size, renderer.settings.ao.half_res);
+        renderer
     }
     pub(crate) fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
-        let (texture, view) = depth(device, width, height);
-        self._depth_texture = texture;
-        self.depth = view;
+        self.size = [width.max(1), height.max(1)];
+        self.post
+            .ensure(device, self.size, self.settings.ao.half_res);
+    }
+    /// Applies validated settings; reallocates only what changed.
+    pub(crate) fn set_settings(&mut self, device: &wgpu::Device, settings: crate::RenderSettings) {
+        if settings.shadows.resolution != self.shadows.resolution() {
+            self.shadows = crate::shadows::ShadowMaps::new(device, settings.shadows.resolution);
+            self.lighting_group = lighting_group(
+                device,
+                &self.lighting_layout,
+                &self.lighting,
+                &self.post,
+                &self.shadows,
+            );
+        }
+        self.settings = settings;
+        self.post.ensure(device, self.size, settings.ao.half_res);
     }
     pub(crate) fn draw(
         &mut self,
@@ -740,9 +822,12 @@ impl CelestialRenderer {
         view: &wgpu::TextureView,
         frame: &CelestialFrame<'_, '_, '_>,
         timestamps: Option<&crate::gpu_profile::CelestialQueries>,
-    ) -> Result<u16, RenderPreparationError> {
+    ) -> Result<u32, RenderPreparationError> {
+        use crate::gpu_profile::pair;
         frame.validate()?;
         let storage = &frame.staging;
+        let settings = self.settings;
+        self.post.ensure(device, self.size, settings.ao.half_res);
         self.sky.upload(device, queue, storage.sky.as_ref());
         if let Some(atlas_frame) = &storage.terrain_atlas
             && let Some(config) = atlas_frame.config
@@ -755,8 +840,10 @@ impl CelestialRenderer {
                 self.terrain_atlas = Some(
                     crate::terrain_atlas::TerrainAtlasRenderer::new(
                         device,
-                        self.target_format,
+                        &crate::post::SCENE_TARGETS,
                         &self.projection_layout,
+                        &self.lighting_layout,
+                        &self.shadows.light_layout,
                         config,
                     )
                     .map_err(RenderPreparationError::TerrainAtlas)?,
@@ -777,13 +864,6 @@ impl CelestialRenderer {
         );
         grow(
             device,
-            &mut self.lines,
-            &mut self.line_capacity,
-            storage.lines.len(),
-            wgpu::BufferUsages::VERTEX,
-        );
-        grow(
-            device,
             &mut self.polylines,
             &mut self.polyline_capacity,
             storage.polylines.len(),
@@ -797,12 +877,16 @@ impl CelestialRenderer {
                 wgpu::BufferUsages::UNIFORM,
                 "Celestial draw uniforms",
             );
-            self.uniform_group = binding(device, &self.uniform_layout, &self.uniforms, 32);
+            self.uniform_group = binding(
+                device,
+                &self.uniform_layout,
+                &self.uniforms,
+                DRAW_UNIFORM_BYTES,
+            );
         }
         queue.write_buffer(&self.projection, 0, &frame.projection.gpu_bytes());
         for (buffer, bytes) in [
             (&self.vertices, &storage.vertices),
-            (&self.lines, &storage.lines),
             (&self.polylines, &storage.polylines),
             (&self.uniforms, &storage.uniforms),
         ] {
@@ -810,32 +894,88 @@ impl CelestialRenderer {
                 queue.write_buffer(buffer, 0, bytes);
             }
         }
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Celestial scene: terrain, bodies, and sky"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+
+        // Lighting and sun shadow cascades of the nearest drawn surface.
+        let near = frame.projection.near_m();
+        let atlas_frame = storage.terrain_atlas.as_ref();
+        let shadow = atlas_frame
+            .and_then(|a| a.shadow.as_ref())
+            .filter(|_| settings.shadows.enabled && storage.lighting.is_some())
+            .filter(|_| !storage.passthrough || storage.view_mode == 11);
+        let cascades = shadow.map(|s| s.cascades);
+        queue.write_buffer(
+            &self.lighting,
+            0,
+            &crate::lighting::pack_lighting(
+                storage.lighting.as_ref(),
+                &settings,
+                cascades.as_ref(),
+                near,
+                storage.view_mode,
+            ),
+        );
+        let mut scope_mask = 0u32;
+        self.shadow_report = ShadowReport::default();
+        if let (Some(shadow), Some(atlas)) = (shadow, self.terrain_atlas.as_mut()) {
+            let cascades = shadow.cascades;
+            let count = (cascades.count as usize).min(4);
+            let lists = &shadow.casters[..count];
+            atlas.prepare_shadows(device, queue, lists);
+            self.shadows.write_projections(queue, &cascades);
+            for c in 0..count {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Sun shadow cascade"),
+                    color_attachments: &[],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.shadows.layer_views[c],
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: timestamps
+                        .and_then(|q| q.pass_writes_partial(pair::SHADOWS, c == 0, c + 1 == count)),
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                atlas.draw_shadow(&mut pass, &self.shadows.light_group, c);
+            }
+            scope_mask |= 1 << pair::SHADOWS;
+            self.shadow_report = ShadowReport {
+                cascades: cascades.count,
+                casters: std::array::from_fn(|c| lists.get(c).map_or(0, |l| l.len() as u32)),
+                splits_m: cascades.splits,
+                texel_m: cascades.texel_m,
+            };
+        }
+
+        let Some(([direct, normal, ambient], depth)) = self.post.scene_views() else {
+            return Err(RenderPreparationError::InvalidProjection);
+        };
+        let clear = |view| {
+            Some(wgpu::RenderPassColorAttachment {
                 view,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        // Linear equivalents of the original display-space sky.
-                        r: 0.001_934_984_5,
-                        g: 0.002_708_978_3,
-                        b: 0.004_896_31,
-                        a: 1.0,
-                    }),
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                     store: wgpu::StoreOp::Store,
                 },
-            })],
+            })
+        };
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Celestial scene: terrain, bodies, and sky"),
+            color_attachments: &[clear(direct), clear(normal), clear(ambient)],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &self.depth,
+                view: depth,
                 depth_ops: Some(wgpu::Operations {
                     load: wgpu::LoadOp::Clear(0.0),
                     store: wgpu::StoreOp::Store,
                 }),
                 stencil_ops: None,
             }),
-            timestamp_writes: timestamps.map(|queries| queries.pass_writes(0)),
+            timestamp_writes: timestamps.map(|queries| queries.pass_writes(pair::SCENE)),
             occlusion_query_set: None,
             multiview_mask: None,
         });
@@ -843,43 +983,63 @@ impl CelestialRenderer {
         let [w, h] = frame.projection.viewport();
         pass.set_viewport(x as f32, y as f32, w as f32, h as f32, 0.0, 1.0);
         pass.set_scissor_rect(x, y, w, h);
+        let inside = timestamps.filter(|q| q.inside_passes());
         if let Some(sky) = &storage.sky {
             let drawn = sky.report().stars_drawn || sky.report().background_drawn;
-            if drawn && let Some(queries) = timestamps.filter(|q| q.inside_passes()) {
-                queries.write_scope(&mut pass, 8);
+            if drawn && let Some(queries) = inside {
+                queries.write_scope(&mut pass, pair::SKY);
             }
             self.sky.draw(&mut pass, sky);
-            if drawn && let Some(queries) = timestamps.filter(|q| q.inside_passes()) {
-                queries.end_scope(&mut pass, 8);
+            if drawn && let Some(queries) = inside {
+                queries.end_scope(&mut pass, pair::SKY);
+                scope_mask |= 1 << pair::SKY;
             }
         }
-        if !storage.draws.is_empty()
-            && let Some(queries) = timestamps.filter(|q| q.inside_passes())
-        {
-            queries.write_scope(&mut pass, 7);
-        }
-        for (i, &start) in storage.draws.iter().enumerate() {
-            self.bind_sphere_state(&mut pass, i as u32, start);
-            pass.draw_indexed(0..3840, 0, 0..1);
-        }
-        if !storage.draws.is_empty()
-            && let Some(queries) = timestamps.filter(|q| q.inside_passes())
-        {
-            queries.end_scope(&mut pass, 7);
+        if !storage.draws.is_empty() {
+            if let Some(queries) = inside {
+                queries.write_scope(&mut pass, pair::SPHERES);
+            }
+            for (i, &start) in storage.draws.iter().enumerate() {
+                self.bind_sphere_state(&mut pass, i as u32, start);
+                pass.draw_indexed(0..3840, 0, 0..1);
+            }
+            if let Some(queries) = inside {
+                queries.end_scope(&mut pass, pair::SPHERES);
+                scope_mask |= 1 << pair::SPHERES;
+            }
         }
         if storage.terrain_atlas.is_some()
             && let Some(atlas) = &self.terrain_atlas
         {
-            if let Some(queries) = timestamps.filter(|q| q.inside_passes()) {
-                queries.write_scope(&mut pass, 3);
+            if let Some(queries) = inside {
+                queries.write_scope(&mut pass, pair::TERRAIN);
             }
-            atlas.draw(&mut pass, &self.projection_group);
-            if let Some(queries) = timestamps.filter(|q| q.inside_passes()) {
-                queries.end_scope(&mut pass, 3);
+            atlas.draw(&mut pass, &self.projection_group, &self.lighting_group);
+            if let Some(queries) = inside {
+                queries.end_scope(&mut pass, pair::TERRAIN);
+                scope_mask |= 1 << pair::TERRAIN;
             }
         }
         drop(pass);
-        if !storage.lines.is_empty() || !storage.polylines.is_empty() {
+        scope_mask |= 1 << pair::SCENE;
+
+        scope_mask |= self.post.encode(
+            queue,
+            encoder,
+            view,
+            &settings,
+            crate::post::PostFrame {
+                near_m: near,
+                focal_px: frame.projection.focal_pixels(),
+                view_mode: storage.view_mode,
+                passthrough: storage.passthrough,
+            },
+            timestamps,
+        );
+
+        if !storage.polylines.is_empty()
+            && let Some(depth) = self.post.depth_view()
+        {
             let mut overlays = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Celestial guides and overlays"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -892,49 +1052,26 @@ impl CelestialRenderer {
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth,
+                    view: depth,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: timestamps.map(|queries| queries.pass_writes(2)),
+                timestamp_writes: timestamps.map(|queries| queries.pass_writes(pair::OVERLAY)),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            let [x, y] = frame.projection.origin();
-            let [w, h] = frame.projection.viewport();
             overlays.set_viewport(x as f32, y as f32, w as f32, h as f32, 0.0, 1.0);
             overlays.set_scissor_rect(x, y, w, h);
-            if !storage.lines.is_empty() {
-                self.bind_history_state(&mut overlays);
-                overlays.draw(0..(storage.lines.len() / 32) as u32, 0..1);
-            }
-            if !storage.polylines.is_empty() {
-                self.bind_polyline_state(&mut overlays);
-                overlays.draw(0..(storage.polylines.len() / 32) as u32, 0..1);
-            }
-        }
-        let mut scope_mask = 1;
-        if !storage.lines.is_empty() || !storage.polylines.is_empty() {
-            scope_mask |= 1 << 2;
-        }
-        if let Some(queries) = timestamps.filter(|q| q.inside_passes()) {
-            if storage
-                .sky
-                .as_ref()
-                .is_some_and(|s| s.report().stars_drawn || s.report().background_drawn)
-            {
-                scope_mask |= 1 << 8;
-            }
-            if storage.terrain_atlas.is_some() && self.terrain_atlas.is_some() {
-                scope_mask |= 1 << 3;
-            }
-            if !storage.draws.is_empty() {
-                scope_mask |= 1 << 7;
-            }
-            let _ = queries;
+            overlays.set_pipeline(&self.polyline_pipeline);
+            overlays.set_vertex_buffer(0, self.polylines.slice(..));
+            overlays.draw(
+                0..(storage.polylines.len() / crate::celestial_lines::LINE_VERTEX_BYTES) as u32,
+                0..1,
+            );
+            scope_mask |= 1 << pair::OVERLAY;
         }
         Ok(scope_mask)
     }
@@ -945,6 +1082,7 @@ impl CelestialRenderer {
         pass.set_pipeline(&self.sphere_pipeline);
         pass.set_bind_group(0, &self.projection_group, &[]);
         pass.set_bind_group(1, &self.uniform_group, &[draw * 256]);
+        pass.set_bind_group(2, &self.lighting_group, &[]);
         pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
         pass.set_vertex_buffer(
             0,
@@ -952,18 +1090,82 @@ impl CelestialRenderer {
                 .slice(start as u64 * 32..(start as u64 + 642) * 32),
         );
     }
-
-    fn bind_history_state(&self, pass: &mut wgpu::RenderPass<'_>) {
-        pass.set_pipeline(&self.line_pipeline);
-        pass.set_bind_group(0, &self.projection_group, &[]);
-        pass.set_vertex_buffer(0, self.lines.slice(..));
-    }
-
-    fn bind_polyline_state(&self, pass: &mut wgpu::RenderPass<'_>) {
-        // Styled curves already contain clip positions and have no bind groups.
-        pass.set_pipeline(&self.polyline_pipeline);
-        pass.set_vertex_buffer(0, self.polylines.slice(..));
-    }
+}
+/// Per-draw sphere uniform: albedo/colour, flags, emission.
+const DRAW_UNIFORM_BYTES: u64 = 48;
+pub(crate) fn lighting_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let fragment = wgpu::ShaderStages::FRAGMENT;
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("Scene lighting"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: fragment,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(crate::lighting::LIGHTING_BYTES as u64),
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: fragment,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(16),
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: fragment,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: fragment,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                count: None,
+            },
+        ],
+    })
+}
+fn lighting_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    lighting: &wgpu::Buffer,
+    post: &crate::post::PostProcess,
+    shadows: &crate::shadows::ShadowMaps,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Scene lighting"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: lighting.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: post.exposure_buffer().as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&shadows.array_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Sampler(&shadows.compare_sampler),
+            },
+        ],
+    })
 }
 fn buffer(
     device: &wgpu::Device,
@@ -1034,43 +1236,32 @@ fn binding(
         }],
     })
 }
-fn depth(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("Celestial infinite reverse-Z"),
-        size: wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Depth32Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
-    let view = texture.create_view(&Default::default());
-    (texture, view)
-}
-fn pipeline(
+fn scene_pipeline(
     device: &wgpu::Device,
-    format: wgpu::TextureFormat,
     layouts: &[&wgpu::BindGroupLayout],
     source: &str,
-    lines: bool,
-    label: &str,
 ) -> wgpu::RenderPipeline {
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("Celestial debug pipeline layout"),
+        label: Some("Celestial sphere pipeline layout"),
         bind_group_layouts: &layouts.iter().copied().map(Some).collect::<Vec<_>>(),
         immediate_size: 0,
     });
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("Observer-relative celestial shader"),
+        label: Some("Observer-relative lit spheres"),
         source: wgpu::ShaderSource::Wgsl(source.into()),
     });
+    let targets: Vec<_> = crate::post::SCENE_TARGETS
+        .iter()
+        .map(|&format| {
+            Some(wgpu::ColorTargetState {
+                format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })
+        })
+        .collect();
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some(label),
+        label: Some("Celestial spheres reverse-Z pipeline"),
         layout: Some(&layout),
         vertex: wgpu::VertexState {
             module: &shader,
@@ -1086,28 +1277,66 @@ fn pipeline(
             module: &shader,
             entry_point: Some("fs_main"),
             compilation_options: Default::default(),
+            targets: &targets,
+        }),
+        primitive: wgpu::PrimitiveState {
+            cull_mode: Some(wgpu::Face::Back),
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: crate::post::DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+/// Anti-aliased guide quads over the tonemapped image, depth-tested against
+/// the scene so bodies occlude the orbits behind them.
+fn overlay_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("Celestial guide pipeline layout"),
+        bind_group_layouts: &[],
+        immediate_size: 0,
+    });
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("Anti-aliased guide lines"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/celestial_lines.wgsl").into()),
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("Celestial anti-aliased guides"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[Some(wgpu::VertexBufferLayout {
+                array_stride: crate::celestial_lines::LINE_VERTEX_BYTES as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &wgpu::vertex_attr_array![0=>Float32x4,1=>Float32x4,2=>Float32x4],
+            })],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format,
-                blend: if lines {
-                    Some(wgpu::BlendState::ALPHA_BLENDING)
-                } else {
-                    None
-                },
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
         primitive: wgpu::PrimitiveState {
-            topology: if lines && !layouts.is_empty() {
-                wgpu::PrimitiveTopology::LineList
-            } else {
-                wgpu::PrimitiveTopology::TriangleList
-            },
-            cull_mode: if lines { None } else { Some(wgpu::Face::Back) },
+            cull_mode: None,
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: Some(!lines),
+            format: crate::post::DEPTH_FORMAT,
+            depth_write_enabled: Some(false),
             depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
             stencil: Default::default(),
             bias: Default::default(),

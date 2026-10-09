@@ -12,6 +12,12 @@ use std::sync::{
     atomic::{AtomicU8, Ordering},
 };
 
+/// Draw shader: shared scene lighting followed by the atlas draw stages.
+const DRAW_SHADER: &str = concat!(
+    include_str!("shaders/lighting.wgsl"),
+    include_str!("shaders/terrain_atlas.wgsl")
+);
+
 /// Largest number of producer jobs accepted in one frame.
 pub const MAX_ATLAS_JOBS_PER_FRAME: usize = 256;
 const TILE_BYTES: u64 = 448;
@@ -34,17 +40,34 @@ pub enum TerrainViewMode {
     Grid,
     Level,
     MorphFade,
+    /// Albedo only, no light.
+    Unlit,
+    /// Ambient occlusion buffer.
+    AoOnly,
+    /// Cascade tint x sun visibility.
+    Shadows,
+    /// False colour in stops relative to the current exposure.
+    Luminance,
 }
 
 impl TerrainViewMode {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 10] = [
         Self::Lit,
+        Self::Unlit,
         Self::Height,
         Self::Normals,
         Self::Grid,
         Self::Level,
         Self::MorphFade,
+        Self::AoOnly,
+        Self::Shadows,
+        Self::Luminance,
     ];
+
+    /// Debug views that bypass exposure, metering and tonemapping.
+    pub fn passthrough(self) -> bool {
+        !matches!(self, Self::Lit | Self::AoOnly | Self::Luminance)
+    }
 
     /// Selector consumed by `terrain_atlas.wgsl`.
     pub fn shader_mode(self) -> u32 {
@@ -55,6 +78,10 @@ impl TerrainViewMode {
             Self::Grid => 5,
             Self::Level => 6,
             Self::MorphFade => 8,
+            Self::Unlit => 9,
+            Self::AoOnly => 10,
+            Self::Shadows => 11,
+            Self::Luminance => 12,
         }
     }
 
@@ -67,6 +94,10 @@ impl TerrainViewMode {
             Self::Grid => "grid",
             Self::Level => "level",
             Self::MorphFade => "morph_fade",
+            Self::Unlit => "unlit",
+            Self::AoOnly => "ao",
+            Self::Shadows => "shadows",
+            Self::Luminance => "luminance",
         }
     }
 
@@ -238,7 +269,7 @@ pub struct AtlasInstance {
     /// 0 = parent data, 1 = own data fully arrived.
     pub arrival: f32,
     pub skirt_m: f32,
-    pub sun_body: [f32; 3],
+    pub material: crate::SurfaceMaterial,
     pub mode: u32,
 }
 
@@ -249,6 +280,17 @@ pub struct TerrainAtlasFrame {
     pub sources: Vec<(u64, Arc<AtlasSource>)>,
     pub jobs: Vec<AtlasProduceJob>,
     pub instances: Vec<AtlasInstance>,
+    /// Sun shadow cascades of the shadowed body and their casters.
+    pub shadow: Option<AtlasShadowFrame>,
+}
+
+/// Cascades fitted by the app and, per cascade, casters selected at a detail
+/// matched to its texel size inside its light-space box, from resident data
+/// only (no producer requests).
+#[derive(Debug, Clone, Default)]
+pub struct AtlasShadowFrame {
+    pub cascades: crate::Cascades,
+    pub casters: [Vec<AtlasInstance>; 4],
 }
 
 /// Produced radial height ranges of one job over a 4x4 grid of its chart
@@ -309,6 +351,12 @@ pub(crate) struct TerrainAtlasRenderer {
     draw_group: wgpu::BindGroup,
     instances: wgpu::Buffer,
     instance_capacity: u64,
+    shadow_pipeline: wgpu::RenderPipeline,
+    shadow_group: wgpu::BindGroup,
+    shadow_instances: wgpu::Buffer,
+    shadow_capacity: u64,
+    /// Instance range of each cascade inside `shadow_instances`.
+    shadow_ranges: [(u32, u32); 4],
     draw_layout: wgpu::BindGroupLayout,
     height_view: wgpu::TextureView,
     normal_view: wgpu::TextureView,
@@ -326,8 +374,10 @@ pub(crate) struct TerrainAtlasRenderer {
 impl TerrainAtlasRenderer {
     pub(crate) fn new(
         device: &wgpu::Device,
-        format: wgpu::TextureFormat,
+        targets: &[wgpu::TextureFormat],
         projection_layout: &wgpu::BindGroupLayout,
+        lighting_layout: &wgpu::BindGroupLayout,
+        light_layout: &wgpu::BindGroupLayout,
         config: TerrainAtlasConfig,
     ) -> Result<Self, String> {
         config.validate(device.limits().max_texture_array_layers)?;
@@ -527,7 +577,7 @@ impl TerrainAtlasRenderer {
         // Draw resources.
         let draw_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Terrain atlas draw"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/terrain_atlas.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(DRAW_SHADER.into()),
         });
         let vertex_fragment = wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT;
         let draw_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -608,9 +658,23 @@ impl TerrainAtlasRenderer {
         );
         let draw_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Terrain atlas draw layout"),
-            bind_group_layouts: &[Some(projection_layout), Some(&draw_layout)],
+            bind_group_layouts: &[
+                Some(projection_layout),
+                Some(&draw_layout),
+                Some(lighting_layout),
+            ],
             immediate_size: 0,
         });
+        let color_targets: Vec<_> = targets
+            .iter()
+            .map(|&format| {
+                Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })
+            })
+            .collect();
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Terrain atlas reverse-Z instanced draw"),
             layout: Some(&draw_pipeline_layout),
@@ -628,11 +692,7 @@ impl TerrainAtlasRenderer {
                 module: &draw_shader,
                 entry_point: Some("fs_main"),
                 compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                targets: &color_targets,
             }),
             primitive: wgpu::PrimitiveState {
                 front_face: wgpu::FrontFace::Ccw,
@@ -650,6 +710,59 @@ impl TerrainAtlasRenderer {
             multiview_mask: None,
             cache: None,
         });
+        let shadow_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Terrain atlas shadow caster layout"),
+                bind_group_layouts: &[Some(light_layout), Some(&draw_layout)],
+                immediate_size: 0,
+            });
+        // Depth-only casters share the draw vertex stage; the projection is
+        // the cascade's view -> light-clip transform. Orthographic depth with
+        // slope-scaled bias; receivers add normal offset.
+        let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Terrain atlas sun shadow casters"),
+            layout: Some(&shadow_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &draw_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: 12,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+                })],
+            },
+            fragment: None,
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: crate::post::DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                bias: wgpu::DepthBiasState {
+                    constant: 2,
+                    slope_scale: 1.5,
+                    clamp: 0.0,
+                },
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let shadow_capacity = 1024;
+        let shadow_instances = instance_buffer(device, shadow_capacity);
+        let shadow_group = self::draw_group(
+            device,
+            &draw_layout,
+            &height_view,
+            &normal_view,
+            &sampler,
+            &shadow_instances,
+            &grid_uniform,
+        );
         // Static grid contents are uploaded by the first `prepare`.
         let (vertex_bytes, index_values) = grid_mesh(config.draw_cells);
         let vertices = device.create_buffer(&wgpu::BufferDescriptor {
@@ -681,6 +794,11 @@ impl TerrainAtlasRenderer {
             draw_group,
             instances,
             instance_capacity,
+            shadow_pipeline,
+            shadow_group,
+            shadow_instances,
+            shadow_capacity,
+            shadow_ranges: [(0, 0); 4],
             draw_layout,
             height_view,
             normal_view,
@@ -948,16 +1066,81 @@ impl TerrainAtlasRenderer {
         }
     }
 
-    pub(crate) fn draw(&self, pass: &mut wgpu::RenderPass<'_>, projection_group: &wgpu::BindGroup) {
+    pub(crate) fn draw(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        projection_group: &wgpu::BindGroup,
+        lighting_group: &wgpu::BindGroup,
+    ) {
         if self.staged_instances == 0 {
             return;
         }
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, projection_group, &[]);
         pass.set_bind_group(1, &self.draw_group, &[]);
+        pass.set_bind_group(2, lighting_group, &[]);
         pass.set_vertex_buffer(0, self.vertices.slice(..));
         pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..self.index_count, 0, 0..self.staged_instances);
+    }
+
+    /// Uploads per-cascade caster lists back to back.
+    pub(crate) fn prepare_shadows(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        cascades: &[Vec<AtlasInstance>],
+    ) {
+        let total: usize = cascades.iter().map(Vec::len).sum();
+        if total as u64 > self.shadow_capacity {
+            self.shadow_capacity = (total as u64).next_power_of_two();
+            self.shadow_instances = instance_buffer(device, self.shadow_capacity);
+            self.shadow_group = draw_group(
+                device,
+                &self.draw_layout,
+                &self.height_view,
+                &self.normal_view,
+                &self.sampler,
+                &self.shadow_instances,
+                &self.grid_uniform,
+            );
+        }
+        let mut bytes = Vec::with_capacity(total * INSTANCE_BYTES as usize);
+        self.shadow_ranges = [(0, 0); 4];
+        let mut start = 0u32;
+        for (c, list) in cascades.iter().enumerate().take(4) {
+            for instance in list {
+                pack_instance(&mut bytes, instance);
+            }
+            self.shadow_ranges[c] = (start, start + list.len() as u32);
+            start += list.len() as u32;
+        }
+        if !bytes.is_empty() {
+            queue.write_buffer(&self.shadow_instances, 0, &bytes);
+        }
+    }
+
+    /// Draws one cascade's casters; the light group selects the cascade by offset.
+    pub(crate) fn draw_shadow(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        light_group: &wgpu::BindGroup,
+        cascade: usize,
+    ) {
+        let (start, end) = self.shadow_ranges[cascade.min(3)];
+        if end <= start || self.frame == 0 {
+            return;
+        }
+        pass.set_pipeline(&self.shadow_pipeline);
+        pass.set_bind_group(
+            0,
+            light_group,
+            &[crate::shadows::ShadowMaps::offset(cascade)],
+        );
+        pass.set_bind_group(1, &self.shadow_group, &[]);
+        pass.set_vertex_buffer(0, self.vertices.slice(..));
+        pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..self.index_count, 0, start..end);
     }
 }
 
@@ -993,15 +1176,17 @@ pub fn produce_for_validation(
     });
     let mut atlas = TerrainAtlasRenderer::new(
         device,
-        wgpu::TextureFormat::Rgba8Unorm,
+        &crate::post::SCENE_TARGETS,
         &projection_layout,
+        &crate::celestial::lighting_layout(device),
+        &crate::shadows::ShadowMaps::light_layout(device),
         config,
     )?;
     let frame = TerrainAtlasFrame {
         config: Some(config),
         sources: sources.to_vec(),
         jobs: jobs.to_vec(),
-        instances: Vec::new(),
+        ..Default::default()
     };
     let mut encoder = device.create_command_encoder(&Default::default());
     atlas.prepare(device, queue, &mut encoder, &frame)?;
@@ -1433,7 +1618,7 @@ fn pack_instance(out: &mut Vec<u8>, instance: &AtlasInstance) {
             instance.anchor_view_m[2],
             instance.radius_m,
         ],
-        [b[0][0], b[0][1], b[0][2], 0.0],
+        [b[0][0], b[0][1], b[0][2], instance.mode as f32],
         [b[1][0], b[1][1], b[1][2], 0.0],
         [b[2][0], b[2][1], b[2][2], 0.0],
         [c.n0[0], c.n0[1], c.n0[2], c.q0_length],
@@ -1463,10 +1648,10 @@ fn pack_instance(out: &mut Vec<u8>, instance: &AtlasInstance) {
             instance.skirt_m,
         ],
         [
-            instance.sun_body[0],
-            instance.sun_body[1],
-            instance.sun_body[2],
-            instance.mode as f32,
+            instance.material.albedo[0],
+            instance.material.albedo[1],
+            instance.material.albedo[2],
+            instance.material.brdf.shader_index(),
         ],
     ];
     for row in &rows {
@@ -1551,7 +1736,7 @@ mod tests {
                 "produce",
                 include_str!("shaders/terrain_atlas_produce.wgsl"),
             ),
-            ("draw", include_str!("shaders/terrain_atlas.wgsl")),
+            ("draw", DRAW_SHADER),
         ] {
             let module = naga::front::wgsl::parse_str(source)
                 .unwrap_or_else(|error| panic!("{name}: {}", error.emit_to_string(source)));

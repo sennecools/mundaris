@@ -29,9 +29,55 @@ struct SystemContent {
     bodies: Vec<BodyContent>,
 }
 
+/// Check a profile's declared provenance and convert its u16 samples to the
+/// canonical little-endian order world authority consumes.
+fn canonical_profile_bytes(
+    provenance: &str,
+    byte_order: &str,
+    mut bytes: Vec<u8>,
+) -> Result<Vec<u8>> {
+    ensure!(
+        matches!(
+            provenance,
+            "original-bake" | "public-domain-derived" | "temporary-reference-input"
+        ),
+        "profile provenance must be original-bake, public-domain-derived or temporary-reference-input"
+    );
+    match byte_order {
+        "little-endian" => {}
+        "big-endian" => {
+            for pair in bytes.as_chunks_mut::<2>().0 {
+                pair.swap(0, 1);
+            }
+        }
+        _ => anyhow::bail!("profile byte_order must be little-endian or big-endian"),
+    }
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_bytes_honour_declared_provenance_and_byte_order() {
+        let le = vec![0x34, 0x12, 0x78, 0x56];
+        let be = vec![0x12, 0x34, 0x56, 0x78];
+        assert_eq!(
+            canonical_profile_bytes("original-bake", "little-endian", le.clone()).unwrap(),
+            le
+        );
+        assert_eq!(
+            canonical_profile_bytes("temporary-reference-input", "big-endian", be).unwrap(),
+            le
+        );
+        assert_eq!(
+            canonical_profile_bytes("public-domain-derived", "little-endian", le.clone()).unwrap(),
+            le
+        );
+        assert!(canonical_profile_bytes("downloaded", "little-endian", le.clone()).is_err());
+        assert!(canonical_profile_bytes("original-bake", "middle-endian", le).is_err());
+    }
 
     #[test]
     fn shared_content_loads_two_distinct_authorities_and_complete_camera() {
@@ -131,7 +177,13 @@ struct TerrainContent {
 struct ProfileContent {
     asset: String,
     sha256: String,
+    /// `original-bake` or `public-domain-derived` (a `mundaris.terrain-bundle.v1`
+    /// height channel; the latter synthesized from credited public-domain DEMs,
+    /// `docs/PLANET_DATA_PIPELINE.md` §3) or `temporary-reference-input` (test
+    /// data that must not ship).
     provenance: String,
+    /// `little-endian` or `big-endian` u16 samples.
+    byte_order: String,
     width: u32,
     height: u32,
     kernel: String,
@@ -268,10 +320,6 @@ fn terrain_definition(
         definition = definition.with_moon_fields(procedural)?;
     }
     if let Some(profile) = content.profile {
-        ensure!(
-            profile.provenance == "temporary-reference-input",
-            "external profile provenance must identify temporary test input"
-        );
         let asset = local_path(root, &profile.asset)?;
         ensure!(
             fs::metadata(&asset)?.len() <= crate::terrain_profile::MOON_PROFILE_BYTES,
@@ -291,10 +339,7 @@ fn terrain_definition(
             bytes.len() as u64 == u64::from(profile.width) * u64::from(profile.height) * 2,
             "profile size does not match dimensions"
         );
-        let mut canonical = bytes;
-        for pair in canonical.as_chunks_mut::<2>().0 {
-            pair.swap(0, 1);
-        }
+        let canonical = canonical_profile_bytes(&profile.provenance, &profile.byte_order, bytes)?;
         let source = TerrainHeightProfile::from_u16_le(profile.width, profile.height, &canonical)?;
         let source = match profile.kernel.as_str() {
             "bspline" => source.with_cubic_bspline(),

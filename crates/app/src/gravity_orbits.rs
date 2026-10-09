@@ -70,6 +70,8 @@ struct Controls {
     terrain_preview: bool,
     sun_from_star: bool,
     terrain_view: TerrainViewMode,
+    /// Session render settings (registry: `crate::render_settings`).
+    render_settings: mundaris_renderer::RenderSettings,
     pending: VecDeque<Command>,
     name: String,
     mass: String,
@@ -118,6 +120,7 @@ impl Controls {
             terrain_preview: false,
             sun_from_star: false,
             terrain_view: terrain_view_from_environment(),
+            render_settings: mundaris_renderer::RenderSettings::default(),
             pending: VecDeque::new(),
             name: body.name().into(),
             mass: body.properties().mass_kg().to_string(),
@@ -183,6 +186,10 @@ pub struct GravityOrbitsDemo {
     clearance_query_us: f64,
     atlas: crate::planet_lod::PlanetLod,
     presentation: Vec<crate::shared_system::BodyPresentation>,
+    /// Authored light and surface reflectance.
+    lighting: crate::scene_lighting::SceneLighting,
+    /// Index of the lighting star in body order.
+    sun_index: usize,
     scene_sha256: String,
     camera_sha256: String,
     surface_owners: Vec<bool>,
@@ -239,6 +246,9 @@ pub struct GravityOrbitsDemo {
     view: crate::studio::view::StudioView,
     /// UI toolkit render time of the previous frame, reported by the host.
     ui_render_ms: Option<f64>,
+    /// Sun elevation above the local horizon of the nearest body at the
+    /// camera: (body index, degrees).
+    sun_elevation: Option<(usize, f64)>,
 }
 struct VisualCurve {
     points: Vec<FramePosition>,
@@ -246,6 +256,29 @@ struct VisualCurve {
     width: f32,
     style: CelestialLineStyle,
     relative: Vec<DVec3>,
+}
+
+impl GravityOrbitsDemo {
+    /// Star disk luminance that reproduces the authored illuminance at its
+    /// reference distance, times the session sun scale.
+    fn sun_disk_radiance(&self) -> f64 {
+        let radius = self
+            .system
+            .body(self.ids[self.sun_index])
+            .map_or(1.0, |body| body.properties().reference_radius_m());
+        let light = mundaris_renderer::FrameLighting {
+            sun_center_view_m: DVec3::ZERO,
+            sun_radius_m: radius,
+            sun_color: self.lighting.sun_color,
+            illuminance_lux: self.lighting.illuminance_lux,
+            reference_distance_m: self.lighting.reference_distance_m,
+            ambient_lux: 0.0,
+            ambient_color: [1.0; 3],
+            bounce_fraction: 0.0,
+            occluders: Vec::new(),
+        };
+        light.sun_disk_radiance() * f64::from(self.controls.render_settings.lighting.sun_scale)
+    }
 }
 
 /// Retain the 0.1 m floor and existing infinite reverse-Z depth path. Relief can
@@ -352,6 +385,16 @@ impl GravityOrbitsDemo {
             scene_sha256,
             camera_sha256,
         } = loaded;
+        let lighting = crate::scene_lighting::SceneLighting::load_canonical()?;
+        let sun_index = presentation
+            .iter()
+            .position(|body| body.semantic_id == lighting.sun_body)
+            .with_context(|| {
+                format!(
+                    "lighting sun body {} is not in the system",
+                    lighting.sun_body
+                )
+            })?;
         let mut analytic = AnalyticSession::new(&mut system, definition)?;
         analytic.set_rate(PlaybackRate::try_multiplier(camera_state.rate)?);
         analytic.set_paused(camera_state.paused);
@@ -438,6 +481,8 @@ impl GravityOrbitsDemo {
             clearance_query_us: 0.0,
             atlas: crate::planet_lod::PlanetLod::new(Some(lod)),
             presentation,
+            lighting,
+            sun_index,
             scene_sha256,
             camera_sha256,
             surface_owners: Vec::new(),
@@ -489,6 +534,7 @@ impl GravityOrbitsDemo {
             last_markers: Vec::new(),
             view: Default::default(),
             ui_render_ms: None,
+            sun_elevation: None,
         })
     }
     pub fn set_lifecycle_drawable(&mut self, drawable: bool) {
@@ -1439,6 +1485,8 @@ impl GravityOrbitsDemo {
         .context("preparing source-centered render view after fixture camera placement")?;
         self.requests.clear();
         let mut clearance = f64::MAX;
+        let mut centres: Vec<(DVec3, f64)> = Vec::with_capacity(self.ids.len());
+        let sun_disk_nits = self.sun_disk_radiance();
         for (index, (id, body)) in pair.system().bodies().enumerate() {
             let frames = pair.projection().frames_for(id)?;
             let radius = body.properties().reference_radius_m();
@@ -1451,12 +1499,20 @@ impl GravityOrbitsDemo {
                 .metres();
             let surface = center.x.hypot(center.y).hypot(center.z) - radius;
             clearance = clearance.min(surface);
+            centres.push((center, radius));
+            let presentation = &self.presentation[index];
             self.requests.push(CelestialRenderBody {
                 body_fixed_frame: frames.body_fixed,
                 reference_radius_m: radius,
-                color: self.presentation[index].color,
-                unlit: self.presentation[index].unlit,
+                color: presentation.color,
+                unlit: presentation.unlit,
                 selected: index == selected_index,
+                material: self.lighting.material(&presentation.semantic_id),
+                emission_nits: if index == self.sun_index {
+                    sun_disk_nits as f32
+                } else {
+                    0.0
+                },
             });
         }
         if let Some(terrain) = self.terrain_clearance {
@@ -1467,41 +1523,107 @@ impl GravityOrbitsDemo {
         self.surface_owners.clear();
         self.surface_owners.resize(self.requests.len(), false);
         let mut frame = CelestialFrame::new(&view, &mut self.staging, projection, &self.sphere);
+        frame.set_view_mode(self.controls.terrain_view);
+        let overlays = self.controls.render_settings.overlays;
+        frame.set_line_style(mundaris_renderer::LineStyleScale {
+            width: overlays.line_width_scale,
+            opacity: overlays.opacity,
+        });
+        let (mut sun_centre, sun_radius) = centres[self.sun_index];
+        let lighting_settings = self.controls.render_settings.lighting;
+        if lighting_settings.studio_sun
+            && let Some((index, (centre, _))) = centres
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != self.sun_index)
+                .min_by(|a, b| (a.1.0.length() - a.1.1).total_cmp(&(b.1.0.length() - b.1.1)))
+        {
+            // Local horizon at the camera over the nearest body; azimuth is
+            // measured from the view direction so the light stays where the
+            // reviewer wants it while turning.
+            let up = -centre.normalize();
+            let forward = DVec3::NEG_Z - up * DVec3::NEG_Z.dot(up);
+            let forward = if forward.length_squared() < 1e-6 {
+                let frames = pair.projection().frames_for(self.ids[index])?;
+                let axis = view
+                    .prepare_source(frames.body_fixed)?
+                    .view_direction(Direction3::try_new(DVec3::Y)?)?
+                    .unit();
+                (axis - up * axis.dot(up)).normalize_or(up.any_orthonormal_vector())
+            } else {
+                forward.normalize()
+            };
+            let right = forward.cross(up).normalize();
+            let (elevation, azimuth) = (
+                f64::from(lighting_settings.sun_elevation_deg).to_radians(),
+                f64::from(lighting_settings.sun_azimuth_deg).to_radians(),
+            );
+            let direction = elevation.cos() * (azimuth.cos() * forward + azimuth.sin() * right)
+                + elevation.sin() * up;
+            sun_centre = direction * sun_centre.length();
+        }
+        self.sun_elevation = centres
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != self.sun_index)
+            .min_by(|a, b| (a.1.0.length() - a.1.1).total_cmp(&(b.1.0.length() - b.1.1)))
+            .map(|(index, (centre, _))| {
+                let up = -centre.normalize();
+                let sun = sun_centre.normalize();
+                (index, up.dot(sun).clamp(-1.0, 1.0).asin().to_degrees())
+            });
+        frame.set_lighting(mundaris_renderer::FrameLighting {
+            sun_center_view_m: sun_centre,
+            sun_radius_m: sun_radius,
+            sun_color: self.lighting.sun_color,
+            illuminance_lux: self.lighting.illuminance_lux,
+            reference_distance_m: self.lighting.reference_distance_m,
+            ambient_lux: self.lighting.ambient_lux,
+            ambient_color: self.lighting.ambient_color,
+            bounce_fraction: self.lighting.bounce_fraction,
+            occluders: centres
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != self.sun_index)
+                .map(|(_, occluder)| *occluder)
+                .take(mundaris_renderer::MAX_OCCLUDERS)
+                .collect(),
+        })?;
+        renderer.set_render_settings(self.controls.render_settings)?;
         if self.controls.terrain_preview {
             let _span = crate::engine_profile::span("Atlas terrain preparation");
             self.atlas
                 .receive_bounds(renderer.take_terrain_atlas_bounds());
-            let star = pair.system().body(self.ids[0])?;
             let mut inputs = Vec::new();
-            for &id in &self.ids {
+            for (index, &id) in self.ids.iter().enumerate() {
                 let body = pair.system().body(id)?;
                 let Some(definition) = body.surface_definition() else {
                     continue;
                 };
-                let sun_body = body
-                    .state()
-                    .body_to_system()
-                    .inverse()
-                    .rotate_direction(Direction3::try_new(
-                        star.state().center_in_system().metres()
-                            - body.state().center_in_system().metres(),
-                    )?)?
-                    .unit();
                 inputs.push(crate::planet_lod::AtlasBodyInput {
                     body: id,
                     body_fixed_frame: pair.projection().frames_for(id)?.body_fixed,
                     definition,
                     radius_m: body.properties().reference_radius_m(),
                     revision: body.terrain_revision().value(),
-                    sun_body,
+                    material: self
+                        .lighting
+                        .material(&self.presentation[index].semantic_id),
                 });
             }
+            let shadow_settings = self.controls.render_settings.shadows;
             let atlas_frame = self.atlas.prepare(
                 &view,
                 projection,
                 &inputs,
                 self.controls.terrain_view.shader_mode(),
                 renderer.terrain_atlas_layer_limit(),
+                shadow_settings
+                    .enabled
+                    .then_some(crate::planet_lod::ShadowCasterPolicy {
+                        settings: shadow_settings,
+                        sun_centre_view_m: sun_centre,
+                    }),
             )?;
             for body in self.atlas.drawn_bodies() {
                 if let Some(index) = self.ids.iter().position(|id| id == body) {
@@ -1649,6 +1771,24 @@ impl GravityOrbitsDemo {
         }));
         self.atlas
             .annotate_terrain(&mut snapshot.terrain, &self.ids, &self.system);
+        let shadows = renderer.shadow_report();
+        snapshot.render_settings = Some(serde_json::json!({
+            "settings": crate::render_settings::listing(&crate::render_settings::RenderState {
+                settings: self.controls.render_settings,
+                view_mode: self.controls.terrain_view,
+            }),
+            "lighting_sha256": self.lighting.sha256,
+            "sun": self.sun_elevation.map(|(index, elevation)| serde_json::json!({
+                "body": self.presentation[index].semantic_id,
+                "elevation_deg": elevation,
+            })),
+            "shadows": {
+                "cascades": shadows.cascades,
+                "casters": shadows.casters,
+                "splits_m": shadows.splits_m,
+                "texel_m": shadows.texel_m,
+            },
+        }));
         // Opt-in native evidence scratch export of this exact prepared state.
         // Disabled for ordinary launches; collection remains observational.
         if let Some(path) = &self.navigation_snapshot_path {

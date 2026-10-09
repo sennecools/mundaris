@@ -55,6 +55,17 @@ impl FrameHost<'_> {
     pub fn gpu_source_frame(&self) -> Option<u64> {
         self.renderer.latest_gpu_profile_submission()
     }
+    pub fn set_render_settings(
+        &mut self,
+        settings: mundaris_renderer::RenderSettings,
+    ) -> Result<()> {
+        self.renderer
+            .set_render_settings(settings)
+            .map_err(anyhow::Error::msg)
+    }
+    pub fn shadow_report(&self) -> mundaris_renderer::ShadowReport {
+        self.renderer.shadow_report()
+    }
     pub fn render_empty(&mut self) -> Result<()> {
         Ok(self.renderer.render_empty()?)
     }
