@@ -403,6 +403,44 @@ pub const PARAM_FIELDS: &[ParamField] = fields! {
     precipitation_scale: 1.0e-3, 1.0e3;
 };
 
+impl PlanetArchetype {
+    /// Planet editor slider range of a parameter: the authored range widened
+    /// by half its span on each side, or the current `value` within ×0.5–2
+    /// for fixed parameters; always inside the field's validation bounds.
+    pub fn editor_range(&self, name: &str, value: f64) -> Option<(f64, f64)> {
+        let field = PARAM_FIELDS.iter().find(|f| f.name == name)?;
+        let c = &self.continents;
+        let t = &self.temperature;
+        let m = &self.moisture;
+        let km = |r: Range| Range(r.0 * 1000.0, r.1 * 1000.0);
+        let authored = match name {
+            "ocean_coverage" => Some(self.ocean_coverage),
+            "continent_wavelength_m" => Some(km(c.wavelength_km)),
+            "warp_wavelength_m" => Some(km(c.warp_wavelength_km)),
+            "warp_strength" => Some(c.warp_strength),
+            "land_height_m" => Some(c.land_height_m),
+            "ocean_depth_m" => Some(c.ocean_depth_m),
+            "equator_c" => Some(t.equator_c),
+            "pole_c" => Some(t.pole_c),
+            "axial_tilt_deg" => Some(t.axial_tilt_deg),
+            "evaporation" => Some(m.evaporation),
+            "rain" => Some(m.rain),
+            _ => None,
+        };
+        let (low, high) = match authored {
+            Some(r) => {
+                let pad = 0.5 * (r.1 - r.0).max(1e-3 * r.1.abs().max(1.0));
+                (r.0 - pad, r.1 + pad)
+            }
+            None if value != 0.0 => (0.5 * value.min(2.0 * value), 2.0 * value.max(0.5 * value)),
+            None => (field.min, field.min + 0.1 * (field.max - field.min)),
+        };
+        let low = low.max(field.min);
+        let high = high.min(field.max);
+        (low < high).then_some((low, high))
+    }
+}
+
 impl PlanetParams {
     pub fn get(&self, name: &str) -> Option<f64> {
         PARAM_FIELDS

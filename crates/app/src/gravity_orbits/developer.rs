@@ -241,6 +241,15 @@ impl GravityOrbitsDemo {
                 self.atlas.hold = *enabled;
                 Ok(())
             }
+            DevCommand::PlanetEdit {
+                body,
+                seed,
+                params,
+                reset,
+            } => {
+                let body = self.developer_body(body)?;
+                self.developer_planet_edit(body, *seed, params, *reset)
+            }
         }
     }
 }

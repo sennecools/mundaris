@@ -58,6 +58,7 @@ enum Command {
 #[cfg(feature = "developer-tools")]
 mod developer;
 mod frame_host;
+mod planet_editing;
 pub mod navigation_input;
 mod studio_bridge;
 mod visual_controls;
@@ -184,6 +185,8 @@ pub struct GravityOrbitsDemo {
     terrain_clearance: Option<crate::terrain_inspection::TerrainClearance>,
     clearance_query_us: f64,
     atlas: crate::planet_lod::PlanetLod,
+    /// Planet editor state of world-map bodies (M1 Step 6).
+    planet_editor: crate::planet_editor::PlanetEditor,
     presentation: Vec<crate::shared_system::BodyPresentation>,
     /// Authored light and surface reflectance.
     lighting: crate::scene_lighting::SceneLighting,
@@ -471,6 +474,7 @@ impl GravityOrbitsDemo {
             terrain_clearance: None,
             clearance_query_us: 0.0,
             atlas: crate::planet_lod::PlanetLod::new(Some(lod)).with_collision(collision),
+            planet_editor: crate::planet_editor::PlanetEditor::new(&presentation),
             presentation,
             lighting,
             sun_index,
@@ -1418,6 +1422,7 @@ impl GravityOrbitsDemo {
         crate::engine_profile::begin_frame(self.developer_frame_number);
         let frame_span = crate::engine_profile::span("Frame");
         let now = Instant::now();
+        self.publish_planet_edits(now);
         let elapsed = self
             .last_wall
             .map_or(Duration::ZERO, |previous| now.duration_since(previous));

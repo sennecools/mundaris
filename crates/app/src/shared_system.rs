@@ -237,6 +237,8 @@ pub struct BodyPresentation {
     pub unlit: bool,
     pub definition_sha256: Option<String>,
     pub definition_revision: Option<u32>,
+    /// Editable world-map source (planet editor), if any.
+    pub world: Option<WorldSource>,
 }
 pub struct SharedTestSystem {
     pub system: CelestialSystem,
@@ -282,18 +284,22 @@ fn parse<T: serde::de::DeserializeOwned>(path: &Path) -> Result<(T, String)> {
 fn world_look(
     root: &Path,
     archetype: &astrum_world::terrain::archetype::PlanetArchetype,
-) -> Result<astrum_world::terrain::world_field::WorldLook> {
+) -> Result<(astrum_world::terrain::world_field::WorldLook, Vec<PathBuf>)> {
     use astrum_world::terrain::{
         archetype::MaterialAsset,
         biome_lut::{BiomeLut, LutMetadata},
     };
-    let (metadata, _): (LutMetadata, _) = parse(&local_path(root, &archetype.biome_lut)?)?;
-    let image = bounded_bytes(&local_path(root, &metadata.image)?)?;
+    let metadata_path = local_path(root, &archetype.biome_lut)?;
+    let (metadata, _): (LutMetadata, _) = parse(&metadata_path)?;
+    let image_path = local_path(root, &metadata.image)?;
+    let image = bounded_bytes(&image_path)?;
     let lut = BiomeLut::from_png(&metadata, &image)
         .with_context(|| format!("invalid biome LUT {}", metadata.image))?;
-    let (snow, _): (MaterialAsset, _) = parse(&local_path(root, &archetype.snow.material)?)?;
-    astrum_world::terrain::world_field::WorldLook::new(archetype, lut, &snow)
-        .context("invalid world colour")
+    let snow_path = local_path(root, &archetype.snow.material)?;
+    let (snow, _): (MaterialAsset, _) = parse(&snow_path)?;
+    let look = astrum_world::terrain::world_field::WorldLook::new(archetype, lut, &snow)
+        .context("invalid world colour")?;
+    Ok((look, vec![metadata_path, image_path, snow_path]))
 }
 
 fn local_path(root: &Path, relative: &str) -> Result<PathBuf> {
@@ -328,13 +334,124 @@ fn body_pole(body: &BodyContent) -> Result<glam::DVec3> {
     Ok((q.normalize().inverse() * axis).normalize())
 }
 
+/// A terrain definition loaded from content, with the editable world-map
+/// source when the body has one.
+pub(crate) struct LoadedTerrain {
+    pub definition: SurfaceDefinition,
+    pub sha256: String,
+    pub revision: u32,
+    pub world: Option<WorldSource>,
+}
+
+/// Planet editor state of a world-map body (M1 Step 6): the body seed and
+/// named `PlanetParams` overrides.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorldEdit {
+    pub seed: u64,
+    pub overrides: Vec<(String, f64)>,
+}
+
+/// Where a world-map body's terrain comes from, for regeneration, hot reload
+/// and saving.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorldSource {
+    /// Content root (absolute) and terrain definition path relative to it.
+    pub root: PathBuf,
+    pub terrain: String,
+    pub radius_m: f64,
+    pub pole: glam::DVec3,
+    /// Seed and overrides as authored in the terrain file.
+    pub saved: WorldEdit,
+    /// Files whose change requires a rebuild: terrain, archetype, LUT
+    /// metadata and image, snow material.
+    pub dependencies: Vec<PathBuf>,
+}
+
+impl WorldSource {
+    /// Rebuild the body's surface from current files with `edit` applied.
+    pub fn rebuild(&self, edit: &WorldEdit) -> Result<(SurfaceDefinition, WorldSource)> {
+        let loaded = terrain_definition(&self.root, &self.terrain, self.radius_m, self.pole, Some(edit))?;
+        let world = loaded.world.context("terrain is no longer a world map")?;
+        Ok((loaded.definition, world))
+    }
+
+    /// Write `edit` into the terrain file: the `seed` and the `overrides` list.
+    /// Everything else (comments included) is kept; the revision is bumped.
+    pub fn save(&self, edit: &WorldEdit) -> Result<()> {
+        let path = local_path(&self.root, &self.terrain)?;
+        let text = String::from_utf8(bounded_bytes(&path)?)?;
+        let saved = rewrite_world_edit(&text, edit)?;
+        let check: TerrainContent = ron::from_str(&saved).context("saved terrain does not parse")?;
+        ensure!(
+            check.seed == edit.seed && check.world.is_some_and(|w| w.overrides == edit.overrides),
+            "saved terrain does not round-trip"
+        );
+        fs::write(&path, saved).with_context(|| format!("writing {}", path.display()))
+    }
+}
+
+/// Editable source of a world-map terrain file on its own (pole along +Y);
+/// for tools and tests that need no scene.
+pub fn load_world_source(root: &Path, terrain: &str, radius_m: f64) -> Result<WorldSource> {
+    terrain_definition(root, terrain, radius_m, glam::DVec3::Y, None)?
+        .world
+        .context("terrain is not a world map")
+}
+
+/// Replace the first `seed: N,` and the `overrides: [...]` list of a terrain
+/// RON file and bump `revision`.
+fn rewrite_world_edit(text: &str, edit: &WorldEdit) -> Result<String> {
+    let field = |text: &str, name: &str| -> Result<(usize, usize)> {
+        let key = format!("
+    {name}:");
+        let start = text.find(&key).with_context(|| format!("terrain file has no top-level {name}"))? + key.len();
+        let end = start + text[start..].find(",
+").context("unterminated field")?;
+        Ok((start, end))
+    };
+    let mut out = text.to_string();
+    let (start, end) = field(&out, "revision")?;
+    let revision: u32 = out[start..end].trim().parse().context("revision is not a number")?;
+    out.replace_range(start..end, &format!(" {}", revision + 1));
+    let (start, end) = field(&out, "seed")?;
+    out.replace_range(start..end, &format!(" {}", edit.seed));
+    let key = "overrides:";
+    let start = out.find(key).context("terrain file has no world overrides")? + key.len();
+    let open = start + out[start..].find('[').context("overrides is not a list")?;
+    let close = open + out[open..].find(']').context("unterminated overrides")?;
+    let list = if edit.overrides.is_empty() {
+        "[]".to_string()
+    } else {
+        let items: String = edit
+            .overrides
+            .iter()
+            .map(|(name, value)| format!("
+            (\"{name}\", {value:?}),"))
+            .collect();
+        format!("[{items}
+        ]")
+    };
+    out.replace_range(open..=close, &list);
+    Ok(out)
+}
+
 fn terrain_definition(
     root: &Path,
     name: &str,
     radius_m: f64,
     pole: glam::DVec3,
-) -> Result<(SurfaceDefinition, String, u32)> {
-    let (content, hash): (TerrainContent, _) = parse(&local_path(root, name)?)?;
+    edit: Option<&WorldEdit>,
+) -> Result<LoadedTerrain> {
+    let terrain_path = local_path(root, name)?;
+    let (mut content, hash): (TerrainContent, _) = parse(&terrain_path)?;
+    let saved = content.world.as_ref().map(|w| WorldEdit {
+        seed: content.seed,
+        overrides: w.overrides.clone(),
+    });
+    if let (Some(edit), Some(world)) = (edit, content.world.as_mut()) {
+        content.seed = edit.seed;
+        world.overrides = edit.overrides.clone();
+    }
     ensure!(
         content.schema == 1 && content.revision > 0 && !content.id.is_empty(),
         "invalid terrain schema, identity or revision"
@@ -380,10 +497,21 @@ fn terrain_definition(
     if let Some(detail) = content.detail_noise {
         definition = definition.with_detail_noise(detail)?;
     }
+    let mut world_source = None;
     if let Some(world) = content.world {
+        let archetype_path = local_path(root, &world.archetype)?;
         let (archetype, _): (astrum_world::terrain::archetype::PlanetArchetype, _) =
-            parse(&local_path(root, &world.archetype)?)?;
-        let look = world_look(root, &archetype)?;
+            parse(&archetype_path)?;
+        let (look, mut dependencies) = world_look(root, &archetype)?;
+        dependencies.extend([terrain_path.clone(), archetype_path]);
+        world_source = Some(WorldSource {
+            root: root.canonicalize()?,
+            terrain: name.to_string(),
+            radius_m,
+            pole,
+            saved: saved.expect("world content has a saved edit"),
+            dependencies,
+        });
         let world = astrum_world::terrain::world_field::WorldDefinition::new(
             archetype,
             look,
@@ -435,7 +563,12 @@ fn terrain_definition(
         definition = definition.with_height_profile(root_profile)?;
     }
     definition.validate_radius(radius_m)?;
-    Ok((definition, hash, content.revision))
+    Ok(LoadedTerrain {
+        definition,
+        sha256: hash,
+        revision: content.revision,
+        world: world_source,
+    })
 }
 
 impl SharedTestSystem {
@@ -495,13 +628,15 @@ impl SharedTestSystem {
                 unlit: body.unlit,
                 definition_sha256: None,
                 definition_revision: None,
+                world: None,
             };
             if let Some(terrain) = &body.terrain {
-                let (definition, hash, revision) =
-                    terrain_definition(root, terrain, body.radius_m, body_pole(body)?)?;
-                system.edit_surface_definition(id, Some(definition))?;
-                style.definition_sha256 = Some(hash);
-                style.definition_revision = Some(revision);
+                let loaded =
+                    terrain_definition(root, terrain, body.radius_m, body_pole(body)?, None)?;
+                system.edit_surface_definition(id, Some(loaded.definition))?;
+                style.definition_sha256 = Some(loaded.sha256);
+                style.definition_revision = Some(loaded.revision);
+                style.world = loaded.world;
             }
             presentation.push(style);
             ids.push(id);

@@ -216,10 +216,16 @@ impl GravityOrbitsDemo {
                     "Captures need the developer interface (--dev-interface)".into(),
                 );
             }
+            StudioAction::PlanetSeed(_)
+            | StudioAction::PlanetRandomSeed
+            | StudioAction::PlanetParam(..)
+            | StudioAction::PlanetResetParam(_)
+            | StudioAction::PlanetRevert
+            | StudioAction::PlanetSave => self.planet_action(action),
         }
     }
 
-    fn log(&mut self, tone: Tone, text: String) {
+    pub(super) fn log(&mut self, tone: Tone, text: String) {
         if self.controls.log.len() == LOG_CAPACITY {
             self.controls.log.pop_front();
         }
@@ -519,6 +525,7 @@ impl GravityOrbitsDemo {
                     snapshot.performance.gpu_overlay_ms,
                 ]
             }),
+            planet: self.planet_view(),
         };
     }
 

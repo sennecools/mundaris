@@ -105,6 +105,31 @@ pub struct StudioView {
     pub render_settings: Vec<crate::render_settings::SettingValue>,
     /// Per-pass GPU times and shadow cascade state for the render inspector.
     pub render_stats: Vec<StatItem>,
+    /// Planet editor of the selected body, when it is a world map.
+    pub planet: Option<PlanetView>,
+}
+
+/// One editable planet parameter (`archetype::PARAM_FIELDS` order).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PlanetParamItem {
+    pub name: String,
+    pub value: f64,
+    /// Slider range.
+    pub range: [f64; 2],
+    /// Overridden in the edit (else sampled from the archetype).
+    pub overridden: bool,
+}
+
+/// Planet editor panel (pipeline §18.1, M1 Step 6).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PlanetView {
+    pub archetype: String,
+    pub terrain_file: String,
+    pub seed: u64,
+    /// Unsaved changes.
+    pub dirty: bool,
+    pub params: Vec<PlanetParamItem>,
+    pub stats: Vec<StatItem>,
 }
 
 /// Playback-rate presets shown in the toolbar.
@@ -139,6 +164,14 @@ pub enum StudioAction {
     /// Sets render registry entry `index` (`render_settings::SPECS`).
     SetSetting(usize, crate::render_settings::SettingValue),
     ResetRenderSettings,
+    /// Planet editor (selected world-map body).
+    PlanetSeed(u64),
+    PlanetRandomSeed,
+    /// Override parameter `index` (`archetype::PARAM_FIELDS`).
+    PlanetParam(usize, f64),
+    PlanetResetParam(usize),
+    PlanetRevert,
+    PlanetSave,
 }
 
 /// Keyboard shortcuts handled by the viewport.

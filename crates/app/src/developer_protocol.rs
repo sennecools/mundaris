@@ -134,6 +134,17 @@ pub enum DevCommand {
         layer: String,
         enabled: bool,
     },
+    /// Planet editor (M1 Step 6): set the seed and override `PlanetParams` of
+    /// a world-map body; `reset` first drops every override. Not saved.
+    PlanetEdit {
+        body: String,
+        #[serde(default)]
+        seed: Option<u64>,
+        #[serde(default)]
+        params: Vec<(String, f64)>,
+        #[serde(default)]
+        reset: bool,
+    },
 }
 fn one() -> f64 {
     1.0

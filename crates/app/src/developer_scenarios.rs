@@ -1185,7 +1185,8 @@ fn resolve_command(
         DevCommand::Select { body }
         | DevCommand::Focus { body, .. }
         | DevCommand::LookAt { body }
-        | DevCommand::SurfacePose { body, .. } => resolve(body)?,
+        | DevCommand::SurfacePose { body, .. }
+        | DevCommand::PlanetEdit { body, .. } => resolve(body)?,
         _ => {}
     }
     Ok(command)

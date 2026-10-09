@@ -22,6 +22,7 @@ pub mod interactive_clock;
 pub mod motion_session;
 pub mod orbit_guides;
 pub mod performance_capture;
+pub mod planet_editor;
 pub mod planet_lod;
 pub mod playback_metrics;
 pub mod profile_export;

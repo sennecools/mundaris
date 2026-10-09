@@ -186,6 +186,8 @@ struct BodyLod {
     collision: Option<collision::BodyCollision>,
     /// False while a world-map source's Tier A bake is still running.
     world_ready: bool,
+    /// Seconds from binding to the finished Tier A bake (world maps).
+    world_ready_s: Option<f64>,
 }
 
 #[derive(Debug, Default, Clone, Copy, Serialize)]
@@ -377,10 +379,17 @@ impl PlanetLod {
     }
 
     /// Mark world-map sources whose Tier A bake has completed (renderer keys).
+    /// Wall time from binding a world-map body to its finished Tier A bake;
+    /// `None` while it runs or for other bodies.
+    pub fn world_bake_seconds(&self, body: BodyId) -> Option<f64> {
+        self.bodies.get(&body)?.world_ready_s
+    }
+
     pub fn receive_ready_sources(&mut self, ready: Vec<u64>) {
         for lod in self.bodies.values_mut() {
-            if ready.contains(&lod.source_key) {
+            if ready.contains(&lod.source_key) && !lod.world_ready {
                 lod.world_ready = true;
+                lod.world_ready_s = Some(lod.bound_at.elapsed().as_secs_f64());
             }
         }
     }
@@ -495,6 +504,7 @@ impl PlanetLod {
                 last_active: self.frame,
                 stats: BodyStats::default(),
                 world_ready,
+                world_ready_s: None,
                 collision: self.collision_policy.map(|policy| {
                     collision::BodyCollision::new(collision::BodyColliders::new(
                         policy.physics_level(input.radius_m),
@@ -1413,6 +1423,7 @@ mod tests {
             stats: BodyStats::default(),
             collision: None,
             world_ready: true,
+            world_ready_s: None,
         }
     }
 

@@ -2,12 +2,12 @@
 //! (docs/STUDIO_UI.md §4). Panels read the toolkit-free [`StudioView`] and
 //! report interactions as [`StudioAction`]s; they hold no engine state.
 
-use egui::{Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, Stroke, Ui};
 use astrum_app::render_settings::{SPECS, SettingKind, SettingValue};
 use astrum_app::studio::view::{
-    CAMERA_MODES, Overlay, RATE_PRESETS, StatItem, StudioAction, StudioView,
+    CAMERA_MODES, Overlay, PlanetView, RATE_PRESETS, StatItem, StudioAction, StudioView,
 };
 use astrum_renderer::TerrainViewMode;
+use egui::{Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, Stroke, Ui};
 
 use super::theme::{self, *};
 
@@ -308,6 +308,9 @@ pub fn inspector(
                     stat_row(ui, stat);
                 }
             });
+            if let Some(planet) = &view.planet {
+                planet_card(ui, planet, actions);
+            }
             card(ui, "OVERLAYS", |ui| {
                 ui.horizontal_wrapped(|ui| {
                     for (index, overlay) in Overlay::ALL.iter().enumerate() {
@@ -469,4 +472,88 @@ pub fn log(ui: &mut Ui, panel: &StudioView) {
                 });
             }
         });
+}
+
+/// Readable label of a `PlanetParams` field name (`ocean_depth_m` → "Ocean
+/// depth (m)").
+fn param_label(name: &str) -> String {
+    let (base, unit) = match name.rsplit_once('_') {
+        Some((base, unit @ ("m" | "c" | "deg" | "km"))) => (base, Some(unit)),
+        _ => (name, None),
+    };
+    let mut label = base.replace('_', " ");
+    if let Some(first) = label.get_mut(..1) {
+        first.make_ascii_uppercase();
+    }
+    match unit {
+        Some("c") => format!("{label} (°C)"),
+        Some(unit) => format!("{label} ({unit})"),
+        None => label,
+    }
+}
+
+/// Planet editor v1 (pipeline §18.1): seed, parameter overrides, save.
+/// Sliders apply on release, so each drag re-bakes the planet once.
+fn planet_card(ui: &mut Ui, planet: &PlanetView, actions: &mut Vec<StudioAction>) {
+    card(ui, "PLANET", |ui| {
+        section_header(
+            ui,
+            &planet.archetype,
+            if planet.dirty {
+                "unsaved"
+            } else {
+                &planet.terrain_file
+            },
+        );
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Seed").color(TEXT_SECONDARY));
+            let mut seed = planet.seed;
+            let response = ui.add(egui::DragValue::new(&mut seed).speed(1.0));
+            if response.changed() && !response.dragged() || response.drag_stopped() {
+                actions.push(StudioAction::PlanetSeed(seed));
+            }
+            if tool_button(ui, "Random", false).clicked() {
+                actions.push(StudioAction::PlanetRandomSeed);
+            }
+        });
+        for (index, param) in planet.params.iter().enumerate() {
+            ui.horizontal(|ui| {
+                let label = param_label(&param.name);
+                let text = RichText::new(label).font(small());
+                ui.label(if param.overridden {
+                    text.color(TEXT_PRIMARY).strong()
+                } else {
+                    text.color(TEXT_SECONDARY)
+                });
+                if param.overridden
+                    && ui
+                        .small_button("↺")
+                        .on_hover_text("Back to the sampled value")
+                        .clicked()
+                {
+                    actions.push(StudioAction::PlanetResetParam(index));
+                }
+            });
+            let mut value = param.value;
+            let [low, high] = param.range;
+            ui.spacing_mut().slider_width = (ui.available_width() - 70.0).max(60.0);
+            let logarithmic = low > 0.0 && high / low > 20.0;
+            let response =
+                ui.add(egui::Slider::new(&mut value, low..=high).logarithmic(logarithmic));
+            if response.drag_stopped() || (response.changed() && !response.dragged()) {
+                actions.push(StudioAction::PlanetParam(index, value));
+            }
+        }
+        ui.horizontal(|ui| {
+            if tool_button_enabled(ui, "Save", false, planet.dirty).clicked() {
+                actions.push(StudioAction::PlanetSave);
+            }
+            if tool_button_enabled(ui, "Revert", false, planet.dirty).clicked() {
+                actions.push(StudioAction::PlanetRevert);
+            }
+        });
+        for stat in &planet.stats {
+            stat_row(ui, stat);
+        }
+    });
 }
