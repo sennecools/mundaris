@@ -701,6 +701,111 @@ impl GravityOrbitsDemo {
         }
     }
 
+    /// Alt+click (logical pixels): selects the globe under the cursor and places the
+    /// camera above that point in surface inspection, looking toward the horizon.
+    pub fn viewport_fly_to(&mut self, pos: [f32; 2]) {
+        self.controls.gesture_start = None;
+        self.controls.gesture_dragged = false;
+        let scale = self.controls.pixels_per_point;
+        let pixels = [f64::from(pos[0]) * scale, f64::from(pos[1]) * scale];
+        let log = match self.fly_to(pixels) {
+            Ok(Some(text)) => (crate::studio::view::Tone::Normal, text),
+            Ok(None) => return,
+            Err(error) => (
+                crate::studio::view::Tone::Warn,
+                format!("Fly to point failed: {error:#}"),
+            ),
+        };
+        if self.controls.log.len() >= 200 {
+            self.controls.log.pop_front();
+        }
+        self.controls.log.push_back(crate::studio::view::LogItem {
+            time: format!("{:>8.1} s", self.system.sample_time().seconds_since_epoch()),
+            text: log.1,
+            tone: log.0,
+        });
+    }
+
+    /// `None` when the pointer is not over a body with a surface.
+    fn fly_to(&mut self, pixels: [f64; 2]) -> Result<Option<String>> {
+        // Pitch below the horizon and clearance bounds for "inspecting the map".
+        const PITCH_DOWN_RAD: f64 = 25.0 * std::f64::consts::PI / 180.0;
+        let projection = self.content_projection(0.1)?;
+        let pair = self.projection.coherent_view(&self.system)?;
+        let camera_pose = self.camera.pose();
+        let mut targets = Vec::new();
+        for m in &self.last_markers {
+            let Some(&body) = self.ids.get(m.request_index) else {
+                continue;
+            };
+            let celestial = self.system.body(body)?;
+            if !celestial.has_surface() {
+                continue;
+            }
+            let fixed = pair.projection().frames_for(body)?.body_fixed;
+            targets.push(SurfacePickTarget {
+                body,
+                center_in_view_m: m.center_in_view_m,
+                radius_m: celestial.properties().reference_radius_m(),
+                body_fixed_from_view: pair
+                    .evaluation()
+                    .reexpress_pose(camera_pose, fixed)?
+                    .orientation()
+                    .quaternion(),
+            });
+        }
+        let Some(hit) = pick_surface_point(&targets, pixels, projection)? else {
+            return Ok(None);
+        };
+        let body = hit.body;
+        let fixed = pair.projection().frames_for(body)?.body_fixed;
+        let radius = self.system.body(body)?.properties().reference_radius_m();
+        let clearance = (radius / 50.0).clamp(2_000.0, 50_000.0);
+        let up = hit.point_body_m.normalize();
+        // Keep looking the way the camera already faces, projected onto the horizon.
+        let current = pair
+            .evaluation()
+            .reexpress_pose(camera_pose, fixed)?
+            .orientation()
+            .quaternion()
+            * -DVec3::Z;
+        let heading = (current - up * current.dot(up))
+            .try_normalize()
+            .unwrap_or_else(|| up.any_orthonormal_vector());
+        let forward = heading * PITCH_DOWN_RAD.cos() - up * PITCH_DOWN_RAD.sin();
+        let right = forward.cross(up).normalize();
+        let view_up = right.cross(forward);
+        let pose = FramePose::new(
+            FramePosition::new(
+                fixed,
+                LocalPosition::try_metres(up * (radius + clearance))?,
+            ),
+            UnitRotation::try_from_quaternion(glam::DQuat::from_mat3(&glam::DMat3::from_cols(
+                right, view_up, -forward,
+            )))?,
+        );
+        // Validate on a candidate so a failed placement cannot alter the observer.
+        // A pending surface places the pose as authored (ADR 0023).
+        let mut camera = self.camera.clone();
+        let measured = camera
+            .query_surface(&pair, body, pose)?
+            .map(|surface| surface.clearance_m);
+        camera.developer_set_surface_pose(&pair, body, pose)?;
+        if let Some(measured) = measured {
+            camera.target_clearance(&pair, measured)?;
+        }
+        camera.enter_surface_inspection(&pair, body)?;
+        self.camera = camera;
+        self.auto_fit = false;
+        self.selection.select(&self.system, body)?;
+        self.controls.refresh_draft(self.system.body(body)?);
+        let name = self.system.body(body)?.name().to_owned();
+        Ok(Some(format!(
+            "Flew to {name} at {:.1} km above the point",
+            clearance / 1000.0
+        )))
+    }
+
     /// Click on a placed body label (index into the published labels).
     pub fn viewport_label_click(&mut self, index: usize, double: bool) {
         let Some(label) = self.controls.placed.get(index) else {

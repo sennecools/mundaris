@@ -2,13 +2,13 @@
 //! and translation of egui input into toolkit-free [`ViewportEvent`]s in
 //! viewport logical pixels.
 
-use egui::{
-    Align2, Color32, CornerRadius, CursorIcon, Event, EventFilter, FontId, Key, MouseWheelUnit,
-    Pos2, Rect, Sense, Stroke, StrokeKind, TextureId, Ui,
-};
 use astrum_app::{
     studio::view::{LabelState, Shortcut, StatItem, StudioView},
     viewport::{FlightKey, PointerButton, ViewportEvent},
+};
+use egui::{
+    Align2, Color32, CornerRadius, CursorIcon, Event, EventFilter, FontId, Key, MouseWheelUnit,
+    Pos2, Rect, Sense, Stroke, StrokeKind, TextureId, Ui,
 };
 
 use super::theme::{self, *};
@@ -33,6 +33,8 @@ pub enum Interaction {
     Shortcut(Shortcut),
     Click([f32; 2], bool),
     LabelClick(usize, bool),
+    /// Alt+click on the globe: fly the camera to that surface point.
+    FlyTo([f32; 2]),
     /// Human input that interrupts an automation lease.
     Human(&'static str),
 }
@@ -193,15 +195,21 @@ impl ViewportInput {
             }
         }
         if !label_clicked {
+            let alt = ui.input(|input| input.modifiers.alt);
             if let Some(pos) = response
                 .interact_pointer_pos()
                 .filter(|_| response.clicked())
             {
-                out.push(Interaction::Click(local(pos), false));
+                out.push(if alt {
+                    Interaction::FlyTo(local(pos))
+                } else {
+                    Interaction::Click(local(pos), false)
+                });
             }
-            if let Some(pos) = response
-                .interact_pointer_pos()
-                .filter(|_| response.double_clicked())
+            if !alt
+                && let Some(pos) = response
+                    .interact_pointer_pos()
+                    .filter(|_| response.double_clicked())
             {
                 out.push(Interaction::Click(local(pos), true));
             }

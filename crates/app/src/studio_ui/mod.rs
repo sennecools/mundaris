@@ -114,6 +114,7 @@ impl Engine {
             Interaction::Event(event) => self.demo.viewport_event(event),
             Interaction::Shortcut(shortcut) => self.demo.viewport_shortcut(shortcut),
             Interaction::Click(pos, double) => self.demo.viewport_click(pos, double),
+            Interaction::FlyTo(pos) => self.demo.viewport_fly_to(pos),
             Interaction::LabelClick(index, double) => self.demo.viewport_label_click(index, double),
             Interaction::Human(reason) => self.human_input(reason),
         }
