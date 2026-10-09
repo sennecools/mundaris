@@ -1,6 +1,10 @@
 //! Pure CDLOD quadtree geometry and selection over cube-sphere charts.
+use astrum_math::surface::{CubeFace, CubePatchAddress, PatchEdge};
 use glam::{DMat3, DVec3};
-use astrum_math::surface::{CubeFace, CubePatchAddress};
+use std::{
+    collections::{HashMap, HashSet},
+    hash::BuildHasherDefault,
+};
 
 /// f64 cube-chart placement of one node; mirrors the GPU chart reconstruction.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -165,12 +169,22 @@ pub struct SelectionInput<'a> {
     pub ranges: &'a [f64],
     pub max_level: u8,
     pub visit_limit: usize,
+    /// Enforce the restricted-quadtree constraint and edge masks (§9.1, §9.8).
+    /// Drawn terrain needs it; unmorphed depth-only shadow casters do not.
+    pub restricted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Selected {
     pub address: CubePatchAddress,
     pub distance_m: f64,
+    /// `PatchEdge::bit` set for every edge whose selected neighbour is one
+    /// level coarser; the draw snaps those edges to the coarse line (§9.8).
+    pub coarser_edges: u8,
+    /// Edges bordering finer selected neighbours. The draw holds those edges
+    /// unmorphed so they show this node's own level, which is exactly what the
+    /// finer side snaps to; the coarser rule wins at a shared corner.
+    pub finer_edges: u8,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -182,6 +196,223 @@ pub struct SelectionResult {
     /// Wanted refinements waiting for measured height bounds.
     pub deferred: usize,
     pub horizon_or_frustum_culled: usize,
+    /// Nodes split only to restore the 2:1 neighbour constraint (§9.1).
+    pub balance_splits: usize,
+    /// The balance pass hit its split cap; some edges may differ by more
+    /// than one level (skirts remain the backstop).
+    pub balance_unresolved: bool,
+}
+
+/// Safety cap on forced splits per selection. Balancing normally needs a few
+/// splits along deferred or truncated boundaries.
+const MAX_BALANCE_SPLITS: usize = 4096;
+
+/// Multiplicative hasher for cube-patch keys. Balancing builds and probes
+/// thousands of these per selection, where SipHash's flood resistance buys
+/// nothing and its cost showed in the frame profile.
+#[derive(Debug, Default, Clone, Copy)]
+struct AddressHasher(u64);
+
+impl std::hash::Hasher for AddressHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_u64(u64::from(byte));
+        }
+    }
+    fn write_u8(&mut self, value: u8) {
+        self.write_u64(u64::from(value));
+    }
+    fn write_u32(&mut self, value: u32) {
+        self.write_u64(u64::from(value));
+    }
+    fn write_usize(&mut self, value: usize) {
+        self.write_u64(value as u64);
+    }
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+type AddressMap<V> = HashMap<CubePatchAddress, V, BuildHasherDefault<AddressHasher>>;
+type AddressSet = HashSet<CubePatchAddress, BuildHasherDefault<AddressHasher>>;
+
+/// Restricted quadtree (§9.1): split selected leaves until every pair of
+/// edge-adjacent selected leaves differs by at most one level, then record
+/// which edges of each leaf border a coarser or finer leaf. CDLOD ranges
+/// already keep most selections balanced; deferred bounds, the visit limit and
+/// frustum changes can break it. A forced split needs no height bounds, so
+/// balancing never coarsens the finer side.
+fn balance(result: &mut SelectionResult, max_level: u8) {
+    let mut leaves: AddressMap<f64> = result
+        .selected
+        .iter()
+        .map(|s| (s.address, s.distance_m))
+        .collect();
+    let mut internal = AddressSet::default();
+    for leaf in leaves.keys() {
+        let mut cursor = leaf.parent();
+        while let Some(ancestor) = cursor {
+            if !internal.insert(ancestor) {
+                break;
+            }
+            cursor = ancestor.parent();
+        }
+    }
+    // Each leaf's edge neighbours and their covering leaves; violations are
+    // found from the finer side (a cover two or more levels coarser).
+    let survey = |leaves: &AddressMap<f64>, internal: &AddressSet| {
+        let mut sorted: Vec<CubePatchAddress> = leaves.keys().copied().collect();
+        sorted.sort_unstable();
+        sorted
+            .into_iter()
+            .map(|address| {
+                let neighbours = PatchEdge::ALL.map(|edge| address.neighbor(edge));
+                let covers = neighbours.map(|n| covering_leaf(n.address, leaves, internal));
+                (address, neighbours, covers)
+            })
+            .collect::<Vec<_>>()
+    };
+    let violated = |address: CubePatchAddress, cover: Option<CubePatchAddress>| {
+        cover.is_some_and(|cover| cover.level() + 1 < address.level())
+    };
+    let mut surveyed = survey(&leaves, &internal);
+    if surveyed
+        .iter()
+        .any(|(address, _, covers)| covers.iter().any(|c| violated(*address, *c)))
+    {
+        let mut queue: Vec<CubePatchAddress> = surveyed.iter().map(|s| s.0).collect();
+        'leaves: while let Some(leaf) = queue.pop() {
+            if !leaves.contains_key(&leaf) {
+                continue;
+            }
+            for edge in PatchEdge::ALL {
+                let cover = covering_leaf(leaf.neighbor(edge).address, &leaves, &internal);
+                let Some(cover) = cover.filter(|_| violated(leaf, cover)) else {
+                    continue;
+                };
+                if result.balance_splits >= MAX_BALANCE_SPLITS || cover.level() >= max_level {
+                    result.balance_unresolved = true;
+                    continue;
+                }
+                let distance = leaves.remove(&cover).expect("cover is a leaf");
+                internal.insert(cover);
+                for child in cover.children().expect("coarser than a selected leaf") {
+                    leaves.insert(child, distance);
+                    queue.push(child);
+                }
+                result.balance_splits += 1;
+                // Re-check this leaf against the new, finer cover.
+                queue.push(leaf);
+                continue 'leaves;
+            }
+        }
+        surveyed = survey(&leaves, &internal);
+    }
+    result.selected = surveyed
+        .into_iter()
+        .map(|(address, neighbours, covers)| {
+            let (mut coarser_edges, mut finer_edges) = (0, 0);
+            for (k, edge) in PatchEdge::ALL.into_iter().enumerate() {
+                match covers[k] {
+                    Some(cover) if cover.level() < address.level() => {
+                        coarser_edges |= edge.bit();
+                    }
+                    Some(_) => {}
+                    // Refined neighbour: finer when a selected leaf touches the edge.
+                    None if touches_edge(
+                        neighbours[k].address,
+                        neighbours[k].edge,
+                        &leaves,
+                        &internal,
+                    ) =>
+                    {
+                        finer_edges |= edge.bit();
+                    }
+                    None => {}
+                }
+            }
+            Selected {
+                address,
+                distance_m: leaves[&address],
+                coarser_edges,
+                finer_edges,
+            }
+        })
+        .collect();
+}
+
+/// The two children of a node along one of its edges.
+fn edge_children(node: CubePatchAddress, edge: PatchEdge) -> Option<[CubePatchAddress; 2]> {
+    let children = node.children().ok()?;
+    let [a, b] = match edge {
+        PatchEdge::UMin => [0, 2],
+        PatchEdge::UMax => [1, 3],
+        PatchEdge::VMin => [0, 1],
+        PatchEdge::VMax => [2, 3],
+    };
+    Some([children[a], children[b]])
+}
+
+/// A refined node has a selected leaf among its descendants along `edge`.
+/// Recurses only through refined nodes on that edge.
+fn touches_edge(
+    node: CubePatchAddress,
+    edge: PatchEdge,
+    leaves: &AddressMap<f64>,
+    internal: &AddressSet,
+) -> bool {
+    internal.contains(&node)
+        && edge_children(node, edge).is_some_and(|children| {
+            children.iter().any(|&child| {
+                leaves.contains_key(&child) || touches_edge(child, edge, leaves, internal)
+            })
+        })
+}
+
+/// Deepest selected leaf level among `node` and its descendants touching
+/// `edge` of `node`; `None` when the region is covered by a coarser leaf or
+/// not selected (culled).
+#[cfg(test)]
+fn deepest_along(
+    node: CubePatchAddress,
+    edge: PatchEdge,
+    leaves: &AddressMap<f64>,
+    internal: &AddressSet,
+) -> Option<u8> {
+    if leaves.contains_key(&node) {
+        return Some(node.level());
+    }
+    if !internal.contains(&node) {
+        return None;
+    }
+    edge_children(node, edge)?
+        .into_iter()
+        .filter_map(|child| deepest_along(child, edge, leaves, internal))
+        .max()
+}
+
+/// The selected leaf at `node` or its nearest selected ancestor. `None` when
+/// `node` or an ancestor is refined (the region is finer or culled) or no
+/// ancestor is selected. Stopping at refined nodes keeps walks short.
+fn covering_leaf(
+    node: CubePatchAddress,
+    leaves: &AddressMap<f64>,
+    internal: &AddressSet,
+) -> Option<CubePatchAddress> {
+    let mut cursor = Some(node);
+    while let Some(candidate) = cursor {
+        if leaves.contains_key(&candidate) {
+            return Some(candidate);
+        }
+        if internal.contains(&candidate) {
+            return None;
+        }
+        cursor = candidate.parent();
+    }
+    None
 }
 
 /// Conservative horizon test: true only when the whole bounding sphere lies
@@ -263,8 +494,13 @@ pub fn select(
             result.selected.push(Selected {
                 address: node,
                 distance_m: distance,
+                coarser_edges: 0,
+                finer_edges: 0,
             });
         }
+    }
+    if input.restricted {
+        balance(&mut result, input.max_level);
     }
     result
 }
@@ -364,6 +600,7 @@ mod tests {
             ranges: &ranges,
             max_level: 22,
             visit_limit: 100_000,
+            restricted: true,
         };
         let result = select(&input, |_| ([-0.2, 0.2], true));
         assert_eq!(result.deferred, 0);
@@ -404,5 +641,116 @@ mod tests {
         }
         eprintln!("selected per level: {histogram:?}");
         assert!(result.selected.len() < 2000, "{}", result.selected.len());
+    }
+
+    /// Every selected leaf's edge neighbours are covered by leaves at most one
+    /// level coarser, and the coarser-edge mask marks exactly those edges.
+    fn assert_restricted(result: &SelectionResult) {
+        let leaves: AddressMap<_> = result
+            .selected
+            .iter()
+            .map(|s| (s.address, s.distance_m))
+            .collect();
+        let internal: AddressSet = result
+            .selected
+            .iter()
+            .flat_map(|s| std::iter::successors(s.address.parent(), |p| p.parent()))
+            .collect();
+        let levels: std::collections::HashMap<_, _> = result
+            .selected
+            .iter()
+            .map(|s| (s.address, s.address.level()))
+            .collect();
+        for selected in &result.selected {
+            for edge in PatchEdge::ALL {
+                let mut cursor = Some(selected.address.neighbor(edge).address);
+                let mut cover = None;
+                while let Some(node) = cursor {
+                    if let Some(level) = levels.get(&node) {
+                        cover = Some(*level);
+                        break;
+                    }
+                    cursor = node.parent();
+                }
+                let level = selected.address.level();
+                if let Some(cover) = cover {
+                    assert!(
+                        level - cover <= 1,
+                        "{:?} edge {edge:?}: neighbour leaf {} levels coarser",
+                        selected.address,
+                        level - cover
+                    );
+                }
+                let coarser = cover.is_some_and(|c| c < level);
+                assert_eq!(selected.coarser_edges & edge.bit() != 0, coarser);
+                let neighbour = selected.address.neighbor(edge);
+                let finer = deepest_along(neighbour.address, neighbour.edge, &leaves, &internal)
+                    .is_some_and(|deepest| deepest > level);
+                assert_eq!(selected.finer_edges & edge.bit() != 0, finer);
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_and_truncated_selections_stay_restricted() {
+        let radius = 109_081.776_801_130_12;
+        let max_level = 18;
+        let ranges = ranges(radius, 32, max_level);
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut forced = 0;
+        for case in 0..200 {
+            let unit = |v: u64| (v >> 11) as f64 / (1u64 << 53) as f64;
+            let direction =
+                DVec3::new(unit(next()) - 0.5, unit(next()) - 0.5, unit(next()) - 0.5).normalize();
+            let altitude = 10f64.powf(unit(next()) * 5.5); // 1 m .. ~300 km
+            let observer = direction * (radius + altitude);
+            let forward =
+                DVec3::new(unit(next()) - 0.5, unit(next()) - 0.5, unit(next()) - 0.5).normalize();
+            let up = if forward.cross(direction).length() > 1e-3 {
+                direction
+            } else {
+                DVec3::X
+            };
+            let right = forward.cross(up).normalize();
+            let up = right.cross(forward);
+            let view_to_body = DMat3::from_cols(right, up, -forward);
+            // Defer a pseudo-random third of nodes below level 6 and cap
+            // the visit budget on some cases to force truncation.
+            let salt = next();
+            let visit_limit = if case % 3 == 0 {
+                64 + (next() % 400) as usize
+            } else {
+                100_000
+            };
+            let input = SelectionInput {
+                observer_body: observer,
+                body_to_view: view_to_body.transpose(),
+                frustum: Frustum::new(700.0, [800.0, 600.0]),
+                radius_m: radius,
+                occluder_radius_m: radius - 0.2,
+                ranges: &ranges,
+                max_level,
+                visit_limit,
+                restricted: true,
+            };
+            let result = select(&input, |node| {
+                let [x, y] = node.coordinates();
+                let h = ((u64::from(x) * 0x9e37_79b9) ^ (u64::from(y) * 0x85eb_ca6b) ^ salt)
+                    .wrapping_mul(0xc2b2_ae35);
+                let refinable = node.level() < 6 || (h >> 40) % 3 != 0;
+                ([-0.2, 0.2], refinable)
+            });
+            assert!(!result.balance_unresolved, "case {case}");
+            assert_restricted(&result);
+            forced += result.balance_splits;
+        }
+        eprintln!("forced balance splits over 200 cases: {forced}");
+        assert!(forced > 0, "the cases should exercise the balance pass");
     }
 }

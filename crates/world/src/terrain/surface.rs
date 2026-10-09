@@ -4,14 +4,14 @@ use super::{
     MoonTerrainConfig, MoonTerrainDefinition, MoonTerrainGenerator, MoonTerrainVersion,
     PreparedSurface, TerrainError, TerrainIdentity, TerrainSample, TerrainSeed,
 };
-use glam::{DMat3, DVec3};
 use astrum_math::{Direction3, noise::gradient_noise, surface::SurfaceLocation};
+use glam::{DMat3, DVec3};
 mod authoring;
+use astrum_terrain_fields::graph::{CompiledGraph, Graph};
 pub use authoring::{
     AffineRandomRange, GeologicalAffineControl, GeologicalDistribution,
     MoonCraterProfileDefinition, MoonFieldBandDefinition, MoonFieldDefinition,
 };
-use astrum_terrain_fields::graph::{CompiledGraph, Graph};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 mod shape;
@@ -21,6 +21,7 @@ mod geology;
 mod hierarchy;
 mod moon_fields;
 mod moon_profile;
+pub mod noise;
 pub mod producer;
 mod provinces;
 mod query_context;
@@ -549,6 +550,7 @@ pub struct SurfaceDefinition {
     atmosphere_identity: u64,
     height_profile: Option<TerrainHeightProfile>,
     moon_fields: Option<MoonFieldDefinition>,
+    detail_noise: Option<noise::DetailNoiseDefinition>,
 }
 impl SurfaceDefinition {
     pub fn new(
@@ -578,6 +580,7 @@ impl SurfaceDefinition {
             atmosphere_identity,
             height_profile: None,
             moon_fields: None,
+            detail_noise: None,
         })
     }
     pub fn generated(
@@ -603,6 +606,7 @@ impl SurfaceDefinition {
             atmosphere_identity: 0x4149_524c_4553_5301,
             height_profile: None,
             moon_fields: None,
+            detail_noise: None,
         }
     }
     pub fn with_height_profile(
@@ -636,6 +640,18 @@ impl SurfaceDefinition {
             distribution,
         )?;
         Ok(self)
+    }
+    /// Add the band-limited fBm detail layer (pipeline §9.3) to any algorithm.
+    pub fn with_detail_noise(
+        mut self,
+        definition: noise::DetailNoiseDefinition,
+    ) -> Result<Self, TerrainError> {
+        definition.validate()?;
+        self.detail_noise = Some(definition);
+        Ok(self)
+    }
+    pub fn detail_noise(&self) -> Option<&noise::DetailNoiseDefinition> {
+        self.detail_noise.as_ref()
     }
     pub fn moon_fields(&self) -> Option<&MoonFieldDefinition> {
         self.moon_fields.as_ref()
@@ -716,6 +732,7 @@ impl SurfaceDefinition {
             ^ self
                 .moon_fields
                 .map_or(0, MoonFieldDefinition::configuration_identity)
+            ^ self.detail_noise.map_or(0, |d| d.configuration_identity())
             ^ prepared
             ^ graph)
     }
@@ -818,6 +835,7 @@ pub struct SurfaceGenerator {
     definition: SurfaceDefinition,
     radius_m: f64,
     field: GeologicalField,
+    detail: Option<noise::DetailNoise>,
     height_bound_m: f64,
     envelope_m: [f64; 2],
     preparation_store: Arc<OnceLock<Option<Arc<query_context::SurfacePreparationStore>>>>,
@@ -925,6 +943,13 @@ impl SurfaceGenerator {
                 (GeologicalField::Other(g), bound)
             }
         };
+        let detail = definition
+            .detail_noise
+            .as_ref()
+            .map(|d| noise::DetailNoise::new(d, definition.terrain_seed()))
+            .transpose()?;
+        let height_bound_m =
+            (height_bound_m + detail.as_ref().map_or(0.0, noise::DetailNoise::bound_m)).next_up();
         let envelope_m = [
             (shape[0] - height_bound_m).next_down(),
             (shape[1] + height_bound_m).next_up(),
@@ -940,10 +965,16 @@ impl SurfaceGenerator {
             definition: definition.clone(),
             radius_m,
             field,
+            detail,
             height_bound_m,
             envelope_m,
             preparation_store: Arc::new(OnceLock::new()),
         })
+    }
+
+    /// Compiled detail layer, if the definition has one.
+    pub fn detail_noise(&self) -> Option<&noise::DetailNoise> {
+        self.detail.as_ref()
     }
 
     /// Heap payload currently retained by this compiled generator's owned
@@ -1465,6 +1496,14 @@ impl SurfaceGenerator {
                     SurfaceQueryWork::default(),
                 )
             }
+        };
+        // Complete (unfiltered) detail layer, after the geology (§9.5).
+        let (height_m, gradient) = match &self.detail {
+            Some(detail) => {
+                let (h, g) = detail.evaluate(n * self.radius_m, None);
+                (height_m + h, gradient + g * self.radius_m)
+            }
+            None => (height_m, gradient),
         };
         let material_noise = match &self.field {
             GeologicalField::MoonFields(field) => field.material_modulation(n),

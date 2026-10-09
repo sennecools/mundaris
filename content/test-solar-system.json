@@ -19,6 +19,15 @@
     "skirt_cells": 2,
     "min_body_pixels": 6
   },
+  "collision": {
+    "schema": 1,
+    "texel_m": 1.0,
+    "page_cells": 32,
+    "max_pages": 96,
+    "prefetch_radius_m": 60.0,
+    "prefetch_altitude_m": 2000.0,
+    "jobs_per_frame": 8
+  },
   "bodies": [
     {
       "id": "sol",

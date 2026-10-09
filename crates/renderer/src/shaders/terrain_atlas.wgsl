@@ -7,8 +7,8 @@ struct Projection { matrix: mat4x4<f32> }
 struct Instance {
     anchor: vec4<f32>,      // camera-relative chart-centre anchor (view axes), w = radius
     b2v_x: vec4<f32>,       // body-to-view rotation columns; x.w = render mode
-    b2v_y: vec4<f32>,
-    b2v_z: vec4<f32>,
+    b2v_y: vec4<f32>,       // w = coarser-neighbour edge mask (s=0, s=1, t=0, t=1)
+    b2v_z: vec4<f32>,       // w = finer-neighbour edge mask
     n0: vec4<f32>,          // chart-centre direction (body axes), w = |q0|
     face_u: vec4<f32>,      // w = chart width
     face_v: vec4<f32>,      // w = level
@@ -99,8 +99,20 @@ fn vs_main(@location(0) vertex: vec3<f32>, @builtin(instance_index) index: u32) 
     // Unmorphed distance decides the CDLOD morph towards the coarser grid.
     let h0 = blended_height(inst, st, 0.0);
     let d0 = length(to_view(inst, body_position(inst, st, h0)));
-    let morph = clamp((d0 - inst.morph.x) / max(inst.morph.y - inst.morph.x, 1.0e-6), 0.0, 1.0);
+    var morph = clamp((d0 - inst.morph.x) / max(inst.morph.y - inst.morph.x, 1.0e-6), 0.0, 1.0);
     let g = st * cells;
+    // Restricted quadtree edges (§9.8). On an edge shared with a coarser node,
+    // odd vertices collapse onto the coarse edge line (t = 1); on an edge shared
+    // with a finer node, this node stays at its own level (t = 0), which is
+    // exactly the line the finer side snaps to. The coarser rule wins at corners.
+    let edge_bits = select(0u, 1u, g.x < 0.5) | select(0u, 2u, g.x > cells - 0.5)
+        | select(0u, 4u, g.y < 0.5) | select(0u, 8u, g.y > cells - 0.5);
+    if (u32(inst.b2v_z.w + 0.5) & edge_bits) != 0u {
+        morph = 0.0;
+    }
+    if (u32(inst.b2v_y.w + 0.5) & edge_bits) != 0u {
+        morph = 1.0;
+    }
     let morphed = st - fract(g * 0.5) * (2.0 / cells) * morph;
     var height = blended_height(inst, morphed, morph);
     if vertex.z > 0.5 {

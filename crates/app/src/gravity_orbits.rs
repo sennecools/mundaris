@@ -9,11 +9,11 @@ use crate::{
     playback_metrics::*, system_view::*,
 };
 use anyhow::{Context, Result};
-use glam::DVec3;
 use astrum_math::*;
 use astrum_renderer::*;
 use astrum_simulation::*;
 use astrum_world::*;
+use glam::DVec3;
 use std::{
     collections::VecDeque,
     num::NonZeroU64,
@@ -106,8 +106,7 @@ impl Controls {
         Self {
             profiler: {
                 let mut profiler = crate::profiler::Profiler::default();
-                profiler.enabled = std::env::var("ASTRUM_PERFORMANCE_LAB")
-                    .is_ok_and(|s| s == "1")
+                profiler.enabled = std::env::var("ASTRUM_PERFORMANCE_LAB").is_ok_and(|s| s == "1")
                     || std::env::var("ASTRUM_PROFILE").is_ok_and(|s| s == "1");
                 crate::engine_profile::set_enabled(profiler.enabled);
                 crate::engine_profile::set_budget_ns("Frame", Some(100_000_000));
@@ -378,6 +377,7 @@ impl GravityOrbitsDemo {
         let crate::shared_system::SharedTestSystem {
             mut system,
             lod,
+            collision,
             motion: definition,
             presentation,
             initial_body_index: selected,
@@ -446,19 +446,10 @@ impl GravityOrbitsDemo {
                 camera_state.orientation_xyzw,
             ))?,
         );
-        let clearance = crate::terrain_inspection::clearance_at_body_position(
-            pair.system().body(body)?,
-            pose.position().local().metres(),
-            body,
-        )?
-        .context("canonical camera needs complete surface authority")?
-        .clearance_m;
-        anyhow::ensure!(
-            clearance >= 1.0,
-            "canonical camera requires at least 1 m clearance"
-        );
+        // The GPU colliders are not read back before the first frame, so the
+        // canonical pose is placed as authored and checked once its surface
+        // resolves (ADR 0023).
         camera.developer_set_surface_pose(&pair, body, pose)?;
-        camera.target_clearance(&pair, clearance)?;
         camera.enter_surface_inspection(&pair, body)?;
         Ok(Self {
             #[cfg(feature = "developer-tools")]
@@ -479,7 +470,7 @@ impl GravityOrbitsDemo {
             diagnostic_capture_request: None,
             terrain_clearance: None,
             clearance_query_us: 0.0,
-            atlas: crate::planet_lod::PlanetLod::new(Some(lod)),
+            atlas: crate::planet_lod::PlanetLod::new(Some(lod)).with_collision(collision),
             presentation,
             lighting,
             sun_index,
@@ -1594,6 +1585,12 @@ impl GravityOrbitsDemo {
             let _span = crate::engine_profile::span("Atlas terrain preparation");
             self.atlas
                 .receive_bounds(renderer.take_terrain_atlas_bounds());
+            // Read-back colliders (ADR 0023): store arrived pages and schedule
+            // the pages under last frame's camera query misses.
+            self.atlas
+                .receive_collision(renderer.take_terrain_collision_pages());
+            self.atlas
+                .request_collision(self.camera.take_surface_misses());
             let mut inputs = Vec::new();
             for (index, &id) in self.ids.iter().enumerate() {
                 let body = pair.system().body(id)?;
@@ -1631,6 +1628,7 @@ impl GravityOrbitsDemo {
                 }
             }
             frame.set_terrain_atlas(atlas_frame);
+            self.camera.refresh_surface(self.atlas.collider_view());
         }
         let prepared = (|| -> Result<()> {
             frame.append_body_observations(&self.requests, &self.surface_owners)?;
@@ -2013,6 +2011,12 @@ mod analytic_publication_tests {
             crate::shared_system::SharedTestSystem::load_canonical(NonZeroU64::new(71).unwrap())
                 .unwrap();
         let mut demo = GravityOrbitsDemo::shared_test_system().unwrap();
+        // ADR 0023: the runtime camera reads read-back GPU colliders, never the
+        // CPU oracle.
+        assert!(matches!(
+            demo.camera.surface_source(),
+            crate::celestial_camera::SurfaceSource::Colliders(_)
+        ));
         let expected = DVec3::from_array(loaded.camera.position_body_m);
         assert!((demo.camera.pose().position().local().metres() - expected).length() < 1e-8);
         let orientation = glam::DQuat::from_array(loaded.camera.orientation_xyzw);

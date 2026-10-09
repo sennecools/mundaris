@@ -171,7 +171,10 @@ try {
     }
     Remove-Item Env:ASTRUM_PERFORMANCE_LAB, Env:ASTRUM_CAPTURE_DIR -ErrorAction SilentlyContinue
     if (-not $DeveloperInterface) { Remove-Item Env:ASTRUM_DEV_REGISTRY, Env:ASTRUM_DEV_OUTPUT, Env:ASTRUM_DEV_BUILD_MANIFEST -ErrorAction SilentlyContinue }
-    $process = Start-Process -FilePath $executable -ArgumentList $arguments -WorkingDirectory $repo -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+    $startArguments = @{ FilePath = $executable; WorkingDirectory = $repo; WindowStyle = 'Hidden'; PassThru = $true; RedirectStandardOutput = $stdoutPath; RedirectStandardError = $stderrPath }
+    # Windows PowerShell 5.1 rejects an empty -ArgumentList.
+    if ($arguments.Count -gt 0) { $startArguments.ArgumentList = $arguments }
+    $process = Start-Process @startArguments
 } finally {
     foreach ($name in $environmentNames) { [Environment]::SetEnvironmentVariable($name, $previousEnvironment[$name], 'Process') }
 }

@@ -4,9 +4,10 @@
 //! requested quadtree nodes straight into texture-array layers; there is no CPU
 //! payload or upload queue. Selected nodes are then drawn with one instanced
 //! draw over a shared grid, using CDLOD morphing towards the coarser grid and a
-//! short arrival fade from ancestor data. Atlas contents are disposable derived
-//! data: the app owns layer assignment, identity and residency, and the world
-//! crate's CPU reference remains the terrain authority.
+//! short arrival fade from ancestor data. Atlas contents are disposable caches:
+//! the app owns layer assignment, identity and residency. Under ADR 0023 the
+//! producer evaluates the authoritative surface function; the world crate's CPU
+//! evaluation is its test oracle.
 use std::sync::{
     Arc,
     atomic::{AtomicU8, Ordering},
@@ -17,14 +18,33 @@ const DRAW_SHADER: &str = concat!(
     include_str!("shaders/lighting.wgsl"),
     include_str!("shaders/terrain_atlas.wgsl")
 );
+/// Producer shader: shared split-lattice noise followed by the atlas producer.
+const PRODUCE_SHADER: &str = concat!(
+    include_str!("shaders/terrain_noise.wgsl"),
+    include_str!("shaders/terrain_atlas_produce.wgsl")
+);
 
 /// Largest number of producer jobs accepted in one frame.
 pub const MAX_ATLAS_JOBS_PER_FRAME: usize = 256;
-const TILE_BYTES: u64 = 448;
+const TILE_BYTES: u64 = 464;
 const INSTANCE_BYTES: u64 = 176;
 const DISPATCH_STRIDE: u64 = 256;
-const MAX_DISPATCHES: u64 = 2 * MAX_ATLAS_JOBS_PER_FRAME as u64;
+/// Largest number of collision pages produced in one frame.
+pub const MAX_COLLISION_JOBS_PER_FRAME: usize = 32;
+/// Largest collision page edge in cells; pages hold `(cells + 1)^2` samples.
+pub const MAX_COLLISION_CELLS: u32 = 64;
+const COLLISION_SAMPLE_BYTES: u64 = 16;
+const COLLISION_BYTES: u64 = COLLISION_SAMPLE_BYTES
+    * MAX_COLLISION_JOBS_PER_FRAME as u64
+    * ((MAX_COLLISION_CELLS + 1) * (MAX_COLLISION_CELLS + 1)) as u64;
+/// Producer job slots: atlas jobs first, collision jobs after them.
+const MAX_TILE_SLOTS: usize = MAX_ATLAS_JOBS_PER_FRAME + MAX_COLLISION_JOBS_PER_FRAME;
+const MAX_DISPATCHES: u64 = (2 * MAX_ATLAS_JOBS_PER_FRAME + MAX_COLLISION_JOBS_PER_FRAME) as u64;
 const READBACK_SLOTS: usize = 4;
+/// Detail-noise octave origins per producer job (`OctaveOrigin` in the shader).
+pub const MAX_ATLAS_OCTAVES: usize = 16;
+const OCTAVE_BYTES: u64 = 48;
+const OCTAVE_BUFFER_BYTES: u64 = OCTAVE_BYTES * (MAX_ATLAS_OCTAVES * MAX_TILE_SLOTS) as u64;
 /// Height bounds are reported per cell of a 4x4 grid over each tile.
 pub const ATLAS_BOUNDS_GRID: usize = 4;
 const BOUNDS_WORDS_PER_JOB: usize = 2 * ATLAS_BOUNDS_GRID * ATLAS_BOUNDS_GRID;
@@ -234,6 +254,17 @@ pub enum AtlasTileKind {
     },
 }
 
+/// Lattice origin of one detail-noise octave for one job, split on the CPU in
+/// f64 (pipeline §4.4). `amplitude_m` includes the node's band-limit weight.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AtlasOctave {
+    pub cell: [i32; 3],
+    pub seed: u32,
+    pub fraction: [f32; 3],
+    pub frequency_per_m: f32,
+    pub amplitude_m: f32,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AtlasProduceJob {
     pub source: u64,
@@ -243,6 +274,8 @@ pub struct AtlasProduceJob {
     pub chart: AtlasChart,
     pub radius_m: f32,
     pub kind: AtlasTileKind,
+    /// Detail-noise octaves, at most `MAX_ATLAS_OCTAVES`.
+    pub octaves: Vec<AtlasOctave>,
 }
 
 /// Atlas layer plus the sub-rectangle `[origin, origin + scale]` of its chart
@@ -271,6 +304,12 @@ pub struct AtlasInstance {
     pub skirt_m: f32,
     pub material: crate::SurfaceMaterial,
     pub mode: u32,
+    /// Edges (`PatchEdge::bit`: s=0, s=1, t=0, t=1) bordering a coarser node;
+    /// their vertices are drawn fully morphed (pipeline §9.8).
+    pub coarser_edges: u8,
+    /// Edges bordering a finer node; drawn unmorphed so both sides meet on
+    /// this node's own level. The coarser rule wins at a shared corner.
+    pub finer_edges: u8,
 }
 
 /// Per-frame atlas work and draw list staged by the app.
@@ -282,6 +321,22 @@ pub struct TerrainAtlasFrame {
     pub instances: Vec<AtlasInstance>,
     /// Sun shadow cascades of the shadowed body and their casters.
     pub shadow: Option<AtlasShadowFrame>,
+    /// Collision pages to evaluate and read back (pipeline §15.1); `layer` is
+    /// unused. At most `MAX_COLLISION_JOBS_PER_FRAME`.
+    pub collision_jobs: Vec<AtlasProduceJob>,
+    /// Cells per collision page edge, `1..=MAX_COLLISION_CELLS`.
+    pub collision_cells: u32,
+}
+
+/// One read-back collision page: `(cells + 1)^2` samples on the job's chart at
+/// `st = (i, j) / cells`, row-major; heights are radial offsets in metres and
+/// normals unit vectors in body axes. Delivered a few frames after the job.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AtlasCollisionPage {
+    pub token: u64,
+    pub cells: u32,
+    pub heights: Vec<f32>,
+    pub normals: Vec<[f32; 3]>,
 }
 
 /// Cascades fitted by the app and, per cascade, casters selected at a detail
@@ -318,6 +373,9 @@ pub struct TerrainAtlasReport {
     pub instances: u32,
     pub sources: u32,
     pub dropped_readbacks: u32,
+    pub collision_jobs: u32,
+    /// Collision batches not read back because every staging buffer was busy.
+    pub dropped_collision_readbacks: u32,
 }
 
 struct SourceGpu {
@@ -330,6 +388,8 @@ struct SourceGpu {
 struct Readback {
     buffer: wgpu::Buffer,
     tokens: Vec<u64>,
+    /// Collision page edge cells of the recorded batch (collision ring only).
+    cells: u32,
     // 0 idle, 1 copy recorded, 2 mapping, 3 mapped, 4 failed
     state: Arc<AtomicU8>,
 }
@@ -340,12 +400,17 @@ pub(crate) struct TerrainAtlasRenderer {
     _normal: wgpu::Texture,
     produce_heights: wgpu::ComputePipeline,
     produce_normals: wgpu::ComputePipeline,
+    produce_collision: wgpu::ComputePipeline,
     source_layout: wgpu::BindGroupLayout,
     produce_group: wgpu::BindGroup,
     tiles: wgpu::Buffer,
+    octaves: wgpu::Buffer,
     dispatch: wgpu::Buffer,
     bounds: wgpu::Buffer,
     readbacks: Vec<Readback>,
+    collision_out: wgpu::Buffer,
+    collision_readbacks: Vec<Readback>,
+    collision_results: Vec<AtlasCollisionPage>,
     sources: std::collections::HashMap<u64, SourceGpu>,
     pipeline: wgpu::RenderPipeline,
     draw_group: wgpu::BindGroup,
@@ -420,9 +485,7 @@ impl TerrainAtlasRenderer {
 
         let produce_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Terrain atlas producer"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("shaders/terrain_atlas_produce.wgsl").into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(PRODUCE_SHADER.into()),
         });
         let storage = |binding, read_only| wgpu::BindGroupLayoutEntry {
             binding,
@@ -461,6 +524,8 @@ impl TerrainAtlasRenderer {
                     },
                     count: None,
                 },
+                storage(5, true),
+                storage(6, false),
             ],
         });
         let image = |binding| wgpu::BindGroupLayoutEntry {
@@ -505,9 +570,10 @@ impl TerrainAtlasRenderer {
         };
         let produce_heights = compute("produce_heights");
         let produce_normals = compute("produce_normals");
+        let produce_collision = compute("produce_collision");
         let tiles = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Terrain atlas producer jobs"),
-            size: TILE_BYTES * MAX_ATLAS_JOBS_PER_FRAME as u64,
+            size: TILE_BYTES * MAX_TILE_SLOTS as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -515,6 +581,12 @@ impl TerrainAtlasRenderer {
             label: Some("Terrain atlas producer dispatches"),
             size: DISPATCH_STRIDE * MAX_DISPATCHES,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let octaves = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Terrain atlas detail octave origins"),
+            size: OCTAVE_BUFFER_BYTES,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let bounds = device.create_buffer(&wgpu::BufferDescriptor {
@@ -525,6 +597,25 @@ impl TerrainAtlasRenderer {
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+        let collision_out = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Terrain collision pages"),
+            size: COLLISION_BYTES,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let collision_readbacks = (0..READBACK_SLOTS)
+            .map(|_| Readback {
+                buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Terrain collision readback"),
+                    size: COLLISION_BYTES,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+                tokens: Vec::new(),
+                cells: 0,
+                state: Arc::new(AtomicU8::new(0)),
+            })
+            .collect();
         let readbacks = (0..READBACK_SLOTS)
             .map(|_| Readback {
                 buffer: device.create_buffer(&wgpu::BufferDescriptor {
@@ -534,6 +625,7 @@ impl TerrainAtlasRenderer {
                     mapped_at_creation: false,
                 }),
                 tokens: Vec::new(),
+                cells: 0,
                 state: Arc::new(AtomicU8::new(0)),
             })
             .collect();
@@ -570,6 +662,14 @@ impl TerrainAtlasRenderer {
                         offset: 0,
                         size: wgpu::BufferSize::new(16),
                     }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: octaves.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: collision_out.as_entire_binding(),
                 },
             ],
         });
@@ -783,12 +883,17 @@ impl TerrainAtlasRenderer {
             _normal: normal,
             produce_heights,
             produce_normals,
+            produce_collision,
             source_layout,
             produce_group,
             tiles,
+            octaves,
             dispatch,
             bounds,
             readbacks,
+            collision_out,
+            collision_readbacks,
+            collision_results: Vec::new(),
             sources: Default::default(),
             pipeline,
             draw_group,
@@ -826,7 +931,55 @@ impl TerrainAtlasRenderer {
         std::mem::take(&mut self.results)
     }
 
+    pub(crate) fn take_collision_pages(&mut self) -> Vec<AtlasCollisionPage> {
+        std::mem::take(&mut self.collision_results)
+    }
+
+    fn collect_collision_readbacks(&mut self) {
+        for readback in &mut self.collision_readbacks {
+            match readback.state.load(Ordering::Acquire) {
+                3 => {
+                    // A failed mapping drops the batch; its pages are requested again.
+                    if let Ok(view) = readback.buffer.slice(..).get_mapped_range() {
+                        let side = (readback.cells + 1) as usize;
+                        let samples = side * side;
+                        for (page, token) in readback.tokens.iter().enumerate() {
+                            let mut heights = Vec::with_capacity(samples);
+                            let mut normals = Vec::with_capacity(samples);
+                            for sample in 0..samples {
+                                let start =
+                                    (page * samples + sample) * COLLISION_SAMPLE_BYTES as usize;
+                                let word = |i: usize| {
+                                    f32::from_le_bytes(
+                                        view[start + 4 * i..start + 4 * i + 4].try_into().unwrap(),
+                                    )
+                                };
+                                heights.push(word(0));
+                                normals.push([word(1), word(2), word(3)]);
+                            }
+                            self.collision_results.push(AtlasCollisionPage {
+                                token: *token,
+                                cells: readback.cells,
+                                heights,
+                                normals,
+                            });
+                        }
+                    }
+                    readback.buffer.unmap();
+                    readback.tokens.clear();
+                    readback.state.store(0, Ordering::Release);
+                }
+                4 => {
+                    readback.tokens.clear();
+                    readback.state.store(0, Ordering::Release);
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn collect_readbacks(&mut self) {
+        self.collect_collision_readbacks();
         for readback in &mut self.readbacks {
             match readback.state.load(Ordering::Acquire) {
                 3 => {
@@ -927,84 +1080,159 @@ impl TerrainAtlasRenderer {
             instances: frame.instances.len() as u32,
             sources: self.sources.len() as u32,
             dropped_readbacks: self.report.dropped_readbacks,
+            collision_jobs: frame.collision_jobs.len() as u32,
+            dropped_collision_readbacks: self.report.dropped_collision_readbacks,
         };
 
-        if !frame.jobs.is_empty() {
-            let mut ordered: Vec<&AtlasProduceJob> = frame.jobs.iter().collect();
-            ordered.sort_by_key(|job| job.source);
-            let mut tile_bytes = Vec::with_capacity(ordered.len() * TILE_BYTES as usize);
-            for job in &ordered {
-                if job.layer >= self.config.layers {
-                    return Err(format!("atlas job layer {} out of range", job.layer));
-                }
-                if !self.sources.contains_key(&job.source) {
-                    return Err(format!(
-                        "atlas job references unbound source {}",
-                        job.source
-                    ));
-                }
+        if frame.jobs.is_empty() && frame.collision_jobs.is_empty() {
+            self.stage_instances(device, queue, frame);
+            return Ok(());
+        }
+        let validate = |job: &AtlasProduceJob| -> Result<(), String> {
+            if !self.sources.contains_key(&job.source) {
+                return Err(format!(
+                    "atlas job references unbound source {}",
+                    job.source
+                ));
+            }
+            if job.octaves.len() > MAX_ATLAS_OCTAVES {
+                return Err(format!(
+                    "atlas job has {} detail octaves; at most {MAX_ATLAS_OCTAVES}",
+                    job.octaves.len()
+                ));
+            }
+            Ok(())
+        };
+        let mut ordered: Vec<&AtlasProduceJob> = frame.jobs.iter().collect();
+        ordered.sort_by_key(|job| job.source);
+        let mut collision: Vec<&AtlasProduceJob> = frame.collision_jobs.iter().collect();
+        collision.sort_by_key(|job| job.source);
+        for job in &ordered {
+            if job.layer >= self.config.layers {
+                return Err(format!("atlas job layer {} out of range", job.layer));
+            }
+            validate(job)?;
+        }
+        for job in &collision {
+            validate(job)?;
+        }
+        // Tile slots: atlas jobs from 0, collision jobs from MAX_ATLAS_JOBS_PER_FRAME.
+        // Each slot's detail octaves start at slot * MAX_ATLAS_OCTAVES.
+        for (first, jobs) in [(0, &ordered), (MAX_ATLAS_JOBS_PER_FRAME, &collision)] {
+            if jobs.is_empty() {
+                continue;
+            }
+            let mut tile_bytes = Vec::with_capacity(jobs.len() * TILE_BYTES as usize);
+            for job in jobs.iter() {
                 pack_tile(&mut tile_bytes, job);
             }
-            queue.write_buffer(&self.tiles, 0, &tile_bytes);
+            queue.write_buffer(&self.tiles, first as u64 * TILE_BYTES, &tile_bytes);
+            for (index, job) in jobs.iter().enumerate() {
+                if !job.octaves.is_empty() {
+                    let offset = (first + index) as u64 * MAX_ATLAS_OCTAVES as u64 * OCTAVE_BYTES;
+                    queue.write_buffer(&self.octaves, offset, &pack_octaves(&job.octaves));
+                }
+            }
+        }
+        if !ordered.is_empty() {
             let mut initial = Vec::with_capacity(ordered.len() * BOUNDS_WORDS_PER_JOB * 4);
             for _ in 0..ordered.len() * BOUNDS_WORDS_PER_JOB / 2 {
                 initial.extend_from_slice(&u32::MAX.to_le_bytes());
                 initial.extend_from_slice(&0u32.to_le_bytes());
             }
             queue.write_buffer(&self.bounds, 0, &initial);
+        }
 
-            // Group consecutive jobs per source; one dispatch pair per group.
+        // Consecutive jobs per source share one dispatch per pass kind:
+        // `(source, first slot, count)`.
+        let group = |jobs: &[&AtlasProduceJob], first: usize| {
             let mut groups: Vec<(u64, u32, u32)> = Vec::new();
-            for (index, job) in ordered.iter().enumerate() {
+            for (index, job) in jobs.iter().enumerate() {
                 match groups.last_mut() {
                     Some((source, _, count)) if *source == job.source => *count += 1,
-                    _ => groups.push((job.source, index as u32, 1)),
+                    _ => groups.push((job.source, (first + index) as u32, 1)),
                 }
             }
-            let separate_normals = self.config.normal_scale > 1;
-            let mut dispatch_bytes = vec![0u8; (DISPATCH_STRIDE * MAX_DISPATCHES) as usize];
-            let mut dispatches = Vec::new();
-            for &(source, base, count) in &groups {
-                let mut push = |side: u32, cells: u32, heights: bool| {
-                    let slot = dispatches.len();
-                    let offset = slot * DISPATCH_STRIDE as usize;
-                    for (i, value) in [base, side, cells, base].into_iter().enumerate() {
-                        dispatch_bytes[offset + i * 4..offset + i * 4 + 4]
-                            .copy_from_slice(&value.to_le_bytes());
-                    }
-                    dispatches.push((source, slot as u32, side, count, heights));
-                };
-                push(self.config.height_side(), self.config.cells, true);
-                if separate_normals {
-                    push(
-                        self.config.normal_side(),
-                        self.config.cells * self.config.normal_scale,
-                        false,
-                    );
-                }
+            groups
+        };
+        #[derive(Clone, Copy)]
+        enum Pass {
+            Heights,
+            Normals,
+            Collision,
+        }
+        let mut dispatch_bytes = vec![0u8; (DISPATCH_STRIDE * MAX_DISPATCHES) as usize];
+        let mut dispatches = Vec::new();
+        let mut push = |source: u64, words: [u32; 4], count: u32, pass: Pass| {
+            let slot = dispatches.len();
+            let offset = slot * DISPATCH_STRIDE as usize;
+            for (i, value) in words.into_iter().enumerate() {
+                dispatch_bytes[offset + i * 4..offset + i * 4 + 4]
+                    .copy_from_slice(&value.to_le_bytes());
             }
-            queue.write_buffer(
-                &self.dispatch,
-                0,
-                &dispatch_bytes[..dispatches.len() * DISPATCH_STRIDE as usize],
+            dispatches.push((source, slot as u32, words[1], count, pass));
+        };
+        for (source, base, count) in group(&ordered, 0) {
+            push(
+                source,
+                [base, self.config.height_side(), self.config.cells, base],
+                count,
+                Pass::Heights,
             );
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Terrain atlas producer"),
-                    timestamp_writes: None,
-                });
-                for &(source, slot, side, count, heights) in &dispatches {
-                    pass.set_pipeline(if heights {
-                        &self.produce_heights
-                    } else {
-                        &self.produce_normals
-                    });
-                    pass.set_bind_group(0, &self.produce_group, &[slot * DISPATCH_STRIDE as u32]);
-                    pass.set_bind_group(1, &self.sources[&source].group, &[]);
-                    let groups_xy = side.div_ceil(8);
-                    pass.dispatch_workgroups(groups_xy, groups_xy, count);
-                }
+            if self.config.normal_scale > 1 {
+                let cells = self.config.cells * self.config.normal_scale;
+                push(
+                    source,
+                    [base, self.config.normal_side(), cells, base],
+                    count,
+                    Pass::Normals,
+                );
             }
+        }
+        let collision_cells = frame.collision_cells;
+        if !collision.is_empty() {
+            if collision.len() > MAX_COLLISION_JOBS_PER_FRAME
+                || !(1..=MAX_COLLISION_CELLS).contains(&collision_cells)
+            {
+                return Err(format!(
+                    "{} collision jobs of {collision_cells} cells exceed the per-frame caps",
+                    collision.len()
+                ));
+            }
+            for (source, base, count) in group(&collision, MAX_ATLAS_JOBS_PER_FRAME) {
+                // The fourth word is the first output page of the group.
+                let page = base - MAX_ATLAS_JOBS_PER_FRAME as u32;
+                push(
+                    source,
+                    [base, collision_cells + 1, collision_cells, page],
+                    count,
+                    Pass::Collision,
+                );
+            }
+        }
+        queue.write_buffer(
+            &self.dispatch,
+            0,
+            &dispatch_bytes[..dispatches.len() * DISPATCH_STRIDE as usize],
+        );
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Terrain atlas producer"),
+                timestamp_writes: None,
+            });
+            for &(source, slot, side, count, kind) in &dispatches {
+                pass.set_pipeline(match kind {
+                    Pass::Heights => &self.produce_heights,
+                    Pass::Normals => &self.produce_normals,
+                    Pass::Collision => &self.produce_collision,
+                });
+                pass.set_bind_group(0, &self.produce_group, &[slot * DISPATCH_STRIDE as u32]);
+                pass.set_bind_group(1, &self.sources[&source].group, &[]);
+                let groups_xy = side.div_ceil(8);
+                pass.dispatch_workgroups(groups_xy, groups_xy, count);
+            }
+        }
+        if !ordered.is_empty() {
             if let Some(readback) = self
                 .readbacks
                 .iter_mut()
@@ -1023,7 +1251,37 @@ impl TerrainAtlasRenderer {
                 self.report.dropped_readbacks += 1;
             }
         }
+        if !collision.is_empty() {
+            let side = u64::from(collision_cells + 1);
+            if let Some(readback) = self
+                .collision_readbacks
+                .iter_mut()
+                .find(|r| r.state.load(Ordering::Acquire) == 0)
+            {
+                encoder.copy_buffer_to_buffer(
+                    &self.collision_out,
+                    0,
+                    &readback.buffer,
+                    0,
+                    collision.len() as u64 * side * side * COLLISION_SAMPLE_BYTES,
+                );
+                readback.tokens = collision.iter().map(|job| job.token).collect();
+                readback.cells = collision_cells;
+                readback.state.store(1, Ordering::Release);
+            } else {
+                self.report.dropped_collision_readbacks += 1;
+            }
+        }
+        self.stage_instances(device, queue, frame);
+        Ok(())
+    }
 
+    fn stage_instances(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame: &TerrainAtlasFrame,
+    ) {
         let count = frame.instances.len() as u64;
         if count > self.instance_capacity {
             self.instance_capacity = count.next_power_of_two();
@@ -1046,12 +1304,16 @@ impl TerrainAtlasRenderer {
             queue.write_buffer(&self.instances, 0, &bytes);
         }
         self.staged_instances = count as u32;
-        Ok(())
     }
 
-    /// Start mapping bounds copied in the just-submitted command buffer.
+    /// Start mapping bounds and collision pages copied in the just-submitted
+    /// command buffer.
     pub(crate) fn on_submitted(&mut self) {
-        for readback in &mut self.readbacks {
+        for readback in self
+            .readbacks
+            .iter_mut()
+            .chain(&mut self.collision_readbacks)
+        {
             if readback.state.load(Ordering::Acquire) != 1 {
                 continue;
             }
@@ -1299,6 +1561,174 @@ pub fn produce_for_validation(
         }
     }
     Ok(output)
+}
+
+/// Produce collision pages through the runtime path (producer dispatch, staging
+/// ring, asynchronous map) on a caller-owned device. Each "frame" submits an
+/// empty encoder and polls without waiting, so the result also reports how
+/// many submissions passed before the pages arrived. Validation only.
+pub fn collision_for_validation(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    config: TerrainAtlasConfig,
+    sources: &[(u64, Arc<AtlasSource>)],
+    jobs: &[AtlasProduceJob],
+    cells: u32,
+) -> Result<(Vec<AtlasCollisionPage>, u32), String> {
+    let projection_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("Validation projection"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: wgpu::BufferSize::new(64),
+            },
+            count: None,
+        }],
+    });
+    let mut atlas = TerrainAtlasRenderer::new(
+        device,
+        &crate::post::SCENE_TARGETS,
+        &projection_layout,
+        &crate::celestial::lighting_layout(device),
+        &crate::shadows::ShadowMaps::light_layout(device),
+        config,
+    )?;
+    let mut frame = TerrainAtlasFrame {
+        config: Some(config),
+        sources: sources.to_vec(),
+        collision_jobs: jobs.to_vec(),
+        collision_cells: cells,
+        ..Default::default()
+    };
+    let mut pages = Vec::new();
+    for submissions in 1..=240u32 {
+        let mut encoder = device.create_command_encoder(&Default::default());
+        atlas.prepare(device, queue, &mut encoder, &frame)?;
+        frame.collision_jobs.clear();
+        queue.submit([encoder.finish()]);
+        atlas.on_submitted();
+        device
+            .poll(wgpu::PollType::Poll)
+            .map_err(|error| error.to_string())?;
+        pages.extend(atlas.take_collision_pages());
+        if pages.len() >= jobs.len() {
+            return Ok((pages, submissions));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    Err(format!(
+        "{} of {} collision pages arrived",
+        pages.len(),
+        jobs.len()
+    ))
+}
+
+/// Evaluate the producer's integer lattice hash (`lattice_bits` in
+/// `terrain_noise.wgsl`) for `(cell, seed)` inputs on a caller-owned device.
+/// Validation-only path: blocking, allocates per call.
+pub fn lattice_hash_for_validation(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    inputs: &[([i32; 3], u32)],
+) -> Result<Vec<[u32; 3]>, String> {
+    const ENTRY: &str = "
+@group(0) @binding(0) var<storage, read> hash_inputs: array<vec4<i32>>;
+@group(0) @binding(1) var<storage, read_write> hash_outputs: array<vec4<u32>>;
+@compute @workgroup_size(64)
+fn hash_main(@builtin(global_invocation_id) id: vec3<u32>) {
+    if id.x >= arrayLength(&hash_inputs) {
+        return;
+    }
+    let c = hash_inputs[id.x];
+    hash_outputs[id.x] = vec4<u32>(lattice_bits(c.xyz, bitcast<u32>(c.w)), 0u);
+}
+";
+    if inputs.is_empty() || inputs.len() > 64 * 65_535 {
+        return Err("hash validation needs 1..=4194240 inputs".into());
+    }
+    let source = format!("{}{ENTRY}", include_str!("shaders/terrain_noise.wgsl"));
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("Lattice hash validation"),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("Lattice hash validation"),
+        layout: None,
+        module: &module,
+        entry_point: Some("hash_main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let bytes = (inputs.len() * 16) as u64;
+    let input = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Lattice hash inputs"),
+        size: bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let packed: Vec<u8> = inputs
+        .iter()
+        .flat_map(|(cell, seed)| {
+            [cell[0], cell[1], cell[2], *seed as i32]
+                .into_iter()
+                .flat_map(i32::to_le_bytes)
+        })
+        .collect();
+    queue.write_buffer(&input, 0, &packed);
+    let output = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Lattice hash outputs"),
+        size: bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Lattice hash readback"),
+        size: bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Lattice hash validation"),
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: input.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: output.as_entire_binding(),
+            },
+        ],
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &group, &[]);
+        pass.dispatch_workgroups((inputs.len() as u32).div_ceil(64), 1, 1);
+    }
+    encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, bytes);
+    queue.submit([encoder.finish()]);
+    readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(|error| error.to_string())?;
+    let view = readback
+        .slice(..)
+        .get_mapped_range()
+        .map_err(|error| error.to_string())?;
+    Ok(view
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .map(|chunk| {
+            std::array::from_fn(|i| u32::from_le_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap()))
+        })
+        .collect())
 }
 
 fn instance_buffer(device: &wgpu::Device, capacity: u64) -> wgpu::Buffer {
@@ -1605,7 +2035,30 @@ fn pack_tile(out: &mut Vec<u8>, job: &AtlasProduceJob) {
         out.extend(f32_bytes(value));
     }
     out.extend(f32_bytes(&weights));
+    for value in [job.octaves.len() as u32, 0, 0, 0] {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
     debug_assert_eq!((out.len() - start) as u64, TILE_BYTES);
+}
+
+fn pack_octaves(octaves: &[AtlasOctave]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(octaves.len() * OCTAVE_BYTES as usize);
+    for octave in octaves {
+        for value in octave.cell {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        out.extend_from_slice(&octave.seed.to_le_bytes());
+        out.extend(f32_bytes(&octave.fraction));
+        out.extend(f32_bytes(&[
+            octave.frequency_per_m,
+            octave.amplitude_m,
+            0.0,
+            0.0,
+            0.0,
+        ]));
+    }
+    debug_assert_eq!(out.len() as u64, octaves.len() as u64 * OCTAVE_BYTES);
+    out
 }
 
 fn pack_instance(out: &mut Vec<u8>, instance: &AtlasInstance) {
@@ -1619,8 +2072,8 @@ fn pack_instance(out: &mut Vec<u8>, instance: &AtlasInstance) {
             instance.radius_m,
         ],
         [b[0][0], b[0][1], b[0][2], instance.mode as f32],
-        [b[1][0], b[1][1], b[1][2], 0.0],
-        [b[2][0], b[2][1], b[2][2], 0.0],
+        [b[1][0], b[1][1], b[1][2], f32::from(instance.coarser_edges)],
+        [b[2][0], b[2][1], b[2][2], f32::from(instance.finer_edges)],
         [c.n0[0], c.n0[1], c.n0[2], c.q0_length],
         [c.face_u[0], c.face_u[1], c.face_u[2], c.width],
         [
@@ -1731,13 +2184,7 @@ mod tests {
 
     #[test]
     fn atlas_shaders_parse_and_validate() {
-        for (name, source) in [
-            (
-                "produce",
-                include_str!("shaders/terrain_atlas_produce.wgsl"),
-            ),
-            ("draw", DRAW_SHADER),
-        ] {
+        for (name, source) in [("produce", PRODUCE_SHADER), ("draw", DRAW_SHADER)] {
             let module = naga::front::wgsl::parse_str(source)
                 .unwrap_or_else(|error| panic!("{name}: {}", error.emit_to_string(source)));
             naga::valid::Validator::new(
@@ -1793,9 +2240,14 @@ mod tests {
                     fractions: [[0.0; 3]; 6],
                     band_weights: [1.0; 3],
                 },
+                octaves: vec![AtlasOctave::default(); 2],
             },
         );
         assert_eq!(bytes.len() as u64, TILE_BYTES);
+        assert_eq!(
+            pack_octaves(&[AtlasOctave::default(); 3]).len() as u64,
+            3 * OCTAVE_BYTES
+        );
         let mut bytes = Vec::new();
         pack_instance(&mut bytes, &AtlasInstance::default());
         assert_eq!(bytes.len() as u64, INSTANCE_BYTES);

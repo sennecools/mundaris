@@ -10,6 +10,9 @@ impl FrameHost<'_> {
     pub fn take_terrain_atlas_bounds(&mut self) -> Vec<astrum_renderer::AtlasBounds> {
         self.renderer.take_terrain_atlas_bounds()
     }
+    pub fn take_terrain_collision_pages(&mut self) -> Vec<astrum_renderer::AtlasCollisionPage> {
+        self.renderer.take_terrain_collision_pages()
+    }
     pub fn terrain_atlas_report(&self) -> astrum_renderer::TerrainAtlasReport {
         self.renderer.terrain_atlas_report()
     }
@@ -26,9 +29,7 @@ impl FrameHost<'_> {
     }
     pub fn native_submission_id(&self) -> Option<u64> {
         match self.renderer.last_render_outcome() {
-            astrum_renderer::RenderOutcome::Submitted { submission_id, .. } => {
-                Some(submission_id)
-            }
+            astrum_renderer::RenderOutcome::Submitted { submission_id, .. } => Some(submission_id),
             _ => None,
         }
     }
@@ -55,10 +56,7 @@ impl FrameHost<'_> {
     pub fn gpu_source_frame(&self) -> Option<u64> {
         self.renderer.latest_gpu_profile_submission()
     }
-    pub fn set_render_settings(
-        &mut self,
-        settings: astrum_renderer::RenderSettings,
-    ) -> Result<()> {
+    pub fn set_render_settings(&mut self, settings: astrum_renderer::RenderSettings) -> Result<()> {
         self.renderer
             .set_render_settings(settings)
             .map_err(anyhow::Error::msg)

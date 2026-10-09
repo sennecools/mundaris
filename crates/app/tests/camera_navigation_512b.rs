@@ -1,8 +1,8 @@
-use glam::DVec3;
 use astrum_app::{celestial_camera::*, gravity_fixtures::*, terrain_inspection};
 use astrum_math::*;
 use astrum_renderer::CelestialProjection;
 use astrum_world::*;
+use glam::DVec3;
 use std::{num::NonZeroU64, time::Duration};
 
 fn fixture() -> (CelestialSystem, CelestialFrameProjection) {
@@ -63,6 +63,8 @@ fn projection(fov: f64, height: u32) -> CelestialProjection {
 
 fn body_orbit(pair: &CoherentCelestialView<'_>, body: BodyId) -> CelestialCamera {
     let mut camera = CelestialCamera::overview(pair, DVec3::ZERO, 1.6e11).unwrap();
+    // Headless: no renderer reads back GPU colliders; use the CPU test oracle.
+    camera.use_cpu_oracle_surface();
     camera.transition_to(pair, FocusTarget::Body(body)).unwrap();
     settle(&mut camera, pair, 1.0);
     camera.enter_body_orbit(pair, body).unwrap();
@@ -191,6 +193,8 @@ fn ordinary_controls_focus_orbit_surface_wheel_and_reach_two_metres() {
     let earth = ids[3];
     let moon = ids[4];
     let mut camera = CelestialCamera::overview(&pair, DVec3::ZERO, 1.6e11).unwrap();
+    // Headless: no renderer reads back GPU colliders; use the CPU test oracle.
+    camera.use_cpu_oracle_surface();
     camera
         .transition_to(&pair, FocusTarget::Body(earth))
         .unwrap();
@@ -315,6 +319,8 @@ fn event_stream_boundaries_and_mixed_surface_trajectory_are_timestep_equivalent(
     let mut endpoints = Vec::new();
     for fps in [30_u32, 60, 144] {
         let mut camera = CelestialCamera::overview(&pair, DVec3::ZERO, 1.6e11).unwrap();
+        // Headless: no renderer reads back GPU colliders; use the CPU test oracle.
+        camera.use_cpu_oracle_surface();
         camera
             .set_navigation_projection(projection(60.0, 1080), 1.0)
             .unwrap();
@@ -488,6 +494,8 @@ fn overview_response_matrix_and_repeated_surface_turns_remain_usable() {
     for fov in [30.0, 60.0, 90.0] {
         for (height, dpi) in [(720, 1.0), (1080, 1.0), (1620, 1.5), (2160, 2.0)] {
             let mut camera = CelestialCamera::overview(&pair, DVec3::ZERO, 1.6e11).unwrap();
+            // Headless: no renderer reads back GPU colliders; use the CPU test oracle.
+            camera.use_cpu_oracle_surface();
             camera
                 .set_navigation_projection(projection(fov, height), dpi)
                 .unwrap();

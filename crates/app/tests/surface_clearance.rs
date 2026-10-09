@@ -1,4 +1,3 @@
-use glam::DVec3;
 use astrum_app::celestial_camera::{CelestialCamera, NavigationInput};
 use astrum_app::terrain_inspection::{clearance_at_body_position, terrain_clearance};
 use astrum_math::surface::SurfaceLocation;
@@ -7,6 +6,7 @@ use astrum_world::{
     BodyProperties, BodyState, CelestialFrameProjection, CelestialSystem, SimulationInstant,
     terrain::*,
 };
+use glam::DVec3;
 use std::num::NonZeroU64;
 use std::time::Duration;
 
@@ -131,6 +131,8 @@ fn camera_guard_uses_composed_envelope_and_invalidates_clearance_cache() {
         let extent = radius;
         let center = initial_position - DVec3::Z * (2.5 * extent);
         camera = CelestialCamera::overview(&pair, center, extent).unwrap();
+        // Headless: no renderer reads back GPU colliders; use the CPU test oracle.
+        camera.use_cpu_oracle_surface();
         camera.enter_free_flight(&pair).unwrap();
         let before = terrain_clearance(&pair, camera.pose(), body)
             .unwrap()

@@ -1,8 +1,8 @@
 //! One observer; selection is independent of explicit focus/attachment.
 use anyhow::{Result, ensure};
-use glam::{DQuat, DVec3};
 use astrum_math::*;
 use astrum_world::*;
+use glam::{DQuat, DVec3};
 use std::time::Duration;
 
 /// Observational controller state; wall-navigation speed is not a simulation derivative.
@@ -82,6 +82,23 @@ struct Transition {
     target_anchor: LocalPosition,
 }
 
+/// Where camera clearance reads the terrain surface (ADR 0023).
+#[derive(Debug, Clone)]
+pub enum SurfaceSource {
+    /// Read-back GPU colliders, the runtime terrain authority. Queries may be
+    /// pending for a few frames; misses are forwarded to the producer.
+    Colliders(crate::planet_lod::collision::ColliderView),
+    /// The CPU surface generator: the test oracle, for headless tests that
+    /// run the camera without a renderer.
+    CpuOracle,
+}
+
+impl Default for SurfaceSource {
+    fn default() -> Self {
+        Self::Colliders(Default::default())
+    }
+}
+
 #[derive(Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)] // Retain value identity without changing camera/source behavior for this comparison.
 enum TerrainAuthority {
@@ -150,6 +167,13 @@ pub struct CelestialCamera {
     sampled_radius_m: Option<f64>,
     terrain_query_count: u64,
     terrain_query_us: f64,
+    surface: SurfaceSource,
+    /// A fixture pose placed while its surface was pending; checked for
+    /// ground clearance once the surface resolves.
+    pending_surface_check: Option<BodyId>,
+    /// A surface-inspection clearance target requested while its surface was
+    /// pending; applied once the collider page arrives.
+    pending_target_clearance: Option<f64>,
     surface_heading: DVec3,
     surface_pitch: f64,
     last_wheel_notches: Option<f64>,
@@ -205,6 +229,9 @@ impl CelestialCamera {
             sampled_radius_m: None,
             terrain_query_count: 0,
             terrain_query_us: 0.0,
+            surface: SurfaceSource::default(),
+            pending_surface_check: None,
+            pending_target_clearance: None,
             surface_heading: -DVec3::Z,
             surface_pitch: 0.0,
             last_wheel_notches: None,
@@ -257,7 +284,7 @@ impl CelestialCamera {
                 .terrain_clearance_guard_m
                 .or(self.navigation_envelope.then_some(1.0)),
             CameraMode::FreeFlight => {
-                if self.base_source == "complete_terrain" {
+                if self.terrain_sampled() {
                     self.terrain_clearance_guard_m
                         .or(self.navigation_envelope.then_some(1.0))
                         .map(|x| {
@@ -313,8 +340,12 @@ impl CelestialCamera {
                 "overview_pivot_distance_minimum"
             } else if minimum.is_none() {
                 "disabled"
-            } else if self.base_source == "complete_terrain" {
+            } else if self.base_source == "gpu_collider" {
+                "sampled_gpu_collider_radial"
+            } else if self.terrain_sampled() {
                 "sampled_complete_terrain_radial"
+            } else if self.base_source == "terrain_pending" {
+                "pending_surface_far_field_floor"
             } else {
                 "reference_sphere_radial_fallback"
             }
@@ -371,17 +402,101 @@ impl CelestialCamera {
             s
         } else {
             let start = std::time::Instant::now();
-            let s = crate::terrain_inspection::clearance_at_body_position(celestial, p, body)?
-                .ok_or_else(|| anyhow::anyhow!("body surface authority is unavailable"))?;
+            let queried = self.query_surface(pair, body, pose)?;
             self.terrain_query_us += start.elapsed().as_secs_f64() * 1e6;
             self.terrain_query_count += 1;
+            let Some(s) = queried else {
+                // Pending: keep this body's last surface for continuity, never
+                // below the far-field collider's lowest surface; with neither,
+                // the reference sphere stands in until the page arrives.
+                let last = self
+                    .clearance_sample
+                    .filter(|s| {
+                        s.body == body && self.sampled_definition.as_ref() == Some(&definition)
+                    })
+                    .map(|s| s.surface_radius_m);
+                let floor = match &self.surface {
+                    SurfaceSource::Colliders(view) => {
+                        astrum_world::terrain::surface_query::SurfaceQuery::far_field_bounds_m(
+                            view, body, direction,
+                        )
+                        .map(|[low, _]| radius + low)
+                    }
+                    SurfaceSource::CpuOracle => None,
+                };
+                let surface = match (last, floor) {
+                    (Some(last), Some(floor)) => last.max(floor),
+                    (Some(last), None) => last,
+                    (None, Some(floor)) => floor,
+                    (None, None) => radius,
+                };
+                self.base_source = "terrain_pending";
+                return Ok(distance - surface);
+            };
             self.sampled_definition = Some(definition);
             self.sampled_radius_m = Some(radius);
             s
         };
         self.clearance_sample = Some(sample);
-        self.base_source = "complete_terrain";
+        self.base_source = match self.surface {
+            SurfaceSource::Colliders(_) => "gpu_collider",
+            SurfaceSource::CpuOracle => "complete_terrain",
+        };
         Ok(sample.clearance_m)
+    }
+    /// A terrain sample (GPU collider or CPU oracle) backs the clearance.
+    fn terrain_sampled(&self) -> bool {
+        matches!(self.base_source, "gpu_collider" | "complete_terrain")
+    }
+    /// Clearance at `pose` from this camera's surface source; `None` when the
+    /// body has no terrain or its surface there is still pending.
+    pub(crate) fn query_surface(
+        &mut self,
+        pair: &CoherentCelestialView<'_>,
+        body: BodyId,
+        pose: FramePose,
+    ) -> Result<Option<crate::terrain_inspection::TerrainClearance>> {
+        let celestial = pair.system().body(body)?;
+        if !celestial.has_surface() {
+            return Ok(None);
+        }
+        let fixed = pair.projection().frames_for(body)?.body_fixed;
+        let p = pair
+            .evaluation()
+            .convert_position(pose.position(), fixed)?
+            .local()
+            .metres();
+        match &mut self.surface {
+            SurfaceSource::CpuOracle => {
+                crate::terrain_inspection::clearance_at_body_position(celestial, p, body)
+            }
+            SurfaceSource::Colliders(view) => Ok(crate::terrain_inspection::clearance_from_query(
+                view, celestial, p, body,
+            )?
+            .ready()),
+        }
+    }
+    /// Evaluate clearance on the CPU test oracle instead of read-back GPU
+    /// colliders. For headless tests that run the camera without a renderer.
+    pub fn use_cpu_oracle_surface(&mut self) {
+        self.surface = SurfaceSource::CpuOracle;
+        self.clearance_sample = None;
+    }
+    pub fn surface_source(&self) -> &SurfaceSource {
+        &self.surface
+    }
+    /// Adopt the latest collider snapshot (no effect on the CPU oracle source).
+    pub fn refresh_surface(&mut self, view: crate::planet_lod::collision::ColliderView) {
+        if let SurfaceSource::Colliders(current) = &mut self.surface {
+            current.refresh(view);
+        }
+    }
+    /// Query misses since the last call, to schedule their collider pages.
+    pub fn take_surface_misses(&mut self) -> Vec<(BodyId, DVec3)> {
+        match &mut self.surface {
+            SurfaceSource::Colliders(view) => view.take_misses(),
+            SurfaceSource::CpuOracle => Vec::new(),
+        }
     }
     /// The transported inspection basis also drives the local debug axes.
     pub(crate) fn inspection_tangent(&self) -> Option<astrum_math::surface::SurfaceTangentBasis> {
@@ -436,7 +551,13 @@ impl CelestialCamera {
             clearance.is_finite(),
             "fixture observer clearance is nonfinite"
         );
-        if clearance < 10.0 {
+        // A pending surface cannot validate the pose yet: place it as authored
+        // and check it once the collider page arrives (`update_navigation`).
+        let pending = self.base_source == "terrain_pending";
+        self.pending_surface_check = pending.then_some(body);
+        if pending {
+            clearance = clearance.max(1.0);
+        } else if clearance < 10.0 {
             position = position.normalize() * (position.length() + 10.0 - clearance);
             pose = FramePose::new(
                 FramePosition::new(fixed, LocalPosition::try_metres(position)?),
@@ -634,11 +755,16 @@ impl CelestialCamera {
             let fixed = pair.projection().frames_for(body)?.body_fixed;
             let pose = pair.evaluation().reexpress_pose(self.pose, fixed)?;
             let direction = Direction3::try_new(pose.position().local().metres())?;
-            let radius = crate::terrain_inspection::terrain_clearance(pair, self.pose, body)?
-                .map_or(
-                    pair.system().body(body)?.properties().reference_radius_m(),
-                    |c| c.surface_radius_m,
-                );
+            let radius = match self.query_surface(pair, body, self.pose)? {
+                Some(c) => c.surface_radius_m,
+                // Pending surface: keep the observer where it is and apply the
+                // target once the collider page arrives (`update_navigation`).
+                None if pair.system().body(body)?.has_surface() => {
+                    self.pending_target_clearance = Some(clearance);
+                    return Ok(());
+                }
+                None => pair.system().body(body)?.properties().reference_radius_m(),
+            };
             let position = direction.unit() * (radius + clearance);
             self.pose = FramePose::new(
                 FramePosition::new(fixed, LocalPosition::try_metres(position)?),
@@ -662,7 +788,8 @@ impl CelestialCamera {
         self.refresh_navigation_constraint(pair)?;
         let body = self.focused_body().expect("body orbit has focus");
         let surface_offset = self.surface_offset_at_orbit_direction(pair, body)?;
-        self.terrain_approach = surface_offset.is_some();
+        // Approach is a property of the body; its sample may still be pending.
+        self.terrain_approach = pair.system().body(body)?.has_surface();
         let surface_offset = surface_offset.unwrap_or(0.0);
         ensure!(
             clearance.is_finite()
@@ -1010,6 +1137,38 @@ impl CelestialCamera {
                 && (1.0..=4.0).contains(&input.boost_multiplier),
             "invalid navigation input"
         );
+        if let Some(body) = self.pending_surface_check {
+            // A fixture pose placed before its surface was read back: once the
+            // surface resolves, lift an observer that is under or within 1 m of
+            // the ground to 10 m, as an immediate placement would have.
+            if let Some(surface) = self.query_surface(pair, body, self.pose)? {
+                self.pending_surface_check = None;
+                if surface.clearance_m < 1.0 {
+                    self.enforce_radial_clearance(pair, body, surface.surface_radius_m, 10.0)?;
+                    #[cfg(feature = "developer-tools")]
+                    if self.developer_fixture_pose.is_some() {
+                        self.developer_fixture_pose = Some(self.pose);
+                    }
+                }
+                self.response_clearance_m = self.sample_clearance(pair, body, self.pose)?;
+            }
+        }
+        if let Some(clearance) = self.pending_target_clearance {
+            // Dropped if the observer left surface inspection meanwhile.
+            match (self.mode, self.focused_body()) {
+                (CameraMode::SurfaceInspection, Some(body)) if !self.transitioning() => {
+                    if self.query_surface(pair, body, self.pose)?.is_some() {
+                        self.pending_target_clearance = None;
+                        self.target_clearance(pair, clearance)?;
+                        #[cfg(feature = "developer-tools")]
+                        if self.developer_fixture_pose.is_some() {
+                            self.developer_fixture_pose = Some(self.pose);
+                        }
+                    }
+                }
+                _ => self.pending_target_clearance = None,
+            }
+        }
         #[cfg(feature = "developer-tools")]
         if self.developer_fixture_pose.is_some() {
             let active = input.drag != [0.0; 2]
@@ -1620,7 +1779,7 @@ impl CelestialCamera {
             CameraAttachment::Translating(id) | CameraAttachment::BodyFixed(id) => id,
             CameraAttachment::System => return Ok(()),
         };
-        if let Some(diagnostic) = crate::terrain_inspection::terrain_clearance(pair, self.pose, id)?
+        if let Some(diagnostic) = self.query_surface(pair, id, self.pose)?
             && diagnostic.clearance_m < clearance_m
         {
             self.enforce_radial_clearance(pair, id, diagnostic.surface_radius_m, clearance_m)?;

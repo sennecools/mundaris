@@ -2,16 +2,16 @@
 //! All tile-relative values are prepared in f64 and narrowed once.
 use super::select::NodeChart;
 use anyhow::{Result, ensure};
-use glam::DVec3;
 use astrum_math::surface::CubePatchAddress;
 use astrum_renderer::{
-    AtlasChart, AtlasFieldsConstants, AtlasImageLevel, AtlasProfileLayer, AtlasSource,
-    AtlasTileKind,
+    AtlasChart, AtlasFieldsConstants, AtlasImageLevel, AtlasOctave, AtlasProfileLayer, AtlasSource,
+    AtlasTileKind, MAX_ATLAS_OCTAVES,
 };
 use astrum_world::terrain::producer::{
     FieldsRecipe, MOON_FIELD_JITTER, MOON_FIELD_LAYOUT_SHIFTS, MOON_FIELD_SHELL,
     MOON_FIELD_SUPPORT, ProducerRecipe, ProfileLayer, ProfilePyramid, ProfileRecipe,
 };
+use glam::DVec3;
 use std::sync::Arc;
 
 fn image(pyramid: &ProfilePyramid) -> Vec<AtlasImageLevel> {
@@ -234,6 +234,40 @@ pub fn tile_kind(
     }
 }
 
+/// Detail-noise octave origins of one node, split in f64 at the exact chart
+/// centre `n0 * R` (pipeline §4.4). The GPU adds `diff * R`, its chart-relative
+/// offset from that same centre, so f32 never holds an absolute lattice
+/// coordinate. Octaves above the node's band limit are omitted.
+pub fn detail_octaves(
+    recipe: &ProducerRecipe,
+    address: CubePatchAddress,
+    chart: &NodeChart,
+    cells: u32,
+) -> Result<Vec<AtlasOctave>> {
+    let Some(detail) = recipe.detail_noise() else {
+        return Ok(Vec::new());
+    };
+    let texel_m =
+        astrum_world::terrain::producer::tile_texel_m(recipe.radius_m(), address.level(), cells);
+    let origins = detail
+        .split(chart.n0 * recipe.radius_m(), texel_m)
+        .map_err(|_| anyhow::anyhow!("detail noise lattice exceeds the GPU integer range"))?;
+    ensure!(
+        origins.len() <= MAX_ATLAS_OCTAVES,
+        "detail noise has more octaves than the GPU producer supports"
+    );
+    Ok(origins
+        .into_iter()
+        .map(|o| AtlasOctave {
+            cell: o.cell,
+            seed: o.seed,
+            fraction: o.fraction,
+            frequency_per_m: o.frequency_per_m,
+            amplitude_m: o.amplitude_m,
+        })
+        .collect())
+}
+
 /// Conservative absolute radial-offset bound of a recipe, used before any
 /// produced bounds are known.
 pub fn recipe_height_bound(recipe: &ProducerRecipe, generator_bound_m: f64) -> f64 {
@@ -249,7 +283,10 @@ pub fn recipe_height_bound(recipe: &ProducerRecipe, generator_bound_m: f64) -> f
                 .iter()
                 .map(|d| d.layer.amplitude_m * 0.5)
                 .sum();
-            (macro_bound + detail_bound).min(generator_bound_m)
+            let noise_bound = recipe
+                .detail_noise()
+                .map_or(0.0, astrum_world::terrain::noise::DetailNoise::bound_m);
+            (macro_bound + detail_bound + noise_bound).min(generator_bound_m)
         }
         ProducerRecipe::Fields(_) => generator_bound_m,
     }

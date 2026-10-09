@@ -44,10 +44,12 @@ pub use render_settings::{
     OverlaySettings, RenderSettings, SHADOW_RESOLUTIONS, ShadowSettings, Tonemapper,
 };
 pub use terrain_atlas::{
-    ATLAS_BOUNDS_GRID, AtlasBounds, AtlasChart, AtlasFieldsConstants, AtlasImageLevel,
-    AtlasInstance, AtlasProduceJob, AtlasProfileLayer, AtlasSampleSource, AtlasShadowFrame,
-    AtlasSource, AtlasTileKind, MAX_ATLAS_JOBS_PER_FRAME, ProducedTileReadback, TerrainAtlasConfig,
-    TerrainAtlasFrame, TerrainAtlasReport, TerrainViewMode, produce_for_validation,
+    ATLAS_BOUNDS_GRID, AtlasBounds, AtlasChart, AtlasCollisionPage, AtlasFieldsConstants,
+    AtlasImageLevel, AtlasInstance, AtlasOctave, AtlasProduceJob, AtlasProfileLayer,
+    AtlasSampleSource, AtlasShadowFrame, AtlasSource, AtlasTileKind, MAX_ATLAS_JOBS_PER_FRAME,
+    MAX_ATLAS_OCTAVES, MAX_COLLISION_CELLS, MAX_COLLISION_JOBS_PER_FRAME, ProducedTileReadback,
+    TerrainAtlasConfig, TerrainAtlasFrame, TerrainAtlasReport, TerrainViewMode,
+    collision_for_validation, lattice_hash_for_validation, produce_for_validation,
 };
 pub use view::*;
 
@@ -346,6 +348,12 @@ impl Renderer {
         true
     }
 
+    /// Collision pages read back since the last call (pipeline §15.1).
+    pub fn take_terrain_collision_pages(&mut self) -> Vec<AtlasCollisionPage> {
+        self.celestial
+            .as_mut()
+            .map_or_else(Vec::new, |c| c.take_collision_pages())
+    }
     /// Produced atlas height bounds delivered since the last call.
     pub fn take_terrain_atlas_bounds(&mut self) -> Vec<AtlasBounds> {
         self.celestial

@@ -1,10 +1,10 @@
-use glam::DVec3;
 use astrum_app::{
     solar_system::{SolarBody, SolarSystemPreset},
     terrain_inspection::{clearance_at_position, terrain_clearance},
 };
 use astrum_math::*;
 use astrum_world::*;
+use glam::DVec3;
 use std::{num::NonZeroU64, time::Duration};
 
 #[test]
@@ -91,6 +91,8 @@ fn rocky_body_orbit_approach_smooths_clearance_above_complete_terrain() {
         let radius = celestial.properties().reference_radius_m();
         for clearance in [2.0, 10.0, 100.0, 1_000.0, 10_000.0, 100_000.0] {
             let mut camera = CelestialCamera::overview(&pair, DVec3::ZERO, 1.0e11).unwrap();
+            // Headless: no renderer reads back GPU colliders; use the CPU test oracle.
+            camera.use_cpu_oracle_surface();
             camera.focus(&pair, body, true, true).unwrap();
             camera.target_clearance(&pair, clearance).unwrap();
             for _ in 0..12 {
@@ -132,6 +134,8 @@ fn translating_orbit_queries_fixed_direction_and_guard_preserves_orientation() {
     let pair = projection.coherent_view(&world).unwrap();
     let (body, _) = world.bodies().nth(SolarBody::Earth as usize).unwrap();
     let mut camera = CelestialCamera::overview(&pair, DVec3::ZERO, 1e11).unwrap();
+    // Headless: no renderer reads back GPU colliders; use the CPU test oracle.
+    camera.use_cpu_oracle_surface();
     camera.focus(&pair, body, false, true).unwrap();
     camera.target_clearance(&pair, 2.0).unwrap();
     for _ in 0..12 {

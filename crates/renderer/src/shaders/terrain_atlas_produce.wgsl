@@ -1,7 +1,8 @@
-// GPU producer for terrain atlas tiles (ADR 0016). Mirrors the world crate's
-// band-limited CPU reference (`terrain::producer`); it is derived render data,
-// never terrain authority. All positions are evaluated relative to the tile's
-// chart centre so f32 keeps sub-texel precision at deep levels.
+// GPU producer for terrain atlas tiles (ADR 0016). Under ADR 0023 this is the
+// terrain authority; the world crate's band-limited CPU evaluation
+// (`terrain::producer`) is its test oracle. All positions are evaluated
+// relative to the tile's chart centre so f32 keeps sub-texel precision at deep
+// levels. Prepended with terrain_noise.wgsl.
 
 struct Tile {
     n0: vec4<f32>,          // chart-centre direction (body axes), w = |q0|
@@ -14,6 +15,7 @@ struct Tile {
     band_cell: array<vec4<i32>, 6>,    // fields: base cell per band * 2 + layout
     band_frac: array<vec4<f32>, 6>,    // fields: base cell fraction, w = edge
     band_weight: vec4<f32>,            // fields: band footprint weights
+    noise: vec4<u32>,                  // x = detail octave count (origins in `octaves`)
 }
 
 struct Dispatch {
@@ -50,12 +52,18 @@ struct FieldsConstants {
 @group(0) @binding(2) var normal_out: texture_storage_2d_array<rgba8snorm, write>;
 @group(0) @binding(3) var<storage, read_write> bounds: array<atomic<u32>>;
 @group(0) @binding(4) var<uniform> dispatch: Dispatch;
+@group(0) @binding(5) var<storage, read> octaves: array<OctaveOrigin>;
+// Collision pages: (height, normal xyz) per sample (pipeline §15.1).
+@group(0) @binding(6) var<storage, read_write> collision_out: array<vec4<f32>>;
 @group(1) @binding(0) var macro_image: texture_2d<u32>;
 @group(1) @binding(1) var detail_image: texture_2d<u32>;
 @group(1) @binding(2) var<uniform> profile: ProfileConstants;
 @group(1) @binding(3) var<uniform> fields: FieldsConstants;
 
 var<private> tile: Tile;
+// Index of `tile` in the job list; its octave origins start at slot * MAX_OCTAVES.
+var<private> tile_slot: u32;
+const MAX_OCTAVES: u32 = 16u;
 
 // ---------------------------------------------------------------- chart
 
@@ -457,6 +465,22 @@ fn evaluate_fields(p: ChartPoint) -> HeightSample {
     return out;
 }
 
+// ---------------------------------------------------------------- detail fBm
+
+// Band-limited fBm (pipeline §9.3, App. A.3). Band-limit weights are folded into
+// each origin's amplitude on the CPU; octaves above the node's limit are absent.
+// The fade towards the parent level shares the draw shader's morph `t`, which
+// blends this page with the parent page. Returns (height, d height / d local).
+fn detail_fbm(local: vec3<f32>) -> vec4<f32> {
+    var sum = vec4<f32>(0.0);
+    let first = tile_slot * MAX_OCTAVES;
+    for (var k = 0u; k < min(tile.noise.x, MAX_OCTAVES); k = k + 1u) {
+        let o = octaves[first + k];
+        sum += split_gradient_noise(o, local) * o.amplitude.x;
+    }
+    return sum;
+}
+
 // ---------------------------------------------------------------- entry points
 
 fn evaluate(st: vec2<f32>) -> vec4<f32> {
@@ -466,6 +490,13 @@ fn evaluate(st: vec2<f32>) -> vec4<f32> {
         sample_value = evaluate_profile(p);
     } else {
         sample_value = evaluate_fields(p);
+    }
+    if tile.noise.x > 0u {
+        // Split lattice: the CPU origin is the exact f64 chart centre n0 * R, so
+        // local = diff * R places samples at the true surface point.
+        let detail = detail_fbm(p.diff * tile.scale.x);
+        sample_value.height += detail.x;
+        sample_value.gradient += detail.yzw * tile.scale.x;
     }
     let n = normalize(p.n);
     let tangent_gradient = sample_value.gradient - n * dot(n, sample_value.gradient);
@@ -486,6 +517,7 @@ fn produce_heights(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= dispatch.side || id.y >= dispatch.side {
         return;
     }
+    tile_slot = dispatch.base + id.z;
     tile = tiles[dispatch.base + id.z];
     let st = (vec2<f32>(id.xy) - vec2<f32>(1.0)) / f32(dispatch.cells);
     let value = evaluate(st);
@@ -516,8 +548,25 @@ fn produce_normals(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= dispatch.side || id.y >= dispatch.side {
         return;
     }
+    tile_slot = dispatch.base + id.z;
     tile = tiles[dispatch.base + id.z];
     let st = (vec2<f32>(id.xy) - vec2<f32>(1.0)) / f32(dispatch.cells);
     let value = evaluate(st);
     textureStore(normal_out, vec2<i32>(id.xy), i32(tile.info.x), vec4<f32>(value.xyz, 0.0));
+}
+
+// Collision page: (cells + 1)^2 samples at st = id / cells, read back to the
+// CPU heightfield colliders. `dispatch.bounds_base` is the group's first page.
+@compute @workgroup_size(8, 8, 1)
+fn produce_collision(@builtin(global_invocation_id) id: vec3<u32>) {
+    if id.x >= dispatch.side || id.y >= dispatch.side {
+        return;
+    }
+    tile_slot = dispatch.base + id.z;
+    tile = tiles[tile_slot];
+    let st = vec2<f32>(id.xy) / f32(dispatch.cells);
+    let value = evaluate(st);
+    let side = dispatch.side;
+    collision_out[(dispatch.bounds_base + id.z) * side * side + id.y * side + id.x] =
+        vec4<f32>(value.w, value.xyz);
 }

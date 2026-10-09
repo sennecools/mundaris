@@ -1,7 +1,7 @@
 //! Checked development operations over the production session.
 use super::*;
 use crate::developer_protocol::{BodyInventory, DevCommand};
-use anyhow::{Context, bail, ensure};
+use anyhow::{bail, ensure};
 use sha2::{Digest, Sha256};
 fn body_handle(session: &str, namespace: u64, index: usize) -> String {
     format!(
@@ -178,22 +178,24 @@ impl GravityOrbitsDemo {
                     ),
                     UnitRotation::try_from_quaternion(glam::DQuat::from_array(*orientation_xyzw))?,
                 );
-                let clearance = crate::terrain_inspection::clearance_at_body_position(
-                    pair.system().body(body)?,
-                    pose.position().local().metres(),
-                    body,
-                )?
-                .context("capture pose requires complete terrain authority")?
-                .clearance_m;
-                ensure!(
-                    clearance >= 1.0,
-                    "capture pose requires at least 1 m clearance"
-                );
-                // The existing fixture helper enforces complete-source clearance.
                 // Validate on a candidate so failed placement cannot alter the observer.
                 let mut camera = self.camera.clone();
+                // With the surface already read back, reject poses under the
+                // ground; otherwise the pose is placed as authored and lifted to
+                // 10 m if the surface turns out to be within 1 m (ADR 0023).
+                let clearance = camera
+                    .query_surface(&pair, body, pose)?
+                    .map(|surface| surface.clearance_m);
+                if let Some(clearance) = clearance {
+                    ensure!(
+                        clearance >= 1.0,
+                        "capture pose requires at least 1 m clearance"
+                    );
+                }
                 camera.developer_set_surface_pose(&pair, body, pose)?;
-                camera.target_clearance(&pair, clearance)?;
+                if let Some(clearance) = clearance {
+                    camera.target_clearance(&pair, clearance)?;
+                }
                 camera.enter_surface_inspection(&pair, body)?;
                 self.camera = camera;
                 self.developer_navigation = None;

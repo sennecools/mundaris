@@ -1,11 +1,13 @@
-//! Derived band-limited production recipes for terrain atlas tiles.
+//! Band-limited production recipes for terrain atlas tiles.
 //!
-//! `SurfaceGenerator::evaluate_point` remains the complete terrain authority.
-//! A recipe evaluates the same algorithms for an explicit texel footprint:
-//! profile image layers sample a pre-filtered mip level and procedural crater
-//! bands fade out below the footprint's sampling limit. GPU producers mirror
-//! this CPU reference within documented tolerances; collision, navigation and
-//! other authoritative queries keep using the complete evaluation.
+//! Under ADR 0023 the GPU producer is the terrain authority: rendering,
+//! collision and height queries all use its output (collision through
+//! asynchronous readback). The CPU evaluation here and
+//! `SurfaceGenerator::evaluate_point` are the test oracle the GPU is checked
+//! against within documented tolerances. A recipe evaluates the surface for an
+//! explicit texel footprint: profile image layers sample a pre-filtered mip
+//! level, procedural crater bands and fBm detail octaves fade out below the
+//! footprint's sampling limit (pipeline §9.3).
 use super::{
     GeologicalField, MoonFieldDefinition, SurfaceGenerator, TerrainError,
     moon_fields::{self, MoonFieldsV1},
@@ -13,13 +15,14 @@ use super::{
         NoopProfileObserver, PROFILE_BANDS, ProfileGrid, ProfileKernel, sample_triplanar,
         triplanar_weights,
     },
+    noise::DetailNoise,
 };
 use glam::{DMat3, DVec3};
 use std::sync::Arc;
 
 /// Version of the footprint filtering semantics below. Derived caches must
 /// include it in their identity.
-pub const BAND_LIMIT_VERSION: u32 = 1;
+pub const BAND_LIMIT_VERSION: u32 = 2;
 /// A crater band contributes fully while `texel <= edge * BAND_FADE_START` and
 /// nothing once `texel >= edge * BAND_FADE_END` (smoothstep in between).
 pub const BAND_FADE_START: f64 = 0.125;
@@ -174,6 +177,8 @@ pub struct ProfileRecipe {
     pub macro_pyramid: Arc<ProfilePyramid>,
     pub macro_layers: Vec<ProfileLayer>,
     pub detail: Vec<ProfileDetailRecipe>,
+    /// Band-limited fBm detail added after the profile (pipeline §9.3).
+    pub detail_noise: Option<DetailNoise>,
 }
 
 /// Lattice shift of crater layout 0 and 1, in cell units.
@@ -187,6 +192,7 @@ pub const MOON_FIELD_SUPPORT: f64 = moon_fields::SUPPORT;
 #[derive(Debug, Clone)]
 pub struct FieldsRecipe {
     field: MoonFieldsV1,
+    detail_noise: Option<DetailNoise>,
 }
 impl FieldsRecipe {
     pub fn radius_m(&self) -> f64 {
@@ -244,6 +250,14 @@ impl ProducerRecipe {
         }
     }
 
+    /// Band-limited fBm detail layer shared by every recipe kind.
+    pub fn detail_noise(&self) -> Option<&DetailNoise> {
+        match self {
+            Self::Profile(recipe) => recipe.detail_noise.as_ref(),
+            Self::Fields(recipe) => recipe.detail_noise.as_ref(),
+        }
+    }
+
     /// CPU reference for the derived band-limited surface at `texel_m`.
     pub fn evaluate(
         &self,
@@ -266,6 +280,14 @@ impl ProducerRecipe {
                         .evaluate_weighted(n, None, Some(recipe.band_weights(texel_m)))?;
                 (height, gradient)
             }
+        };
+        let (height_m, gradient) = match self.detail_noise() {
+            Some(detail) => {
+                let radius = self.radius_m();
+                let (h, g) = detail.evaluate(n * radius, Some(texel_m));
+                (height_m + h, gradient + g * radius)
+            }
+            None => (height_m, gradient),
         };
         let gradient = gradient - n * n.dot(gradient);
         let normal = (n - gradient / (self.radius_m() + height_m)).normalize();
@@ -349,6 +371,7 @@ impl SurfaceGenerator {
             GeologicalField::MoonFields(field) => {
                 Ok(ProducerRecipe::Fields(Box::new(FieldsRecipe {
                     field: field.clone(),
+                    detail_noise: self.detail.clone(),
                 })))
             }
             GeologicalField::MoonProfile(field) => {
@@ -412,6 +435,7 @@ impl SurfaceGenerator {
                     macro_pyramid: pyramid,
                     macro_layers,
                     detail,
+                    detail_noise: self.detail.clone(),
                 }))
             }
             _ => Err(TerrainError::InvalidConfig),
@@ -467,6 +491,24 @@ mod tests {
         SurfaceGenerator::new(&definition, 140_000.0).unwrap()
     }
 
+    fn with_detail(generator: SurfaceGenerator) -> SurfaceGenerator {
+        let definition = generator
+            .definition
+            .clone()
+            .with_detail_noise(crate::terrain::noise::tests::moon_like())
+            .unwrap();
+        SurfaceGenerator::new(&definition, generator.radius_m).unwrap()
+    }
+
+    fn generators() -> [SurfaceGenerator; 4] {
+        [
+            profile_generator(),
+            fields_generator(),
+            with_detail(profile_generator()),
+            with_detail(fields_generator()),
+        ]
+    }
+
     fn directions() -> Vec<DVec3> {
         [
             DVec3::new(0.3, 0.2, 0.93),
@@ -481,7 +523,7 @@ mod tests {
 
     #[test]
     fn fine_footprint_reproduces_the_complete_authority() {
-        for generator in [profile_generator(), fields_generator()] {
+        for generator in generators() {
             let recipe = generator.producer_recipe().unwrap();
             for n in directions() {
                 let reference = generator
@@ -502,7 +544,7 @@ mod tests {
 
     #[test]
     fn coarse_footprints_remove_unresolvable_detail_and_stay_bounded() {
-        for generator in [profile_generator(), fields_generator()] {
+        for generator in generators() {
             let recipe = generator.producer_recipe().unwrap();
             let bound = generator.height_bound_m;
             for n in directions() {

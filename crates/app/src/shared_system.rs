@@ -1,9 +1,9 @@
 //! The single authored test solar system shared by interactive and automated runs.
 //! Parsing, asset verification and generator validation happen before worker demand.
 use anyhow::{Context, Result, ensure};
-use glam::{DQuat, DVec3};
 use astrum_math::*;
 use astrum_world::{terrain::*, *};
+use glam::{DQuat, DVec3};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -26,6 +26,8 @@ struct SystemContent {
     camera_state: String,
     /// Atlas terrain LOD policy (ADR 0016).
     lod: crate::planet_lod::LodPolicy,
+    /// Read-back collision policy (pipeline §15.1, ADR 0023).
+    collision: crate::planet_lod::collision::CollisionPolicy,
     bodies: Vec<BodyContent>,
 }
 
@@ -169,6 +171,9 @@ struct TerrainContent {
     geology: GeologicalDistribution,
     procedural: Option<MoonFieldDefinition>,
     profile: Option<ProfileContent>,
+    /// Optional band-limited fBm detail layer (pipeline §9.3).
+    #[serde(default)]
+    detail_noise: Option<astrum_world::terrain::noise::DetailNoiseDefinition>,
     material_composition: [f64; 2],
     material_contrast: f64,
 }
@@ -220,6 +225,7 @@ pub struct BodyPresentation {
 pub struct SharedTestSystem {
     pub system: CelestialSystem,
     pub lod: crate::planet_lod::LodPolicy,
+    pub collision: crate::planet_lod::collision::CollisionPolicy,
     pub motion: CelestialMotionDefinition,
     pub presentation: Vec<BodyPresentation>,
     pub initial_body_index: usize,
@@ -319,6 +325,9 @@ fn terrain_definition(
     if let Some(procedural) = content.procedural {
         definition = definition.with_moon_fields(procedural)?;
     }
+    if let Some(detail) = content.detail_noise {
+        definition = definition.with_detail_noise(detail)?;
+    }
     if let Some(profile) = content.profile {
         let asset = local_path(root, &profile.asset)?;
         ensure!(
@@ -377,6 +386,10 @@ impl SharedTestSystem {
             "only the shared test solar system is supported"
         );
         content.lod.validate().context("invalid lod policy")?;
+        content
+            .collision
+            .validate()
+            .context("invalid collision policy")?;
         ensure!(
             (3..=32).contains(&content.bodies.len()),
             "test system must have 3..=32 bodies"
@@ -502,6 +515,7 @@ impl SharedTestSystem {
         Ok(Self {
             system,
             lod: content.lod,
+            collision: content.collision,
             motion,
             presentation,
             initial_body_index,

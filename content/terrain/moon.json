@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "id": "eroded-profile-test",
-  "revision": 2,
+  "revision": 3,
   "identity": 1297043278,
   "seed": 2,
   "algorithm": "MoonProfileV1",
@@ -67,5 +67,14 @@
     0.0,
     1.0
   ],
-  "material_contrast": 0.4
+  "material_contrast": 0.4,
+  "detail_noise": {
+    "version": 1,
+    "seed_salt": 1,
+    "base_wavelength_m": 32.0,
+    "min_wavelength_m": 0.5,
+    "lacunarity": 2.0,
+    "gain": 0.5,
+    "amplitude_m": 1.0
+  }
 }

@@ -2,8 +2,8 @@
 use crate::{
     CelestialProjection, DebugLine, PreparedView, RenderPreparationError, reference_sphere_occludes,
 };
-use glam::DVec3;
 use astrum_math::{Direction3, FrameId, FramePosition, LocalPosition};
+use glam::DVec3;
 use std::collections::BTreeMap;
 
 /// Deterministic level-3 icosphere: 642 unit vertices, 1280 outward triangles.
@@ -688,6 +688,11 @@ impl CelestialRenderer {
         if let Some(atlas) = &mut self.terrain_atlas {
             atlas.on_submitted();
         }
+    }
+    pub(crate) fn take_collision_pages(&mut self) -> Vec<crate::AtlasCollisionPage> {
+        self.terrain_atlas
+            .as_mut()
+            .map_or_else(Vec::new, |atlas| atlas.take_collision_pages())
     }
     pub(crate) fn take_atlas_bounds(&mut self) -> Vec<crate::AtlasBounds> {
         self.terrain_atlas

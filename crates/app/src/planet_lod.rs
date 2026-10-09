@@ -11,11 +11,11 @@
 //! World surface definitions stay the authority. Atlas layers, bounds and
 //! node tables are disposable derived state keyed by body, definition, radius
 //! and terrain revision; body motion only changes per-frame transforms.
-mod producer;
+pub mod collision;
+pub mod producer;
 pub mod select;
 
 use anyhow::{Context, Result, ensure};
-use glam::{DMat3, DVec3};
 use astrum_math::{Direction3, FrameId, surface::CubePatchAddress};
 use astrum_renderer::{
     AtlasBounds, AtlasInstance, AtlasProduceJob, AtlasSampleSource, AtlasSource,
@@ -26,6 +26,7 @@ use astrum_world::{
     BodyId,
     terrain::{SurfaceDefinition, SurfaceGenerator, producer::ProducerRecipe},
 };
+use glam::{DMat3, DVec3};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -180,6 +181,8 @@ struct BodyLod {
     first_complete_s: Option<f64>,
     last_active: u64,
     stats: BodyStats,
+    /// Read-back colliders; `None` without a collision policy.
+    collision: Option<collision::BodyCollision>,
 }
 
 #[derive(Debug, Default, Clone, Copy, Serialize)]
@@ -200,6 +203,15 @@ pub struct BodyStats {
     pub data_tiles_in_use: usize,
     /// Sun shadow caster instances drawn from resident data.
     pub shadow_casters: usize,
+    /// Splits forced by the restricted-quadtree constraint (§9.1).
+    pub balance_splits: usize,
+    /// The balance pass hit its cap this frame.
+    pub balance_unresolved: bool,
+    /// Drawn nodes with at least one edge snapped to a coarser neighbour.
+    pub snapped_nodes: usize,
+    /// Resident read-back collider pages and pages awaiting readback.
+    pub collision_pages: usize,
+    pub collision_in_flight: usize,
 }
 
 /// One body to consider this frame.
@@ -249,6 +261,10 @@ pub struct PlanetLod {
     samples: VecDeque<FrameSample>,
     drawn_bodies: Vec<BodyId>,
     last_error: Option<String>,
+    collision_policy: Option<collision::CollisionPolicy>,
+    /// Collision job token -> (body, bind slot, page, request frame).
+    collision_tokens: HashMap<u64, (BodyId, u64, CubePatchAddress, u64)>,
+    collision_stats: collision::CollisionStats,
 }
 
 const SAMPLE_HISTORY: usize = 256;
@@ -277,6 +293,74 @@ impl PlanetLod {
             samples: VecDeque::new(),
             drawn_bodies: Vec::new(),
             last_error: None,
+            collision_policy: None,
+            collision_tokens: HashMap::new(),
+            collision_stats: collision::CollisionStats::default(),
+        }
+    }
+
+    /// Enable read-back colliders (pipeline §15.1) under a validated policy.
+    pub fn with_collision(mut self, policy: collision::CollisionPolicy) -> Self {
+        self.collision_policy = Some(policy);
+        self
+    }
+
+    /// Snapshot of every bound body's colliders for `SurfaceQuery` callers.
+    pub fn collider_view(&self) -> collision::ColliderView {
+        collision::ColliderView::from_bodies(self.bodies.iter().filter_map(|(body, lod)| {
+            lod.collision
+                .as_ref()
+                .map(|collision| (*body, Arc::clone(&collision.colliders)))
+        }))
+    }
+
+    /// Schedule the collision pages under query misses (body-fixed directions).
+    pub fn request_collision(&mut self, misses: Vec<(BodyId, DVec3)>) {
+        self.collision_stats.misses_last_frame = misses.len();
+        for (body, direction) in misses {
+            if let Some(collision) = self
+                .bodies
+                .get_mut(&body)
+                .and_then(|lod| lod.collision.as_mut())
+            {
+                collision.want_urgent(direction, self.frame);
+            }
+        }
+    }
+
+    /// Store read-back collision pages; pages of rebound or released bodies
+    /// are dropped as stale.
+    pub fn receive_collision(&mut self, pages: Vec<astrum_renderer::AtlasCollisionPage>) {
+        let Some(policy) = self.collision_policy else {
+            return;
+        };
+        for page in pages {
+            let Some((body, slot, address, requested)) = self.collision_tokens.remove(&page.token)
+            else {
+                self.collision_stats.stale_total += 1;
+                continue;
+            };
+            let Some(collision) = self
+                .bodies
+                .get_mut(&body)
+                .filter(|lod| lod.slot == slot)
+                .and_then(|lod| lod.collision.as_mut())
+            else {
+                self.collision_stats.stale_total += 1;
+                continue;
+            };
+            let Some(collider) =
+                collision::ColliderPage::new(page.cells, page.heights, page.normals)
+            else {
+                self.collision_stats.stale_total += 1;
+                continue;
+            };
+            collision.receive(address, collider, self.frame, policy.max_pages);
+            let latency = self.frame.saturating_sub(requested);
+            self.collision_stats.received_total += 1;
+            self.collision_stats.last_latency_frames = latency;
+            self.collision_stats.max_latency_frames =
+                self.collision_stats.max_latency_frames.max(latency);
         }
     }
 
@@ -302,6 +386,9 @@ impl PlanetLod {
                     let grid = result
                         .cells
                         .map(|[low, high]| [f64::from(low), f64::from(high)]);
+                    if let Some(collision) = &mut lod.collision {
+                        collision.far_field(address, grid);
+                    }
                     if lod.bounds.insert(address, grid).is_none() {
                         lod.bounds_order.push_back(address);
                         if lod.bounds_order.len() > BOUNDS_CACHE_CAPACITY
@@ -321,6 +408,7 @@ impl PlanetLod {
         if self.layer_count != config.layers {
             self.bodies.clear();
             self.tokens.clear();
+            self.collision_tokens.clear();
             self.layer_count = config.layers;
             self.free_layers = (0..config.layers).rev().collect();
         }
@@ -393,6 +481,13 @@ impl PlanetLod {
                 first_complete_s: None,
                 last_active: self.frame,
                 stats: BodyStats::default(),
+                collision: self.collision_policy.map(|policy| {
+                    collision::BodyCollision::new(collision::BodyColliders::new(
+                        policy.physics_level(input.radius_m),
+                        self.policy.map_or(0, |lod| lod.base_resident_level),
+                        height_bound_m,
+                    ))
+                }),
             },
         );
         Ok(true)
@@ -453,6 +548,9 @@ impl PlanetLod {
         };
         let now = Instant::now();
         let mut budget = policy.jobs_per_frame as usize;
+        let mut collision_budget = self
+            .collision_policy
+            .map_or(0, |collision| collision.jobs_per_frame as usize);
         for input in bodies {
             let source = view.prepare_source(input.body_fixed_frame)?;
             let observer = source.observer_in_source().metres();
@@ -483,17 +581,7 @@ impl PlanetLod {
                 .push((lod.source_key, Arc::clone(&lod.source)));
             let radius = input.radius_m;
             let data_offset = policy.data_level_offset();
-            let ranges: Vec<f64> = (0..=policy.max_level)
-                .map(|level| {
-                    let cell = astrum_world::terrain::producer::tile_texel_m(
-                        radius,
-                        level,
-                        policy.draw_cells,
-                    );
-                    (cell * focal / policy.pixel_error)
-                        .max(policy.min_range_factor * cell * f64::from(policy.draw_cells))
-                })
-                .collect();
+            let ranges = lod_ranges(&policy, radius, focal);
             let selection = {
                 let _span = crate::engine_profile::span("Atlas selection");
                 let measured = &lod.bounds;
@@ -508,6 +596,7 @@ impl PlanetLod {
                         ranges: &ranges,
                         max_level: policy.max_level,
                         visit_limit: VISIT_LIMIT,
+                        restricted: true,
                     },
                     |address| {
                         node_bounds(
@@ -578,6 +667,8 @@ impl PlanetLod {
                     let lod = self.bodies.get_mut(&input.body).expect("bound above");
                     let chart = select::chart(node);
                     let kind = producer::tile_kind(&lod.recipe, node, &chart, policy.tile_cells)?;
+                    let octaves =
+                        producer::detail_octaves(&lod.recipe, node, &chart, policy.tile_cells)?;
                     let token = self.next_token;
                     self.next_token += 1;
                     self.tokens.insert(token, (input.body, lod.slot, node));
@@ -588,6 +679,7 @@ impl PlanetLod {
                         chart: producer::atlas_chart(&chart),
                         radius_m: radius as f32,
                         kind,
+                        octaves,
                     });
                     lod.nodes.insert(
                         node,
@@ -610,13 +702,15 @@ impl PlanetLod {
                 visited: selection.visited,
                 truncated: selection.truncated,
                 deferred: selection.deferred,
+                balance_splits: selection.balance_splits,
+                balance_unresolved: selection.balance_unresolved,
                 jobs_last_frame: jobs_this_body,
                 ..BodyStats::default()
             };
             for selected in &selection.selected {
                 let Some(built) = build_instance(
                     &lod.nodes,
-                    selected.address,
+                    selected,
                     &NodeContext {
                         data_offset,
                         policy: &policy,
@@ -642,6 +736,9 @@ impl PlanetLod {
                 }
                 frame.instances.push(built.instance);
                 stats.drawn += 1;
+                if selected.coarser_edges != 0 {
+                    stats.snapped_nodes += 1;
+                }
                 stats.finest_level = stats.finest_level.max(selected.address.level());
                 // Mark data sources as used for LRU.
                 for owner in [built.owner, built.parent_owner] {
@@ -704,6 +801,7 @@ impl PlanetLod {
                                 ranges: &caster_ranges,
                                 max_level: policy.max_level,
                                 visit_limit: VISIT_LIMIT,
+                                restricted: false,
                             },
                             |address| {
                                 node_bounds(
@@ -730,13 +828,41 @@ impl PlanetLod {
                         shadow.casters[c] = casters
                             .selected
                             .iter()
-                            .filter_map(|s| build_instance(&lod.nodes, s.address, &context))
+                            .filter_map(|s| build_instance(&lod.nodes, s, &context))
                             .map(|built| built.instance)
                             .collect();
                     }
                     stats.shadow_casters = shadow.casters.iter().map(Vec::len).sum();
                     frame.shadow = Some(shadow);
                 }
+            }
+            if let (Some(collision_policy), Some(collision), false) =
+                (self.collision_policy, lod.collision.as_mut(), self.hold)
+            {
+                let _span = crate::engine_profile::span("Collision page requests");
+                collision.prefetch(observer, radius, &collision_policy, frame_number);
+                for address in collision.schedule(frame_number, collision_budget) {
+                    let chart = select::chart(address);
+                    let cells = collision_policy.page_cells;
+                    let token = self.next_token;
+                    self.next_token += 1;
+                    self.collision_tokens
+                        .insert(token, (input.body, lod.slot, address, frame_number));
+                    frame.collision_jobs.push(AtlasProduceJob {
+                        source: lod.source_key,
+                        layer: 0,
+                        token,
+                        chart: producer::atlas_chart(&chart),
+                        radius_m: radius as f32,
+                        kind: producer::tile_kind(&lod.recipe, address, &chart, cells)?,
+                        octaves: producer::detail_octaves(&lod.recipe, address, &chart, cells)?,
+                    });
+                    collision_budget -= 1;
+                    self.collision_stats.requested_total += 1;
+                }
+                frame.collision_cells = collision_policy.page_cells;
+                stats.collision_pages = collision.colliders.page_count();
+                stats.collision_in_flight = collision.in_flight();
             }
             stats.resident = lod.nodes.len();
             stats.data_tiles_in_use = lod
@@ -774,6 +900,7 @@ impl PlanetLod {
             // Readbacks dropped under pressure never return; forget old tokens.
             let floor = self.next_token.saturating_sub(50_000);
             self.tokens.retain(|token, _| *token >= floor);
+            self.collision_tokens.retain(|token, _| *token >= floor);
         }
         self.jobs_total += frame.jobs.len() as u64;
         self.selection_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -867,12 +994,28 @@ impl PlanetLod {
             "evictions_total": self.evictions_total,
             "bounds_received": self.bounds_received,
             "stale_bounds": self.stale_bounds,
+            "collision_policy": self.collision_policy,
+            "collision": self.collision_stats,
             "selection_ms": self.selection_ms,
             "bodies": bodies,
             "frame_samples": self.samples,
             "last_error": self.last_error,
         })
     }
+}
+
+/// Distance below which a node of each level must be refined. The same
+/// ranges set the CDLOD morph band (`build_instance`), so split decisions and
+/// morphing share one error metric (§9.4).
+fn lod_ranges(policy: &LodPolicy, radius_m: f64, focal_px: f64) -> Vec<f64> {
+    (0..=policy.max_level)
+        .map(|level| {
+            let cell =
+                astrum_world::terrain::producer::tile_texel_m(radius_m, level, policy.draw_cells);
+            (cell * focal_px / policy.pixel_error)
+                .max(policy.min_range_factor * cell * f64::from(policy.draw_cells))
+        })
+        .collect()
 }
 
 /// Data tile that a draw node samples: its ancestor `offset` levels up, or a root.
@@ -932,9 +1075,10 @@ struct BuiltInstance {
 /// ancestor; `None` when nothing resident covers it.
 fn build_instance(
     nodes: &HashMap<CubePatchAddress, Resident>,
-    address: CubePatchAddress,
+    selected: &select::Selected,
     c: &NodeContext<'_>,
 ) -> Option<BuiltInstance> {
+    let address = selected.address;
     let data = data_address(address, c.data_offset);
     let (owner, owner_node) = finest_resident(nodes, data)?;
     let (own_origin, own_scale) = select::rect_within(address, owner);
@@ -977,8 +1121,7 @@ fn build_instance(
         let start = end - c.policy.morph_fraction * (end - c.ranges[level as usize]);
         (start as f32, end as f32)
     };
-    let cell =
-        astrum_world::terrain::producer::tile_texel_m(c.radius, level, c.policy.draw_cells);
+    let cell = astrum_world::terrain::producer::tile_texel_m(c.radius, level, c.policy.draw_cells);
     Some(BuiltInstance {
         instance: AtlasInstance {
             anchor_view_m: anchor_view.as_vec3().to_array(),
@@ -998,6 +1141,9 @@ fn build_instance(
             skirt_m: (c.policy.skirt_cells * cell) as f32,
             material: c.material,
             mode: c.mode,
+            // Shadow casters do not morph, so they need no edge snap.
+            coarser_edges: if c.morph { selected.coarser_edges } else { 0 },
+            finer_edges: if c.morph { selected.finer_edges } else { 0 },
         },
         owner,
         parent_owner,
@@ -1196,7 +1342,7 @@ mod tests {
         assert!(nodes.contains_key(&c) && nodes.contains_key(&a) && nodes.contains_key(&root));
     }
 
-    fn test_body_id() -> BodyId {
+    pub(super) fn test_body_id() -> BodyId {
         use astrum_math::*;
         use astrum_world::*;
         let mut system = CelestialSystem::new(
@@ -1241,149 +1387,7 @@ mod tests {
             first_complete_s: None,
             last_active: 0,
             stats: BodyStats::default(),
-        }
-    }
-
-    #[test]
-    #[ignore = "requires a real GPU adapter; compares GPU atlas tiles with the CPU band-limited reference"]
-    fn gpu_tiles_match_the_cpu_band_limited_reference() {
-        use astrum_math::surface::CubeFace;
-        let loaded = crate::shared_system::SharedTestSystem::load_canonical(
-            std::num::NonZeroU64::new(5).unwrap(),
-        )
-        .unwrap();
-        let policy = loaded.lod;
-        let camera = DVec3::from_array(loaded.camera.position_body_m).normalize();
-        let (device, queue) = pollster::block_on(async {
-            let instance =
-                wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-            let adapter = instance
-                .request_adapter(&wgpu::RequestAdapterOptions {
-                    power_preference: wgpu::PowerPreference::HighPerformance,
-                    force_fallback_adapter: false,
-                    compatible_surface: None,
-                    apply_limit_buckets: false,
-                })
-                .await
-                .expect("GPU adapter");
-            adapter
-                .request_device(&wgpu::DeviceDescriptor {
-                    label: Some("Atlas producer validation"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
-                    experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                    memory_hints: wgpu::MemoryHints::MemoryUsage,
-                    trace: wgpu::Trace::Off,
-                })
-                .await
-                .expect("device")
-        });
-        let config = TerrainAtlasConfig {
-            cells: policy.tile_cells,
-            draw_cells: policy.draw_cells,
-            layers: 32,
-            normal_scale: policy.normal_scale,
-        };
-        // Nodes: a root, a face corner, and the canonical camera's path at
-        // middle and deep levels.
-        let path_node = |level: u8| {
-            let (face, uv) = astrum_math::surface::SurfaceLocation::new(
-                astrum_math::Direction3::try_new(camera).unwrap(),
-            )
-            .face_uv();
-            let count = 1u32 << level;
-            let index = |c: f64| (((c + 1.0) * 0.5 * f64::from(count)) as u32).min(count - 1);
-            CubePatchAddress::try_new(face, level, index(uv[0]), index(uv[1])).unwrap()
-        };
-        let nodes = [
-            CubePatchAddress::root(CubeFace::PositiveY),
-            CubePatchAddress::try_new(CubeFace::NegativeX, 4, 15, 0).unwrap(),
-            path_node(8),
-            path_node(14),
-            path_node(18),
-        ];
-        for (_, body) in loaded.system.bodies().filter(|(_, b)| b.has_surface()) {
-            let definition = body.surface_definition().unwrap();
-            let radius = body.properties().reference_radius_m();
-            let generator = SurfaceGenerator::new(definition, radius).unwrap();
-            let recipe = generator.producer_recipe().unwrap();
-            let source = Arc::new(producer::atlas_source(&recipe).unwrap());
-            let jobs: Vec<_> = nodes
-                .iter()
-                .enumerate()
-                .map(|(index, &node)| {
-                    let chart = select::chart(node);
-                    AtlasProduceJob {
-                        source: 1,
-                        layer: index as u32,
-                        token: index as u64 + 1,
-                        chart: producer::atlas_chart(&chart),
-                        radius_m: radius as f32,
-                        kind: producer::tile_kind(&recipe, node, &chart, config.cells).unwrap(),
-                    }
-                })
-                .collect();
-            let produced = astrum_renderer::produce_for_validation(
-                &device,
-                &queue,
-                config,
-                &[(1, source)],
-                &jobs,
-            )
-            .unwrap();
-            for (node, tile) in nodes.iter().zip(&produced) {
-                let chart = select::chart(*node);
-                let texel = astrum_world::terrain::producer::tile_texel_m(
-                    radius,
-                    node.level(),
-                    config.cells,
-                );
-                let side = config.height_side() as usize;
-                let (mut max_height_error, mut max_normal_deg) = (0.0f64, 0.0f64);
-                let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
-                for j in (0..side).step_by(5) {
-                    for i in (0..side).step_by(5) {
-                        let st = [
-                            (i as f64 - 1.0) / f64::from(config.cells),
-                            (j as f64 - 1.0) / f64::from(config.cells),
-                        ];
-                        let reference = recipe.evaluate(chart.direction(st), texel).unwrap();
-                        let gpu = f64::from(tile.heights[j * side + i]);
-                        max_height_error = max_height_error.max((gpu - reference.height_m).abs());
-                        low = low.min(gpu);
-                        high = high.max(gpu);
-                        if config.normal_scale == 1 {
-                            let n = tile.normals[j * side + i];
-                            let n = DVec3::new(n[0].into(), n[1].into(), n[2].into()).normalize();
-                            max_normal_deg = max_normal_deg
-                                .max(n.dot(reference.normal).clamp(-1.0, 1.0).acos().to_degrees());
-                        }
-                    }
-                }
-                let nside = config.normal_side() as usize;
-                let ncells = f64::from(config.cells * config.normal_scale);
-                for j in (0..nside).step_by(7) {
-                    for i in (0..nside).step_by(7) {
-                        let st = [(i as f64 - 1.0) / ncells, (j as f64 - 1.0) / ncells];
-                        let reference = recipe.evaluate(chart.direction(st), texel).unwrap();
-                        let n = tile.normals[j * nside + i];
-                        let n = DVec3::new(n[0].into(), n[1].into(), n[2].into()).normalize();
-                        max_normal_deg = max_normal_deg
-                            .max(n.dot(reference.normal).clamp(-1.0, 1.0).acos().to_degrees());
-                    }
-                }
-                println!(
-                    "{} {:?}: max |dh| {max_height_error:.6} m, max normal {max_normal_deg:.3} deg, \
-                     sampled range [{low:.3}, {high:.3}], gpu bounds {:?}",
-                    body.name(),
-                    node,
-                    tile.bounds
-                );
-                assert!(max_height_error < 0.02, "height error {max_height_error}");
-                assert!(max_normal_deg < 1.5, "normal error {max_normal_deg}");
-                let (min_m, max_m) = tile.bounds.expect("bounds readback");
-                assert!(f64::from(min_m) <= low + 1e-3 && f64::from(max_m) >= high - 1e-3);
-            }
+            collision: None,
         }
     }
 
@@ -1417,5 +1421,327 @@ mod tests {
             node_bounds(&HashMap::new(), grandchild, 500.0, 1, 2),
             ([-500.0, 500.0], false)
         );
+    }
+
+    #[test]
+    fn morph_band_uses_the_split_ranges_and_completes_at_its_end() {
+        let policy = policy();
+        let radius = 109_081.776_801_130_12;
+        let ranges = lod_ranges(&policy, radius, 700.0);
+        for level in 1..=policy.max_level {
+            let level = usize::from(level);
+            // A level-L node exists while its parent is within ranges[L-1]
+            // and morphs to the parent grid over the outer part of that band.
+            let end = ranges[level - 1];
+            let start = end - policy.morph_fraction * (end - ranges[level]);
+            assert!(ranges[level] < start && start < end);
+            let t = |d: f64| ((d - start) / (end - start)).clamp(0.0, 1.0);
+            assert_eq!(t(end), 1.0);
+            assert_eq!(t(start), 0.0);
+        }
+    }
+
+    /// Synthetic terrain for seam tests: smooth, multi-scale and analytic, so
+    /// every data tile samples one exact function.
+    fn seam_height(direction: DVec3) -> f64 {
+        200.0 * (50.0 * direction.x + 1.0).sin() * (43.0 * direction.y).sin()
+            + 20.0 * (2100.0 * direction.x + 1900.0 * direction.z).sin()
+            + 2.0 * (41_000.0 * direction.y + 37_000.0 * direction.z).sin()
+    }
+
+    /// f64 replica of `terrain_atlas.wgsl` `vs_main`: the drawn body-space
+    /// position of grid point `st` of `instance` (node `address`).
+    fn replica_vertex(
+        instance: &AtlasInstance,
+        address: CubePatchAddress,
+        layers: &HashMap<u32, CubePatchAddress>,
+        policy: &LodPolicy,
+        observer: DVec3,
+        st: [f64; 2],
+    ) -> (DVec3, f64) {
+        let cells = f64::from(policy.tile_cells);
+        let draw = f64::from(policy.draw_cells);
+        let radius = f64::from(instance.radius_m);
+        let data = |layer: u32, s: [f64; 2]| {
+            let owner = select::chart(layers[&layer]);
+            let p = s.map(|c| (c * cells + 1.0).clamp(0.0, cells + 2.0));
+            let base = p.map(|c| c.floor().min(cells + 1.0));
+            let texel = |i: f64, j: f64| {
+                seam_height(owner.direction([(i - 1.0) / cells, (j - 1.0) / cells]))
+            };
+            let f = [p[0] - base[0], p[1] - base[1]];
+            let a = texel(base[0], base[1]) * (1.0 - f[0]) + texel(base[0] + 1.0, base[1]) * f[0];
+            let b = texel(base[0], base[1] + 1.0) * (1.0 - f[0])
+                + texel(base[0] + 1.0, base[1] + 1.0) * f[0];
+            a * (1.0 - f[1]) + b * f[1]
+        };
+        let sample = |source: AtlasSampleSource, s: [f64; 2]| {
+            let scale = f64::from(source.scale);
+            data(
+                source.layer,
+                [
+                    f64::from(source.origin[0]) + s[0] * scale,
+                    f64::from(source.origin[1]) + s[1] * scale,
+                ],
+            )
+        };
+        let blended = |s: [f64; 2], morph: f64| {
+            let own = sample(instance.own, s);
+            let coarse = sample(instance.parent, s);
+            let arrived = coarse + (own - coarse) * f64::from(instance.arrival);
+            arrived + (coarse - arrived) * morph
+        };
+        let chart = select::chart(address);
+        let position = |s: [f64; 2], h: f64| chart.direction(s) * (radius + h);
+        let d0 = (position(st, blended(st, 0.0)) - observer).length();
+        let (start, end) = (
+            f64::from(instance.morph_start_m),
+            f64::from(instance.morph_end_m),
+        );
+        let mut morph = ((d0 - start) / (end - start).max(1.0e-6)).clamp(0.0, 1.0);
+        let g = st.map(|c| c * draw);
+        let bits = u8::from(g[0] < 0.5)
+            | (u8::from(g[0] > draw - 0.5) << 1)
+            | (u8::from(g[1] < 0.5) << 2)
+            | (u8::from(g[1] > draw - 0.5) << 3);
+        if instance.finer_edges & bits != 0 {
+            morph = 0.0;
+        }
+        if instance.coarser_edges & bits != 0 {
+            morph = 1.0;
+        }
+        let morphed = [0, 1].map(|i| st[i] - (g[i] * 0.5).fract() * (2.0 / draw) * morph);
+        (position(morphed, blended(morphed, morph)), morph)
+    }
+
+    fn edge_points(edge: astrum_math::surface::PatchEdge, draw: u32) -> Vec<[f64; 2]> {
+        (0..=draw)
+            .map(|k| {
+                let [i, j] = edge.grid(k, draw);
+                [
+                    f64::from(i) / f64::from(draw),
+                    f64::from(j) / f64::from(draw),
+                ]
+            })
+            .collect()
+    }
+
+    fn distance_to_polyline(p: DVec3, line: &[DVec3]) -> f64 {
+        line.windows(2)
+            .map(|w| {
+                let d = w[1] - w[0];
+                let t = if d.length_squared() > 0.0 {
+                    ((p - w[0]).dot(d) / d.length_squared()).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                (p - (w[0] + d * t)).length()
+            })
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    #[derive(Debug, Default)]
+    struct SeamReport {
+        /// Coarser neighbour drawn at its own level along the shared edge.
+        coarser_edges: usize,
+        coarser_gap_m: f64,
+        /// Coarser neighbour itself morphing towards its parent there.
+        coarser_morphing_edges: usize,
+        coarser_morphing_gap_m: f64,
+        same_level_edges: usize,
+        same_level_gap_m: f64,
+        reversed_edges: usize,
+        reversed_gap_m: f64,
+        balance_splits: usize,
+    }
+
+    /// Select around a near-ground observer, build real instances with every
+    /// data tile resident, and measure how far each node's drawn edge vertices
+    /// lie from its neighbour's drawn edge polyline (§19.2).
+    fn seam_report(
+        defer: bool,
+        up: DVec3,
+        bound_m: f64,
+        viewport: [f64; 2],
+        max_level: u8,
+        same_level_stride: usize,
+    ) -> SeamReport {
+        let mut same_level_seen = 0usize;
+        use astrum_math::surface::PatchEdge;
+        let policy = policy();
+        let radius = 109_081.776_801_130_12;
+        let focal = 700.0;
+        let up = up.normalize();
+        let observer = up * (radius + seam_height(up) + 30.0);
+        let forward = DVec3::X.reject_from(up).normalize();
+        let right = forward.cross(up).normalize();
+        let view_to_body = DMat3::from_cols(right, up, -forward);
+        let body_to_view = view_to_body.transpose();
+        let ranges = lod_ranges(&policy, radius, focal);
+        let selection = select::select(
+            &select::SelectionInput {
+                observer_body: observer,
+                body_to_view,
+                frustum: select::Frustum::new(focal, viewport),
+                radius_m: radius,
+                occluder_radius_m: radius - 250.0,
+                // Tight bounds keep the selection small; heights only matter to
+                // the replica, which samples `seam_height` directly.
+                ranges: &ranges,
+                max_level,
+                visit_limit: 100_000,
+                restricted: true,
+            },
+            |node| {
+                let [x, y] = node.coordinates();
+                let refinable = !defer || node.level() < 8 || (x ^ y) % 3 != 0;
+                ([-bound_m, bound_m], refinable)
+            },
+        );
+        let data_offset = policy.data_level_offset();
+        let produced = Instant::now() - std::time::Duration::from_secs(60);
+        let mut nodes = HashMap::new();
+        let mut layers = HashMap::new();
+        for s in &selection.selected {
+            let mut cursor = Some(data_address(s.address, data_offset));
+            while let Some(node) = cursor {
+                if nodes.contains_key(&node) {
+                    break;
+                }
+                let layer = layers.len() as u32;
+                layers.insert(layer, node);
+                nodes.insert(
+                    node,
+                    Resident {
+                        layer,
+                        produced,
+                        last_used: 0,
+                    },
+                );
+                cursor = node.parent();
+            }
+        }
+        let context = NodeContext {
+            data_offset,
+            policy: &policy,
+            ranges: &ranges,
+            body_to_view,
+            observer,
+            radius,
+            now: Instant::now(),
+            material: Default::default(),
+            mode: 0,
+            morph: true,
+        };
+        let instances: HashMap<_, _> = selection
+            .selected
+            .iter()
+            .map(|s| {
+                let built = build_instance(&nodes, s, &context).expect("all data resident");
+                assert!(!built.virtual_node && built.arrival == 1.0);
+                (s.address, built.instance)
+            })
+            .collect();
+        let vertex = |address: CubePatchAddress, st: [f64; 2]| {
+            replica_vertex(
+                &instances[&address],
+                address,
+                &layers,
+                &policy,
+                observer,
+                st,
+            )
+        };
+        let mut report = SeamReport {
+            balance_splits: selection.balance_splits,
+            ..SeamReport::default()
+        };
+        for s in &selection.selected {
+            for edge in PatchEdge::ALL {
+                let neighbour = s.address.neighbor(edge);
+                let mut cursor = Some(neighbour.address);
+                let mut cover = None;
+                while let Some(node) = cursor {
+                    if instances.contains_key(&node) {
+                        cover = Some(node);
+                        break;
+                    }
+                    cursor = node.parent();
+                }
+                let Some(cover) = cover else { continue };
+                if cover.level() == s.address.level() {
+                    same_level_seen += 1;
+                    if !same_level_seen.is_multiple_of(same_level_stride) {
+                        continue;
+                    }
+                }
+                let cover_edge: Vec<(DVec3, f64)> = edge_points(neighbour.edge, policy.draw_cells)
+                    .into_iter()
+                    .map(|st| vertex(cover, st))
+                    .collect();
+                let line: Vec<DVec3> = cover_edge.iter().map(|v| v.0).collect();
+                let cover_morph = cover_edge.iter().map(|v| v.1).fold(0.0, f64::max);
+                let gap = edge_points(edge, policy.draw_cells)
+                    .into_iter()
+                    .map(|st| distance_to_polyline(vertex(s.address, st).0, &line))
+                    .fold(0.0, f64::max);
+                if cover.level() < s.address.level() && cover_morph > 0.0 {
+                    report.coarser_morphing_edges += 1;
+                    report.coarser_morphing_gap_m = report.coarser_morphing_gap_m.max(gap);
+                } else if cover.level() < s.address.level() {
+                    report.coarser_edges += 1;
+                    report.coarser_gap_m = report.coarser_gap_m.max(gap);
+                } else if neighbour.reversed {
+                    report.reversed_edges += 1;
+                    report.reversed_gap_m = report.reversed_gap_m.max(gap);
+                } else {
+                    report.same_level_edges += 1;
+                    report.same_level_gap_m = report.same_level_gap_m.max(gap);
+                }
+            }
+        }
+        report
+    }
+
+    #[test]
+    fn drawn_edges_meet_same_level_and_coarser_neighbours() {
+        // The canonical camera direction, and a cube corner where three faces
+        // meet (cross-face edges; this cube basis never reverses orientation).
+        for up in [
+            DVec3::new(2000.7, 1250.4, 109_120.9),
+            DVec3::new(1.0, 1.0, 1.0),
+        ] {
+            for defer in [false, true] {
+                let report = seam_report(defer, up, 2.0, [1280.0, 720.0], 20, 1);
+                eprintln!("seams at {up} (deferred bounds: {defer}): {report:?}");
+                assert!(report.coarser_edges > 0 && report.same_level_edges > 0);
+                // The f64 replica is exact up to rounding: fine edges snapped
+                // to the coarse line lie on the coarse neighbour's drawn edge,
+                // and same-orientation same-level edges coincide.
+                assert!(report.coarser_gap_m < 1.0e-6, "{report:?}");
+                assert!(report.same_level_gap_m < 1.0e-6, "{report:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn edges_meet_while_bounds_are_unmeasured() {
+        // Before tiles report measured bounds, selection uses the conservative
+        // body bound (hundreds of metres), which inflates deep nodes, forces
+        // balance splits and leaves coarse neighbours mid-morph at fine edges.
+        let report = seam_report(
+            false,
+            DVec3::new(2000.7, 1250.4, 109_120.9),
+            250.0,
+            [640.0, 360.0],
+            18,
+            // Same-level edges are covered above; sample them sparsely here.
+            97,
+        );
+        eprintln!("seams with unmeasured bounds: {report:?}");
+        assert!(report.balance_splits > 0 && report.coarser_morphing_edges > 0);
+        assert!(report.coarser_gap_m < 1.0e-6, "{report:?}");
+        assert!(report.coarser_morphing_gap_m < 1.0e-6, "{report:?}");
+        assert!(report.same_level_gap_m < 1.0e-6, "{report:?}");
     }
 }
