@@ -8,21 +8,86 @@ use mundaris_app::{
         view::StatItem,
     },
 };
-use slint::{ModelRc, VecModel};
-
 use std::{
     cell::{Ref, RefCell},
-    rc::Rc,
     sync::Arc,
     sync::mpsc,
 };
 
 use serde_json::Value;
 
-use crate::{
-    FrameBar, HotSpan, LaneRow, ProfilerData, SpanBox, Stat, Tick,
-    ui_sync::{stat, sync},
-};
+/// One frame-strip bar; heights are fractions of the strip (0..1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrameBar {
+    pub height: f32,
+    /// Engine CPU share of the strip height.
+    pub cpu: f32,
+    /// Sampled GPU frame time share; 0 when not sampled.
+    pub gpu: f32,
+    /// 0 within budget, 2 over 16.7 ms, 3 over 33.3 ms.
+    pub tone: i32,
+    pub selected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LaneRow {
+    pub name: String,
+    pub first_row: i32,
+    pub rows: i32,
+}
+
+/// A span placed in the shown timeline window (x and width are 0..1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpanBox {
+    pub x: f32,
+    pub width: f32,
+    pub row: i32,
+    pub name: String,
+    pub color: i32,
+    pub kind: SpanKind,
+    /// Clipped at the right edge of the shown window.
+    pub clipped: bool,
+    pub selected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tick {
+    pub x: f32,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HotSpan {
+    pub name: String,
+    pub last: String,
+    pub p50: String,
+    pub p95: String,
+    pub max: String,
+}
+
+/// Everything the profiler panel draws, rebuilt at the panel refresh rate.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ProfilerData {
+    pub enabled: bool,
+    pub frozen: bool,
+    pub capturing: bool,
+    pub following: bool,
+    pub full_frame: bool,
+    pub bars: Vec<FrameBar>,
+    /// 16.7 ms budget line as a fraction of the strip height.
+    pub budget: f32,
+    pub lanes: Vec<LaneRow>,
+    pub spans: Vec<SpanBox>,
+    pub rows: i32,
+    pub ticks: Vec<Tick>,
+    pub timeline_title: String,
+    pub empty_hint: String,
+    pub frame_stats: Vec<StatItem>,
+    pub span_detail: Vec<StatItem>,
+    pub hot: Vec<HotSpan>,
+    pub gpu_stats: Vec<StatItem>,
+    pub export_status: String,
+}
 
 /// Frames shown in the strip.
 pub const STRIP_FRAMES: usize = 240;
@@ -32,19 +97,9 @@ const STRIP_MS: f64 = 2.0 * BUDGET_MS;
 const SPAN_COLORS: u32 = 8;
 const HOT_ROWS: usize = 12;
 
-/// Persistent list models for the profiler panel. Rows are synced in place so
-/// Slint keeps its element instances; replacing lists made every refresh
-/// rebuild ~300 elements and measurably missed vsync.
+/// Off-thread derivation state for the profiler panel.
 #[derive(Default)]
 pub struct ProfilerModels {
-    bars: Rc<VecModel<FrameBar>>,
-    lanes: Rc<VecModel<LaneRow>>,
-    spans: Rc<VecModel<SpanBox>>,
-    ticks: Rc<VecModel<Tick>>,
-    frame_stats: Rc<VecModel<Stat>>,
-    span_detail: Rc<VecModel<Stat>>,
-    hot: Rc<VecModel<HotSpan>>,
-    gpu_stats: Rc<VecModel<Stat>>,
     cache: RefCell<Derived>,
     worker: RefCell<Option<DeriveWorker>>,
 }
@@ -161,11 +216,6 @@ impl ProfilerModels {
     }
 }
 
-fn bind<T: Clone + PartialEq + 'static>(model: &Rc<VecModel<T>>, rows: Vec<T>) -> ModelRc<T> {
-    sync(model, rows);
-    ModelRc::from(model.clone())
-}
-
 fn ms(value: Option<f64>) -> String {
     value.map_or_else(|| "—".to_string(), |ms| format!("{ms:.2} ms"))
 }
@@ -236,7 +286,7 @@ pub fn build(demo: &mut GravityOrbitsDemo, models: &ProfilerModels) -> (Profiler
     let (lanes, spans, rows, ticks, title) = match &timeline {
         Some(timeline) => {
             // "Engine work" fits the window to engine CPU work and GPU scopes;
-            // UI drawing is shown clipped at the right edge.
+            // UI drawing and presentation waits are clipped at the right edge.
             let view = if full_frame {
                 timeline.duration_ms
             } else {
@@ -261,14 +311,9 @@ pub fn build(demo: &mut GravityOrbitsDemo, models: &ProfilerModels) -> (Profiler
                             span.name,
                             span.duration_ms,
                             if clipped { " →" } else { "" }
-                        )
-                        .into(),
+                        ),
                         color: profiler_view::color_slot(&span.name, SPAN_COLORS) as i32,
-                        kind: match span.kind {
-                            SpanKind::Work => 0,
-                            SpanKind::Ui => 1,
-                            SpanKind::Gpu => 2,
-                        },
+                        kind: span.kind,
                         clipped,
                         selected: Some(index) == selected_span,
                     }
@@ -293,8 +338,7 @@ pub fn build(demo: &mut GravityOrbitsDemo, models: &ProfilerModels) -> (Profiler
                         format!("{t:.2} ms")
                     } else {
                         format!("{t:.0} ms")
-                    }
-                    .into(),
+                    },
                 })
                 .collect();
             let gpu = timeline.gpu_ms.map_or_else(
@@ -307,10 +351,11 @@ pub fn build(demo: &mut GravityOrbitsDemo, models: &ProfilerModels) -> (Profiler
                 timeline.rows as i32,
                 ticks,
                 format!(
-                    "frame {} · engine {:.2} ms · UI draw {:.2} ms · other {:.2} ms · {gpu}{}",
+                    "frame {} · engine {:.2} ms · UI draw {:.2} ms · vsync wait {:.2} ms · other {:.2} ms · {gpu}{}",
                     timeline.frame_id,
                     timeline.work_ms,
                     timeline.ui_ms,
+                    timeline.wait_ms,
                     timeline.untracked_ms,
                     if following {
                         " · following latest"
@@ -352,7 +397,7 @@ pub fn build(demo: &mut GravityOrbitsDemo, models: &ProfilerModels) -> (Profiler
                 .gpu_ms
                 .map_or_else(|| "not sampled".to_string(), |gpu| format!("{gpu:.2} ms")),
         ),
-        StatItem::new("UI draw (Slint)", ms(sample.ui_render_ms)),
+        StatItem::new("UI draw", ms(sample.ui_render_ms)),
         StatItem::new(
             "Bottleneck",
             profiler_view::bottleneck(
@@ -415,10 +460,10 @@ pub fn build(demo: &mut GravityOrbitsDemo, models: &ProfilerModels) -> (Profiler
         .take(HOT_ROWS)
         .map(|row| HotSpan {
             name: row.name.as_str().into(),
-            last: format!("{:.2}", row.last_ms).into(),
-            p50: format!("{:.2}", row.p50_ms).into(),
-            p95: format!("{:.2}", row.p95_ms).into(),
-            max: format!("{:.2}", row.max_ms).into(),
+            last: format!("{:.2}", row.last_ms),
+            p50: format!("{:.2}", row.p50_ms),
+            p95: format!("{:.2}", row.p95_ms),
+            max: format!("{:.2}", row.max_ms),
         })
         .collect();
     // Scopes of the selected frame when sampled, else of the latest sample.
@@ -449,19 +494,19 @@ pub fn build(demo: &mut GravityOrbitsDemo, models: &ProfilerModels) -> (Profiler
         capturing,
         following,
         full_frame,
-        bars: bind(&models.bars, bars),
+        bars,
         budget: (BUDGET_MS / STRIP_MS) as f32,
-        lanes: bind(&models.lanes, lanes),
-        spans: bind(&models.spans, spans),
+        lanes,
+        spans,
         rows,
-        ticks: bind(&models.ticks, ticks),
-        timeline_title: title.into(),
+        ticks,
+        timeline_title: title,
         empty_hint: empty_hint.into(),
-        frame_stats: bind(&models.frame_stats, frame_stats.iter().map(stat).collect()),
-        span_detail: bind(&models.span_detail, span_detail.iter().map(stat).collect()),
-        hot: bind(&models.hot, hot),
-        gpu_stats: bind(&models.gpu_stats, gpu_stats.iter().map(stat).collect()),
-        export_status: export_status.into(),
+        frame_stats: frame_stats.to_vec(),
+        span_detail,
+        hot,
+        gpu_stats,
+        export_status,
     };
     (data, bar_frames)
 }

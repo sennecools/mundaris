@@ -23,7 +23,11 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-slint.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+egui-winit.workspace = true
+wgpu.workspace = true
+winit.workspace = true
 sha2 = "0.10"
 base64 = { version = "0.22", optional = true }
 
@@ -34,7 +38,6 @@ required-features = ["developer-tools"]
 
 [dev-dependencies]
 criterion.workspace = true
-wgpu.workspace = true
 pollster.workspace = true
 
 [[example]]
@@ -56,6 +59,3 @@ harness = false
 
 [lints]
 workspace = true
-
-[build-dependencies]
-slint-build.workspace = true

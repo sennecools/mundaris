@@ -5,10 +5,11 @@ use serde_json::Value;
 
 use crate::developer_snapshot::GpuScopeSnapshot;
 
-/// Main-thread spans of UI toolkit drawing. They are shown in their own style
-/// and excluded from the engine-work window; surface acquire and present (the
-/// vsync wait) happen outside them and appear as untracked time.
-pub const UI_SPANS: &[&str] = &["Slint UI draw"];
+/// Main-thread spans of Studio UI layout, tessellation and encoding. They are
+/// shown in their own style and excluded from the engine-work window.
+pub const UI_SPANS: &[&str] = &["UI draw"];
+/// Main-thread spans that block on presentation (the vsync wait).
+pub const WAIT_SPANS: &[&str] = &["Surface acquire", "Present"];
 /// CPU span whose end is the queue submit; the GPU lane starts there.
 pub const SUBMIT_SPAN: &str = "GPU submission";
 pub const GPU_LANE: &str = "GPU (from submit)";
@@ -17,6 +18,7 @@ pub const GPU_LANE: &str = "GPU (from submit)";
 pub enum SpanKind {
     Work,
     Ui,
+    Wait,
     Gpu,
 }
 
@@ -48,12 +50,13 @@ pub struct TimelineSpan {
 pub struct FrameTimeline {
     pub frame_id: u64,
     pub duration_ms: f64,
-    /// End of the last non-UI span (CPU or GPU): the engine-work window.
+    /// End of the last engine span (CPU or GPU): the engine-work window.
     pub work_end_ms: f64,
-    /// Top-level main-thread engine work, UI drawing, and the remaining
-    /// main-thread time (event loop, surface acquire and present).
+    /// Top-level main-thread engine work, UI drawing, presentation waits, and
+    /// the remaining untracked main-thread time (event loop).
     pub work_ms: f64,
     pub ui_ms: f64,
+    pub wait_ms: f64,
     pub untracked_ms: f64,
     /// GPU frame time when this frame's submission was timestamp-sampled.
     pub gpu_ms: Option<f64>,
@@ -187,6 +190,8 @@ pub fn frame_timeline(
                 depth: event.depth,
                 kind: if UI_SPANS.contains(&event.name) {
                     SpanKind::Ui
+                } else if WAIT_SPANS.contains(&event.name) {
+                    SpanKind::Wait
                 } else {
                     SpanKind::Work
                 },
@@ -207,8 +212,12 @@ pub fn frame_timeline(
             .map(|s| s.duration_ms)
             .sum::<f64>()
     };
-    let (work_ms, ui_ms) = (main_top(SpanKind::Work), main_top(SpanKind::Ui));
-    let untracked_ms = (duration_ms - work_ms - ui_ms).max(0.0);
+    let (work_ms, ui_ms, wait_ms) = (
+        main_top(SpanKind::Work),
+        main_top(SpanKind::Ui),
+        main_top(SpanKind::Wait),
+    );
+    let untracked_ms = (duration_ms - work_ms - ui_ms - wait_ms).max(0.0);
 
     let mut timeline = FrameTimeline {
         frame_id,
@@ -216,6 +225,7 @@ pub fn frame_timeline(
         work_end_ms: 0.0,
         work_ms,
         ui_ms,
+        wait_ms,
         untracked_ms,
         gpu_ms: None,
         lanes: timeline_lanes,
@@ -229,11 +239,11 @@ pub fn frame_timeline(
     Some(timeline)
 }
 
-/// End of the last main-thread or GPU span that is not UI drawing.
+/// End of the last main-thread engine span or GPU span.
 fn work_end(spans: &[TimelineSpan]) -> f64 {
     spans
         .iter()
-        .filter(|s| s.kind != SpanKind::Ui && (s.lane == 0 || s.kind == SpanKind::Gpu))
+        .filter(|s| (s.lane == 0 && s.kind == SpanKind::Work) || s.kind == SpanKind::Gpu)
         .map(|s| s.start_ms + s.duration_ms)
         .fold(0.0, f64::max)
 }
@@ -375,7 +385,7 @@ mod tests {
                 {"worker": {"kind": "main"}, "events": [
                     {"name": "Frame", "frame_id": 7, "start_ns": 1_000_000, "end_ns": 3_000_000, "nesting_depth": 0},
                     {"name": "Simulation", "frame_id": 7, "start_ns": 1_200_000, "end_ns": 1_700_000, "nesting_depth": 1},
-                    {"name": "Slint UI draw", "frame_id": 7, "start_ns": 3_100_000, "end_ns": 3_600_000, "nesting_depth": 0},
+                    {"name": "UI draw", "frame_id": 7, "start_ns": 3_100_000, "end_ns": 3_600_000, "nesting_depth": 0},
                     {"name": "Frame", "frame_id": 8, "start_ns": 9_000_000, "end_ns": 9_500_000, "nesting_depth": 0}
                 ]}
             ],
@@ -415,7 +425,8 @@ mod tests {
         let profile = json!({"lanes": [{"worker": {"kind": "main"}, "events": [
             {"name": "Frame", "frame_id": 3, "start_ns": 0, "end_ns": 600_000, "nesting_depth": 0},
             {"name": "GPU submission", "frame_id": 3, "start_ns": 400_000, "end_ns": 500_000, "nesting_depth": 1},
-            {"name": "Slint UI draw", "frame_id": 3, "start_ns": 2_000_000, "end_ns": 10_000_000, "nesting_depth": 0}
+            {"name": "Surface acquire", "frame_id": 3, "start_ns": 700_000, "end_ns": 1_100_000, "nesting_depth": 0},
+            {"name": "UI draw", "frame_id": 3, "start_ns": 2_000_000, "end_ns": 10_000_000, "nesting_depth": 0}
         ]}]});
         let gpu = [
             GpuScopeSnapshot {
@@ -434,13 +445,14 @@ mod tests {
         let timeline = frame_timeline(&profile, 3, Some(&gpu)).unwrap();
         assert!((timeline.work_ms - 0.6).abs() < 1e-9);
         assert!((timeline.ui_ms - 8.0).abs() < 1e-9);
-        assert!((timeline.untracked_ms - 1.4).abs() < 1e-9);
+        assert!((timeline.wait_ms - 0.4).abs() < 1e-9);
+        assert!((timeline.untracked_ms - 1.0).abs() < 1e-9);
         let ui = timeline
             .spans
             .iter()
             .find(|s| s.kind == SpanKind::Ui)
             .unwrap();
-        assert_eq!(ui.name, "Slint UI draw");
+        assert_eq!(ui.name, "UI draw");
         assert_eq!(timeline.lanes.last().unwrap().name, GPU_LANE);
         let scene = timeline
             .spans

@@ -29,11 +29,12 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wgpu = "30"
-slint = { version = "=1.18.1", default-features = false, features = ["std", "compat-1-2", "accessibility", "backend-winit", "renderer-femtovg-wgpu", "unstable-wgpu-30"] }
-slint-build = "=1.18.1"
+egui = "=0.36.2"
+egui-wgpu = "=0.36.2"
+egui-winit = { version = "=0.36.2", default-features = false }
+winit = "0.30"
 
 [workspace.lints.rust]
-# Library crates also `#![forbid(unsafe_code)]` at their roots; the app binary
-# denies it because Slint-generated UI code allows it locally.
+# Library crates also `#![forbid(unsafe_code)]` at their roots.
 unsafe_code = "deny"
 unused_must_use = "deny"
