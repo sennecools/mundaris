@@ -1,0 +1,129 @@
+{
+  "schema": 2,
+  "id": "moon_lro_crater_floor_b",
+  "version": 1,
+  "seed": 1974,
+  "footprint_m": 4000,
+  "graph": {
+    "nodes": [
+      {
+        "id": "flat",
+        "op": {
+          "kind": "constant",
+          "value": 0
+        }
+      },
+      {
+        "id": "hardness",
+        "op": {
+          "kind": "constant",
+          "value": 0.5
+        }
+      }
+    ],
+    "height": "flat",
+    "hardness": "hardness"
+  },
+  "pipeline": [
+    {
+      "name": "exemplar",
+      "filter": {
+        "kind": "exemplar_synthesis",
+        "resolution": 2048,
+        "seed": 17,
+        "alpha": 0.5,
+        "lambda": 0.05,
+        "levels": [
+          {
+            "patch_px": 80,
+            "overlap_px": 16,
+            "candidates": 3000,
+            "feather_px": 2
+          },
+          {
+            "patch_px": 80,
+            "overlap_px": 16,
+            "candidates": 3000,
+            "feather_px": 2
+          },
+          {
+            "patch_px": 48,
+            "overlap_px": 16,
+            "candidates": 3000,
+            "feather_px": 3
+          },
+          {
+            "patch_px": 48,
+            "overlap_px": 16,
+            "candidates": 3000,
+            "feather_px": 4
+          },
+          {
+            "patch_px": 48,
+            "overlap_px": 16,
+            "candidates": 4000,
+            "feather_px": 5
+          }
+        ],
+        "sources": [
+          {
+            "product": "VIRTANEN1",
+            "path": "D:/Mundaris/target/reference-dem/lroc/NAC_DTM_VIRTANEN1.TIF",
+            "sha256": "9ee87e18632dc1483cf8bef91d7b852ad1d6da0ccb91df90858bb0ffcfc68549",
+            "windows": [
+              [
+                256,
+                12800,
+                1024
+              ],
+              [
+                256,
+                14336,
+                1024
+              ],
+              [
+                256,
+                14848,
+                1024
+              ],
+              [
+                512,
+                13824,
+                1024
+              ],
+              [
+                768,
+                14336,
+                1024
+              ]
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "derived": {
+    "channel_resolution": 1024,
+    "flow_exponent": 1.1,
+    "relief_radius_m": 120,
+    "wetness": {
+      "flow": 0.8,
+      "deposition": 0.4,
+      "shelter": 0.3,
+      "bias": 0
+    },
+    "exposure": {
+      "relief": 0.8,
+      "convexity": 0.4,
+      "bias": 0.5
+    },
+    "spawn": {
+      "flow": 0.5,
+      "incision": 0.5,
+      "steepness": 0.4,
+      "steep_tangent": 1,
+      "bias": -0.2
+    }
+  },
+  "output_relief_m": null
+}

@@ -1,0 +1,144 @@
+{
+  "schema": 2,
+  "id": "moon_lro_highland_b",
+  "version": 1,
+  "seed": 1970,
+  "footprint_m": 4000,
+  "graph": {
+    "nodes": [
+      {
+        "id": "flat",
+        "op": {
+          "kind": "constant",
+          "value": 0
+        }
+      },
+      {
+        "id": "hardness",
+        "op": {
+          "kind": "constant",
+          "value": 0.5
+        }
+      }
+    ],
+    "height": "flat",
+    "hardness": "hardness"
+  },
+  "pipeline": [
+    {
+      "name": "exemplar",
+      "filter": {
+        "kind": "exemplar_synthesis",
+        "resolution": 2048,
+        "seed": 7,
+        "alpha": 0.5,
+        "lambda": 0.05,
+        "levels": [
+          {
+            "patch_px": 80,
+            "overlap_px": 16,
+            "candidates": 3000,
+            "feather_px": 2
+          },
+          {
+            "patch_px": 80,
+            "overlap_px": 16,
+            "candidates": 3000,
+            "feather_px": 2
+          },
+          {
+            "patch_px": 48,
+            "overlap_px": 16,
+            "candidates": 3000,
+            "feather_px": 3
+          },
+          {
+            "patch_px": 48,
+            "overlap_px": 16,
+            "candidates": 3000,
+            "feather_px": 4
+          },
+          {
+            "patch_px": 48,
+            "overlap_px": 16,
+            "candidates": 4000,
+            "feather_px": 5
+          }
+        ],
+        "sources": [
+          {
+            "product": "APOLLO16",
+            "path": "D:/Mundaris/target/reference-dem/lroc/NAC_DTM_APOLLO16.TIF",
+            "sha256": "27600cea35c19e53039affe5782828482f3590ef6f4654181557dcaf4b4359fd",
+            "windows": [
+              [
+                4608,
+                7168,
+                1024
+              ],
+              [
+                5632,
+                7168,
+                1024
+              ],
+              [
+                4608,
+                8192,
+                1024
+              ],
+              [
+                5632,
+                8192,
+                1024
+              ],
+              [
+                5632,
+                10240,
+                1024
+              ],
+              [
+                4608,
+                11264,
+                1024
+              ],
+              [
+                6656,
+                9216,
+                1024
+              ],
+              [
+                6656,
+                10240,
+                1024
+              ]
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "derived": {
+    "channel_resolution": 1024,
+    "flow_exponent": 1.1,
+    "relief_radius_m": 120,
+    "wetness": {
+      "flow": 0.8,
+      "deposition": 0.4,
+      "shelter": 0.3,
+      "bias": 0
+    },
+    "exposure": {
+      "relief": 0.8,
+      "convexity": 0.4,
+      "bias": 0.5
+    },
+    "spawn": {
+      "flow": 0.5,
+      "incision": 0.5,
+      "steepness": 0.4,
+      "steep_tangent": 1,
+      "bias": -0.2
+    }
+  },
+  "output_relief_m": null
+}

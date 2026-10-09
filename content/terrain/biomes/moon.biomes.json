@@ -1,0 +1,78 @@
+{
+  "format": "mundaris.biome-catalog.v1",
+  "id": "moon_biomes_v1",
+  "seed": 1969,
+  "channels": ["highland", "mare", "crater_floor", "crater_rim_ejecta"],
+  "cell_m": 4000.0,
+  "cell_blend_m": 800.0,
+  "cell_warp_m": 700.0,
+  "band_limit_m": 1500.0,
+  "biomes": [
+    {
+      "id": "highland",
+      "channel": "highland",
+      "sub_biomes": [
+        {
+          "id": "highland_smooth",
+          "select": { "field": "slope", "below": 0.03, "softness": 0.01 },
+          "amplitude": 1.0,
+          "variants": [
+            { "bundle": "moon_lro_highland_c", "height_sha256": "c7475d23de5adfff2bc5680c23c4c0739afe532e85da3cbaf4a40702c1dc945a", "weight": 1.0 },
+            { "bundle": "moon_lro_highland_a", "height_sha256": "84660e4da633800b804bc74b07295eda3ab2a337ad67866eb9a68830330b9f2e", "weight": 1.0 }
+          ]
+        },
+        {
+          "id": "highland_hummocky",
+          "select": { "field": "slope", "above": 0.03, "softness": 0.01 },
+          "amplitude": 1.0,
+          "variants": [
+            { "bundle": "moon_lro_highland_b", "height_sha256": "c11d9ce4aedb7e0f1f8ae98b5848e9a596f956aa951594fa50a96c1264e37b3d", "weight": 1.0 },
+            { "bundle": "moon_lro_highland_a", "height_sha256": "84660e4da633800b804bc74b07295eda3ab2a337ad67866eb9a68830330b9f2e", "weight": 0.5 }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "mare",
+      "channel": "mare",
+      "sub_biomes": [
+        {
+          "id": "mare_plains",
+          "amplitude": 1.0,
+          "variants": [
+            { "bundle": "moon_lro_mare_a", "height_sha256": "a8a4981ca3dd4e6c0ced98ee80a21b9824fda531dfc92534d947b53d0130d755", "weight": 1.0 },
+            { "bundle": "moon_lro_mare_b", "height_sha256": "86382de999ffc871338e54aa7d61dad93a8d38897ebbe94ba8453d62233b602d", "weight": 0.6 }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "crater_floor",
+      "channel": "crater_floor",
+      "sub_biomes": [
+        {
+          "id": "crater_floor_hummocky",
+          "amplitude": 1.0,
+          "variants": [
+            { "bundle": "moon_lro_crater_floor_a", "height_sha256": "37e3a5381f695ebd8d1a76c17ef68375bf6cf5a99c4e07b9d99abccd1a50344e", "weight": 1.0 },
+            { "bundle": "moon_lro_crater_floor_b", "height_sha256": "9d4a10a78e82e579b313a9be4d20bf0668443fae14a21c224ae7c6252713a3c7", "weight": 1.0 }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "crater_rim_ejecta",
+      "channel": "crater_rim_ejecta",
+      "sub_biomes": [
+        {
+          "id": "crater_rim_blocky",
+          "amplitude": 1.0,
+          "variants": [
+            { "bundle": "moon_lro_rim_a", "height_sha256": "19cfd2197f25410a028d51273a9360964f4d1f6baf4558fdc0bc83e0196a7a30", "weight": 1.0 },
+            { "bundle": "moon_lro_rim_b", "height_sha256": "3d23478205a1a8cff11d87ed93599abd479bbb699a29e50d886fb78a6b24bc53", "weight": 1.0 }
+          ]
+        }
+      ]
+    }
+  ]
+}
