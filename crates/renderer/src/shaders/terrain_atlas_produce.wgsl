@@ -15,7 +15,7 @@ struct Tile {
     band_cell: array<vec4<i32>, 6>,    // fields: base cell per band * 2 + layout
     band_frac: array<vec4<f32>, 6>,    // fields: base cell fraction, w = edge
     band_weight: vec4<f32>,            // fields: band footprint weights
-    noise: vec4<u32>,                  // x = detail octave count (origins in `octaves`); world: z = elevation mip offset, w = mip cells
+    noise: vec4<u32>,                  // x = detail octave count (origins in `octaves`); world: y = Tier A face cells, z = elevation mip offset, w = mip cells
 }
 
 struct Dispatch {
@@ -58,6 +58,9 @@ struct FieldsConstants {
 // Page albedo: sRGB-encoded linear colour; alpha 1 where the page owns its
 // colour (world maps), 0 where the draw uses the instance material.
 @group(0) @binding(7) var albedo_out: texture_storage_2d_array<rgba8unorm, write>;
+// Page climate: (temperature °C, moisture, wind east, wind north) for world
+// maps, zero elsewhere.
+@group(0) @binding(8) var climate_out: texture_storage_2d_array<rgba16float, write>;
 @group(1) @binding(0) var macro_image: texture_2d<u32>;
 @group(1) @binding(1) var detail_image: texture_2d<u32>;
 @group(1) @binding(2) var<uniform> profile: ProfileConstants;
@@ -592,6 +595,24 @@ fn page_albedo(st: vec2<f32>, value: vec4<f32>) -> vec4<f32> {
     return vec4<f32>(linear_to_srgb(world_albedo(d, value.w, value.xyz)), 1.0);
 }
 
+// Page climate texel at `st`: temperature and moisture from the node's mip (as
+// the albedo), wind from the level-0 runs (3 and 4 of the Tier A result).
+fn page_climate(st: vec2<f32>) -> vec4<f32> {
+    if tile.info.y != 2u || tile.noise.y == 0u {
+        return vec4<f32>(0.0);
+    }
+    let d = normalize(chart_point(st).n);
+    cube_level_n = tile.noise.w;
+    let stride = 6u * cube_level_n * cube_level_n;
+    let t = cube_sample(tile.noise.z + stride, d, false);
+    let m = cube_sample(tile.noise.z + 2u * stride, d, false);
+    cube_level_n = tile.noise.y;
+    let run = 6u * cube_level_n * cube_level_n;
+    let east = cube_sample(3u * run, d, false);
+    let north = cube_sample(4u * run, d, false);
+    return vec4<f32>(t, m, east, north);
+}
+
 // ---------------------------------------------------------------- entry points
 
 fn evaluate(st: vec2<f32>) -> vec4<f32> {
@@ -640,6 +661,7 @@ fn produce_heights(@builtin(global_invocation_id) id: vec3<u32>) {
         // Normal map at geometry resolution shares this evaluation.
         textureStore(normal_out, vec2<i32>(id.xy), layer, vec4<f32>(value.xyz, 0.0));
         textureStore(albedo_out, vec2<i32>(id.xy), layer, page_albedo(st, value));
+        textureStore(climate_out, vec2<i32>(id.xy), layer, page_climate(st));
     }
     // 4x4 min/max grid over the chart; samples on shared cell edges and the
     // border apron count towards every adjacent cell.
@@ -668,6 +690,7 @@ fn produce_normals(@builtin(global_invocation_id) id: vec3<u32>) {
     let value = evaluate(st);
     textureStore(normal_out, vec2<i32>(id.xy), i32(tile.info.x), vec4<f32>(value.xyz, 0.0));
     textureStore(albedo_out, vec2<i32>(id.xy), i32(tile.info.x), page_albedo(st, value));
+    textureStore(climate_out, vec2<i32>(id.xy), i32(tile.info.x), page_climate(st));
 }
 
 // Collision page: (cells + 1)^2 samples at st = id / cells, read back to the

@@ -254,6 +254,7 @@ pub fn tile_kind(
             Ok(AtlasTileKind::World {
                 mip_offset,
                 mip_cells,
+                base_cells: cells,
             })
         }
     }

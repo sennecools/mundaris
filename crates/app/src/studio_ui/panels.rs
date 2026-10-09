@@ -27,6 +27,12 @@ fn view_mode_name(mode: TerrainViewMode) -> &'static str {
         TerrainViewMode::AoOnly => "AO only",
         TerrainViewMode::Shadows => "Shadow cascades",
         TerrainViewMode::Luminance => "Luminance (stops)",
+        TerrainViewMode::Elevation => "Elevation",
+        TerrainViewMode::OceanMask => "Ocean mask",
+        TerrainViewMode::Temperature => "Temperature",
+        TerrainViewMode::Moisture => "Moisture",
+        TerrainViewMode::Wind => "Wind",
+        TerrainViewMode::Biome => "Biome",
     }
 }
 

@@ -72,10 +72,22 @@ pub enum TerrainViewMode {
     Shadows,
     /// False colour in stops relative to the current exposure.
     Luminance,
+    /// Hypsometric ramp over the terrain height (sea level 0).
+    Elevation,
+    /// Water where the ground is below sea level, land grey elsewhere.
+    OceanMask,
+    /// Page temperature, -40..+40 °C.
+    Temperature,
+    /// Page moisture, 0..1.
+    Moisture,
+    /// Page wind: hue from direction, brightness from speed.
+    Wind,
+    /// Page albedo (biome/snow/water colour) without light.
+    Biome,
 }
 
 impl TerrainViewMode {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 16] = [
         Self::Lit,
         Self::Unlit,
         Self::Height,
@@ -86,6 +98,12 @@ impl TerrainViewMode {
         Self::AoOnly,
         Self::Shadows,
         Self::Luminance,
+        Self::Elevation,
+        Self::OceanMask,
+        Self::Temperature,
+        Self::Moisture,
+        Self::Wind,
+        Self::Biome,
     ];
 
     /// Debug views that bypass exposure, metering and tonemapping.
@@ -106,6 +124,12 @@ impl TerrainViewMode {
             Self::AoOnly => 10,
             Self::Shadows => 11,
             Self::Luminance => 12,
+            Self::Elevation => 13,
+            Self::OceanMask => 14,
+            Self::Temperature => 15,
+            Self::Moisture => 16,
+            Self::Wind => 17,
+            Self::Biome => 18,
         }
     }
 
@@ -122,6 +146,12 @@ impl TerrainViewMode {
             Self::AoOnly => "ao",
             Self::Shadows => "shadows",
             Self::Luminance => "luminance",
+            Self::Elevation => "elevation",
+            Self::OceanMask => "ocean",
+            Self::Temperature => "temperature",
+            Self::Moisture => "moisture",
+            Self::Wind => "wind",
+            Self::Biome => "biome",
         }
     }
 
@@ -336,7 +366,12 @@ pub enum AtlasTileKind {
     /// world fields: offset in f32 values and face cells
     /// (`tier_a::field_mip_layout`; climate mips follow at +6·cells² and
     /// +12·cells²).
-    World { mip_offset: u32, mip_cells: u32 },
+    World {
+        mip_offset: u32,
+        mip_cells: u32,
+        /// Tier A face cells: level 0 of the wind runs (page climate).
+        base_cells: u32,
+    },
 }
 
 /// Lattice origin of one detail-noise octave for one job, split on the CPU in
@@ -493,6 +528,7 @@ pub(crate) struct TerrainAtlasRenderer {
     _height: wgpu::Texture,
     _normal: wgpu::Texture,
     _albedo: wgpu::Texture,
+    _climate: wgpu::Texture,
     produce_heights: wgpu::ComputePipeline,
     produce_normals: wgpu::ComputePipeline,
     produce_collision: wgpu::ComputePipeline,
@@ -521,6 +557,7 @@ pub(crate) struct TerrainAtlasRenderer {
     height_view: wgpu::TextureView,
     normal_view: wgpu::TextureView,
     albedo_view: wgpu::TextureView,
+    climate_view: wgpu::TextureView,
     sampler: wgpu::Sampler,
     grid_uniform: wgpu::Buffer,
     vertices: wgpu::Buffer,
@@ -577,6 +614,12 @@ impl TerrainAtlasRenderer {
             wgpu::TextureFormat::Rgba8Unorm,
             "Terrain atlas albedo",
         );
+        // Temperature °C, moisture, wind east, wind north (zero off world maps).
+        let climate = array(
+            config.normal_side(),
+            wgpu::TextureFormat::Rgba16Float,
+            "Terrain atlas climate",
+        );
         let array_view = |texture: &wgpu::Texture| {
             texture.create_view(&wgpu::TextureViewDescriptor {
                 dimension: Some(wgpu::TextureViewDimension::D2Array),
@@ -586,6 +629,7 @@ impl TerrainAtlasRenderer {
         let height_view = array_view(&height);
         let normal_view = array_view(&normal);
         let albedo_view = array_view(&albedo);
+        let climate_view = array_view(&climate);
 
         let produce_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Terrain atlas producer"),
@@ -631,6 +675,7 @@ impl TerrainAtlasRenderer {
                 storage(5, true),
                 storage(6, false),
                 storage_texture(7, wgpu::TextureFormat::Rgba8Unorm),
+                storage_texture(8, wgpu::TextureFormat::Rgba16Float),
             ],
         });
         let image = |binding| wgpu::BindGroupLayoutEntry {
@@ -787,6 +832,10 @@ impl TerrainAtlasRenderer {
                     binding: 7,
                     resource: wgpu::BindingResource::TextureView(&storage_view(&albedo)),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(&storage_view(&climate)),
+                },
             ],
         });
 
@@ -855,6 +904,16 @@ impl TerrainAtlasRenderer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -876,7 +935,7 @@ impl TerrainAtlasRenderer {
         let draw_group = draw_group(
             device,
             &draw_layout,
-            [&height_view, &normal_view, &albedo_view],
+            [&height_view, &normal_view, &albedo_view, &climate_view],
             &sampler,
             &instances,
             &grid_uniform,
@@ -982,7 +1041,7 @@ impl TerrainAtlasRenderer {
         let shadow_group = self::draw_group(
             device,
             &draw_layout,
-            [&height_view, &normal_view, &albedo_view],
+            [&height_view, &normal_view, &albedo_view, &climate_view],
             &sampler,
             &shadow_instances,
             &grid_uniform,
@@ -1008,6 +1067,7 @@ impl TerrainAtlasRenderer {
             _height: height,
             _normal: normal,
             _albedo: albedo,
+            _climate: climate,
             produce_heights,
             produce_normals,
             produce_collision,
@@ -1035,6 +1095,7 @@ impl TerrainAtlasRenderer {
             height_view,
             normal_view,
             albedo_view,
+            climate_view,
             sampler,
             grid_uniform,
             vertices,
@@ -1444,7 +1505,12 @@ impl TerrainAtlasRenderer {
             self.draw_group = draw_group(
                 device,
                 &self.draw_layout,
-                [&self.height_view, &self.normal_view, &self.albedo_view],
+                [
+                    &self.height_view,
+                    &self.normal_view,
+                    &self.albedo_view,
+                    &self.climate_view,
+                ],
                 &self.sampler,
                 &self.instances,
                 &self.grid_uniform,
@@ -1519,7 +1585,12 @@ impl TerrainAtlasRenderer {
             self.shadow_group = draw_group(
                 device,
                 &self.draw_layout,
-                [&self.height_view, &self.normal_view, &self.albedo_view],
+                [
+                    &self.height_view,
+                    &self.normal_view,
+                    &self.albedo_view,
+                    &self.climate_view,
+                ],
                 &self.sampler,
                 &self.shadow_instances,
                 &self.grid_uniform,
@@ -1572,7 +1643,23 @@ pub struct ProducedTileReadback {
     /// Page albedo per normal texel: linear rgb (decoded from sRGB) and the
     /// ownership alpha.
     pub albedo: Vec<[f32; 4]>,
+    /// Page climate per normal texel: temperature °C, moisture, wind east,
+    /// wind north (decoded from f16; zero off world maps).
+    pub climate: Vec<[f32; 4]>,
     pub bounds: Option<(f32, f32)>,
+}
+
+/// IEEE binary16 to f32 (validation readback of the climate page).
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exponent = i32::from((bits >> 10) & 0x1f);
+    let fraction = f32::from(bits & 0x3ff);
+    match exponent {
+        0 => sign * fraction * 2f32.powi(-24),
+        31 if fraction == 0.0 => sign * f32::INFINITY,
+        31 => f32::NAN,
+        _ => sign * (1.0 + fraction / 1024.0) * 2f32.powi(exponent - 15),
+    }
 }
 
 /// Run the producer for `jobs` on a caller-owned device and read every job's
@@ -1616,9 +1703,10 @@ pub fn produce_for_validation(
     let read_layer = |encoder: &mut wgpu::CommandEncoder,
                       texture: &wgpu::Texture,
                       side: u32,
-                      layer: u32|
+                      layer: u32,
+                      texel_bytes: u32|
      -> (wgpu::Buffer, u32) {
-        let row = (side * 4).div_ceil(256) * 256;
+        let row = (side * texel_bytes).div_ceil(256) * 256;
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Atlas validation readback"),
             size: u64::from(row * side),
@@ -1659,26 +1747,42 @@ pub fn produce_for_validation(
             &atlas._height,
             config.height_side(),
             job.layer,
+            4,
         );
         let normals = read_layer(
             &mut encoder,
             &atlas._normal,
             config.normal_side(),
             job.layer,
+            4,
         );
         let albedo = read_layer(
             &mut encoder,
             &atlas._albedo,
             config.normal_side(),
             job.layer,
+            4,
         );
-        buffers.push((heights, normals, albedo));
+        let climate = read_layer(
+            &mut encoder,
+            &atlas._climate,
+            config.normal_side(),
+            job.layer,
+            8,
+        );
+        buffers.push((heights, normals, albedo, climate));
     }
     queue.submit([encoder.finish()]);
     atlas.on_submitted();
     let mut output = Vec::new();
-    for ((heights, height_row), (normals, normal_row), (albedo, albedo_row)) in &buffers {
-        for buffer in [heights, normals, albedo] {
+    for (
+        (heights, height_row),
+        (normals, normal_row),
+        (albedo, albedo_row),
+        (climate, climate_row),
+    ) in &buffers
+    {
+        for buffer in [heights, normals, albedo, climate] {
             buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
         }
         device
@@ -1736,10 +1840,26 @@ pub fn produce_for_validation(
             }
         }
         drop(view);
+        let view = climate
+            .slice(..)
+            .get_mapped_range()
+            .map_err(|error| error.to_string())?;
+        let mut climate_values = Vec::with_capacity(side * side);
+        for y in 0..side {
+            for x in 0..side {
+                let at = y * *climate_row as usize + x * 8;
+                let half = |k: usize| {
+                    f16_to_f32(u16::from_le_bytes([view[at + 2 * k], view[at + 2 * k + 1]]))
+                };
+                climate_values.push([half(0), half(1), half(2), half(3)]);
+            }
+        }
+        drop(view);
         output.push(ProducedTileReadback {
             heights: height_values,
             normals: normal_values,
             albedo: albedo_values,
+            climate: climate_values,
             bounds: None,
         });
     }
@@ -1936,8 +2056,8 @@ fn instance_buffer(device: &wgpu::Device, capacity: u64) -> wgpu::Buffer {
 fn draw_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
-    // Height, normal and albedo atlas views.
-    [height, normal, albedo]: [&wgpu::TextureView; 3],
+    // Height, normal, albedo and climate atlas views.
+    [height, normal, albedo, climate]: [&wgpu::TextureView; 4],
     sampler: &wgpu::Sampler,
     instances: &wgpu::Buffer,
     grid: &wgpu::Buffer,
@@ -1969,6 +2089,10 @@ fn draw_group(
             wgpu::BindGroupEntry {
                 binding: 5,
                 resource: wgpu::BindingResource::TextureView(albedo),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(climate),
             },
         ],
     })
@@ -2284,14 +2408,15 @@ fn pack_tile(out: &mut Vec<u8>, job: &AtlasProduceJob) {
         out.extend(f32_bytes(value));
     }
     out.extend(f32_bytes(&weights));
-    let (mip_offset, mip_cells) = match job.kind {
+    let (mip_offset, mip_cells, base_cells) = match job.kind {
         AtlasTileKind::World {
             mip_offset,
             mip_cells,
-        } => (mip_offset, mip_cells),
-        _ => (0, 0),
+            base_cells,
+        } => (mip_offset, mip_cells, base_cells),
+        _ => (0, 0, 0),
     };
-    for value in [job.octaves.len() as u32, 0, mip_offset, mip_cells] {
+    for value in [job.octaves.len() as u32, base_cells, mip_offset, mip_cells] {
         out.extend_from_slice(&value.to_le_bytes());
     }
     debug_assert_eq!((out.len() - start) as u64, TILE_BYTES);
@@ -2451,6 +2576,16 @@ mod tests {
             .validate(&module)
             .unwrap_or_else(|error| panic!("{name}: {}", error.emit_to_string(source)));
         }
+    }
+
+    #[test]
+    fn f16_decoding_matches_known_values() {
+        assert_eq!(f16_to_f32(0x3c00), 1.0);
+        assert_eq!(f16_to_f32(0xc000), -2.0);
+        assert_eq!(f16_to_f32(0x0000), 0.0);
+        assert_eq!(f16_to_f32(0x7bff), 65504.0);
+        assert_eq!(f16_to_f32(0x0001), 2f32.powi(-24));
+        assert!(f16_to_f32(0x7e00).is_nan());
     }
 
     #[test]

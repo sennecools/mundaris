@@ -31,6 +31,8 @@ struct Grid {
 @group(1) @binding(4) var<uniform> grid: Grid;
 // Page albedo (sRGB-encoded; alpha 1 where the page owns its colour).
 @group(1) @binding(5) var albedo_atlas: texture_2d_array<f32>;
+// Page climate: temperature °C, moisture, wind east, wind north (zero off world maps).
+@group(1) @binding(6) var climate_atlas: texture_2d_array<f32>;
 
 fn height_at(layer: i32, st: vec2<f32>) -> f32 {
     let cells = grid.data.x;
@@ -151,6 +153,46 @@ fn level_color(level: f32) -> vec3<f32> {
     return 0.5 + 0.5 * cos(6.2831853 * (t + vec3<f32>(0.0, 0.33, 0.67)));
 }
 
+// Field-overlay ramps are authored as display (sRGB) colours.
+fn display(c: vec3<f32>) -> vec3<f32> {
+    return atlas_srgb_to_linear(c);
+}
+
+fn elevation_ramp(h: f32) -> vec3<f32> {
+    if h < 0.0 {
+        let t = sqrt(clamp(-h / 4000.0, 0.0, 1.0));
+        return display(mix(vec3<f32>(0.25, 0.85, 0.9), vec3<f32>(0.02, 0.06, 0.35), t));
+    }
+    let t = clamp(h / 3000.0, 0.0, 1.0);
+    var c = mix(vec3<f32>(0.2, 0.55, 0.2), vec3<f32>(0.55, 0.7, 0.3), clamp(t / 0.2, 0.0, 1.0));
+    c = mix(c, vec3<f32>(0.6, 0.45, 0.25), clamp((t - 0.2) / 0.25, 0.0, 1.0));
+    c = mix(c, vec3<f32>(0.5, 0.42, 0.38), clamp((t - 0.45) / 0.3, 0.0, 1.0));
+    c = mix(c, vec3<f32>(1.0), clamp((t - 0.75) / 0.25, 0.0, 1.0));
+    return display(c);
+}
+
+fn temperature_ramp(celsius: f32) -> vec3<f32> {
+    let t = clamp((celsius + 40.0) / 80.0, 0.0, 1.0);
+    let cold = vec3<f32>(0.1, 0.25, 0.9);
+    let hot = vec3<f32>(0.9, 0.12, 0.1);
+    return display(select(mix(vec3<f32>(1.0), hot, (t - 0.5) * 2.0), mix(cold, vec3<f32>(1.0), t * 2.0), t < 0.5));
+}
+
+fn moisture_ramp(m: f32) -> vec3<f32> {
+    let t = clamp(m, 0.0, 1.0);
+    let dry = vec3<f32>(0.76, 0.65, 0.42);
+    let green = vec3<f32>(0.2, 0.6, 0.25);
+    let blue = vec3<f32>(0.1, 0.3, 0.8);
+    return display(select(mix(green, blue, (t - 0.5) * 2.0), mix(dry, green, t * 2.0), t < 0.5));
+}
+
+fn wind_colour(east: f32, north: f32) -> vec3<f32> {
+    let speed = length(vec2<f32>(east, north));
+    let angle = atan2(north, east);
+    let hue = 0.5 + 0.5 * cos(angle + vec3<f32>(0.0, 2.0943951, 4.1887902));
+    return display(hue * clamp(speed, 0.1, 1.0));
+}
+
 @fragment
 fn fs_main(input: VertexOut) -> SceneOut {
     let inst = instances[input.instance];
@@ -186,6 +228,28 @@ fn fs_main(input: VertexOut) -> SceneOut {
         debug_color = level_color(inst.face_v.w) * (0.35 + 0.65 * max(dot(n_view, l), 0.0));
     } else if mode == 8u {
         debug_color = vec3<f32>(input.blend.y, 1.0 - input.blend.x, 0.25);
+    } else if mode == 13u {
+        debug_color = elevation_ramp(input.ground);
+    } else if mode == 14u {
+        debug_color = select(display(vec3<f32>(0.45)), display(vec3<f32>(0.1, 0.3, 0.7)), water);
+    } else if mode == 18u {
+        // Page colour without light (linear; the display encodes it).
+        debug_color = albedo;
+    } else if mode >= 15u && mode <= 17u {
+        let own_c = textureSampleLevel(climate_atlas, normal_sampler, input.own_uv, input.layers.x, 0.0);
+        let parent_c = textureSampleLevel(climate_atlas, normal_sampler, input.parent_uv, input.layers.y, 0.0);
+        let climate = mix(mix(parent_c, own_c, input.blend.x), parent_c, input.blend.y);
+        // Bodies without a world map own no climate: neutral grey.
+        debug_color = display(vec3<f32>(0.25));
+        if page.a >= 0.5 {
+            if mode == 15u {
+                debug_color = temperature_ramp(climate.x);
+            } else if mode == 16u {
+                debug_color = moisture_ramp(climate.y);
+            } else {
+                debug_color = wind_colour(climate.z, climate.w);
+            }
+        }
     }
     if debug_color.x >= 0.0 {
         // Debug views bypass exposure and tonemapping (post pass clamps them).
