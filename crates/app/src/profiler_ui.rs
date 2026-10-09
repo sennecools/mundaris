@@ -4,7 +4,7 @@ use mundaris_app::{
     GravityOrbitsDemo,
     profiler::FrameSample,
     studio::{
-        profiler_view::{self, FrameTimeline, SpanStatRow},
+        profiler_view::{self, FrameTimeline, SpanKind, SpanStatRow},
         view::StatItem,
     },
 };
@@ -79,7 +79,8 @@ fn derive(profile: Arc<Value>, requested: Option<u64>) -> Derived {
             .map(|index| frames[index])
             .or(frames.last().copied())
     });
-    let timeline = selected_frame.and_then(|frame| profiler_view::frame_timeline(&profile, frame));
+    let timeline =
+        selected_frame.and_then(|frame| profiler_view::frame_timeline(&profile, frame, None));
     let hot = profiler_view::span_stats(&profile);
     Derived {
         profile: Some(profile),
@@ -169,6 +170,14 @@ fn ms(value: Option<f64>) -> String {
     value.map_or_else(|| "—".to_string(), |ms| format!("{ms:.2} ms"))
 }
 
+/// Main-thread CPU of a frame: engine work plus UI drawing.
+fn main_thread_ms(host_ms: Option<f64>, ui_ms: Option<f64>) -> Option<f64> {
+    match (host_ms, ui_ms) {
+        (None, None) => None,
+        (host, ui) => Some(host.unwrap_or(0.0) + ui.unwrap_or(0.0)),
+    }
+}
+
 /// Tick spacing that yields roughly 4–8 labelled divisions.
 fn tick_step(duration_ms: f64) -> f64 {
     [0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0]
@@ -198,6 +207,10 @@ pub fn build(demo: &mut GravityOrbitsDemo, models: &ProfilerModels) -> (Profiler
             FrameBar {
                 height: (interval / STRIP_MS).clamp(0.0, 1.0) as f32,
                 cpu: (sample.host_ms.unwrap_or(0.0) / STRIP_MS).clamp(0.0, 1.0) as f32,
+                gpu: sample
+                    .gpu_ms
+                    .map_or(0.0, |gpu| (gpu / STRIP_MS).clamp(0.005, 1.0))
+                    as f32,
                 tone: if interval > 2.0 * BUDGET_MS {
                     3
                 } else if interval > BUDGET_MS {
@@ -210,22 +223,55 @@ pub fn build(demo: &mut GravityOrbitsDemo, models: &ProfilerModels) -> (Profiler
         })
         .collect();
 
-    let timeline = &derived.timeline;
+    // The worker derives the CPU timeline; the GPU lane of a sampled frame is
+    // added here from the profiler's per-frame GPU samples.
+    let mut timeline = derived.timeline.clone();
+    if let Some(timeline) = &mut timeline
+        && let Some(gpu) = profiler.gpu_frame(timeline.frame_id)
+    {
+        profiler_view::add_gpu_lane(timeline, &gpu.scopes);
+    }
+    let full_frame = profiler.full_frame;
     let selected_span = profiler.selected_span;
-    let (lanes, spans, rows, ticks, title) = match timeline {
+    let (lanes, spans, rows, ticks, title) = match &timeline {
         Some(timeline) => {
-            let duration = timeline.duration_ms.max(1e-6);
+            // "Engine work" fits the window to engine CPU work and GPU scopes;
+            // UI drawing is shown clipped at the right edge.
+            let view = if full_frame {
+                timeline.duration_ms
+            } else {
+                timeline.work_end_ms * 1.04
+            }
+            .max(1e-3);
             let spans = timeline
                 .spans
                 .iter()
                 .enumerate()
-                .map(|(index, span)| SpanBox {
-                    x: (span.start_ms / duration) as f32,
-                    width: (span.duration_ms / duration) as f32,
-                    row: span.row as i32,
-                    name: span.name.as_str().into(),
-                    color: profiler_view::color_slot(&span.name, SPAN_COLORS) as i32,
-                    selected: Some(index) == selected_span,
+                .filter(|(_, span)| span.start_ms < view)
+                .map(|(index, span)| {
+                    let end = span.start_ms + span.duration_ms;
+                    let clipped = end > view;
+                    let precision = if span.duration_ms < 1.0 { 2 } else { 1 };
+                    SpanBox {
+                        x: (span.start_ms / view) as f32,
+                        width: ((end.min(view) - span.start_ms) / view) as f32,
+                        row: span.row as i32,
+                        name: format!(
+                            "{} {:.precision$} ms{}",
+                            span.name,
+                            span.duration_ms,
+                            if clipped { " →" } else { "" }
+                        )
+                        .into(),
+                        color: profiler_view::color_slot(&span.name, SPAN_COLORS) as i32,
+                        kind: match span.kind {
+                            SpanKind::Work => 0,
+                            SpanKind::Ui => 1,
+                            SpanKind::Gpu => 2,
+                        },
+                        clipped,
+                        selected: Some(index) == selected_span,
+                    }
                 })
                 .collect();
             let lanes = timeline
@@ -237,12 +283,12 @@ pub fn build(demo: &mut GravityOrbitsDemo, models: &ProfilerModels) -> (Profiler
                     rows: lane.rows as i32,
                 })
                 .collect();
-            let step = tick_step(duration);
+            let step = tick_step(view);
             let ticks = (0..)
                 .map(|k| f64::from(k) * step)
-                .take_while(|t| *t < duration)
+                .take_while(|t| *t < view)
                 .map(|t| Tick {
-                    x: (t / duration) as f32,
+                    x: (t / view) as f32,
                     text: if step < 1.0 {
                         format!("{t:.2} ms")
                     } else {
@@ -251,15 +297,21 @@ pub fn build(demo: &mut GravityOrbitsDemo, models: &ProfilerModels) -> (Profiler
                     .into(),
                 })
                 .collect();
+            let gpu = timeline.gpu_ms.map_or_else(
+                || "GPU not sampled".to_string(),
+                |gpu| format!("GPU {gpu:.2} ms"),
+            );
             (
                 lanes,
                 spans,
                 timeline.rows as i32,
                 ticks,
                 format!(
-                    "frame {} · {:.2} ms of main-thread work{}",
+                    "frame {} · engine {:.2} ms · UI draw {:.2} ms · other {:.2} ms · {gpu}{}",
                     timeline.frame_id,
-                    timeline.duration_ms,
+                    timeline.work_ms,
+                    timeline.ui_ms,
+                    timeline.untracked_ms,
                     if following {
                         " · following latest"
                     } else {
@@ -284,7 +336,7 @@ pub fn build(demo: &mut GravityOrbitsDemo, models: &ProfilerModels) -> (Profiler
         .copied()
         .unwrap_or_default();
     let interval_p50 = profiler.interval_percentile(0.5);
-    let engine_limit = [profiler.host_percentile(0.5), sample.gpu_ms]
+    let engine_limit = [profiler.host_percentile(0.5), profiler.gpu_percentile(0.5)]
         .into_iter()
         .flatten()
         .fold(None, |max: Option<f64>, v| {
@@ -294,8 +346,22 @@ pub fn build(demo: &mut GravityOrbitsDemo, models: &ProfilerModels) -> (Profiler
         StatItem::new("Frame", sample.frame.to_string()),
         StatItem::new("Interval", ms(sample.interval_ms)),
         StatItem::new("Engine CPU", ms(sample.host_ms)),
-        StatItem::new("GPU", ms(sample.gpu_ms)),
-        StatItem::new("UI render + vsync wait", ms(sample.ui_render_ms)),
+        StatItem::new(
+            "GPU (scene)",
+            sample
+                .gpu_ms
+                .map_or_else(|| "not sampled".to_string(), |gpu| format!("{gpu:.2} ms")),
+        ),
+        StatItem::new("UI draw (Slint)", ms(sample.ui_render_ms)),
+        StatItem::new(
+            "Bottleneck",
+            profiler_view::bottleneck(
+                sample.interval_ms,
+                main_thread_ms(sample.host_ms, sample.ui_render_ms),
+                sample.gpu_ms,
+            )
+            .label(),
+        ),
         StatItem::new(
             "Tiles produced",
             sample
@@ -319,11 +385,26 @@ pub fn build(demo: &mut GravityOrbitsDemo, models: &ProfilerModels) -> (Profiler
         .zip(selected_span)
         .and_then(|(timeline, index)| {
             let span = timeline.spans.get(index)?;
+            let lane = timeline.lanes[span.lane].name.clone();
             Some(vec![
                 StatItem::new("Name", span.name.clone()),
                 StatItem::new("Duration", format!("{:.3} ms", span.duration_ms)),
-                StatItem::new("Starts at", format!("+{:.3} ms", span.start_ms)),
-                StatItem::new("Thread", timeline.lanes[span.lane].name.clone()),
+                StatItem::new(
+                    if span.kind == SpanKind::Gpu {
+                        "After submit"
+                    } else {
+                        "Starts at"
+                    },
+                    format!("+{:.3} ms", span.start_ms),
+                ),
+                StatItem::new(
+                    if span.kind == SpanKind::Gpu {
+                        "Queue"
+                    } else {
+                        "Thread"
+                    },
+                    lane,
+                ),
                 StatItem::new("Depth", span.depth.to_string()),
             ])
         })
@@ -340,12 +421,25 @@ pub fn build(demo: &mut GravityOrbitsDemo, models: &ProfilerModels) -> (Profiler
             max: format!("{:.2}", row.max_ms).into(),
         })
         .collect();
-    let gpu_stats = [
-        StatItem::new("Scene pass", ms(gpu_passes[0])),
-        StatItem::new("Terrain draw", ms(gpu_passes[1])),
-        StatItem::new("Overlays", ms(gpu_passes[2])),
-        StatItem::new("Frame total", ms(sample.gpu_ms)),
-    ];
+    // Scopes of the selected frame when sampled, else of the latest sample.
+    let gpu_frame = selected_frame
+        .and_then(|frame| profiler.gpu_frame(frame))
+        .or_else(|| profiler.latest_gpu_frame());
+    let gpu_stats: Vec<StatItem> = match gpu_frame {
+        Some(gpu) => std::iter::once(StatItem::new("Sampled frame", gpu.frame.to_string()))
+            .chain(gpu.scopes.iter().map(|scope| {
+                StatItem::new(
+                    &format!("{}{}", "  ".repeat(usize::from(scope.depth)), scope.name),
+                    format!("{:.2} ms", scope.end_ms - scope.start_ms),
+                )
+            }))
+            .collect(),
+        None => vec![
+            StatItem::new("Scene pass", ms(gpu_passes[0])),
+            StatItem::new("Terrain draw", ms(gpu_passes[1])),
+            StatItem::new("Overlays", ms(gpu_passes[2])),
+        ],
+    };
     let enabled = profiler.enabled;
     let frozen = profiler.paused;
     let export_status = profiler.export_status().unwrap_or_default().to_string();
@@ -354,6 +448,7 @@ pub fn build(demo: &mut GravityOrbitsDemo, models: &ProfilerModels) -> (Profiler
         frozen,
         capturing,
         following,
+        full_frame,
         bars: bind(&models.bars, bars),
         budget: (BUDGET_MS / STRIP_MS) as f32,
         lanes: bind(&models.lanes, lanes),

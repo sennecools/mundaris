@@ -274,7 +274,19 @@ pub struct PerformanceSnapshot {
     pub gpu_timestamp_capability: String,
     #[serde(default)]
     pub gpu_source_frame: Option<u64>,
+    /// Timestamped scopes of the same GPU sample, relative to its GPU frame start.
+    #[serde(default)]
+    pub gpu_scopes: Vec<GpuScopeSnapshot>,
     pub upload_bytes: Option<u64>,
+}
+
+/// One GPU timestamp scope on the sampled frame's GPU clock.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GpuScopeSnapshot {
+    pub name: String,
+    pub depth: u8,
+    pub start_ms: f64,
+    pub end_ms: f64,
 }
 impl PerformanceSnapshot {
     /// Native uses `latest_completed`.
@@ -286,6 +298,17 @@ impl PerformanceSnapshot {
         self.gpu_transition_fallback_ms = profile
             .transition_fallback
             .map(|d| d.as_secs_f64() * 1000.0);
+        self.gpu_scopes = profile
+            .scopes
+            .iter()
+            .flatten()
+            .map(|scope| GpuScopeSnapshot {
+                name: scope.name.into(),
+                depth: scope.depth,
+                start_ms: scope.start.as_secs_f64() * 1000.0,
+                end_ms: scope.end.as_secs_f64() * 1000.0,
+            })
+            .collect();
         self.gpu_timing_scope = scope.into();
         self
     }

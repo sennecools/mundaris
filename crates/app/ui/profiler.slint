@@ -8,6 +8,8 @@ export struct FrameBar {
     height: float,
     // Engine CPU share of the bar (0..1 of strip height).
     cpu: float,
+    // Sampled GPU frame time (0..1 of strip height); 0 when not sampled.
+    gpu: float,
     // 0 within budget, 2 over 16.7 ms, 3 over 33.3 ms.
     tone: int,
     selected: bool,
@@ -26,6 +28,10 @@ export struct SpanBox {
     row: int,
     name: string,
     color: int,
+    // 0 CPU work, 1 UI drawing (Slint), 2 GPU scope.
+    kind: int,
+    // Clipped at the right edge of the shown window.
+    clipped: bool,
     selected: bool,
 }
 
@@ -47,6 +53,7 @@ export struct ProfilerData {
     frozen: bool,
     capturing: bool,
     following: bool,
+    full-frame: bool,
     bars: [FrameBar],
     budget: float,
     lanes: [LaneRow],
@@ -95,6 +102,11 @@ component FrameStrip inherits Rectangle {
             height: parent.height * bar.cpu;
             background: Theme.series-3;
             opacity: 0.85;
+        }
+        if bar.gpu > 0: Rectangle {
+            y: max(0px, parent.height * (1 - bar.gpu) - 1px);
+            height: 2px;
+            background: Theme.series-4;
         }
         TouchArea {
             clicked => { root.select(index); }
@@ -176,16 +188,18 @@ component Timeline inherits Rectangle {
         width: max(1px, span.width * (root.width - root.label-width));
         height: root.row-height - 2px;
         border-radius: 2px;
-        background: Palette.spans[span.color];
-        opacity: span.selected ? 1 : 0.82;
-        border-width: span.selected ? 1px : 0px;
-        border-color: Theme.text-primary;
+        background: span.kind == 1 ? Theme.surface-3
+            : span.kind == 2 ? Theme.series-4 : Palette.spans[span.color];
+        opacity: span.selected ? 1 : span.kind == 2 ? 0.6 + 0.15 * mod(span.row, 3) : 0.82;
+        border-width: span.selected || span.kind == 1 ? 1px : 0px;
+        border-color: span.selected ? Theme.text-primary : Theme.border-strong;
         if self.width > 36px: Text {
             x: 4px;
             width: parent.width - 6px;
             text: span.name;
             font-size: Theme.font-small;
-            color: #0b0e13;
+            color: span.kind == 1 ? Theme.text-secondary : #0b0e13;
+            horizontal-alignment: span.clipped ? right : left;
             vertical-alignment: center;
             overflow: elide;
         }
@@ -204,6 +218,7 @@ export component Profiler inherits Rectangle {
     callback select-frame(int);
     callback follow-latest();
     callback select-span(int);
+    callback set-full-frame(bool);
 
     background: Theme.surface-1;
     HorizontalLayout {
@@ -230,6 +245,11 @@ export component Profiler inherits Rectangle {
                     clicked => { root.follow-latest(); }
                 }
                 ToolButton {
+                    text: root.data.full-frame ? "Full frame" : "Engine work";
+                    active: !root.data.full-frame;
+                    clicked => { root.set-full-frame(!root.data.full-frame); }
+                }
+                ToolButton {
                     text: root.data.capturing ? "Stop bad-frame capture" : "Capture bad frames";
                     active: root.data.capturing;
                     clicked => { root.capture(); }
@@ -251,7 +271,7 @@ export component Profiler inherits Rectangle {
             }
             SectionHeader {
                 text: "FRAMES";
-                detail: "interval (bar) · engine CPU (green) · 16.7 ms line · click to inspect";
+                detail: "interval (bar) · engine CPU (green) · GPU (purple mark, sampled frames) · 16.7 ms line · click to inspect";
             }
             FrameStrip {
                 height: 56px;
@@ -259,7 +279,7 @@ export component Profiler inherits Rectangle {
                 budget: root.data.budget;
                 select(index) => { root.select-frame(index); }
             }
-            SectionHeader { text: "CPU TIMELINE"; detail: root.data.timeline-title; }
+            SectionHeader { text: "TIMELINE"; detail: root.data.timeline-title; }
             Timeline {
                 vertical-stretch: 1;
                 lanes: root.data.lanes;
@@ -279,7 +299,7 @@ export component Profiler inherits Rectangle {
                 for stat in root.data.frame-stats: StatRow { stat: stat; }
                 if root.data.span-detail.length > 0: SectionHeader { text: "SELECTED SPAN"; }
                 for stat in root.data.span-detail: StatRow { stat: stat; }
-                SectionHeader { text: "GPU PASSES"; }
+                SectionHeader { text: "GPU SCOPES"; detail: "selected or latest sampled frame"; }
                 for stat in root.data.gpu-stats: StatRow { stat: stat; }
                 SectionHeader { text: "HOT SPANS"; detail: "last · p50 · p95 · max (ms)"; }
                 for row in root.data.hot: HorizontalLayout {

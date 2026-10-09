@@ -3,6 +3,23 @@
 
 use serde_json::Value;
 
+use crate::developer_snapshot::GpuScopeSnapshot;
+
+/// Main-thread spans of UI toolkit drawing. They are shown in their own style
+/// and excluded from the engine-work window; surface acquire and present (the
+/// vsync wait) happen outside them and appear as untracked time.
+pub const UI_SPANS: &[&str] = &["Slint UI draw"];
+/// CPU span whose end is the queue submit; the GPU lane starts there.
+pub const SUBMIT_SPAN: &str = "GPU submission";
+pub const GPU_LANE: &str = "GPU (from submit)";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpanKind {
+    Work,
+    Ui,
+    Gpu,
+}
+
 /// One thread lane of the timeline.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimelineLane {
@@ -23,6 +40,7 @@ pub struct TimelineSpan {
     pub duration_ms: f64,
     pub name: String,
     pub depth: usize,
+    pub kind: SpanKind,
 }
 
 /// Spans of one frame across every lane, relative to the frame start.
@@ -30,6 +48,15 @@ pub struct TimelineSpan {
 pub struct FrameTimeline {
     pub frame_id: u64,
     pub duration_ms: f64,
+    /// End of the last non-UI span (CPU or GPU): the engine-work window.
+    pub work_end_ms: f64,
+    /// Top-level main-thread engine work, UI drawing, and the remaining
+    /// main-thread time (event loop, surface acquire and present).
+    pub work_ms: f64,
+    pub ui_ms: f64,
+    pub untracked_ms: f64,
+    /// GPU frame time when this frame's submission was timestamp-sampled.
+    pub gpu_ms: Option<f64>,
     pub lanes: Vec<TimelineLane>,
     pub spans: Vec<TimelineSpan>,
     pub rows: usize,
@@ -108,7 +135,14 @@ pub fn frame_ids(profile: &Value) -> Vec<u64> {
 
 /// Timeline of `frame_id`: the frame window spans every main-thread event of
 /// that frame; worker spans overlapping the window are included and clipped.
-pub fn frame_timeline(profile: &Value, frame_id: u64) -> Option<FrameTimeline> {
+/// `gpu` scopes, when this frame was sampled, form a final lane placed from the
+/// end of the CPU submit span; that is the earliest the GPU can start, so the
+/// lane shows GPU durations and order, not measured CPU/GPU clock alignment.
+pub fn frame_timeline(
+    profile: &Value,
+    frame_id: u64,
+    gpu: Option<&[GpuScopeSnapshot]>,
+) -> Option<FrameTimeline> {
     let lanes = profile["lanes"].as_array()?;
     let (start_ns, end_ns) = lanes
         .iter()
@@ -151,6 +185,11 @@ pub fn frame_timeline(profile: &Value, frame_id: u64) -> Option<FrameTimeline> {
                 duration_ms: ms(clipped_end - clipped_start),
                 name: event.name.to_string(),
                 depth: event.depth,
+                kind: if UI_SPANS.contains(&event.name) {
+                    SpanKind::Ui
+                } else {
+                    SpanKind::Work
+                },
             });
         }
         timeline_lanes.push(TimelineLane {
@@ -160,13 +199,137 @@ pub fn frame_timeline(profile: &Value, frame_id: u64) -> Option<FrameTimeline> {
         });
         next_row += rows;
     }
-    Some(FrameTimeline {
+    let duration_ms = ms(end_ns - start_ns);
+    let main_top = |kind| {
+        spans
+            .iter()
+            .filter(|s| s.lane == 0 && s.depth == 0 && s.kind == kind)
+            .map(|s| s.duration_ms)
+            .sum::<f64>()
+    };
+    let (work_ms, ui_ms) = (main_top(SpanKind::Work), main_top(SpanKind::Ui));
+    let untracked_ms = (duration_ms - work_ms - ui_ms).max(0.0);
+
+    let mut timeline = FrameTimeline {
         frame_id,
-        duration_ms: ms(end_ns - start_ns),
+        duration_ms,
+        work_end_ms: 0.0,
+        work_ms,
+        ui_ms,
+        untracked_ms,
+        gpu_ms: None,
         lanes: timeline_lanes,
         spans,
         rows: next_row,
-    })
+    };
+    timeline.work_end_ms = work_end(&timeline.spans);
+    if let Some(scopes) = gpu {
+        add_gpu_lane(&mut timeline, scopes);
+    }
+    Some(timeline)
+}
+
+/// End of the last main-thread or GPU span that is not UI drawing.
+fn work_end(spans: &[TimelineSpan]) -> f64 {
+    spans
+        .iter()
+        .filter(|s| s.kind != SpanKind::Ui && (s.lane == 0 || s.kind == SpanKind::Gpu))
+        .map(|s| s.start_ms + s.duration_ms)
+        .fold(0.0, f64::max)
+}
+
+/// Append the GPU lane for a sampled frame, placed from the end of the CPU
+/// submit span. No-op without scopes or without a submit span.
+pub fn add_gpu_lane(timeline: &mut FrameTimeline, scopes: &[GpuScopeSnapshot]) {
+    let Some(anchor) = timeline
+        .spans
+        .iter()
+        .find(|s| s.lane == 0 && s.name == SUBMIT_SPAN)
+        .map(|s| s.start_ms + s.duration_ms)
+    else {
+        return;
+    };
+    if scopes.is_empty() {
+        return;
+    }
+    let lane = timeline.lanes.len();
+    let first_row = timeline.rows;
+    let rows = scopes
+        .iter()
+        .map(|s| usize::from(s.depth) + 1)
+        .max()
+        .unwrap_or(1);
+    for scope in scopes {
+        timeline.spans.push(TimelineSpan {
+            lane,
+            row: first_row + usize::from(scope.depth),
+            start_ms: anchor + scope.start_ms,
+            duration_ms: (scope.end_ms - scope.start_ms).max(0.0),
+            name: scope.name.clone(),
+            depth: usize::from(scope.depth),
+            kind: SpanKind::Gpu,
+        });
+        timeline.duration_ms = timeline.duration_ms.max(anchor + scope.end_ms);
+    }
+    timeline.gpu_ms = scopes
+        .iter()
+        .find(|s| s.depth == 0)
+        .map(|s| s.end_ms - s.start_ms);
+    timeline.lanes.push(TimelineLane {
+        name: GPU_LANE.into(),
+        first_row,
+        rows,
+    });
+    timeline.rows += rows;
+    timeline.work_end_ms = work_end(&timeline.spans);
+}
+/// What limited a frame, judged from its own timings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bottleneck {
+    /// Main-thread CPU and GPU both finished well inside the presented interval.
+    Vsync,
+    Cpu,
+    Gpu,
+    Unknown,
+}
+
+impl Bottleneck {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Vsync => "Vsync (headroom)",
+            Self::Cpu => "CPU",
+            Self::Gpu => "GPU",
+            Self::Unknown => "—",
+        }
+    }
+}
+
+/// A frame is CPU- or GPU-bound when that side takes most of the interval;
+/// otherwise presentation (vsync) set the pace. `cpu_ms` should include UI
+/// drawing on the main thread. The GPU figure covers scene work only: the UI
+/// toolkit's own GPU composition is not timestamped.
+pub fn bottleneck(
+    interval_ms: Option<f64>,
+    cpu_ms: Option<f64>,
+    gpu_ms: Option<f64>,
+) -> Bottleneck {
+    const BOUND_SHARE: f64 = 0.8;
+    let Some(interval) = interval_ms.filter(|v| *v > 0.0) else {
+        return Bottleneck::Unknown;
+    };
+    let cpu = cpu_ms.unwrap_or(0.0);
+    let gpu = gpu_ms.unwrap_or(0.0);
+    if cpu.max(gpu) < BOUND_SHARE * interval {
+        if cpu_ms.is_none() && gpu_ms.is_none() {
+            Bottleneck::Unknown
+        } else {
+            Bottleneck::Vsync
+        }
+    } else if gpu > cpu {
+        Bottleneck::Gpu
+    } else {
+        Bottleneck::Cpu
+    }
 }
 
 /// Rolling per-name statistics, slowest p95 first.
@@ -212,7 +375,7 @@ mod tests {
                 {"worker": {"kind": "main"}, "events": [
                     {"name": "Frame", "frame_id": 7, "start_ns": 1_000_000, "end_ns": 3_000_000, "nesting_depth": 0},
                     {"name": "Simulation", "frame_id": 7, "start_ns": 1_200_000, "end_ns": 1_700_000, "nesting_depth": 1},
-                    {"name": "Slint UI render", "frame_id": 7, "start_ns": 3_100_000, "end_ns": 3_600_000, "nesting_depth": 0},
+                    {"name": "Slint UI draw", "frame_id": 7, "start_ns": 3_100_000, "end_ns": 3_600_000, "nesting_depth": 0},
                     {"name": "Frame", "frame_id": 8, "start_ns": 9_000_000, "end_ns": 9_500_000, "nesting_depth": 0}
                 ]}
             ],
@@ -225,7 +388,7 @@ mod tests {
 
     #[test]
     fn frame_window_covers_main_events_and_clips_workers() {
-        let timeline = frame_timeline(&profile(), 7).unwrap();
+        let timeline = frame_timeline(&profile(), 7, None).unwrap();
         assert!((timeline.duration_ms - 2.6).abs() < 1e-9);
         assert_eq!(timeline.lanes[0].name, "Main thread");
         assert_eq!(timeline.lanes[0].rows, 2);
@@ -244,7 +407,78 @@ mod tests {
             .find(|s| s.name == "Simulation")
             .unwrap();
         assert_eq!(simulation.row, 1);
-        assert!(frame_timeline(&profile(), 99).is_none());
+        assert!(frame_timeline(&profile(), 99, None).is_none());
+    }
+
+    #[test]
+    fn ui_draw_is_separated_and_gpu_lane_starts_at_submit() {
+        let profile = json!({"lanes": [{"worker": {"kind": "main"}, "events": [
+            {"name": "Frame", "frame_id": 3, "start_ns": 0, "end_ns": 600_000, "nesting_depth": 0},
+            {"name": "GPU submission", "frame_id": 3, "start_ns": 400_000, "end_ns": 500_000, "nesting_depth": 1},
+            {"name": "Slint UI draw", "frame_id": 3, "start_ns": 2_000_000, "end_ns": 10_000_000, "nesting_depth": 0}
+        ]}]});
+        let gpu = [
+            GpuScopeSnapshot {
+                name: "GPU frame".into(),
+                depth: 0,
+                start_ms: 0.0,
+                end_ms: 0.3,
+            },
+            GpuScopeSnapshot {
+                name: "Scene pass".into(),
+                depth: 1,
+                start_ms: 0.05,
+                end_ms: 0.25,
+            },
+        ];
+        let timeline = frame_timeline(&profile, 3, Some(&gpu)).unwrap();
+        assert!((timeline.work_ms - 0.6).abs() < 1e-9);
+        assert!((timeline.ui_ms - 8.0).abs() < 1e-9);
+        assert!((timeline.untracked_ms - 1.4).abs() < 1e-9);
+        let ui = timeline
+            .spans
+            .iter()
+            .find(|s| s.kind == SpanKind::Ui)
+            .unwrap();
+        assert_eq!(ui.name, "Slint UI draw");
+        assert_eq!(timeline.lanes.last().unwrap().name, GPU_LANE);
+        let scene = timeline
+            .spans
+            .iter()
+            .find(|s| s.name == "Scene pass")
+            .unwrap();
+        assert!(
+            (scene.start_ms - 0.55).abs() < 1e-9,
+            "submit end 0.5 + 0.05"
+        );
+        assert_eq!(scene.row, timeline.lanes.last().unwrap().first_row + 1);
+        assert!(
+            (timeline.work_end_ms - 0.8).abs() < 1e-9,
+            "GPU frame ends at 0.5 + 0.3"
+        );
+        assert_eq!(timeline.gpu_ms.map(|v| (v * 1e3).round()), Some(300.0));
+
+        let unsampled = frame_timeline(&profile, 3, None).unwrap();
+        assert!(unsampled.gpu_ms.is_none());
+        assert!((unsampled.work_end_ms - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bottleneck_compares_each_side_with_the_interval() {
+        assert_eq!(
+            bottleneck(Some(8.3), Some(0.6), Some(0.3)),
+            Bottleneck::Vsync
+        );
+        assert_eq!(
+            bottleneck(Some(20.0), Some(18.0), Some(2.0)),
+            Bottleneck::Cpu
+        );
+        assert_eq!(
+            bottleneck(Some(20.0), Some(3.0), Some(19.0)),
+            Bottleneck::Gpu
+        );
+        assert_eq!(bottleneck(Some(8.3), None, None), Bottleneck::Unknown);
+        assert_eq!(bottleneck(None, Some(1.0), None), Bottleneck::Unknown);
     }
 
     #[test]

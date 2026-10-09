@@ -234,6 +234,13 @@ fn wire_callbacks(ui: &StudioWindow) {
     ui.on_profiler_select_span(|index| {
         with_engine(|engine| engine.demo.profiler().selected_span = Some(index as usize))
     });
+    ui.on_profiler_set_full_frame(|value| {
+        with_engine(|engine| {
+            let profiler = engine.demo.profiler();
+            profiler.full_frame = value;
+            profiler.selected_span = None;
+        })
+    });
     ui.on_stop_automation(move || with_engine(|engine| engine.human_input("human_stop")));
 
     ui.on_viewport_pointer(|kind, button, x, y| {
@@ -400,11 +407,11 @@ fn main() -> Result<()> {
         .set_rendering_notifier(move |state, _api| match state {
             slint::RenderingState::BeforeRendering => {
                 render_started = Some(std::time::Instant::now());
-                // Recorded on the main lane so the timeline shows UI cost and the
-                // vsync wait inside it next to engine work.
-                render_span = Some(mundaris_app::engine_profile::span(
-                    "Slint UI render + vsync wait",
-                ));
+                // Recorded on the main lane so the timeline shows UI cost next to
+                // engine work. Slint acquires the surface before this notification
+                // and presents after AfterRendering, so the span is UI drawing and
+                // submission only (measured ~95% CPU-busy), not a vsync wait.
+                render_span = Some(mundaris_app::engine_profile::span("Slint UI draw"));
             }
             slint::RenderingState::AfterRendering => {
                 drop(render_span.take());

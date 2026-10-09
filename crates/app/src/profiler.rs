@@ -6,7 +6,7 @@ use std::{collections::VecDeque, sync::Arc, time::Instant};
 
 use serde_json::Value;
 
-use crate::developer_snapshot::DeveloperSnapshot;
+use crate::developer_snapshot::{DeveloperSnapshot, GpuScopeSnapshot};
 
 /// Frames of history kept for charts and percentiles (10 s at 60 Hz).
 pub const HISTORY_CAPACITY: usize = 600;
@@ -19,7 +19,11 @@ pub struct FrameSample {
     pub interval_ms: Option<f64>,
     pub host_ms: Option<f64>,
     pub cpu_ms: Option<f64>,
+    /// GPU frame time measured for this frame's own submission; `None` when the
+    /// single timestamp readback slot did not sample it.
     pub gpu_ms: Option<f64>,
+    /// Renderer submission of this frame, used to attribute later GPU samples.
+    pub submission: Option<u64>,
     pub ui_render_ms: Option<f64>,
     pub terrain_jobs: Option<u64>,
 }
@@ -41,11 +45,19 @@ impl FrameSample {
             interval_ms: None,
             host_ms: snapshot.performance.host_frame_ms,
             cpu_ms: snapshot.performance.frame_cpu_ms,
-            gpu_ms: snapshot.performance.gpu_frame_ms,
+            gpu_ms: None,
+            submission: snapshot.performance.native_submission_id,
             ui_render_ms: snapshot.performance.ui_render_ms,
             terrain_jobs: jobs,
         }
     }
+}
+
+/// GPU timestamp scopes of one sampled frame, relative to its GPU frame start.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GpuFrame {
+    pub frame: u64,
+    pub scopes: Vec<GpuScopeSnapshot>,
 }
 
 /// Controls shared by the Studio UI and the developer protocol.
@@ -65,7 +77,12 @@ pub struct Profiler {
     pub selected_frame: Option<u64>,
     /// Index of the selected span in the shown timeline.
     pub selected_span: Option<usize>,
+    /// Timeline spans the whole frame including UI drawing, instead of
+    /// fitting the engine work.
+    pub full_frame: bool,
     history: VecDeque<FrameSample>,
+    gpu_frames: VecDeque<GpuFrame>,
+    last_gpu_source: Option<u64>,
     last_observed: Option<Instant>,
     latest_profile: Option<Arc<Value>>,
     frozen_snapshot: Option<Arc<DeveloperSnapshot>>,
@@ -82,7 +99,10 @@ impl Default for Profiler {
             capture_stop_requested: false,
             selected_frame: None,
             selected_span: None,
+            full_frame: false,
             history: VecDeque::with_capacity(HISTORY_CAPACITY),
+            gpu_frames: VecDeque::new(),
+            last_gpu_source: None,
             last_observed: None,
             latest_profile: None,
             frozen_snapshot: None,
@@ -117,6 +137,52 @@ impl Profiler {
             interval_ms,
             ..FrameSample::from_snapshot(snapshot)
         });
+        self.attribute_gpu(snapshot);
+    }
+
+    /// GPU timings complete a few frames after submission; attach each new
+    /// sample to the retained frame that submitted it.
+    fn attribute_gpu(&mut self, snapshot: &DeveloperSnapshot) {
+        let performance = &snapshot.performance;
+        if let Some(source) = performance.gpu_source_frame {
+            self.attribute_gpu_sample(source, performance.gpu_frame_ms, &performance.gpu_scopes);
+        }
+    }
+
+    fn attribute_gpu_sample(
+        &mut self,
+        source: u64,
+        gpu_ms: Option<f64>,
+        scopes: &[GpuScopeSnapshot],
+    ) {
+        if self.last_gpu_source.replace(source) == Some(source) {
+            return;
+        }
+        let Some(sample) = self
+            .history
+            .iter_mut()
+            .rev()
+            .find(|sample| sample.submission == Some(source))
+        else {
+            return;
+        };
+        sample.gpu_ms = gpu_ms;
+        if self.gpu_frames.len() == HISTORY_CAPACITY {
+            self.gpu_frames.pop_front();
+        }
+        self.gpu_frames.push_back(GpuFrame {
+            frame: sample.frame,
+            scopes: scopes.to_vec(),
+        });
+    }
+
+    pub fn latest_gpu_frame(&self) -> Option<&GpuFrame> {
+        self.gpu_frames.back()
+    }
+
+    /// GPU scopes measured for `frame`, if that frame was sampled.
+    pub fn gpu_frame(&self, frame: u64) -> Option<&GpuFrame> {
+        self.gpu_frames.iter().rev().find(|gpu| gpu.frame == frame)
     }
 
     /// Retain the latest CPU profile payload at the caller's bounded cadence.
@@ -135,6 +201,11 @@ impl Profiler {
     /// Percentile of host frame time over the retained history.
     pub fn host_percentile(&self, fraction: f64) -> Option<f64> {
         percentile(self.history.iter().filter_map(|s| s.host_ms), fraction)
+    }
+
+    /// Percentile of sampled GPU frame time over the retained history.
+    pub fn gpu_percentile(&self, fraction: f64) -> Option<f64> {
+        percentile(self.history.iter().filter_map(|s| s.gpu_ms), fraction)
     }
 
     /// Percentile of the wall-clock interval between frames.
@@ -225,5 +296,33 @@ mod tests {
         assert_eq!(profiler.host_percentile(0.5), Some(20.0));
         assert_eq!(profiler.host_percentile(1.0), Some(30.0));
         assert_eq!(Profiler::default().host_percentile(0.5), None);
+    }
+
+    #[test]
+    fn gpu_samples_attach_to_the_submitting_frame_once() {
+        let mut profiler = Profiler::default();
+        for frame in 10..14 {
+            profiler.history.push_back(FrameSample {
+                frame,
+                submission: Some(frame + 100),
+                ..Default::default()
+            });
+        }
+        let scopes = [GpuScopeSnapshot {
+            name: "GPU frame".into(),
+            depth: 0,
+            start_ms: 0.0,
+            end_ms: 0.4,
+        }];
+        profiler.attribute_gpu_sample(111, Some(0.4), &scopes);
+        // The same completed sample is reported again on later frames.
+        profiler.attribute_gpu_sample(111, Some(0.4), &scopes);
+        let gpu: Vec<_> = profiler.history().map(|s| s.gpu_ms).collect();
+        assert_eq!(gpu, [None, Some(0.4), None, None]);
+        assert_eq!(profiler.gpu_frame(11).map(|g| g.scopes.len()), Some(1));
+        assert!(profiler.gpu_frame(12).is_none());
+        // A submission no longer retained is dropped, not misattributed.
+        profiler.attribute_gpu_sample(42, Some(9.0), &scopes);
+        assert_eq!(profiler.gpu_percentile(1.0), Some(0.4));
     }
 }

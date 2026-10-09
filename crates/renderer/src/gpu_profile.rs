@@ -39,6 +39,67 @@ pub struct GpuProfile {
     pub remaining_celestial: Option<std::time::Duration>,
     /// Distant background and finite-star draws only, excluding upload/readback.
     pub sky: Option<std::time::Duration>,
+    /// Measured scopes placed relative to the start of the sampled GPU frame
+    /// (the frame scope when present, else the earliest scope), in nesting order.
+    pub scopes: [Option<GpuScopeSpan>; GPU_SCOPE_SLOTS],
+}
+
+/// One timestamped GPU scope on the sampled frame's own GPU clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuScopeSpan {
+    pub name: &'static str,
+    /// 0 frame, 1 render pass, 2 scope inside a pass.
+    pub depth: u8,
+    pub start: std::time::Duration,
+    pub end: std::time::Duration,
+}
+
+pub const GPU_SCOPE_SLOTS: usize = 6;
+
+/// (mask bit and query pair, name, depth) of every scope the timeline shows.
+const TIMELINE_SCOPES: [(usize, &str, u8); GPU_SCOPE_SLOTS] = [
+    (FRAME_QUERY_PAIR, "GPU frame", 0),
+    (0, "Scene pass", 1),
+    (8, "Sky", 2),
+    (7, "Body spheres", 2),
+    (3, "Terrain", 2),
+    (2, "Overlay pass", 1),
+];
+
+fn scope_spans(
+    ticks: &[u64],
+    period_nanoseconds: f32,
+    scope_mask: u16,
+) -> [Option<GpuScopeSpan>; GPU_SCOPE_SLOTS] {
+    let pair = |pair: usize| {
+        let start = *ticks.get(pair * 2)?;
+        let end = *ticks.get(pair * 2 + 1)?;
+        (scope_mask & (1u16 << pair) != 0 && end >= start).then_some((start, end))
+    };
+    let origin = pair(FRAME_QUERY_PAIR).map(|(start, _)| start).or_else(|| {
+        TIMELINE_SCOPES
+            .iter()
+            .filter_map(|&(index, ..)| pair(index).map(|(start, _)| start))
+            .min()
+    });
+    let to_duration = |ticks: u64| {
+        let ns = ticks as f64 * f64::from(period_nanoseconds);
+        (ns.is_finite() && ns >= 0.0).then(|| std::time::Duration::from_nanos(ns.round() as u64))
+    };
+    TIMELINE_SCOPES.map(|(index, name, depth)| {
+        let origin = origin?;
+        let (start, end) = pair(index)?;
+        if index == 8 && start == end {
+            return None; // Cold-query sky sentinel, as in `decode`.
+        }
+        // A scope before the frame origin is not comparable on this clock.
+        Some(GpuScopeSpan {
+            name,
+            depth,
+            start: to_duration(start.checked_sub(origin)?)?,
+            end: to_duration(end.checked_sub(origin)?)?,
+        })
+    })
 }
 
 /// Low-cost counters describing timestamp query requests and asynchronous
@@ -167,6 +228,7 @@ pub(crate) fn decode(ticks: &[u64], period_nanoseconds: f32, scope_mask: u16) ->
         // A zero elapsed interval cannot establish sky work on the cold query;
         // retain unavailable semantics rather than publishing a fabricated win.
         sky: scoped(8, 8).filter(|elapsed| !elapsed.is_zero()),
+        scopes: scope_spans(ticks, period_nanoseconds, scope_mask),
     }
 }
 
@@ -454,6 +516,40 @@ mod tests {
         assert_eq!(profile.celestial_pass, two_ns);
         assert_eq!(profile.terrain, two_ns);
         assert_eq!(profile.sky, two_ns);
+    }
+
+    #[test]
+    fn scopes_are_placed_relative_to_the_frame_start() {
+        let mut ticks = vec![0u64; QUERY_COUNT as usize];
+        let mut set = |pair: usize, start: u64, end: u64| {
+            ticks[pair * 2] = start;
+            ticks[pair * 2 + 1] = end;
+        };
+        set(FRAME_QUERY_PAIR, 1000, 1400);
+        set(0, 1010, 1300); // scene pass
+        set(3, 1100, 1250); // terrain inside it
+        set(2, 1300, 1390); // overlay pass
+        set(7, 900, 950); // sphere scope, masked out below
+        let mask = FRAME_SCOPE_BIT | 1 | (1 << 2) | (1 << 3);
+        let scopes = decode(&ticks, 2.0, mask).scopes;
+        let get = |name| scopes.iter().flatten().find(|s| s.name == name).copied();
+        let ns = std::time::Duration::from_nanos;
+        assert_eq!(
+            get("GPU frame").map(|s| (s.start, s.end)),
+            Some((ns(0), ns(800)))
+        );
+        assert_eq!(
+            get("Terrain").map(|s| (s.start, s.end, s.depth)),
+            Some((ns(200), ns(500), 2))
+        );
+        assert_eq!(get("Overlay pass").map(|s| s.start), Some(ns(600)));
+        assert!(get("Body spheres").is_none(), "unmasked scope ignored");
+        assert!(get("Sky").is_none());
+
+        // Without the frame scope the earliest scope is the origin.
+        let scopes = decode(&ticks, 1.0, 1 | (1 << 3)).scopes;
+        assert_eq!(scopes[1].map(|s| s.start), Some(ns(0)));
+        assert_eq!(scopes[4].map(|s| s.start), Some(ns(90)));
     }
 
     #[test]

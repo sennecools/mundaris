@@ -601,6 +601,7 @@ export component StudioWindow inherits Window {
     callback profiler-select-frame(int);
     callback profiler-follow-latest();
     callback profiler-select-span(int);
+    callback profiler-set-full-frame(bool);
     in property <[LogLine]> log-lines;
 
     // Status bar
@@ -687,6 +688,7 @@ export component StudioWindow inherits Window {
                         select-frame(index) => { root.profiler-select-frame(index); }
                         follow-latest => { root.profiler-follow-latest(); }
                         select-span(index) => { root.profiler-select-span(index); }
+                        set-full-frame(value) => { root.profiler-set-full-frame(value); }
                     }
                     if root.bottom-tab == 1: LogView {
                         vertical-stretch: 1;

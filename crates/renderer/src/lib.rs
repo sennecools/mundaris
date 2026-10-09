@@ -27,7 +27,7 @@ pub use celestial_view::*;
 pub use cpu_profile::CpuStageTimer;
 pub use debug::{DebugFrame, DebugLine, DebugProjection, DebugStaging};
 pub use gpu_profile::{
-    CpuUploadProfile, GpuProfile, TimestampAvailability, TimestampProfilingMetrics,
+    CpuUploadProfile, GpuProfile, GpuScopeSpan, TimestampAvailability, TimestampProfilingMetrics,
 };
 pub use terrain_atlas::{
     ATLAS_BOUNDS_GRID, AtlasBounds, AtlasChart, AtlasFieldsConstants, AtlasImageLevel,
@@ -109,7 +109,9 @@ impl GpuContext {
     }
 
     async fn new_async() -> Result<Self, RendererError> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        // WGPU_BACKEND and related variables may select a backend for diagnosis.
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
