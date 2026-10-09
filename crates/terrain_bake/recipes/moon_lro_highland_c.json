@@ -68,7 +68,7 @@
         "sources": [
           {
             "product": "APOLLO14",
-            "path": "D:/Mundaris/target/reference-dem/lroc/NAC_DTM_APOLLO14.TIF",
+            "path": "D:/Astrum/target/reference-dem/lroc/NAC_DTM_APOLLO14.TIF",
             "sha256": "e16502e2fae009e694c1e650f87856bf7c02924b917b98a0b22c533e12e07b3f",
             "windows": [
               [
@@ -115,7 +115,7 @@
           },
           {
             "product": "APOLLO16",
-            "path": "D:/Mundaris/target/reference-dem/lroc/NAC_DTM_APOLLO16.TIF",
+            "path": "D:/Astrum/target/reference-dem/lroc/NAC_DTM_APOLLO16.TIF",
             "sha256": "27600cea35c19e53039affe5782828482f3590ef6f4654181557dcaf4b4359fd",
             "windows": [
               [

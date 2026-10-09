@@ -68,7 +68,7 @@
         "sources": [
           {
             "product": "GIORDNBRNO4",
-            "path": "D:/Mundaris/target/reference-dem/lroc/NAC_DTM_GIORDNBRNO4.TIF",
+            "path": "D:/Astrum/target/reference-dem/lroc/NAC_DTM_GIORDNBRNO4.TIF",
             "sha256": "3c7c488f343318f9ca855725546d66dbde1af28ceb438e495b18eb5d91cd770c",
             "windows": [
               [
@@ -115,7 +115,7 @@
           },
           {
             "product": "VIRTANEN1",
-            "path": "D:/Mundaris/target/reference-dem/lroc/NAC_DTM_VIRTANEN1.TIF",
+            "path": "D:/Astrum/target/reference-dem/lroc/NAC_DTM_VIRTANEN1.TIF",
             "sha256": "9ee87e18632dc1483cf8bef91d7b852ad1d6da0ccb91df90858bb0ffcfc68549",
             "windows": [
               [

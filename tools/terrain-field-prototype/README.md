@@ -10,17 +10,17 @@ planet rendering remain separate work.
 Run in PowerShell 7:
 
 ```powershell
-& D:/Mundaris/worktrees/procedural-terrain-data/tools/terrain-field-prototype/scripts/start-authoring.ps1 -Background
+& D:/Astrum/worktrees/procedural-terrain-data/tools/terrain-field-prototype/scripts/start-authoring.ps1 -Background
 ```
 
 The launcher builds with the package lockfile, starts the service on
 [127.0.0.1:4179](http://127.0.0.1:4179/), and prints its process receipt. Open that
-URL. Build output stays in `D:/Mundaris/target/procedural-terrain-data`; default
-export bundles go to `D:/Mundaris/target/terrain-authoring/exports`. Use
+URL. Build output stays in `D:/Astrum/target/procedural-terrain-data`; default
+export bundles go to `D:/Astrum/target/terrain-authoring/exports`. Use
 `-OutputRoot` to choose another export directory, `-Port` if the default is busy,
 and `-NoBuild` to reuse the current binary. Without `-Background`, the service runs
 in the terminal until Ctrl+C. Background process receipts and logs are under
-`D:/Mundaris/target/terrain-authoring/logs`.
+`D:/Astrum/target/terrain-authoring/logs`.
 
 Stop only the process identified by your receipt, after confirming that its
 executable is the authoring tool. A browser tab closing does not stop the service.
@@ -75,12 +75,12 @@ does not simulate erosion, hydrology, climate circulation, or geological history
 From this directory, with the workspace's pinned Rust toolchain:
 
 ```powershell
-$env:CARGO_TARGET_DIR='D:/Mundaris/target/procedural-terrain-data'
+$env:CARGO_TARGET_DIR='D:/Astrum/target/procedural-terrain-data'
 cargo test --locked
-cargo run --locked -- export recipes/airless-rocky.json D:/Mundaris/ai/tasks/2026-10-08-procedural-terrain-data/exports/airless-rocky-32 32
-cargo run --locked -- verify D:/Mundaris/ai/tasks/2026-10-08-procedural-terrain-data/exports/airless-rocky-32
-cargo run --locked -- export recipes/temperate-highlands.json D:/Mundaris/ai/tasks/2026-10-08-procedural-terrain-data/exports/temperate-highlands-16 16
-cargo run --locked -- verify D:/Mundaris/ai/tasks/2026-10-08-procedural-terrain-data/exports/temperate-highlands-16
+cargo run --locked -- export recipes/airless-rocky.json D:/Astrum/ai/tasks/2026-10-08-procedural-terrain-data/exports/airless-rocky-32 32
+cargo run --locked -- verify D:/Astrum/ai/tasks/2026-10-08-procedural-terrain-data/exports/airless-rocky-32
+cargo run --locked -- export recipes/temperate-highlands.json D:/Astrum/ai/tasks/2026-10-08-procedural-terrain-data/exports/temperate-highlands-16 16
+cargo run --locked -- verify D:/Astrum/ai/tasks/2026-10-08-procedural-terrain-data/exports/temperate-highlands-16
 ```
 
 The lockfile is included; `cargo generate-lockfile` was used once when creating

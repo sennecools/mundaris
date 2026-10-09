@@ -29,8 +29,8 @@
           { "patch_px": 48, "overlap_px": 16, "candidates": 4000, "feather_px": 5 }
         ],
         "sources": [
-          { "product": "MRECRISIUM2", "path": "D:/Mundaris/target/reference-dem/lroc/NAC_DTM_MRECRISIUM2.TIF", "sha256": "ad6545e005ffb24cb151a4c2aca056997345b884e8289dead50c9abbd311bb64", "windows": [[512, 6656, 2048], [512, 512, 2048], [768, 11520, 1024], [1280, 13056, 1024], [256, 13056, 1024], [256, 9728, 1024], [1280, 10496, 1024], [1280, 9472, 1024], [256, 8704, 1024]] },
-          { "product": "APOLLO11", "path": "D:/Mundaris/target/reference-dem/lroc/NAC_DTM_APOLLO11.TIF", "sha256": "920da622e3d7c3f047c67a970b5429aaadf00f886804e3fc6c72f6e5298043e9", "windows": [[768, 10496, 1024], [256, 1536, 1024], [512, 2816, 1024], [512, 4096, 1024], [1024, 9216, 1024], [512, 12032, 1024], [1024, 8192, 1024], [1024, 512, 1024], [1024, 5120, 1024]] }
+          { "product": "MRECRISIUM2", "path": "D:/Astrum/target/reference-dem/lroc/NAC_DTM_MRECRISIUM2.TIF", "sha256": "ad6545e005ffb24cb151a4c2aca056997345b884e8289dead50c9abbd311bb64", "windows": [[512, 6656, 2048], [512, 512, 2048], [768, 11520, 1024], [1280, 13056, 1024], [256, 13056, 1024], [256, 9728, 1024], [1280, 10496, 1024], [1280, 9472, 1024], [256, 8704, 1024]] },
+          { "product": "APOLLO11", "path": "D:/Astrum/target/reference-dem/lroc/NAC_DTM_APOLLO11.TIF", "sha256": "920da622e3d7c3f047c67a970b5429aaadf00f886804e3fc6c72f6e5298043e9", "windows": [[768, 10496, 1024], [256, 1536, 1024], [512, 2816, 1024], [512, 4096, 1024], [1024, 9216, 1024], [512, 12032, 1024], [1024, 8192, 1024], [1024, 512, 1024], [1024, 5120, 1024]] }
         ]
       }
     }

@@ -70,7 +70,7 @@ function Get-ContentSnapshot {
 }
 
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
-    $evidenceBase = 'D:\Mundaris\ai\tasks\2026-10-08-generation-optimization\evidence\shared-test-system'
+    $evidenceBase = 'D:\Astrum\ai\tasks\2026-10-08-generation-optimization\evidence\shared-test-system'
     $stamp = [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss-fff')
     $OutputDirectory = Join-Path $evidenceBase ("$stamp-" + [Guid]::NewGuid().ToString('N'))
 } elseif (-not [IO.Path]::IsPathRooted($OutputDirectory)) {

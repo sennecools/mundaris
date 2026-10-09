@@ -68,7 +68,7 @@
         "sources": [
           {
             "product": "APOLLO16",
-            "path": "D:/Mundaris/target/reference-dem/lroc/NAC_DTM_APOLLO16.TIF",
+            "path": "D:/Astrum/target/reference-dem/lroc/NAC_DTM_APOLLO16.TIF",
             "sha256": "27600cea35c19e53039affe5782828482f3590ef6f4654181557dcaf4b4359fd",
             "windows": [
               [

@@ -2,14 +2,14 @@
 [CmdletBinding()]
 param(
     [ValidateRange(1024, 65535)][int] $Port = 4179,
-    [string] $OutputRoot = 'D:/Mundaris/target/terrain-authoring/exports',
+    [string] $OutputRoot = 'D:/Astrum/target/terrain-authoring/exports',
     [switch] $NoBuild,
     [switch] $Background
 )
 
 $ErrorActionPreference = 'Stop'
 $packageRoot = Split-Path -Parent $PSScriptRoot
-$buildRoot = 'D:/Mundaris/target/procedural-terrain-data'
+$buildRoot = 'D:/Astrum/target/procedural-terrain-data'
 $env:CARGO_TARGET_DIR = $buildRoot
 $binaryPath = Join-Path $buildRoot 'debug/terrain-field-prototype.exe'
 $manifestPath = Join-Path $packageRoot 'Cargo.toml'
@@ -34,12 +34,12 @@ if (-not $Background) {
     return
 }
 
-$logRoot = 'D:/Mundaris/target/terrain-authoring/logs'
+$logRoot = 'D:/Astrum/target/terrain-authoring/logs'
 New-Item -ItemType Directory -Path $logRoot -Force | Out-Null
 $runId = [System.Guid]::NewGuid().ToString('N')
 $stdoutPath = Join-Path $logRoot "$runId.stdout.log"
 $stderrPath = Join-Path $logRoot "$runId.stderr.log"
-$process = Start-Process -FilePath $binaryPath -ArgumentList @('serve', ('"' + $outputPath + '"'), $Port.ToString()) -WorkingDirectory 'D:/Mundaris' -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
+$process = Start-Process -FilePath $binaryPath -ArgumentList @('serve', ('"' + $outputPath + '"'), $Port.ToString()) -WorkingDirectory 'D:/Astrum' -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
 $receipt = [pscustomobject]@{
     pid = $process.Id
     binary = $binaryPath
