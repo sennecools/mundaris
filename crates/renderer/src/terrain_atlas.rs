@@ -850,18 +850,30 @@ impl TerrainAtlasRenderer {
                 immediate_size: 0,
             });
         let compute = |entry| {
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            let started = std::time::Instant::now();
+            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(entry),
                 layout: Some(&produce_pipeline_layout),
                 module: &produce_shader,
                 entry_point: Some(entry),
                 compilation_options: Default::default(),
                 cache: None,
-            })
+            });
+            log_pipeline_time(entry, started);
+            pipeline
         };
-        let produce_heights = compute("produce_heights");
-        let produce_normals = compute("produce_normals");
-        let produce_collision = compute("produce_collision");
+        // Driver compilation of the large producer shader takes seconds per
+        // entry point on a cold cache: compile the three in parallel.
+        let (produce_heights, produce_normals, produce_collision) = std::thread::scope(|scope| {
+            let normals = scope.spawn(|| compute("produce_normals"));
+            let collision = scope.spawn(|| compute("produce_collision"));
+            let heights = compute("produce_heights");
+            (
+                heights,
+                normals.join().expect("pipeline thread"),
+                collision.join().expect("pipeline thread"),
+            )
+        });
         let tiles = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Terrain atlas producer jobs"),
             size: TILE_BYTES * MAX_TILE_SLOTS as u64,
@@ -1223,6 +1235,7 @@ impl TerrainAtlasRenderer {
             label: Some("Terrain plants cull"),
             source: wgpu::ShaderSource::Wgsl(CULL_SHADER.into()),
         });
+        let started = std::time::Instant::now();
         let scatter_cull = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Terrain plants cull"),
             layout: Some(&cull_layout),
@@ -1231,6 +1244,7 @@ impl TerrainAtlasRenderer {
             compilation_options: Default::default(),
             cache: None,
         });
+        log_pipeline_time("cs_scatter", started);
         let scatter_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Terrain scatter (prototype trees and boulders)"),
             layout: Some(&scatter_draw_layout),
@@ -2847,6 +2861,14 @@ fn upload_source(
         world_fields: None,
         hydrology,
     })
+}
+
+/// `ASTRUM_PIPELINE_TIMING=1` prints how long each slow pipeline took to
+/// create (driver shader compilation; cached by the driver afterwards).
+fn log_pipeline_time(name: &str, started: std::time::Instant) {
+    if std::env::var_os("ASTRUM_PIPELINE_TIMING").is_some() {
+        eprintln!("pipeline {name}: {:.0} ms", started.elapsed().as_secs_f64() * 1e3);
+    }
 }
 
 /// PROTOTYPE (M5 Life): `ASTRUM_NO_SCATTER=1` turns the plant draw off (for

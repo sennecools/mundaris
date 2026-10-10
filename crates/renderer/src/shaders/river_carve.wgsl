@@ -15,6 +15,9 @@ struct RiverCarve {
     gradient: vec3<f32>,
     // Water surface (m), or -1e30 without water.
     water: f32,
+    // 0..1: inside a river's riparian corridor (wetter ground, gallery
+    // forests), strongest on the banks of large rivers.
+    riparian: f32,
 }
 
 fn river_vertex(v: u32) -> u32 {
@@ -24,6 +27,14 @@ fn river_vertex(v: u32) -> u32 {
 fn river_position(v: u32) -> vec3<f32> {
     let b = river_vertex(v);
     return vec3<f32>(rivers_f32(b), rivers_f32(b + 1u), rivers_f32(b + 2u));
+}
+
+// 0.45..1.55 from a vertex index (integer hash).
+fn river_swell(v: u32) -> f32 {
+    var x = v * 747796405u + 2891336453u;
+    x = ((x >> ((x >> 28u) + 4u)) ^ x) * 277803737u;
+    x = (x >> 22u) ^ x;
+    return 0.45 + 1.1 * f32(x >> 8u) / 16777216.0;
 }
 
 fn river_cell(d: vec3<f32>, cells: u32) -> u32 {
@@ -41,6 +52,7 @@ fn river_carve(d: vec3<f32>, h: f32, gradient: vec3<f32>, ribbon_m: f32) -> Rive
     out.height = h;
     out.gradient = gradient;
     out.water = -1.0e30;
+    out.riparian = 0.0;
     if arrayLength(&world_rivers) < 16u || world_rivers[7u] == 0u {
         return out;
     }
@@ -118,6 +130,13 @@ fn river_carve(d: vec3<f32>, h: f32, gradient: vec3<f32>, ribbon_m: f32) -> Rive
             let width_term = select(0.0, (h - bed) * dprofile * x / (span * side_slope), cut_sets_width);
             out.gradient = gradient * (profile - width_term) + away * ((h - bed) * dprofile * radius / span);
         }
+        // Corridor width grows with the river; small streams get a thin one.
+        // Per-vertex hashed widening, interpolated along the segment so the
+        // corridor stays continuous but swells and narrows like real galleries.
+        let swell = mix(river_swell(s), river_swell(down), t);
+        let corridor = clamp(25.0 * width, 120.0, 2500.0) * swell;
+        let size = smoothstep(2.0, 40.0, width);
+        out.riparian = max(out.riparian, size * (1.0 - smoothstep(0.1 * corridor, corridor, distance)));
         if distance <= max(edge, ribbon_m) {
             var surface = bed + depth;
             if distance > edge {
