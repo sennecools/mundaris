@@ -5,11 +5,11 @@ use std::path::Path;
 use astrum_flora::genome::{GrowthForm, OrganKind};
 use astrum_flora::metrics::Bands;
 use astrum_flora::params::{ParamKind, ParamValue, Params};
-use astrum_flora::{Genome, Kit, SpeciesFile, grow_plant, load_species_dir, variant_seed};
+use astrum_flora::{Genome, Kit, SpeciesFile, grow_plant, load_species_for_body, variant_seed};
 
 fn species() -> Vec<SpeciesFile> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content/flora/species");
-    load_species_dir(&dir).unwrap()
+    load_species_for_body(&dir, &dir.join("../planets"), "rust").unwrap()
 }
 
 fn fnv(bytes: &[u8]) -> u64 {
@@ -50,7 +50,7 @@ fn same_seed_same_bytes() {
 /// `powf`/`sin`/`cos`, which are not guaranteed bit-identical across
 /// platforms (genesis §9.3 determinism scope is still open). Update the
 /// constant deliberately when the grower changes.
-const GOLDEN_BUSHEL_12345: u64 = 0x4ceb_5c98_827d_4ef3;
+const GOLDEN_BUSHEL_12345: u64 = 0xac6b_2aca_8c42_8679;
 
 #[test]
 fn golden_seed() {
@@ -84,7 +84,11 @@ fn species_pass_scorer_bands() {
 fn species_roundtrip_ron() {
     for sp in species() {
         let text = sp.to_ron();
-        assert_eq!(SpeciesFile::from_ron(&text).unwrap(), sp);
+        // The resolved look is derived (palette), not stored.
+        let mut expected = sp.clone();
+        expected.look = Default::default();
+        assert_eq!(SpeciesFile::from_ron(&text).unwrap(), expected);
+        assert!(!text.contains("look"), "{text}");
     }
 }
 

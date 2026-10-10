@@ -14,6 +14,7 @@ pub mod hash;
 pub mod kit;
 pub mod mesh;
 pub mod niche;
+pub mod palette;
 pub mod metrics;
 pub mod params;
 pub mod raster;
@@ -85,4 +86,17 @@ pub fn load_species_dir(dir: &std::path::Path) -> Result<Vec<SpeciesFile>, Strin
             SpeciesFile::from_ron(&text).map_err(|e| format!("{}: {e}", p.display()))
         })
         .collect()
+}
+
+/// Species of `species_dir` coloured by the palette of `body`'s planet file
+/// in `planets_dir` (species keep the neutral look when it is missing).
+pub fn load_species_for_body(
+    species_dir: &std::path::Path,
+    planets_dir: &std::path::Path,
+    body: &str,
+) -> Result<Vec<SpeciesFile>, String> {
+    let mut species = load_species_dir(species_dir)?;
+    let planet = palette::load_planet(planets_dir, body)?;
+    palette::apply(&mut species, &planet);
+    Ok(species)
 }

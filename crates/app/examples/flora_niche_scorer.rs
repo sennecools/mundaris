@@ -18,7 +18,7 @@ use std::fmt::Write as _;
 use astrum_app::shared_system::SharedTestSystem;
 use astrum_flora::niche::{Layer, Site};
 use astrum_flora::scatter::Placement;
-use astrum_flora::{SpeciesFile, load_species_dir};
+use astrum_flora::{SpeciesFile, load_species_for_body};
 use astrum_world::terrain::SurfaceGenerator;
 use astrum_world::terrain::producer::ProducerRecipe;
 use glam::DVec3;
@@ -63,7 +63,12 @@ fn main() {
     let out = std::path::PathBuf::from(args.get(2).map(String::as_str).unwrap_or("target/flora-niche"));
     std::fs::create_dir_all(&out).unwrap();
     let species_dir = args.get(3).map(String::as_str).unwrap_or("content/flora/species");
-    let species: Vec<SpeciesFile> = load_species_dir(std::path::Path::new(species_dir)).unwrap();
+    let species: Vec<SpeciesFile> = load_species_for_body(
+        std::path::Path::new(species_dir),
+        std::path::Path::new("content/flora/planets"),
+        &body_name.to_lowercase(),
+    )
+    .unwrap();
     let placement = Placement { species: &species };
     let ns = species.len();
 

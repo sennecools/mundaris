@@ -4,7 +4,7 @@
 
 use astrum_flora::niche::{Layer, Site};
 use astrum_flora::scatter::{Placement, species_wgsl, value};
-use astrum_flora::{SpeciesFile, load_species_dir};
+use astrum_flora::{SpeciesFile, load_species_for_body};
 use astrum_renderer::GpuContext;
 use wgpu::util::DeviceExt;
 
@@ -13,7 +13,7 @@ const NICHE: &str = include_str!("../src/shaders/scatter_niche.wgsl");
 
 fn species() -> Vec<SpeciesFile> {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content/flora/species");
-    load_species_dir(&dir).unwrap()
+    load_species_for_body(&dir, &dir.join("../planets"), "rust").unwrap()
 }
 
 #[test]

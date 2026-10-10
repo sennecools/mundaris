@@ -20,7 +20,7 @@
 use std::sync::{Arc, OnceLock};
 
 use astrum_flora::scatter::{MAX_SPECIES, species_wgsl, splice_species};
-use astrum_flora::{Kit, LOD_COUNT, Mesh, SpeciesFile, grow_meshes, load_species_dir, variant_seed};
+use astrum_flora::{Kit, LOD_COUNT, Mesh, SpeciesFile, grow_meshes, load_species_for_body, variant_seed};
 use wgpu::util::DeviceExt;
 
 /// Grown variants per species (`FLORA_VARIANTS` in scatter_cull.wgsl).
@@ -54,7 +54,9 @@ struct Grown {
 
 fn grow_all() -> Grown {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content/flora/species");
-    let mut species: Vec<SpeciesFile> = match load_species_dir(&dir) {
+    // PROTOTYPE: Rust is the only body with life; its planet file sets the palette.
+    let planets = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content/flora/planets");
+    let mut species: Vec<SpeciesFile> = match load_species_for_body(&dir, &planets, "rust") {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!("flora: {e}; using the built-in niche table and procedural plants");

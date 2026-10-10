@@ -23,6 +23,12 @@ pub struct SpeciesFile {
     pub name: String,
     pub genome: Genome,
     pub niche: crate::niche::Niche,
+    /// Hand-set colours replacing the planet palette (art direction only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub look_override: Option<Look>,
+    /// Resolved colours: the planet palette (`palette::apply`) or the
+    /// override. Not stored.
+    #[serde(skip)]
     pub look: Look,
 }
 
@@ -196,8 +202,7 @@ pub struct Genome {
     pub fruit_chance: f64,
 }
 
-/// PROTOTYPE colours (linear RGB) until the G1 palette derives them from the
-/// star spectrum.
+/// Species colours (linear RGB), from the planet palette (`palette.rs`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Look {
@@ -369,6 +374,13 @@ const GENOME_PARAMS: &[ParamDesc<Genome>] = genome_params! {
 impl Params for Genome {
     fn descriptors() -> &'static [ParamDesc<Self>] {
         GENOME_PARAMS
+    }
+}
+
+impl Default for Look {
+    /// Neutral greens, used until a planet palette is applied.
+    fn default() -> Self {
+        Look { bark: [0.1, 0.07, 0.05], organ: [0.035, 0.1, 0.03], organ_tip: [0.12, 0.19, 0.035], accent: [0.5, 0.05, 0.3] }
     }
 }
 

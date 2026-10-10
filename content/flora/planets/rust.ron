@@ -1,0 +1,18 @@
+// Life on Rust (genesis design §2–§3): the inputs of the planet palette.
+// PROTOTYPE: the star's effective temperature lives here until the scene
+// carries stellar data (Sol is Sun-like: 5772 K; the sun colour in
+// content/lighting.json is consistent with it).
+PlanetLife(
+    schema: 1,
+    body: "rust",
+    star_temperature_k: 5772.0,
+    // Earth-like air (Rust has oceans, rain and forests).
+    atmosphere: (pressure_bar: 0.9, composition: NitrogenOxygen),
+    // content/lighting.json body albedo of Rust.
+    ground_albedo: (0.26, 0.15, 0.09),
+    seed: 7,
+    // User decision 2026-10-10: a per-planet dial, Rust about 0.4; the look
+    // is plausible but stylised.
+    strangeness: 0.4,
+    realism: 0.5,
+)

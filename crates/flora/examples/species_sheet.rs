@@ -2,7 +2,7 @@
 //! first seed, with metrics printed under each plant.
 //!
 //! cargo run -p astrum_flora --release --example species_sheet -- \
-//!     [species_dir] [out_dir] [seeds]
+//!     [species_dir] [out_dir] [seeds] [planets_dir] [body]
 //! Defaults: content/flora/species, target/flora-sheets, 6.
 //! Writes `<species>.png` per species and `metrics.md` (table) to out_dir.
 
@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use astrum_flora::metrics::Bands;
 use astrum_flora::raster::{Camera, Canvas, draw, text};
-use astrum_flora::{Kit, LOD_COUNT, grow_plant, load_species_dir, variant_seed};
+use astrum_flora::{Kit, LOD_COUNT, grow_plant, load_species_for_body, variant_seed};
 use glam::{Vec2, Vec3};
 
 const CELL_W: usize = 240;
@@ -34,7 +34,9 @@ fn main() {
     let seeds: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(6);
     std::fs::create_dir_all(&out).unwrap();
     let kit = Kit::builtin();
-    let species = load_species_dir(&dir).unwrap_or_else(|e| panic!("{e}"));
+    let planets = PathBuf::from(args.get(4).map(String::as_str).unwrap_or("content/flora/planets"));
+    let body = args.get(5).map(String::as_str).unwrap_or("rust");
+    let species = load_species_for_body(&dir, &planets, body).unwrap_or_else(|e| panic!("{e}"));
     let mut md = String::from(
         "| species | seed | grow ms | nodes | organs | tris L0/L1/L2 | KB L0/L1/L2 | height m | width m | base r m | aspect | fill | fd | base w | intersect | shed | fails |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
     );
