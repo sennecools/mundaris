@@ -191,7 +191,9 @@ pub fn style(egui_style: &egui::Style) -> Style {
     style.tab.tab_body.stroke = Stroke::NONE;
     style.tab.tab_body.corner_radius = CornerRadius::ZERO;
     style.tab.tab_body.inner_margin = Margin::same(SPACE_3 as i8);
-    style.buttons.close_tab_color = TEXT_DISABLED;
+    // Hidden until the tab is hovered (`Tabs::on_tab_button` draws it then);
+    // egui_dock still draws the bright × while the button itself is hovered.
+    style.buttons.close_tab_color = Color32::TRANSPARENT;
     style.buttons.close_tab_active_color = TEXT_PRIMARY;
     style.buttons.close_tab_bg_fill = SURFACE_3;
     style.overlay.selection_color = ACCENT.linear_multiply(0.25);
@@ -199,6 +201,10 @@ pub fn style(egui_style: &egui::Style) -> Style {
     style.overlay.button_border_stroke = Stroke::new(1.0, BORDER_STRONG);
     style
 }
+
+/// egui_dock's close button and × sizes (crate-private there).
+const CLOSE_BUTTON: f32 = 24.0;
+const CLOSE_X: f32 = 9.0;
 
 /// Where the viewport tab sits this frame; the engine renders after the dock
 /// pass and paints into it with the tab's painter.
@@ -266,6 +272,15 @@ impl TabViewer for Tabs<'_> {
         }
     }
 
+    /// Close-on-hover: a small × appears on a closeable tab while the pointer
+    /// is over it (user direction 2026-10-10). egui_dock reserves the button
+    /// area at the tab's right end and handles the click.
+    fn on_tab_button(&mut self, tab: &mut Tab, response: &egui::Response) {
+        if self.is_closeable(tab) {
+            hover_close(response);
+        }
+    }
+
     fn is_closeable(&self, tab: &Tab) -> bool {
         *tab != Tab::Viewport
     }
@@ -290,6 +305,30 @@ impl TabViewer for Tabs<'_> {
     }
 }
 
+/// Draws the hover × of a closeable tab button (see `Tabs::on_tab_button`),
+/// except while dragging or while the button itself is hovered (egui_dock
+/// then draws its highlighted ×).
+fn hover_close(response: &egui::Response) {
+    if response.ctx.dragged_id().is_some() {
+        return;
+    }
+    let Some(pointer) = response.ctx.pointer_hover_pos() else {
+        return;
+    };
+    let rect = response.rect;
+    let button = Rect::from_center_size(
+        egui::pos2(rect.right() - CLOSE_BUTTON / 2.0, rect.center().y),
+        egui::Vec2::splat(CLOSE_BUTTON),
+    );
+    if !rect.contains(pointer) || button.contains(pointer) {
+        return;
+    }
+    let x = Rect::from_center_size(button.center(), egui::Vec2::splat(CLOSE_X));
+    let painter = response.ctx.layer_painter(response.layer_id);
+    let stroke = Stroke::new(1.0, TEXT_SECONDARY);
+    painter.line_segment([x.left_top(), x.right_bottom()], stroke);
+    painter.line_segment([x.right_top(), x.left_bottom()], stroke);
+}
 /// Ensures the viewport exists on the main surface (a hand-edited or
 /// corrupt layout file could lose it).
 pub fn repair(state: &mut DockState<Tab>) {
@@ -306,6 +345,7 @@ pub fn repair(state: &mut DockState<Tab>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui_dock::DockArea;
 
     fn tabs(state: &DockState<Tab>) -> Vec<Tab> {
         let mut tabs: Vec<Tab> = state.iter_all_tabs().map(|(_, tab)| *tab).collect();
@@ -353,6 +393,84 @@ mod tests {
         assert!(is_open(&state, Tab::Log) && is_open(&state, Tab::Profiler));
     }
 
+    /// Viewer with the real hover-close hook but no Studio state.
+    struct HoverViewer {
+        rects: Vec<(Tab, Rect)>,
+    }
+
+    impl TabViewer for HoverViewer {
+        type Tab = Tab;
+        fn id(&mut self, tab: &mut Tab) -> Id {
+            Id::new(("test-tab", *tab))
+        }
+        fn title(&mut self, tab: &mut Tab) -> WidgetText {
+            tab.title().into()
+        }
+        fn ui(&mut self, _ui: &mut Ui, _tab: &mut Tab) {}
+        fn on_tab_button(&mut self, tab: &mut Tab, response: &egui::Response) {
+            self.rects.push((*tab, response.rect));
+            if *tab != Tab::Viewport {
+                hover_close(response);
+            }
+        }
+        fn is_closeable(&self, tab: &Tab) -> bool {
+            *tab != Tab::Viewport
+        }
+    }
+
+    /// Runs one headless frame with the pointer at `pointer`; returns the tab
+    /// button rects and the number of hover-× strokes painted.
+    fn hover_frame(
+        ctx: &egui::Context,
+        state: &mut DockState<Tab>,
+        pointer: Option<egui::Pos2>,
+    ) -> (Vec<(Tab, Rect)>, usize) {
+        let mut viewer = HoverViewer { rects: Vec::new() };
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            events: pointer.map(egui::Event::PointerMoved).into_iter().collect(),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            let style = style(ui.style());
+            DockArea::new(state)
+                .style(style)
+                .show_close_buttons(true)
+                .show_inside(ui, &mut viewer);
+        });
+        output.textures_delta.clear();
+        let strokes = output
+            .shapes
+            .iter()
+            .filter(|clipped| {
+                matches!(&clipped.shape, egui::Shape::LineSegment { stroke, .. }
+                    if stroke.color == TEXT_SECONDARY)
+            })
+            .count();
+        (viewer.rects, strokes)
+    }
+
+    #[test]
+    fn close_cross_shows_only_on_hovered_closeable_tabs() {
+        let ctx = egui::Context::default();
+        let mut state = editor_layout(240.0, 340.0, 170.0, false, InspectorTab::Body);
+        let (rects, idle) = hover_frame(&ctx, &mut state, None);
+        assert_eq!(idle, 0, "no × without hover");
+        let rect_of = |tab| rects.iter().find(|(t, _)| *t == tab).unwrap().1;
+        let planet = rect_of(Tab::Planet);
+        let (_, hovered) = hover_frame(
+            &ctx,
+            &mut state,
+            Some(planet.left_center() + egui::vec2(6.0, 0.0)),
+        );
+        assert_eq!(hovered, 2, "one × (two strokes) on the hovered tab");
+        let viewport = rect_of(Tab::Viewport);
+        let (_, on_viewport) = hover_frame(&ctx, &mut state, Some(viewport.center()));
+        assert_eq!(on_viewport, 0, "the viewport never offers close");
+    }
     #[test]
     fn repair_restores_a_lost_viewport() {
         let mut state = DockState::new(vec![Tab::Scene]);

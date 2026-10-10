@@ -657,7 +657,7 @@ fn draw(
             DockArea::new(layout.dock_mut(workspace))
                 .id(egui::Id::new(("studio-dock", workspace.index())))
                 .style(style)
-                .show_close_buttons(false)
+                .show_close_buttons(true)
                 .show_leaf_close_all_buttons(false)
                 .show_leaf_collapse_buttons(false)
                 .show_inside(ui, &mut tabs);
