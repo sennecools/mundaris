@@ -119,7 +119,11 @@ fn fs_tonemap(input: FullscreenOut) -> @location(0) vec4<f32> {
     }
     out = grade(out);
     if post.tonemap.y > 0.5 {
-        let noise = ign(input.position.xy, post.tonemap.z) - 0.5;
+        // Triangular-PDF dither of +-1 LSB (two decorrelated IGN samples):
+        // unlike +-0.5 LSB uniform noise it also breaks up the middle of
+        // wide 8-bit bands in slow sky gradients.
+        let noise = ign(input.position.xy, post.tonemap.z)
+            + ign(input.position.xy + vec2<f32>(37.0, 17.0), post.tonemap.z + 0.5) - 1.0;
         out = from_srgb(clamp(to_srgb(out) + noise / 255.0, vec3<f32>(0.0), vec3<f32>(1.0)));
     }
     return vec4<f32>(out, 1.0);

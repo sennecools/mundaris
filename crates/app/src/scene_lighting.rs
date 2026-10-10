@@ -5,7 +5,7 @@
 //! falls off with the inverse square, so the scaled test system stays
 //! physically ordered without real solar luminosity.
 use anyhow::{Context, Result, ensure};
-use astrum_renderer::{Atmosphere, Brdf, SurfaceMaterial};
+use astrum_renderer::{Atmosphere, Brdf, Grade, StylisedLook, SurfaceMaterial};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, path::Path};
@@ -55,6 +55,45 @@ struct MaterialContent {
     /// Optional atmosphere drawn as sky and aerial perspective.
     #[serde(default)]
     atmosphere: Option<AtmosphereContent>,
+    /// Optional stylised look of the planet (any field omitted keeps the
+    /// generic stylised value).
+    #[serde(default)]
+    look: Option<LookContent>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LookContent {
+    sky_tint: Option<[f32; 3]>,
+    sky_saturation: Option<f32>,
+    haze: Option<f32>,
+    sky: Option<f32>,
+    shadow_sky: Option<f32>,
+    bloom: Option<f32>,
+    grade_lift: Option<[f32; 3]>,
+    grade_gain: Option<[f32; 3]>,
+    grade_saturation: Option<f32>,
+    grade_contrast: Option<f32>,
+}
+
+impl LookContent {
+    fn resolve(&self) -> StylisedLook {
+        let d = StylisedLook::default();
+        StylisedLook {
+            sky_tint: self.sky_tint.unwrap_or(d.sky_tint),
+            sky_saturation: self.sky_saturation.unwrap_or(d.sky_saturation),
+            haze: self.haze.unwrap_or(d.haze),
+            sky: self.sky.unwrap_or(d.sky),
+            shadow_sky: self.shadow_sky.unwrap_or(d.shadow_sky),
+            bloom: self.bloom.unwrap_or(d.bloom),
+            grade: Grade {
+                lift: self.grade_lift.unwrap_or(d.grade.lift),
+                gain: self.grade_gain.unwrap_or(d.grade.gain),
+                saturation: self.grade_saturation.unwrap_or(d.grade.saturation),
+                contrast: self.grade_contrast.unwrap_or(d.grade.contrast),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,6 +121,7 @@ pub struct SceneLighting {
     pub sky_color: [f32; 3],
     materials: BTreeMap<String, SurfaceMaterial>,
     atmospheres: BTreeMap<String, Atmosphere>,
+    looks: BTreeMap<String, StylisedLook>,
     pub sha256: String,
 }
 
@@ -132,6 +172,7 @@ impl SceneLighting {
         );
         let mut materials = BTreeMap::new();
         let mut atmospheres = BTreeMap::new();
+        let mut looks = BTreeMap::new();
         for (body, content_material) in &content.bodies {
             let material = content_material;
             let brdf = Brdf::from_name(&material.brdf)
@@ -154,6 +195,11 @@ impl SceneLighting {
                 ensure!(atmosphere.validate(), "{body}: invalid atmosphere");
                 atmospheres.insert(body.clone(), atmosphere);
             }
+            if let Some(look) = &content_material.look {
+                let look = look.resolve();
+                ensure!(look.validate(), "{body}: invalid look");
+                looks.insert(body.clone(), look);
+            }
         }
         Ok(Self {
             sun_body: sun.body.clone(),
@@ -167,8 +213,14 @@ impl SceneLighting {
             sky_color: chromaticity(ambient.sky_color, "sky")?,
             materials,
             atmospheres,
+            looks,
             sha256: format!("{:x}", Sha256::digest(bytes)),
         })
+    }
+
+    /// Stylised look of a body (authored, else the generic stylised look).
+    pub fn look(&self, semantic_id: &str) -> StylisedLook {
+        self.looks.get(semantic_id).copied().unwrap_or_default()
     }
 
     /// Authored atmosphere of a body, if it has one.

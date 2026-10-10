@@ -1708,6 +1708,7 @@ impl GravityOrbitsDemo {
                 center_view_m: center,
                 radius_m: radius,
                 atmosphere,
+                look: self.lighting.look(&self.presentation[index].semantic_id),
             })?;
         }
         renderer.set_render_settings(self.controls.render_settings)?;

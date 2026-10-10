@@ -145,7 +145,7 @@ pub(crate) struct PostProcess {
     /// Colour-grade LUT (crate::grade) and the look it was built for.
     grade_lut: wgpu::Texture,
     grade_view: wgpu::TextureView,
-    grade_look: Option<crate::LookPreset>,
+    grade_look: Option<crate::Grade>,
     atmosphere_pipeline: wgpu::RenderPipeline,
     atmosphere_buffer: wgpu::Buffer,
     /// History written last frame (index into `TaaTargets::history`).
@@ -174,6 +174,8 @@ pub(crate) struct PostFrame {
     pub taa: Option<[[f32; 4]; 6]>,
     /// Atmosphere parameters (shader `Atmosphere` struct), when one is drawn.
     pub atmosphere: Option<[[f32; 4]; 8]>,
+    /// Stylised look of the surrounding body (grade, bloom).
+    pub look: crate::StylisedLook,
 }
 
 fn entry(
@@ -694,7 +696,7 @@ impl PostProcess {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: wgpu::TextureFormat::Rgb10a2Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -1168,7 +1170,7 @@ impl PostProcess {
                 // The stylised look blooms more (art direction 2026-10-10).
                 settings.bloom.intensity
                     * if settings.look.preset == crate::LookPreset::Stylised {
-                        2.5
+                        frame.look.bloom
                     } else {
                         1.0
                     },
@@ -1191,9 +1193,9 @@ impl PostProcess {
                 .flat_map(|v| v.to_le_bytes())
                 .collect::<Vec<_>>(),
         );
-        let look = settings.look.preset;
-        if self.grade_look != Some(look) {
-            let lut = crate::grade::Grade::for_look(look).lut();
+        let grade = crate::Grade::for_look(settings.look.preset, &frame.look);
+        if self.grade_look != Some(grade) {
+            let lut = grade.lut();
             let n = crate::grade::LUT_SIZE;
             queue.write_texture(
                 self.grade_lut.as_image_copy(),
@@ -1209,7 +1211,7 @@ impl PostProcess {
                     depth_or_array_layers: n,
                 },
             );
-            self.grade_look = Some(look);
+            self.grade_look = Some(grade);
         }
         let mut mask = 0u32;
         if let Some(ms) = &t.ms {

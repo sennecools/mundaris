@@ -46,6 +46,8 @@ pub struct FrameAtmosphere {
     pub center_view_m: DVec3,
     pub radius_m: f64,
     pub atmosphere: Atmosphere,
+    /// The body's stylised look (used when the look preset is stylised).
+    pub look: crate::StylisedLook,
 }
 
 impl FrameAtmosphere {
@@ -54,6 +56,7 @@ impl FrameAtmosphere {
             && self.radius_m.is_finite()
             && self.radius_m > 0.0
             && self.atmosphere.validate()
+            && self.look.validate()
     }
 }
 
@@ -90,9 +93,11 @@ pub(crate) fn pack(
     let a = &atmosphere.atmosphere;
     let (tint, saturation, haze_boost, sky_boost) = match look.preset {
         LookPreset::Physical => ([1.0, 1.0, 1.0], 1.0, 1.0, 1.0),
-        // Toward the references: thicker haze toward the horizon, a brighter,
-        // cyan-leaning and more saturated sky; the grade adds warmth.
-        LookPreset::Stylised => ([0.85, 1.05, 1.15], 1.15, 2.5, 2.0),
+        // The planet's stylised sky (lighting.json bodies.<id>.look).
+        LookPreset::Stylised => {
+            let s = &atmosphere.look;
+            (s.sky_tint, s.sky_saturation, s.haze, s.sky)
+        }
     };
     let s = |v: f64| v as f32;
     Some([
