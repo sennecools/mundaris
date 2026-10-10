@@ -12,6 +12,7 @@ mod celestial_view;
 #[cfg(feature = "surface-profile")]
 mod cpu_profile;
 mod debug;
+mod flora_draw;
 mod gpu_profile;
 mod lighting;
 #[cfg(feature = "developer-tools")]

@@ -18,7 +18,8 @@ const DRAW_SHADER: &str = concat!(
     include_str!("shaders/lighting.wgsl"),
     include_str!("shaders/terrain_atlas.wgsl"),
     include_str!("shaders/scatter_draw.wgsl"),
-    include_str!("shaders/scatter_vs.wgsl")
+    include_str!("shaders/scatter_vs.wgsl"),
+    include_str!("shaders/scatter_flora.wgsl")
 );
 /// PROTOTYPE (M5 Life): plant culling compute shader (same helpers as the draw).
 const CULL_SHADER: &str = concat!(
@@ -687,6 +688,7 @@ pub(crate) struct TerrainAtlasRenderer {
     scatter_pipeline: wgpu::RenderPipeline,
     scatter_shadow_pipeline: wgpu::RenderPipeline,
     scatter_cull: wgpu::ComputePipeline,
+    flora: crate::flora_draw::FloraDraw,
     grass_cull: wgpu::ComputePipeline,
     grass_pipeline: wgpu::RenderPipeline,
     grass_ro_group: wgpu::BindGroup,
@@ -1210,7 +1212,7 @@ impl TerrainAtlasRenderer {
         });
         let plant_args = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Terrain plant draw arguments"),
-            size: 64,
+            size: crate::flora_draw::ARGS_BYTES,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::INDIRECT
                 | wgpu::BufferUsages::COPY_DST,
@@ -1440,6 +1442,14 @@ impl TerrainAtlasRenderer {
                 multiview_mask: None,
                 cache: None,
             });
+        // PROTOTYPE (flora lane): grown species for the near plants.
+        let flora = crate::flora_draw::FloraDraw::new(
+            device,
+            &draw_shader,
+            &scatter_draw_layout,
+            &scatter_shadow_layout,
+            &color_targets,
+        );
         let shadow_capacity = 1024;
         let shadow_instances = instance_buffer(device, shadow_capacity);
         let shadow_group = self::draw_group(
@@ -1489,6 +1499,7 @@ impl TerrainAtlasRenderer {
             scatter_pipeline,
             scatter_shadow_pipeline,
             scatter_cull,
+            flora,
             grass_cull,
             grass_pipeline,
             grass_ro_group,
@@ -1978,7 +1989,10 @@ impl TerrainAtlasRenderer {
             0
         };
         // Plants at words 0..3 (staged node count at 4), grass at 8..11.
-        let args = [96u32, 0, 0, 0, staged, 0, 0, 0, 18, 0, 0, 0, 0, 0, 0, 0];
+        let mut args = [0u32; (crate::flora_draw::ARGS_BYTES / 4) as usize];
+        args[..16].copy_from_slice(&[96u32, 0, 0, 0, staged, 0, 0, 0, 18, 0, 0, 0, 0, 0, 0, 0]);
+        // PROTOTYPE (flora lane): grown-species mask and bucket draws.
+        self.flora.write_args(&mut args);
         let bytes: Vec<u8> = args.iter().flat_map(|w| w.to_le_bytes()).collect();
         queue.write_buffer(&self.plant_args, 0, &bytes);
         if staged == 0 {
@@ -2086,6 +2100,7 @@ impl TerrainAtlasRenderer {
             pass.set_pipeline(&self.scatter_pipeline);
             pass.set_bind_group(3, &self.plants_ro_group, &[]);
             pass.draw_indirect(&self.plant_args, 0);
+            self.flora.draw(pass, &self.plant_args);
             pass.set_pipeline(&self.grass_pipeline);
             pass.set_bind_group(3, &self.grass_ro_group, &[]);
             pass.draw_indirect(&self.plant_args, 32);
@@ -2160,6 +2175,7 @@ impl TerrainAtlasRenderer {
             pass.set_bind_group(2, &self.empty_group, &[]);
             pass.set_bind_group(3, &self.plants_ro_group, &[]);
             pass.draw_indirect(&self.plant_args, 0);
+            self.flora.draw_shadow(pass, &self.plant_args);
         }
     }
 }
@@ -3040,7 +3056,10 @@ fn upload_source(
 /// create (driver shader compilation; cached by the driver afterwards).
 fn log_pipeline_time(name: &str, started: std::time::Instant) {
     if std::env::var_os("ASTRUM_PIPELINE_TIMING").is_some() {
-        eprintln!("pipeline {name}: {:.0} ms", started.elapsed().as_secs_f64() * 1e3);
+        eprintln!(
+            "pipeline {name}: {:.0} ms",
+            started.elapsed().as_secs_f64() * 1e3
+        );
     }
 }
 
