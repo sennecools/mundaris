@@ -219,6 +219,7 @@ pub struct CelestialStaging {
     centers: Vec<(DVec3, f64)>,
     terrain_atlas: Option<crate::TerrainAtlasFrame>,
     lighting: Option<crate::FrameLighting>,
+    atmosphere: Option<crate::FrameAtmosphere>,
     view_mode: u32,
     passthrough: bool,
     line_style: crate::LineStyleScale,
@@ -256,6 +257,7 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
         staging.uniforms.clear();
         staging.polylines.clear();
         staging.lighting = None;
+        staging.atmosphere = None;
         staging.view_mode = crate::TerrainViewMode::Lit.shader_mode();
         staging.passthrough = false;
         staging.line_style = crate::LineStyleScale::default();
@@ -296,6 +298,20 @@ impl<'view, 'tree, 'storage> CelestialFrame<'view, 'tree, 'storage> {
             return Err(RenderPreparationError::InvalidDebugGeometry);
         }
         self.staging.lighting = Some(lighting);
+        Ok(())
+    }
+
+    /// The atmosphere around the camera (nearest body), drawn as sky and
+    /// aerial perspective by the post chain.
+    pub fn set_atmosphere(
+        &mut self,
+        atmosphere: crate::FrameAtmosphere,
+    ) -> Result<(), RenderPreparationError> {
+        if !atmosphere.validate() {
+            self.failed = true;
+            return Err(RenderPreparationError::InvalidDebugGeometry);
+        }
+        self.staging.atmosphere = Some(atmosphere);
         Ok(())
     }
 
@@ -1211,6 +1227,17 @@ impl CelestialRenderer {
         drop(pass);
         scope_mask |= 1 << pair::SCENE;
 
+        let atmosphere = {
+            let [width, height] = frame.projection.viewport();
+            crate::atmosphere::pack(
+                storage.atmosphere.as_ref(),
+                storage.lighting.as_ref(),
+                &settings,
+                f64::from(height) * 0.5 / frame.projection.focal_pixels(),
+                f64::from(width) / f64::from(height.max(1)),
+                near,
+            )
+        };
         scope_mask |= self.post.encode(
             queue,
             encoder,
@@ -1222,6 +1249,7 @@ impl CelestialRenderer {
                 view_mode: storage.view_mode,
                 passthrough: storage.passthrough,
                 taa,
+                atmosphere,
             },
             timestamps,
         );

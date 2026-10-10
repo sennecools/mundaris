@@ -104,7 +104,7 @@ impl Engine {
             return;
         };
         for (index, spec) in registry::SPECS.iter().enumerate() {
-            if !spec.id.starts_with(GRAPHICS_PREFIX) {
+            if !GRAPHICS_PREFIXES.iter().any(|prefix| spec.id.starts_with(prefix)) {
                 continue;
             }
             if let Some(value) = saved.get(spec.id)
@@ -128,7 +128,7 @@ impl Engine {
         let map: serde_json::Map<String, serde_json::Value> = registry::SPECS
             .iter()
             .enumerate()
-            .filter(|(_, spec)| spec.id.starts_with(GRAPHICS_PREFIX))
+            .filter(|(_, spec)| GRAPHICS_PREFIXES.iter().any(|prefix| spec.id.starts_with(prefix)))
             .filter_map(|(index, spec)| {
                 let value = values.get(index).copied()?;
                 Some((spec.id.to_string(), registry::value_json(index, value)))
@@ -332,7 +332,8 @@ const LAYOUT_PATH: &str = "target/studio-layout.json";
 /// Graphics options (render settings under `GRAPHICS_PREFIX`) remembered
 /// between runs; session state, not content.
 const GRAPHICS_PATH: &str = "target/studio-graphics.json";
-const GRAPHICS_PREFIX: &str = "render.aa.";
+/// Registry id prefixes of the saved graphics options.
+const GRAPHICS_PREFIXES: [&str; 2] = ["render.aa.", "render.look."];
 /// Drag look sensitivity, saved with the graphics options.
 const LOOK_KEY: &str = "camera.look_sensitivity";
 

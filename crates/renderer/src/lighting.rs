@@ -400,14 +400,18 @@ pub(crate) fn pack_lighting(
     }
     if let Some(l) = lighting {
         // Row 32 (after the cascade matrices): sky light.
+        // The stylised look triples the sky light (lifted, sky-coloured
+        // shadows) and turns on the soft rim light (w = 1).
+        let stylised = settings.look.preset == crate::LookPreset::Stylised;
         let sky = (l.sky_fraction
             * f64::from(settings.lighting.ambient_scale)
-            * f64::from(settings.lighting.sky_scale)) as f32;
+            * f64::from(settings.lighting.sky_scale)
+            * if stylised { 3.0 } else { 1.0 }) as f32;
         floats[128..132].copy_from_slice(&[
             l.sky_color[0] * sky,
             l.sky_color[1] * sky,
             l.sky_color[2] * sky,
-            0.0,
+            if stylised { 1.0 } else { 0.0 },
         ]);
     }
     floats.iter().flat_map(|f| f.to_le_bytes()).collect()

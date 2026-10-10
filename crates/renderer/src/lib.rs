@@ -7,6 +7,8 @@
 #![forbid(unsafe_code)]
 
 mod aa;
+mod atmosphere;
+mod grade;
 mod celestial;
 mod celestial_lines;
 mod celestial_view;
@@ -30,6 +32,7 @@ pub mod tier_a;
 pub mod terrain_capture;
 mod view;
 pub use aa::SAMPLE_COUNTS;
+pub use atmosphere::{Atmosphere, FrameAtmosphere};
 pub use celestial::*;
 pub use celestial_lines::{
     CelestialLineStyle, CelestialPolyline, LineStyleScale, PolylinePreparationReport,
@@ -47,7 +50,8 @@ pub use lighting::{
 };
 pub use render_settings::{
     AntiAliasing, AoSettings, BloomSettings, ExposureMode, ExposureSettings, LightingSettings,
-    MAX_CASCADES, OverlaySettings, RenderSettings, SHADOW_RESOLUTIONS, ShadowSettings, Tonemapper,
+    LookPreset, LookSettings, MAX_CASCADES, OverlaySettings, RenderSettings, SHADOW_RESOLUTIONS,
+    ShadowSettings, Tonemapper,
 };
 pub use terrain_atlas::{
     ATLAS_BOUNDS_GRID, ATLAS_LADDER_LEVELS, ATLAS_LADDERS, AtlasBounds, AtlasChart,

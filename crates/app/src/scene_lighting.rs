@@ -5,7 +5,7 @@
 //! falls off with the inverse square, so the scaled test system stays
 //! physically ordered without real solar luminosity.
 use anyhow::{Context, Result, ensure};
-use astrum_renderer::{Brdf, SurfaceMaterial};
+use astrum_renderer::{Atmosphere, Brdf, SurfaceMaterial};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, path::Path};
@@ -52,6 +52,20 @@ fn white() -> [f32; 3] {
 struct MaterialContent {
     albedo: [f32; 3],
     brdf: String,
+    /// Optional atmosphere drawn as sky and aerial perspective.
+    #[serde(default)]
+    atmosphere: Option<AtmosphereContent>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AtmosphereContent {
+    top_height_m: f64,
+    rayleigh_per_m: [f32; 3],
+    rayleigh_scale_height_m: f64,
+    mie_per_m: f32,
+    mie_scale_height_m: f64,
+    mie_g: f32,
 }
 
 /// Validated scene light; colours are normalised chromaticities.
@@ -67,6 +81,7 @@ pub struct SceneLighting {
     pub sky_fraction: f64,
     pub sky_color: [f32; 3],
     materials: BTreeMap<String, SurfaceMaterial>,
+    atmospheres: BTreeMap<String, Atmosphere>,
     pub sha256: String,
 }
 
@@ -116,7 +131,9 @@ impl SceneLighting {
             "sky fraction must be within 0..1"
         );
         let mut materials = BTreeMap::new();
-        for (body, material) in &content.bodies {
+        let mut atmospheres = BTreeMap::new();
+        for (body, content_material) in &content.bodies {
+            let material = content_material;
             let brdf = Brdf::from_name(&material.brdf)
                 .with_context(|| format!("{body}: unknown BRDF {}", material.brdf))?;
             let material = SurfaceMaterial {
@@ -125,6 +142,18 @@ impl SceneLighting {
             };
             ensure!(material.validate(), "{body}: albedo must be within 0..1");
             materials.insert(body.clone(), material);
+            if let Some(a) = &content_material.atmosphere {
+                let atmosphere = Atmosphere {
+                    top_height_m: a.top_height_m,
+                    rayleigh_per_m: a.rayleigh_per_m,
+                    rayleigh_scale_height_m: a.rayleigh_scale_height_m,
+                    mie_per_m: a.mie_per_m,
+                    mie_scale_height_m: a.mie_scale_height_m,
+                    mie_g: a.mie_g,
+                };
+                ensure!(atmosphere.validate(), "{body}: invalid atmosphere");
+                atmospheres.insert(body.clone(), atmosphere);
+            }
         }
         Ok(Self {
             sun_body: sun.body.clone(),
@@ -137,8 +166,14 @@ impl SceneLighting {
             sky_fraction: ambient.sky_fraction,
             sky_color: chromaticity(ambient.sky_color, "sky")?,
             materials,
+            atmospheres,
             sha256: format!("{:x}", Sha256::digest(bytes)),
         })
+    }
+
+    /// Authored atmosphere of a body, if it has one.
+    pub fn atmosphere(&self, semantic_id: &str) -> Option<Atmosphere> {
+        self.atmospheres.get(semantic_id).copied()
     }
 
     /// Authored material of a body, or a neutral 18 % grey.
