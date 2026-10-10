@@ -564,7 +564,10 @@ fn parts(
             return;
         }
         OrganLod::Puffs { count, detail } => {
-            puffs(m, sk, sp, seed, count, detail);
+            // Fringe cards: the organ's spray (cluster) card when the kit has
+            // one, else the organ itself.
+            let card = kit.shape_named(&format!("{:?}Spray", g.organ)).or_else(|_| kit.shape_named("Spray")).ok().or(kit.organ(g.organ));
+            puffs(m, sk, sp, seed, count, detail, card);
             return;
         }
         OrganLod::Thin(k) => k,
@@ -820,7 +823,8 @@ fn icosphere(detail: u32) -> (Vec<DVec3>, Vec<[u32; 3]>) {
 /// with the whole crown's, so the crown shades as one soft shape; colour
 /// runs from `organ` inside/below to `organ_tip` outside/above. At
 /// `detail` ≥ 1 the fruits stay as small chunky accents.
-fn puffs(m: &mut Mesh, sk: &Skeleton, sp: &SpeciesFile, seed: u64, count: usize, detail: u32) {
+#[allow(clippy::too_many_arguments)]
+fn puffs(m: &mut Mesh, sk: &Skeleton, sp: &SpeciesFile, seed: u64, count: usize, detail: u32, card: Option<&crate::kit::KitShape>) {
     let organs: Vec<_> = sk.parts.iter().filter(|p| p.kind == PartKind::Organ).collect();
     if organs.is_empty() {
         return;
@@ -867,6 +871,14 @@ fn puffs(m: &mut Mesh, sk: &Skeleton, sp: &SpeciesFile, seed: u64, count: usize,
     }
     let span = (hi.z - lo.z).max(1e-3);
     let pointed = sp.genome.crown_shape == crate::genome::CrownShape::Cone;
+    // Gradient inside the crown: deep shaded inner colour to bright warm
+    // tips, by height in the crown and by how much the surface faces out.
+    let gradient = |pos: DVec3, nrm: DVec3, crown_n: DVec3| {
+        let h = ((pos.z - lo.z) / span).clamp(0.0, 1.0);
+        let t = (0.55 * h + 0.45 * (0.5 + 0.5 * crown_n.dot(nrm))).clamp(0.0, 1.0);
+        let t = (t * t * (3.0 - 2.0 * t)) as f32;
+        lerp3(scale3(sp.look.organ, 0.55), scale3(sp.look.organ_tip, 1.25), t)
+    };
     let (unit, faces) = icosphere(detail);
     let wind = [2, 60, 0, class::ORGAN];
     for (c, &centre) in centres.iter().enumerate() {
@@ -894,16 +906,46 @@ fn puffs(m: &mut Mesh, sk: &Skeleton, sp: &SpeciesFile, seed: u64, count: usize,
             let pos = centre + local;
             let crown_n = (pos - crown).normalize_or(DVec3::Z);
             let nrm = (0.45 * *u + 0.55 * crown_n + 0.15 * DVec3::Z).normalize();
-            let h = ((pos.z - lo.z) / span).clamp(0.0, 1.0);
-            let t = (0.55 * h + 0.45 * (0.5 + 0.5 * crown_n.dot(nrm))).clamp(0.0, 1.0) as f32;
-            // Gradient inside the crown: shaded inner organ colour to bright tips.
-            let col = lerp3(scale3(sp.look.organ, 0.7), scale3(sp.look.organ_tip, 1.2), t);
+            let col = gradient(pos, nrm, crown_n);
             // Faces turned into the crown are darker (cheap AO).
             let ao = (0.6 + 0.4 * (0.5 + 0.5 * u.dot(out_dir))) as f32;
             m.push(pos, nrm, col, ao, centre, wind);
         }
         for f in &faces {
             m.indices.extend_from_slice(&[base + f[0], base + f[1], base + f[2]]);
+        }
+        // Ragged leafy edge: a fringe of enlarged organ cards poking out of
+        // the hull, shaded with the puff's rounded normal so they read as
+        // part of the clump, not as single leaves.
+        let Some(shape) = card else { continue };
+        // Up to 12 (LOD0) / 5 cards, within ~the hull's own triangle count.
+        let fringe = (faces.len() / shape.triangles.len().max(1)).clamp(2, if detail >= 1 { 12 } else { 5 });
+        let leaf = 2.6 * size.max(0.08 * r);
+        for k in 0..fringe {
+            let key = c as u64 * 1024 + k as u64;
+            // Direction on the puff, biased away from the crown centre and up.
+            let z = 2.0 * rng.unit(key, 14) - 1.0;
+            let a = rng.unit(key, 15) * std::f64::consts::TAU;
+            let s = (1.0 - z * z).max(0.0).sqrt();
+            let d = (DVec3::new(s * a.cos(), s * a.sin(), z) + 0.8 * out_dir + 0.3 * DVec3::Z).normalize_or(DVec3::Z);
+            let anchor = centre + d * radii * 0.85;
+            let (t1, _) = perp(d);
+            let tilt = rng.unit(key, 16) * std::f64::consts::TAU;
+            let tangent = t1 * tilt.cos() + d.cross(t1) * tilt.sin();
+            let fwd = (0.75 * d + 0.66 * tangent).normalize();
+            let nrm_card = d.cross(fwd).cross(fwd).normalize_or(d) * -1.0;
+            let side = nrm_card.cross(fwd);
+            let crown_n = (anchor - crown).normalize_or(DVec3::Z);
+            let shade_n = (0.45 * d + 0.55 * crown_n + 0.15 * DVec3::Z).normalize();
+            let col = gradient(anchor + d * leaf * 0.5, shade_n, crown_n);
+            let b = m.vertices.len() as u32;
+            for v in &shape.positions {
+                let p = anchor + (fwd * v[0] as f64 + side * v[1] as f64 + nrm_card * v[2] as f64) * leaf;
+                m.push(p, shade_n, col, 0.9, centre, wind);
+            }
+            for t in &shape.triangles {
+                m.indices.extend_from_slice(&[b + t[0] as u32, b + t[1] as u32, b + t[2] as u32]);
+            }
         }
     }
     if detail >= 1 {

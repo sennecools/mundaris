@@ -386,8 +386,19 @@ impl Palette {
             leaf[0] -= 0.03;
             leaf[1] *= 0.85;
         }
-        let tip = [leaf[0] + 0.07, leaf[1] * 1.15, (leaf[2] + 4.0 * st.signed(1, 0)).rem_euclid(360.0)];
-        let bark = [self.bark[0] + 0.04 * st.signed(2, 0), self.bark[1], (self.bark[2] + 12.0 * st.signed(3, 0)).rem_euclid(360.0)];
+        let mut tip = [leaf[0] + 0.07, leaf[1] * 1.15, (leaf[2] + 4.0 * st.signed(1, 0)).rem_euclid(360.0)];
+        let mut bark = [self.bark[0] + 0.04 * st.signed(2, 0), self.bark[1], (self.bark[2] + 12.0 * st.signed(3, 0)).rem_euclid(360.0)];
+        if p.foliage == crate::genome::FoliageStyle::Stylised {
+            // Stylised look (art direction 2026-10-10, NMS 2016 reference):
+            // saturated deeper base, bright warm tips (hue pulled up to 18°
+            // toward yellow-orange), dark cool blue-violet bark. Independent
+            // of the strangeness dial (hues stay the planet's).
+            leaf = [leaf[0] - 0.03, (leaf[1] * 1.6).min(0.2), leaf[2]];
+            let warm = ((75.0 - leaf[2] + 540.0).rem_euclid(360.0) - 180.0).clamp(-18.0, 18.0);
+            tip = [leaf[0] + 0.15, (leaf[1] * 1.3).min(0.24), (tip[2] + warm).rem_euclid(360.0)];
+            let cool = ((285.0 - bark[2] + 540.0).rem_euclid(360.0) - 180.0) * 0.7;
+            bark = [bark[0] - 0.08, 0.05, (bark[2] + cool).rem_euclid(360.0)];
+        }
         let accent = [self.accent[0], self.accent[1], (self.accent[2] + 20.0 * st.signed(4, 0)).rem_euclid(360.0)];
         let f = |lch: [f64; 3]| from_lch(lch).map(|v| v.clamp(0.0, 1.0) as f32);
         Look { bark: f(bark), organ: f(leaf), organ_tip: f(tip), accent: f(accent) }

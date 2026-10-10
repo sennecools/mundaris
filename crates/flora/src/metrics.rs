@@ -357,13 +357,14 @@ impl Bands {
     };
 
     /// Stylised foliage (art direction 2026-10-10): smooth puff silhouettes
-    /// (box-counting dimension near 1), full crowns, lower poly.
+    /// with a ragged leaf fringe (box-counting dimension 0.9–1.4), full
+    /// crowns, lower poly.
     pub const STYLISED: Bands = Bands {
-        max_triangles: [6_500, 1_500, 600],
+        max_triangles: [7_500, 1_500, 600],
         max_intersecting_fraction: 0.03,
-        fractal_dimension: (0.9, 1.2),
+        fractal_dimension: (0.9, 1.4),
         crown_fill: (0.5, 0.92),
-        crown_solidity_min: 0.9,
+        crown_solidity_min: 0.8,
     };
 
     /// Bands for a species' foliage style.
