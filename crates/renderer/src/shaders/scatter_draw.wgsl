@@ -205,12 +205,55 @@ fn forest_cover(inst: Instance, st: vec2<f32>, normal_body: vec3<f32>, climate: 
     let view = vec3<f32>(1.0 / max(cell_m2, 1.0e-3), sc_keep(d), cos_v);
     let site = sc_forest(sc_face(inst.n0.xyz), c.x, c.y, footprint, FlSite(climate.x, climate.y, ground, slope, sediment), view);
     var colour = site.color;
-    // Canopy texture: crowns and gaps (~30 m) and clumps (~90 m), each fading
-    // to its mean once the drawn grid is too coarse to carry it.
     let face = sc_face(inst.n0.xyz);
-    let crowns = mix(sc_value(face, c.x / 3.0, c.y / 3.0, 44u), 0.5, smoothstep(0.75, 1.5, footprint));
+    // Crown cells: the tint shows the crowns it stands for as sun-lit domes
+    // at the plants' own positions (sc_plant's cell hash and roll) over a
+    // shaded floor, so a far forest keeps its crown-scale light and shade.
+    // Mean-preserving; fades to the mean once a cell spans under ~2 pixels.
+    let detail = 1.0 - smoothstep(0.3, 0.7, footprint_px);
+    if detail > 0.0 {
+        let fsite = FlSite(climate.x, climate.y, ground, slope, sediment);
+        let crown_m2 = fl_layer_crown(FL_CANOPY_MASK, fsite).x;
+        let rc = clamp(sqrt(crown_m2 / 3.14159265) * site.stature / max(cell_m * inverseSqrt(inst.n0.w * inst.n0.w * inst.n0.w), 1.0e-3), 0.05, 1.2);
+        // Sun in the cell frame (face u, face v, up).
+        let sun_view = normalize(lighting.sun.xyz - view_pos);
+        let sun_body = vec3<f32>(dot(inst.b2v_x.xyz, sun_view), dot(inst.b2v_y.xyz, sun_view), dot(inst.b2v_z.xyz, sun_view));
+        let tu = normalize(inst.face_u.xyz - up_body * dot(inst.face_u.xyz, up_body));
+        let tv = normalize(cross(up_body, tu));
+        let sun_t = vec3<f32>(dot(sun_body, tu), dot(sun_body, tv), dot(sun_body, up_body));
+        let base = floor(c);
+        var best = -1.0;
+        var lit = 0.0;
+        for (var dj = -1; dj <= 1; dj = dj + 1) {
+            for (var di = -1; di <= 1; di = di + 1) {
+                let cell = base + vec2<f32>(f32(di), f32(dj));
+                let h = sc_pcg3d(vec3<u32>(u32(i32(cell.x)), u32(i32(cell.y)), face * 64u + 63u));
+                if sc_unit(h.z) >= site.tree + site.shrub {
+                    continue;
+                }
+                let centre = cell + vec2<f32>(0.15 + 0.7 * sc_unit(h.x), 0.15 + 0.7 * sc_unit(h.y));
+                let off = (c - centre) / rc;
+                let r2 = dot(off, off);
+                // Topmost dome wins where crowns overlap.
+                let z = sqrt(max(1.0 - r2, 0.0));
+                if r2 < 1.0 && z > best {
+                    best = z;
+                    lit = max(dot(normalize(vec3<f32>(off, z)), sun_t), 0.0);
+                }
+            }
+        }
+        let inside = select(0.0, 1.0, best >= 0.0);
+        let pattern = mix(0.45, 0.55 + 0.75 * lit, inside);
+        // Expected pattern: crown share of the ground times the mean lit
+        // term of a dome seen from above (2/3 of the sun's height).
+        let share = clamp((site.tree + site.shrub) * 3.14159265 * rc * rc, 0.0, 0.95);
+        let mean = mix(0.45, 0.55 + 0.75 * (2.0 / 3.0) * max(sun_t.z, 0.0), share);
+        colour *= mix(1.0, pattern / max(mean, 0.05), detail);
+    }
+    // Stand-scale variation (~90 m clumps), fading once the grid is too
+    // coarse to carry it.
     let clumps = mix(sc_value(face, c.x / 9.0, c.y / 9.0, 45u), 0.5, smoothstep(2.25, 4.5, footprint));
-    colour *= 1.0 + 0.6 * (crowns - 0.5) + 0.35 * (clumps - 0.5);
+    colour *= 1.0 + 0.35 * (clumps - 0.5);
     return vec4<f32>(colour, clamp(site.cover, 0.0, 0.98));
 }
 

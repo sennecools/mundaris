@@ -2,7 +2,7 @@
 //! `content/flora/rocks`, 5 variants dry and young (top row) and wet and old
 //! (bottom row, rounded, mossy), plus LOD1/LOD2 of variant 0.
 //!
-//! cargo run -p astrum_flora --release --example rock_sheet -- [out_dir]
+//! cargo run -p astrum_flora --release --example rock_sheet -- [out_dir] [realistic|stylised]
 //! Writes `<archetype>.png` and `rocks.md` (triangles per LOD, closed-edge
 //! fraction, size, grow time). Exits non-zero when a check fails.
 
@@ -13,7 +13,8 @@ use std::time::Instant;
 use astrum_flora::hash::{derive, name_key};
 use astrum_flora::palette::{Palette, from_lch, load_planet};
 use astrum_flora::raster::{Camera, Canvas, draw, text};
-use astrum_flora::rock::{Weathering, closed_edges_fraction, grow_rock, load_rocks_dir};
+use astrum_flora::genome::FoliageStyle;
+use astrum_flora::rock::{Weathering, closed_edges_fraction, grow_rock_style, load_rocks_dir};
 use glam::{Vec2, Vec3};
 
 const CELL: usize = 200;
@@ -25,6 +26,12 @@ fn main() {
     let rocks = load_rocks_dir(std::path::Path::new("content/flora/rocks")).unwrap();
     let planet = load_planet(std::path::Path::new("content/flora/planets"), "rust").unwrap();
     let pal = Palette::for_planet(&planet);
+    // Style: the planet file's, or `realistic` / `stylised` as the 2nd argument.
+    let style = match args.get(2).map(String::as_str) {
+        Some("realistic") => FoliageStyle::Realistic,
+        Some("stylised") => FoliageStyle::Stylised,
+        _ => planet.foliage,
+    };
     let moss = from_lch([pal.foliage[0] - 0.08, pal.foliage[1] * 0.8, pal.foliage[2]]).map(|v| v as f32);
     let states = [
         ("DRY YOUNG", Weathering { wetness: 0.1, age: 0.2, moss, moss_cover: 0.0 }),
@@ -43,7 +50,7 @@ fn main() {
             for v in 0..5u64 {
                 let seed = derive(name_key(&rock.name), v);
                 let t = Instant::now();
-                let lods = grow_rock(rock, seed, w);
+                let lods = grow_rock_style(rock, seed, w, style);
                 let ms = t.elapsed().as_secs_f64() * 1e3;
                 let tris: Vec<usize> = lods.iter().map(|m| m.triangles()).collect();
                 let closed = closed_edges_fraction(&lods[0]);

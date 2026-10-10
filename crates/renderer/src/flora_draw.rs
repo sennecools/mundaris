@@ -24,7 +24,7 @@ use std::sync::{Arc, OnceLock};
 use astrum_flora::hash::{derive, name_key};
 use astrum_flora::impostor::{ATLAS, Impostor, bake};
 use astrum_flora::palette::{Palette, PlanetRock, from_lch, load_planet};
-use astrum_flora::rock::{RockFile, Weathering, grow_rock};
+use astrum_flora::rock::{RockFile, Weathering, grow_rock_style};
 use astrum_flora::scatter::{MAX_ROCKS, MAX_SPECIES, species_wgsl, splice_species};
 use astrum_flora::{Kit, LOD_COUNT, Mesh, SpeciesFile, grow_meshes, load_species_for_body, variant_seed};
 use wgpu::util::DeviceExt;
@@ -125,6 +125,7 @@ fn grow_all() -> Grown {
         }
     };
     let kit = Kit::builtin();
+    let style = planet.as_ref().map(|p| p.foliage).unwrap_or_default();
     let started = std::time::Instant::now();
     // Grow and bake every (entry, variant) on its own thread.
     let jobs: Vec<(usize, usize)> = (0..species.len())
@@ -145,7 +146,7 @@ fn grow_all() -> Grown {
                         grow_meshes(sp, kit, variant_seed(sp, v as u32)).1
                     } else {
                         let rock = &rocks[e - MAX_SPECIES].1;
-                        grow_rock(rock, derive(name_key(&rock.name), v as u64), &w)
+                        grow_rock_style(rock, derive(name_key(&rock.name), v as u64), &w, style)
                     };
                     let imp = bake(&lods[1]);
                     (lods, imp)
