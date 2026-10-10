@@ -1,0 +1,34 @@
+// Terra landform set (docs/ASTRUM_TERRAIN_PIPELINE.md §8.1, App. C.3; M2 Shape
+// design §2). Weight rules are expressions over Tier A fields (see
+// crates/world/src/terrain/landform/expr.rs for fields and functions); they
+// compile to bytecode, so edits need no shader rebuild. Recipes add relief
+// below the Tier A band edge on top of the eroded macro elevation:
+// h = macro + Σ w_i · amplitude_i · recipe_i + detail.
+LandformSet(
+    schema: 1,
+    name: "terra",
+    // About two world-map texels; recipe stacks start at or below it.
+    relief_band_edge_m: 2600.0,
+    normalize: true,
+    fallback: "plains",
+    landforms: [
+        (
+            name: "mountains",
+            weight: "smoothstep(0.5, 0.8, uplift)",
+            recipe: "recipes/mountains.ron",
+            amplitude_m: (500.0, 900.0),
+        ),
+        (
+            name: "hills",
+            weight: "bump(uplift, 0.15, 0.7) * (0.3 + 0.7 * humid)",
+            recipe: "recipes/hills.ron",
+            amplitude_m: (200.0, 400.0),
+        ),
+        (
+            name: "plains",
+            weight: "(1 - smoothstep(0.2, 0.55, uplift)) * (0.4 + 0.6 * smoothstep(0.2, 0.6, sediment))",
+            recipe: "recipes/plains.ron",
+            amplitude_m: (10.0, 30.0),
+        ),
+    ],
+)

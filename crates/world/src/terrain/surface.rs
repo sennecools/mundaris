@@ -18,6 +18,7 @@ pub use shape::*;
 mod director;
 mod geology;
 mod hierarchy;
+pub mod ladder;
 mod moon_fields;
 mod moon_profile;
 pub mod ladder;

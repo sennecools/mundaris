@@ -1,0 +1,28 @@
+// Mountains (pipeline §8.3): ridged noise stretched along the plate boundary
+// (4th noise dimension q_w = f·kappa·boundary_coord), warped so ranges are not
+// straight, slope-damped and gullied (§9.6), scaled by uplift and kept out of
+// the macro valley floors by the flow field. Output is in units of the
+// landform amplitude.
+Recipe(
+    schema: 1,
+    output: "out",
+    graph: [
+        // 2048 m (dyadic, needed for anisotropy) down to 32 m; the first three
+        // octaves run twice as long along the boundary. f·kappa·clamp ≤ 256:
+        // 2 · 64 km / 512 m = 250.
+        ("ridge", RidgedFbm(
+            base_wavelength_m: 2048.0,
+            min_wavelength_m: 24.0,
+            gain: 0.5,
+            sharpness: 2.0,
+            salt: 1,
+            anisotropy: Some((stretch: 2, kappa: 2.0, octaves: 3, clamp_km: 64.0)),
+        )),
+        // Warp wavelengths ≥ 2 × the ridge base; f·strength ≤ 64 (1200 m / 32 m).
+        ("warp", Warp(input: "ridge", strength_m: 1200.0, base_wavelength_m: 16384.0, octaves: 3, salt: 2)),
+        ("damp", SlopeDamped(input: "warp", damp: 1.2)),
+        ("erode", ErosionFilter(input: "damp", strength: 0.6, base_wavelength_m: 512.0, octaves: 4, salt: 3)),
+        ("valley", Curve(input: Field(Flow), points: [(0.0, 1.0), (0.6, 0.3), (1.0, 0.1)])),
+        ("out", Multiply(a: "erode", b: Multiply(a: Field(Uplift), b: "valley"))),
+    ],
+)

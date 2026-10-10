@@ -1,0 +1,11 @@
+// Plains (pipeline §8.3): very low fBm (amplitude 10–30 m per body), flatter
+// on thick sediment. Rivers and floodplains (M3) do most of the shaping.
+Recipe(
+    schema: 1,
+    output: "out",
+    graph: [
+        ("base", Fbm(base_wavelength_m: 2048.0, min_wavelength_m: 64.0, gain: 0.45, salt: 21)),
+        ("flatten", Curve(input: Field(Sediment), points: [(0.0, 1.0), (1.0, 0.3)])),
+        ("out", Multiply(a: "base", b: "flatten")),
+    ],
+)
