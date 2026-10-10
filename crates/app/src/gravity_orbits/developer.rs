@@ -250,6 +250,7 @@ impl GravityOrbitsDemo {
                 let body = self.developer_body(body)?;
                 self.developer_planet_edit(body, *seed, params, *reset)
             }
+            DevCommand::Studio { .. } => bail!("studio commands are applied by the Studio shell"),
         }
     }
 }

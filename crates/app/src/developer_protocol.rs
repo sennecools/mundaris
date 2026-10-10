@@ -145,6 +145,32 @@ pub enum DevCommand {
         #[serde(default)]
         reset: bool,
     },
+    /// Studio shell (the `studio_ui` binary only): switch workspace, show a
+    /// panel tab, drive the species browser. Applied in this order; species
+    /// edits regrow the line-up but are never saved.
+    Studio {
+        /// `editor`, `performance` or `flora`.
+        #[serde(default)]
+        workspace: Option<String>,
+        /// A panel tab to open (if closed) and bring to front, by title:
+        /// `viewport`, `scene`, `body`, `planet`, `render`, `log`,
+        /// `profiler`, `species`, `genome`, `line-up`.
+        #[serde(default)]
+        tab: Option<String>,
+        /// Species file stem to select (e.g. `broadleaf`).
+        #[serde(default)]
+        species: Option<String>,
+        /// Discards unsaved edits of the selected species first.
+        #[serde(default)]
+        species_revert: bool,
+        /// Genome or niche parameter edits by key: `[key, value]`, value a
+        /// number, boolean or option name.
+        #[serde(default)]
+        species_params: Vec<(String, serde_json::Value)>,
+        /// Number of variants in the line-up.
+        #[serde(default)]
+        variants: Option<u32>,
+    },
 }
 fn one() -> f64 {
     1.0

@@ -166,6 +166,15 @@ pub fn set_open(state: &mut DockState<Tab>, tab: Tab, open: bool) {
     }
 }
 
+/// Opens `tab` if it is closed and makes it the active tab of its node.
+#[cfg_attr(not(feature = "developer-tools"), allow(dead_code))]
+pub fn show(state: &mut DockState<Tab>, tab: Tab) {
+    set_open(state, tab, true);
+    if let Some(path) = state.find_tab(&tab) {
+        let _ = state.set_active_tab(path);
+    }
+}
+
 /// Dock colours from the theme tokens: tabs sit on the darkest surface, the
 /// active tab joins its panel's surface, and splitters are thin borders.
 pub fn style(egui_style: &egui::Style) -> Style {

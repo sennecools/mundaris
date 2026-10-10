@@ -6,6 +6,8 @@
 //! sized to the viewport → overlays → tessellate → surface acquire (the vsync
 //! wait under FIFO) → encode and submit → present.
 
+#[cfg(feature = "developer-tools")]
+mod dev_shell;
 mod dock;
 mod panels;
 mod profiler_panel;
@@ -72,6 +74,9 @@ pub struct Engine {
     last_panels: Option<Instant>,
     /// Species browser (Flora workspace); grows on its own worker thread.
     species: SpeciesEditor,
+    /// Workspace and tab changes from astrum-dev `studio` commands.
+    #[cfg(feature = "developer-tools")]
+    shell_requests: dev_shell::ShellRequests,
 }
 
 impl Engine {
@@ -89,6 +94,8 @@ impl Engine {
             panel_view: StudioView::default(),
             last_panels: None,
             species: SpeciesEditor::load(&species_dir()),
+            #[cfg(feature = "developer-tools")]
+            shell_requests: Default::default(),
         };
         engine.load_graphics();
         engine
@@ -157,7 +164,11 @@ impl Engine {
     #[cfg(feature = "developer-tools")]
     fn developer_turn(&mut self) {
         if let Some(service) = &mut self.developer {
-            service.turn(&mut self.demo, &mut self.renderer, true);
+            let mut shell = dev_shell::Shell {
+                species: &mut self.species,
+                requests: &mut self.shell_requests,
+            };
+            service.turn_with_shell(&mut self.demo, &mut self.renderer, true, &mut shell);
             if service.shutdown_requested {
                 self.quit = true;
             }
@@ -647,6 +658,16 @@ fn draw(
         profiler_shown,
         thumbnails,
     } = ui_state;
+    #[cfg(feature = "developer-tools")]
+    {
+        if let Some(next) = engine.shell_requests.workspace.take() {
+            layout.workspace = next;
+        }
+        if let Some(tab) = engine.shell_requests.tab.take() {
+            let current = layout.workspace;
+            dock::show(layout.dock_mut(current), tab);
+        }
+    }
     let workspace = layout.workspace;
     // The species view is built only while a species panel is open.
     let species_open = [Tab::Species, Tab::Genome, Tab::LineUp]

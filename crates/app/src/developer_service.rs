@@ -23,6 +23,21 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+/// The application shell around the engine (the Studio): applies
+/// [`DevCommand::Studio`] commands, which act on panels, not on the scene.
+pub trait DevShell {
+    fn studio(&mut self, command: &DevCommand) -> Result<()>;
+}
+
+/// Shell of an application without Studio panels.
+pub struct NoShell;
+
+impl DevShell for NoShell {
+    fn studio(&mut self, _command: &DevCommand) -> Result<()> {
+        anyhow::bail!("studio commands need the Studio (studio_ui)")
+    }
+}
+
 struct Pending {
     request: DevRequest,
     reply: SyncSender<DevResponse>,
@@ -362,6 +377,16 @@ impl DeveloperService {
         }
     }
     pub fn turn(&mut self, demo: &mut GravityOrbitsDemo, renderer: &mut Renderer, drawable: bool) {
+        self.turn_with_shell(demo, renderer, drawable, &mut NoShell);
+    }
+    /// [`Self::turn`] with a shell that applies [`DevCommand::Studio`] commands.
+    pub fn turn_with_shell(
+        &mut self,
+        demo: &mut GravityOrbitsDemo,
+        renderer: &mut Renderer,
+        drawable: bool,
+        shell: &mut dyn DevShell,
+    ) {
         if self
             .lease
             .as_ref()
@@ -487,7 +512,7 @@ impl DeveloperService {
                     json!({"error":"request_timeout"}),
                 )
             } else {
-                self.handle(&p.request, demo, renderer, drawable)
+                self.handle(&p.request, demo, renderer, drawable, shell)
             };
             let _ = p.reply.try_send(response);
         }
@@ -526,6 +551,7 @@ impl DeveloperService {
         demo: &mut GravityOrbitsDemo,
         renderer: &mut Renderer,
         drawable: bool,
+        shell: &mut dyn DevShell,
     ) -> DevResponse {
         let response = |status: &str, data: Value| {
             DevResponse::new(
@@ -543,7 +569,7 @@ impl DeveloperService {
         let (status, data) = match &request.operation {
             DevOperation::Capabilities => (
                 "ok",
-                json!({"protocol_version":PROTOCOL_VERSION,"queue_capacity":REQUEST_CAPACITY,"applications_per_turn":COMMANDS_PER_TURN,"history_capacity":HISTORY_CAPACITY,"lease_seconds":LEASE_SECONDS,"native_capture":"on_demand_surface_copy","presets":["test-solar-system"],"actions":["profiler","select","focus","overview","look_at","navigation_mode","navigation","clearance","surface_pose","pause","rate","seek","single_step","reset","render_mode","setting","reset_render_settings","layer","resident_cover_hold"]}),
+                json!({"protocol_version":PROTOCOL_VERSION,"queue_capacity":REQUEST_CAPACITY,"applications_per_turn":COMMANDS_PER_TURN,"history_capacity":HISTORY_CAPACITY,"lease_seconds":LEASE_SECONDS,"native_capture":"on_demand_surface_copy","presets":["test-solar-system"],"actions":["profiler","select","focus","overview","look_at","navigation_mode","navigation","clearance","surface_pose","pause","rate","seek","single_step","reset","render_mode","setting","reset_render_settings","layer","resident_cover_hold","studio"]}),
             ),
             DevOperation::Inspect => {
                 let mut snapshot = self.current_observation(drawable, demo.world().revision());
@@ -619,7 +645,10 @@ impl DeveloperService {
                 if !self.owns(lease) {
                     ("failed", json!({"error":"lost_ownership"}))
                 } else {
-                    let result = demo.developer_apply_command(command);
+                    let result = match command {
+                        DevCommand::Studio { .. } => shell.studio(command),
+                        _ => demo.developer_apply_command(command),
+                    };
                     let revision = demo.world().revision();
                     match result {
                         Ok(()) => {
