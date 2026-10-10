@@ -44,6 +44,10 @@ pub fn view_mode_name(mode: TerrainViewMode) -> &'static str {
         TerrainViewMode::Moisture => "Moisture",
         TerrainViewMode::Wind => "Wind",
         TerrainViewMode::Biome => "Biome",
+        TerrainViewMode::Uplift => "Uplift",
+        TerrainViewMode::Hardness => "Rock hardness",
+        TerrainViewMode::Sediment => "Sediment",
+        TerrainViewMode::Flow => "Flow",
     }
 }
 

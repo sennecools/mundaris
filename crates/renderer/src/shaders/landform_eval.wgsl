@@ -66,6 +66,8 @@ fn lf_field_run(field: u32) -> vec2<u32> {
 // Per-sample cache: (value, gradient per metre) by field id at the sample
 // direction.
 var<private> lf_cache: array<vec4<f32>, 9>;
+// True once `lf_fill_cache` ran for this sample.
+var<private> lf_cache_valid: bool;
 // Field ids of the four lanes of a 4-field sample (> 8: unused lane).
 var<private> lf4_ids: vec4<u32>;
 
@@ -713,6 +715,7 @@ fn landform_relief(local: vec3<f32>, d: vec3<f32>) -> vec4<f32> {
     }
     let code = lf_word(1u);
     lf_fill_cache(d);
+    lf_cache_valid = true;
     lf_fill_rule_fields();
     var sum = vec4<f32>(0.0);
     for (var i = 0u; i < count; i = i + 1u) {
@@ -724,4 +727,17 @@ fn landform_relief(local: vec3<f32>, d: vec3<f32>) -> vec4<f32> {
         sum += vec4<f32>(w * h.x, h.yzw * w);
     }
     return sum;
+}
+
+// Shape overlay texel (uplift, hardness, sediment, flow) from the field
+// cache of this sample; zero when no landforms were evaluated.
+fn page_shape() -> vec4<f32> {
+    if !lf_cache_valid {
+        return vec4<f32>(0.0);
+    }
+    return clamp(
+        vec4<f32>(lf_cache[0].x, lf_cache[3].x, lf_cache[1].x, lf_cache[2].x),
+        vec4<f32>(0.0),
+        vec4<f32>(1.0),
+    );
 }

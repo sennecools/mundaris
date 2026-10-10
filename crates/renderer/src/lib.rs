@@ -166,6 +166,13 @@ impl GpuContext {
                         .max_storage_buffer_binding_size
                         .min(512 << 20),
                     max_buffer_size: adapter.limits().max_buffer_size.min(512 << 20),
+                    // The atlas producer writes five page textures (height,
+                    // normal, albedo, climate, shape); the portable default
+                    // is four. Desktop adapters offer far more.
+                    max_storage_textures_per_shader_stage: adapter
+                        .limits()
+                        .max_storage_textures_per_shader_stage
+                        .min(8),
                     ..wgpu::Limits::default()
                 },
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),

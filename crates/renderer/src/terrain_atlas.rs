@@ -100,10 +100,18 @@ pub enum TerrainViewMode {
     Wind,
     /// Page albedo (biome/snow/water colour) without light.
     Biome,
+    /// Shape page: orogenic uplift 0..1 (M2).
+    Uplift,
+    /// Shape page: rock hardness 0..1.
+    Hardness,
+    /// Shape page: deposited sediment 0..1.
+    Sediment,
+    /// Shape page: macro drainage proxy 0..1.
+    Flow,
 }
 
 impl TerrainViewMode {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 20] = [
         Self::Lit,
         Self::Unlit,
         Self::Height,
@@ -120,6 +128,10 @@ impl TerrainViewMode {
         Self::Moisture,
         Self::Wind,
         Self::Biome,
+        Self::Uplift,
+        Self::Hardness,
+        Self::Sediment,
+        Self::Flow,
     ];
 
     /// Debug views that bypass exposure, metering and tonemapping.
@@ -146,6 +158,10 @@ impl TerrainViewMode {
             Self::Moisture => 16,
             Self::Wind => 17,
             Self::Biome => 18,
+            Self::Uplift => 19,
+            Self::Hardness => 20,
+            Self::Sediment => 21,
+            Self::Flow => 22,
         }
     }
 
@@ -168,6 +184,10 @@ impl TerrainViewMode {
             Self::Moisture => "moisture",
             Self::Wind => "wind",
             Self::Biome => "biome",
+            Self::Uplift => "uplift",
+            Self::Hardness => "hardness",
+            Self::Sediment => "sediment",
+            Self::Flow => "flow",
         }
     }
 
@@ -647,6 +667,7 @@ pub(crate) struct TerrainAtlasRenderer {
     _height: wgpu::Texture,
     _normal: wgpu::Texture,
     _albedo: wgpu::Texture,
+    _shape: wgpu::Texture,
     _climate: wgpu::Texture,
     produce: wgpu::ComputePipeline,
     source_layout: wgpu::BindGroupLayout,
@@ -682,6 +703,7 @@ pub(crate) struct TerrainAtlasRenderer {
     height_view: wgpu::TextureView,
     normal_view: wgpu::TextureView,
     albedo_view: wgpu::TextureView,
+    shape_view: wgpu::TextureView,
     climate_view: wgpu::TextureView,
     sampler: wgpu::Sampler,
     grid_uniform: wgpu::Buffer,
@@ -749,6 +771,13 @@ impl TerrainAtlasRenderer {
             wgpu::TextureFormat::Rgba16Float,
             "Terrain atlas climate",
         );
+        // Shape overlays (M2): uplift, hardness, sediment, flow (zero off
+        // world maps with landforms).
+        let shape = array(
+            config.normal_side(),
+            wgpu::TextureFormat::Rgba8Unorm,
+            "Terrain atlas shape",
+        );
         let array_view = |texture: &wgpu::Texture| {
             texture.create_view(&wgpu::TextureViewDescriptor {
                 dimension: Some(wgpu::TextureViewDimension::D2Array),
@@ -759,6 +788,7 @@ impl TerrainAtlasRenderer {
         let normal_view = array_view(&normal);
         let albedo_view = array_view(&albedo);
         let climate_view = array_view(&climate);
+        let shape_view = array_view(&shape);
 
         let produce_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Terrain atlas producer"),
@@ -806,6 +836,7 @@ impl TerrainAtlasRenderer {
                 storage(6, false),
                 storage_texture(7, wgpu::TextureFormat::Rgba8Unorm),
                 storage_texture(8, wgpu::TextureFormat::Rgba16Float),
+                storage_texture(9, wgpu::TextureFormat::Rgba8Unorm),
             ],
         });
         let image = |binding| wgpu::BindGroupLayoutEntry {
@@ -956,6 +987,10 @@ impl TerrainAtlasRenderer {
                     binding: 8,
                     resource: wgpu::BindingResource::TextureView(&storage_view(&climate)),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(&storage_view(&shape)),
+                },
             ],
         });
 
@@ -1036,6 +1071,17 @@ impl TerrainAtlasRenderer {
                     },
                     count: None,
                 },
+                // Shape overlay page (M2 editor overlays).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1057,7 +1103,7 @@ impl TerrainAtlasRenderer {
         let draw_group = draw_group(
             device,
             &draw_layout,
-            [&height_view, &normal_view, &albedo_view, &climate_view],
+            [&height_view, &normal_view, &albedo_view, &climate_view, &shape_view],
             &sampler,
             &instances,
             &grid_uniform,
@@ -1336,7 +1382,7 @@ impl TerrainAtlasRenderer {
         let shadow_group = self::draw_group(
             device,
             &draw_layout,
-            [&height_view, &normal_view, &albedo_view, &climate_view],
+            [&height_view, &normal_view, &albedo_view, &climate_view, &shape_view],
             &sampler,
             &shadow_instances,
             &grid_uniform,
@@ -1363,6 +1409,7 @@ impl TerrainAtlasRenderer {
             _height: height,
             _normal: normal,
             _albedo: albedo,
+            _shape: shape,
             _climate: climate,
             produce,
             source_layout,
@@ -1396,6 +1443,7 @@ impl TerrainAtlasRenderer {
             height_view,
             normal_view,
             albedo_view,
+            shape_view,
             climate_view,
             sampler,
             grid_uniform,
@@ -1899,6 +1947,7 @@ impl TerrainAtlasRenderer {
                     &self.normal_view,
                     &self.albedo_view,
                     &self.climate_view,
+                    &self.shape_view,
                 ],
                 &self.sampler,
                 &self.instances,
@@ -1989,6 +2038,7 @@ impl TerrainAtlasRenderer {
                     &self.normal_view,
                     &self.albedo_view,
                     &self.climate_view,
+                    &self.shape_view,
                 ],
                 &self.sampler,
                 &self.shadow_instances,
@@ -2703,8 +2753,8 @@ fn instance_buffer(device: &wgpu::Device, capacity: u64) -> wgpu::Buffer {
 fn draw_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
-    // Height, normal, albedo and climate atlas views.
-    [height, normal, albedo, climate]: [&wgpu::TextureView; 4],
+    // Height, normal, albedo, climate and shape atlas views.
+    [height, normal, albedo, climate, shape]: [&wgpu::TextureView; 5],
     sampler: &wgpu::Sampler,
     instances: &wgpu::Buffer,
     grid: &wgpu::Buffer,
@@ -2740,6 +2790,10 @@ fn draw_group(
             wgpu::BindGroupEntry {
                 binding: 6,
                 resource: wgpu::BindingResource::TextureView(climate),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::TextureView(shape),
             },
         ],
     })

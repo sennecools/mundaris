@@ -67,6 +67,9 @@ struct FieldsConstants {
 // Page climate: (temperature °C, moisture, wind east, wind north) for world
 // maps, zero elsewhere.
 @group(0) @binding(8) var climate_out: texture_storage_2d_array<rgba16float, write>;
+// Shape overlays (M2 editor): uplift, hardness, sediment, flow at the page
+// texel for world maps with landforms (`page_shape`), zero elsewhere.
+@group(0) @binding(9) var shape_out: texture_storage_2d_array<rgba8unorm, write>;
 @group(1) @binding(0) var macro_image: texture_2d<u32>;
 @group(1) @binding(1) var detail_image: texture_2d<u32>;
 @group(1) @binding(2) var<uniform> profile: ProfileConstants;
@@ -909,6 +912,7 @@ fn produce(@builtin(global_invocation_id) id: vec3<u32>) {
         textureStore(normal_out, vec2<i32>(id.xy), layer, vec4<f32>(value.xyz, page_water(st, value)));
         textureStore(albedo_out, vec2<i32>(id.xy), layer, page_albedo(st, value));
         textureStore(climate_out, vec2<i32>(id.xy), layer, page_climate(st));
+        textureStore(shape_out, vec2<i32>(id.xy), layer, page_shape());
     }
     if mode == 1u {
         return;

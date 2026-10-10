@@ -35,6 +35,8 @@ struct Grid {
 @group(1) @binding(5) var albedo_atlas: texture_2d_array<f32>;
 // Page climate: temperature °C, moisture, wind east, wind north (zero off world maps).
 @group(1) @binding(6) var climate_atlas: texture_2d_array<f32>;
+// Shape overlay page (M2): uplift, hardness, sediment, flow (fragment only).
+@group(1) @binding(7) var shape_atlas: texture_2d_array<f32>;
 
 fn height_at(layer: i32, st: vec2<f32>) -> f32 {
     let cells = grid.data.x;
@@ -188,6 +190,22 @@ fn moisture_ramp(m: f32) -> vec3<f32> {
     return display(select(mix(green, blue, (t - 0.5) * 2.0), mix(dry, green, t * 2.0), t < 0.5));
 }
 
+// Overlay ramp for a 0..1 field: dark blue, teal, yellow, white.
+fn unit_ramp(x: f32) -> vec3<f32> {
+    let t = clamp(x, 0.0, 1.0);
+    let a = vec3<f32>(0.05, 0.07, 0.25);
+    let b = vec3<f32>(0.1, 0.55, 0.55);
+    let c = vec3<f32>(0.95, 0.85, 0.2);
+    let d = vec3<f32>(1.0);
+    var col = mix(c, d, (t - 0.8) / 0.2);
+    if t < 0.4 {
+        col = mix(a, b, t / 0.4);
+    } else if t < 0.8 {
+        col = mix(b, c, (t - 0.4) / 0.4);
+    }
+    return display(col);
+}
+
 fn wind_colour(east: f32, north: f32) -> vec3<f32> {
     let speed = length(vec2<f32>(east, north));
     let angle = atan2(north, east);
@@ -257,6 +275,14 @@ fn fs_main(input: VertexOut) -> SceneOut {
     } else if mode == 18u {
         // Page colour without light (linear; the display encodes it).
         debug_color = albedo;
+    } else if mode >= 19u && mode <= 22u {
+        let own_s = textureSampleLevel(shape_atlas, normal_sampler, input.own_uv, input.layers.x, 0.0);
+        let parent_s = textureSampleLevel(shape_atlas, normal_sampler, input.parent_uv, input.layers.y, 0.0);
+        let shape = mix(mix(parent_s, own_s, input.blend.x), parent_s, input.blend.y);
+        debug_color = display(vec3<f32>(0.25));
+        if page.a >= 0.5 {
+            debug_color = unit_ramp(shape[mode - 19u]);
+        }
     } else if mode >= 15u && mode <= 17u {
         let own_c = textureSampleLevel(climate_atlas, normal_sampler, input.own_uv, input.layers.x, 0.0);
         let parent_c = textureSampleLevel(climate_atlas, normal_sampler, input.parent_uv, input.layers.y, 0.0);

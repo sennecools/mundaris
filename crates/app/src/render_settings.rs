@@ -94,6 +94,10 @@ const VIEW_MODES: &[&str] = &[
     "moisture",
     "wind",
     "biome",
+    "uplift",
+    "hardness",
+    "sediment",
+    "flow",
 ];
 const TONEMAPPERS: &[&str] = &["agx", "aces", "clamp"];
 const EXPOSURE_MODES: &[&str] = &["auto", "manual"];
