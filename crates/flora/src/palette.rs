@@ -386,6 +386,25 @@ impl Palette {
             leaf[0] -= 0.03;
             leaf[1] *= 0.85;
         }
+        // Strangeness carries the woody species into the planet's alien hue
+        // families too (none at 0.4, most of the way at 0.7): canopy trees
+        // take the family nearest amber/orange (art direction 2026-10-10,
+        // NMS 2016 crowns), shrubs a seeded family; chroma rises toward the
+        // realism dial's cap.
+        let alien = crate::niche::smoothstep(0.4, 0.75, p.strangeness);
+        if alien > 0.0 {
+            let fam = self.hue_families(p);
+            let dist = |a: f64, b: f64| ((a - b + 540.0).rem_euclid(360.0) - 180.0).abs();
+            let target = if n.layer == Layer::Canopy {
+                *fam.iter().min_by(|a, b| dist(**a, 45.0).total_cmp(&dist(**b, 45.0))).unwrap()
+            } else {
+                fam[(st.unit(5, 0) * 3.0) as usize % 3]
+            };
+            let target = (target + 12.0 * st.signed(6, 0)).rem_euclid(360.0);
+            let dh = (target - leaf[2] + 540.0).rem_euclid(360.0) - 180.0;
+            leaf[2] = (leaf[2] + alien * dh).rem_euclid(360.0);
+            leaf[1] = leaf[1].max(alien * 0.8 * chroma_cap(p.realism()));
+        }
         let mut tip = [leaf[0] + 0.07, leaf[1] * 1.15, (leaf[2] + 4.0 * st.signed(1, 0)).rem_euclid(360.0)];
         let mut bark = [self.bark[0] + 0.04 * st.signed(2, 0), self.bark[1], (self.bark[2] + 12.0 * st.signed(3, 0)).rem_euclid(360.0)];
         if p.foliage == crate::genome::FoliageStyle::Stylised {

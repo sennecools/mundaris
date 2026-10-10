@@ -218,10 +218,14 @@ fn grow_all() -> Grown {
 /// species loaded).
 pub(crate) fn species_shader(shader: &str) -> String {
     let g = grown();
-    if g.species.is_empty() {
-        return shader.to_string();
+    let mut out = if g.species.is_empty() { shader.to_string() } else { splice_species(shader, &species_wgsl(&g.species, &g.rocks)) };
+    // Debug (measurement): ASTRUM_FLORA_FULL_M overrides the full-density
+    // view distance of the plant thinning (SCATTER_FULL_M, metres).
+    if let Some(m) = std::env::var("ASTRUM_FLORA_FULL_M").ok().and_then(|v| v.parse::<f32>().ok()) {
+        out = out.replace("const SCATTER_FULL_M: f32 = 350.0;", &format!("const SCATTER_FULL_M: f32 = {m:.1};"));
+        tracing::info!("flora: SCATTER_FULL_M overridden to {m} m");
     }
-    splice_species(shader, &species_wgsl(&g.species, &g.rocks))
+    out
 }
 
 fn grown() -> Arc<Grown> {
