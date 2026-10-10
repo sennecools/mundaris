@@ -176,6 +176,34 @@ pub struct LightingSettings {
     pub sun_azimuth_deg: f32,
 }
 
+/// Overall look (art direction 2026-10-10): physical light, or the stylised
+/// preset (hazier bright sky, coloured lifted shadows, warm grade, bloom).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LookPreset {
+    #[default]
+    Physical,
+    Stylised,
+}
+
+impl LookPreset {
+    pub const ALL: [Self; 2] = [Self::Physical, Self::Stylised];
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Physical => "physical",
+            Self::Stylised => "stylised",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LookSettings {
+    pub preset: LookPreset,
+    /// Multiplier on atmospheric scattering density (aerial perspective).
+    pub haze: f32,
+    /// Multiplier on the scattered sky light (0 = no atmosphere drawn).
+    pub sky_scale: f32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OverlaySettings {
     pub line_width_scale: f32,
@@ -194,6 +222,7 @@ pub struct RenderSettings {
     pub lighting: LightingSettings,
     pub overlays: OverlaySettings,
     pub anti_aliasing: AntiAliasing,
+    pub look: LookSettings,
 }
 
 impl Default for RenderSettings {
@@ -248,6 +277,11 @@ impl Default for RenderSettings {
             },
             // User choice 2026-10-10 after the side-by-side comparison.
             anti_aliasing: AntiAliasing::Msaa4,
+            look: LookSettings {
+                preset: LookPreset::Physical,
+                haze: 1.0,
+                sky_scale: 1.0,
+            },
         }
     }
 }
@@ -283,6 +317,8 @@ impl RenderSettings {
             self.lighting.sun_azimuth_deg,
             self.overlays.line_width_scale,
             self.overlays.opacity,
+            self.look.haze,
+            self.look.sky_scale,
         ];
         if finite.iter().any(|value| !value.is_finite()) {
             return Err("render settings contain a nonfinite value".into());
@@ -333,6 +369,10 @@ impl RenderSettings {
         check(
             self.overlays.line_width_scale > 0.0 && (0.0..=1.0).contains(&self.overlays.opacity),
             "overlay style out of range",
+        )?;
+        check(
+            (0.0..=20.0).contains(&self.look.haze) && (0.0..=20.0).contains(&self.look.sky_scale),
+            "look haze/sky out of range",
         )
     }
 }

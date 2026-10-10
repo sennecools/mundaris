@@ -8,6 +8,15 @@
 @group(0) @binding(4) var<storage, read> exposure: Exposure;
 @group(0) @binding(5) var ao_tex: texture_2d<f32>;
 @group(0) @binding(6) var depth_tex: texture_depth_2d;
+// Colour grade (look preset): display-encoded in, display-encoded out.
+@group(0) @binding(7) var grade_lut: texture_3d<f32>;
+
+fn grade(c: vec3<f32>) -> vec3<f32> {
+    let size = f32(textureDimensions(grade_lut).x);
+    let encoded = clamp(to_srgb(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0))), vec3<f32>(0.0), vec3<f32>(1.0));
+    let uvw = encoded * ((size - 1.0) / size) + 0.5 / size;
+    return from_srgb(textureSampleLevel(grade_lut, linear_clamp, uvw, 0.0).rgb);
+}
 
 // Minimal AgX (Wrensch 2023, after Sobotka): inset, log2 encode, sigmoid, outset.
 fn agx_contrast(x: vec3<f32>) -> vec3<f32> {
@@ -108,6 +117,7 @@ fn fs_tonemap(input: FullscreenOut) -> @location(0) vec4<f32> {
     } else {
         out = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
     }
+    out = grade(out);
     if post.tonemap.y > 0.5 {
         let noise = ign(input.position.xy, post.tonemap.z) - 0.5;
         out = from_srgb(clamp(to_srgb(out) + noise / 255.0, vec3<f32>(0.0), vec3<f32>(1.0)));

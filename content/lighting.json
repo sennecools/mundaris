@@ -48,7 +48,19 @@
         0.15,
         0.09
       ],
-      "brdf": "lambert"
+      "brdf": "lambert",
+      "atmosphere": {
+        "top_height_m": 60000,
+        "rayleigh_per_m": [
+          5.2e-6,
+          12.2e-6,
+          29.8e-6
+        ],
+        "rayleigh_scale_height_m": 8000,
+        "mie_per_m": 2.1e-5,
+        "mie_scale_height_m": 1200,
+        "mie_g": 0.76
+      }
     }
   }
 }

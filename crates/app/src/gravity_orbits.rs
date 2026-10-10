@@ -1697,6 +1697,19 @@ impl GravityOrbitsDemo {
                 .take(astrum_renderer::MAX_OCCLUDERS)
                 .collect(),
         })?;
+        // Sky and aerial perspective of the nearest body with an atmosphere.
+        if let Some((index, _)) = self.sun_elevation
+            && let Some(atmosphere) = self
+                .lighting
+                .atmosphere(&self.presentation[index].semantic_id)
+        {
+            let (center, radius) = centres[index];
+            frame.set_atmosphere(astrum_renderer::FrameAtmosphere {
+                center_view_m: center,
+                radius_m: radius,
+                atmosphere,
+            })?;
+        }
         renderer.set_render_settings(self.controls.render_settings)?;
         if self.controls.terrain_preview {
             let _span = crate::engine_profile::span("Atlas terrain preparation");

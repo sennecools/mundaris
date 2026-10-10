@@ -96,6 +96,9 @@ struct Targets {
     ms: Option<MsTargets>,
     ldr: Option<LdrTarget>,
     taa: Option<TaaTargets>,
+    /// Atmosphere output, copied back over `direct`.
+    atmosphere: Target,
+    atmosphere_group: wgpu::BindGroup,
     ao_size: [u32; 2],
     bloom_levels: u32,
     direct: Target,
@@ -138,6 +141,13 @@ pub(crate) struct PostProcess {
     taa_layout: wgpu::BindGroupLayout,
     taa_pipeline: wgpu::RenderPipeline,
     taa_buffer: wgpu::Buffer,
+    atmosphere_layout: wgpu::BindGroupLayout,
+    /// Colour-grade LUT (crate::grade) and the look it was built for.
+    grade_lut: wgpu::Texture,
+    grade_view: wgpu::TextureView,
+    grade_look: Option<crate::LookPreset>,
+    atmosphere_pipeline: wgpu::RenderPipeline,
+    atmosphere_buffer: wgpu::Buffer,
     /// History written last frame (index into `TaaTargets::history`).
     taa_parity: usize,
     /// The history holds a previous frame (false after (re)allocation).
@@ -162,6 +172,8 @@ pub(crate) struct PostFrame {
     pub passthrough: bool,
     /// TAA parameters of this frame (shader `Taa` struct), when TAA is on.
     pub taa: Option<[[f32; 4]; 6]>,
+    /// Atmosphere parameters (shader `Atmosphere` struct), when one is drawn.
+    pub atmosphere: Option<[[f32; 4]; 8]>,
 }
 
 fn entry(
@@ -443,6 +455,15 @@ impl PostProcess {
                 storage_entry(4, fragment, true),
                 texture_entry(5, fragment, false),
                 depth_entry(6),
+                entry(
+                    7,
+                    fragment,
+                    wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                ),
             ],
         );
         let bloom_layout = layout(
@@ -620,6 +641,64 @@ impl PostProcess {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let atmosphere_layout = layout(
+            device,
+            "Atmosphere inputs",
+            &[
+                entry(
+                    0,
+                    fragment,
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(
+                            crate::atmosphere::ATMOSPHERE_BYTES,
+                        ),
+                    },
+                ),
+                texture_entry(1, fragment, false),
+                depth_entry(2),
+                storage_entry(3, fragment, true),
+            ],
+        );
+        let atmosphere_shader = module(
+            device,
+            "Atmosphere",
+            concat!(
+                include_str!("shaders/post_common.wgsl"),
+                include_str!("shaders/atmosphere.wgsl")
+            ),
+        );
+        let atmosphere_pipeline = fullscreen(
+            device,
+            "Atmosphere",
+            &atmosphere_layout,
+            &atmosphere_shader,
+            "fs_atmosphere",
+            HDR_FORMAT,
+            None,
+        );
+        let atmosphere_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Atmosphere parameters"),
+            size: crate::atmosphere::ATMOSPHERE_BYTES,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let grade_lut = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Colour grade LUT"),
+            size: wgpu::Extent3d {
+                width: crate::grade::LUT_SIZE,
+                height: crate::grade::LUT_SIZE,
+                depth_or_array_layers: crate::grade::LUT_SIZE,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let grade_view = grade_lut.create_view(&Default::default());
         let fxaa_layout = layout(
             device,
             "FXAA inputs",
@@ -735,6 +814,12 @@ impl PostProcess {
             taa_layout,
             taa_pipeline,
             taa_buffer,
+            atmosphere_layout,
+            grade_lut,
+            grade_view,
+            grade_look: None,
+            atmosphere_pipeline,
+            atmosphere_buffer,
             taa_parity: 0,
             taa_valid: false,
             fxaa_layout,
@@ -924,11 +1009,24 @@ impl PostProcess {
         });
         // New history textures hold nothing yet.
         self.taa_valid = false;
+        let atmosphere = target(device, "Atmosphere output", size, HDR_FORMAT);
+        let atmosphere_group = group(
+            "Atmosphere inputs",
+            &self.atmosphere_layout,
+            &[
+                buffer(0, &self.atmosphere_buffer),
+                view(1, &direct.view),
+                view(2, &depth.view),
+                buffer(3, &self.exposure),
+            ],
+        );
         let targets = Targets {
             samples,
             ms,
             ldr,
             taa,
+            atmosphere,
+            atmosphere_group,
             gtao_group: group(
                 "GTAO inputs",
                 &self.gtao_layout,
@@ -972,6 +1070,7 @@ impl PostProcess {
                     buffer(4, &self.exposure),
                     view(5, &ao.view),
                     view(6, &depth.view),
+                    view(7, &self.grade_view),
                 ],
             ),
             down_groups,
@@ -1066,7 +1165,13 @@ impl PostProcess {
             ],
             [
                 if bloom_enabled { 1.0 } else { 0.0 },
-                settings.bloom.intensity,
+                // The stylised look blooms more (art direction 2026-10-10).
+                settings.bloom.intensity
+                    * if settings.look.preset == crate::LookPreset::Stylised {
+                        2.5
+                    } else {
+                        1.0
+                    },
                 settings.bloom.radius,
                 t.bloom_levels as f32,
             ],
@@ -1086,6 +1191,26 @@ impl PostProcess {
                 .flat_map(|v| v.to_le_bytes())
                 .collect::<Vec<_>>(),
         );
+        let look = settings.look.preset;
+        if self.grade_look != Some(look) {
+            let lut = crate::grade::Grade::for_look(look).lut();
+            let n = crate::grade::LUT_SIZE;
+            queue.write_texture(
+                self.grade_lut.as_image_copy(),
+                &lut,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(n * 4),
+                    rows_per_image: Some(n),
+                },
+                wgpu::Extent3d {
+                    width: n,
+                    height: n,
+                    depth_or_array_layers: n,
+                },
+            );
+            self.grade_look = Some(look);
+        }
         let mut mask = 0u32;
         if let Some(ms) = &t.ms {
             // One pass resolves the colour MRT (weighted) and the depth.
@@ -1147,6 +1272,37 @@ impl PostProcess {
             &t.composite_group,
         );
         mask |= 1 << pair::AO_COMPOSITE;
+        if let Some(values) = frame.atmosphere.filter(|_| !frame.passthrough) {
+            // Sky and aerial perspective over the lit HDR image (before TAA,
+            // exposure, bloom and tonemap).
+            queue.write_buffer(
+                &self.atmosphere_buffer,
+                0,
+                &values
+                    .iter()
+                    .flatten()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            );
+            pass(
+                encoder,
+                "Atmosphere",
+                &t.atmosphere.view,
+                clear,
+                None,
+                &self.atmosphere_pipeline,
+                &t.atmosphere_group,
+            );
+            encoder.copy_texture_to_texture(
+                t.atmosphere._texture.as_image_copy(),
+                t.direct._texture.as_image_copy(),
+                wgpu::Extent3d {
+                    width: t.size[0],
+                    height: t.size[1],
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
         if let (Some(taa), Some(mut values)) = (&t.taa, frame.taa) {
             // Lit HDR (direct + ambient × AO) is final here: TAA writes the
             // other history and copies it back over `direct`, so exposure,
@@ -1328,6 +1484,13 @@ mod tests {
                 concat!(
                     include_str!("shaders/post_common.wgsl"),
                     include_str!("shaders/aa_taa.wgsl")
+                ),
+            ),
+            (
+                "atmosphere",
+                concat!(
+                    include_str!("shaders/post_common.wgsl"),
+                    include_str!("shaders/atmosphere.wgsl")
                 ),
             ),
         ] {

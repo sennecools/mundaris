@@ -8,7 +8,8 @@
 //! content.
 use anyhow::{Result, bail, ensure};
 use astrum_renderer::{
-    AntiAliasing, ExposureMode, RenderSettings, SHADOW_RESOLUTIONS, TerrainViewMode, Tonemapper,
+    AntiAliasing, ExposureMode, LookPreset, RenderSettings, SHADOW_RESOLUTIONS, TerrainViewMode,
+    Tonemapper,
 };
 use serde_json::{Value, json};
 
@@ -106,6 +107,8 @@ const RESOLUTIONS: &[&str] = &["1024", "2048", "4096"];
 const SUN_MODES: &[&str] = &["star", "studio"];
 /// `AntiAliasing::ALL` order.
 const AA_MODES: &[&str] = &["off", "fxaa", "msaa2", "msaa4", "msaa8", "taa"];
+/// `LookPreset::ALL` order.
+const LOOKS: &[&str] = &["physical", "stylised"];
 
 pub const SPECS: &[SettingSpec] = &[
     spec(
@@ -114,6 +117,14 @@ pub const SPECS: &[SettingSpec] = &[
         "View mode",
         SettingKind::Choice(VIEW_MODES),
     ),
+    spec(
+        "render.look.preset",
+        "Look",
+        "Preset",
+        SettingKind::Choice(LOOKS),
+    ),
+    spec("render.look.haze", "Look", "Haze", float(0.0, 8.0, "×")),
+    spec("render.look.sky", "Look", "Sky light", float(0.0, 4.0, "×")),
     spec(
         "render.aa.mode",
         "Anti-aliasing",
@@ -331,6 +342,9 @@ pub fn get(state: &RenderState, index: usize) -> SettingValue {
     let f = |v: f32| Float(f64::from(v));
     match SPECS[index].id {
         "render.view_mode" => Choice(choice_index(&TerrainViewMode::ALL, state.view_mode)),
+        "render.look.preset" => Choice(choice_index(&LookPreset::ALL, s.look.preset)),
+        "render.look.haze" => f(s.look.haze),
+        "render.look.sky" => f(s.look.sky_scale),
         "render.aa.mode" => Choice(choice_index(&AntiAliasing::ALL, s.anti_aliasing)),
         "render.tonemap.operator" => Choice(choice_index(&Tonemapper::ALL, s.tonemap)),
         "render.dither" => Bool(s.dither),
@@ -405,6 +419,9 @@ pub fn set(state: &mut RenderState, index: usize, value: SettingValue) -> Result
     };
     match spec.id {
         "render.view_mode" => next.view_mode = TerrainViewMode::ALL[c(value)],
+        "render.look.preset" => s.look.preset = LookPreset::ALL[c(value)],
+        "render.look.haze" => s.look.haze = f(value),
+        "render.look.sky" => s.look.sky_scale = f(value),
         "render.aa.mode" => s.anti_aliasing = AntiAliasing::ALL[c(value)],
         "render.tonemap.operator" => s.tonemap = Tonemapper::ALL[c(value)],
         "render.dither" => s.dither = b(value),

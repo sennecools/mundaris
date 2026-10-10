@@ -16,7 +16,7 @@ struct Lighting {
     depth_range: vec4<f32>,  // light depth range per cascade (m)
     occluders: array<vec4<f32>, 8>,
     cascades: array<mat4x4<f32>, 4>,
-    sky: vec4<f32>,          // rgb = sky colour × sky fraction of the sun (lux per lux), -
+    sky: vec4<f32>,          // rgb = sky colour × sky fraction of the sun (lux per lux), w = stylised look
 }
 
 struct Exposure {
@@ -241,7 +241,11 @@ fn shade(p: vec3<f32>, n: vec3<f32>, up: vec3<f32>, albedo: vec3<f32>, brdf: f32
     let elevation = dot(up, l);
     let sky_level = smoothstep(-0.1, 0.05, elevation) * sqrt(max(elevation, 0.02));
     let sky = e * lighting.sky.rgb * sky_level * 0.5 * (1.0 + dot(n, up)) * disk;
-    let ambient = albedo / PI * (lighting.ambient.rgb + bounce + sky);
+    // Stylised look: a soft sky-coloured rim on grazing surfaces (foliage
+    // silhouettes, crown edges), lit by the sky like the ambient term.
+    let rim = lighting.sky.w * pow(1.0 - max(dot(n, v), 0.0), 3.0) * 0.6
+        * e * lighting.sky.rgb * sky_level * disk;
+    let ambient = albedo / PI * (lighting.ambient.rgb + bounce + sky + rim);
     if mode == VIEW_SHADOWS {
         var tint = array<vec3<f32>, 5>(
             vec3<f32>(1.0, 0.35, 0.3), vec3<f32>(0.35, 1.0, 0.35),
