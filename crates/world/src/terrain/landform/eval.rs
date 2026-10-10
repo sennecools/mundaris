@@ -28,7 +28,7 @@
 //!   wavelength `λ_g`) uses `G` summed over relief octaves with
 //!   `f_eff ≤ f_g/2` plus earlier gully octaves: stripes run downhill
 //!   (`t̂ = n̂ × Ĝ_t` is the contour direction) and the octave adds
-//!   `strength·λ_g/(2π)·min(|G_t|, EROSION_SLOPE_CAP/A)·w_g·(1 − hardness)·(s_g − μ_g)`.
+//!   `strength·λ_g/(2π)·min(|G_t|, EROSION_SLOPE_CAP/A)·w_g·(1 − 0.6·hardness)·(s_g − μ_g)`.
 //!   The damping factors, the stripe direction and the `min(..)` slope term
 //!   are held locally constant in the gradient (as in IQ's derivative fBm and
 //!   the gully filters of §9.6; exact derivatives would need the Hessian), so
@@ -51,6 +51,10 @@ pub const LANE_WARP: u32 = 1;
 pub const LANE_GULLY: u32 = 4;
 /// Hillslope (rise over run) above which gully depth stops growing.
 pub const EROSION_SLOPE_CAP: f64 = 1.0;
+/// Share of rock hardness that fades gullies: `1 − GULLY_HARDNESS_FADE·hardness`.
+/// The pipeline (§9.6) fades by `1 − hardness`; orogens are ~0.85 hard, which
+/// left mountains almost without gullies (M2 tuning 2026-10-10).
+pub const GULLY_HARDNESS_FADE: f64 = 0.6;
 /// Gully kernel: jittered points `cell + 0.5 + GULLY_JITTER·(u − 0.5)` with
 /// `u` from `lattice_bits(cell, seed)/2³²`, weights
 /// `max(0, 1 − d²/GULLY_RADIUS²)²` over the 3×3×3 cells around `floor(x)`.
@@ -333,7 +337,10 @@ fn evaluate_stack(
     if let Some(e) = s.erosion {
         let gully_seed = node_seed(params.seed, e.salt, LANE_GULLY);
         let hardness = clamped_field(fields, RecipeField::Hardness, q);
-        let fade = Dual::new(1.0 - hardness.value, -hardness.gradient);
+        let fade = Dual::new(
+            1.0 - GULLY_HARDNESS_FADE * hardness.value,
+            -hardness.gradient * GULLY_HARDNESS_FADE,
+        );
         let mut gullies = DVec3::ZERO;
         for k in 0..e.octaves {
             let octave = LadderOctave {

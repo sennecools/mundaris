@@ -427,7 +427,8 @@ fn lf_stack(at: u32, local: vec3<f32>, amplitude: f32, body_seed: u32) -> vec4<f
         let e_mean = lf_f32(at + 24u);
         let gully_seed = lf_node_seed(body_seed, lf_word(at + 23u), 4u);
         let hardness = lf_clamped_field(3u, normal);
-        let fade = vec4<f32>(1.0 - hardness.x, -hardness.yzw);
+        // `eval::GULLY_HARDNESS_FADE` = 0.6.
+        let fade = vec4<f32>(1.0 - 0.6 * hardness.x, -0.6 * hardness.yzw);
         var gullies = vec3<f32>(0.0);
         for (var k = 0u; k < e_octaves; k = k + 1u) {
             let level = e_level - i32(k);
