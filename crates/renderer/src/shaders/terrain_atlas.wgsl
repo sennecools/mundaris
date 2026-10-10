@@ -225,13 +225,15 @@ fn fs_main(input: VertexOut) -> SceneOut {
     let parent_a = textureSampleLevel(albedo_atlas, normal_sampler, input.parent_uv, input.layers.y, 0.0);
     let page = mix(mix(parent_a, own_a, input.blend.x), parent_a, input.blend.y);
     var land_albedo = mix(inst.material.rgb, atlas_srgb_to_linear(page.rgb), page.a);
+    // Base cells per pixel, continuous across nodes (uniform control flow).
+    let cell_footprint = max(length(fwidth(sc_cells(inst, input.grid_st))), 1.0e-3);
     if inst.surface.x > 0.5 && page.a >= 0.5 {
         // PROTOTYPE (M5 Life): forest floor and canopy tint where the scatter
         // would grow trees, so forests read from a distance (§12.5 hand-off).
         let own_c = textureSampleLevel(climate_atlas, normal_sampler, input.own_uv, input.layers.x, 0.0);
         let parent_c = textureSampleLevel(climate_atlas, normal_sampler, input.parent_uv, input.layers.y, 0.0);
         let climate = mix(mix(parent_c, own_c, input.blend.x), parent_c, input.blend.y);
-        let canopy = forest_cover(inst, input.grid_st, normalize(sampled.xyz), climate.xy, input.ground, length(input.view_pos));
+        let canopy = forest_cover(inst, input.grid_st, normalize(sampled.xyz), climate.xy, input.ground, length(input.view_pos), cell_footprint);
         land_albedo = mix(land_albedo, canopy.rgb, canopy.a);
     }
     let n0_view = inst.b2v_x.xyz * inst.n0.x + inst.b2v_y.xyz * inst.n0.y + inst.b2v_z.xyz * inst.n0.z;

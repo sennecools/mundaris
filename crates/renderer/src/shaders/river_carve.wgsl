@@ -136,7 +136,15 @@ fn river_carve(d: vec3<f32>, h: f32, gradient: vec3<f32>, ribbon_m: f32) -> Rive
         let swell = mix(river_swell(s), river_swell(down), t);
         let corridor = clamp(25.0 * width, 120.0, 2500.0) * swell;
         let size = smoothstep(2.0, 40.0, width);
-        out.riparian = max(out.riparian, size * (1.0 - smoothstep(0.1 * corridor, corridor, distance)));
+        // Band limit: page texels wider than the corridor would point-sample it
+        // into texel-sized blocks. Widen the falloff by the texel and scale by
+        // the corridor's expected share of a texel, so coarse pages carry a
+        // faint, smooth tint instead (texel = ribbon_m / 0.75).
+        let texel = ribbon_m / 0.75;
+        let inner = max(0.1 * corridor - texel, 0.0);
+        let outer = corridor + texel;
+        let coverage = min(1.0, corridor / max(texel, 1.0));
+        out.riparian = max(out.riparian, size * coverage * (1.0 - smoothstep(inner, outer, distance)));
         if distance <= max(edge, ribbon_m) {
             var surface = bed + depth;
             if distance > edge {

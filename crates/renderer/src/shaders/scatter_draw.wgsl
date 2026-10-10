@@ -108,15 +108,24 @@ fn sc_forest(face: u32, ci: f32, cj: f32, footprint: f32, t: f32, m: f32, slope:
     let wet = smoothstep(0.16, 0.42, m);
     let steep = smoothstep(32.0 * SCATTER_DEG, 48.0 * SCATTER_DEG, slope);
     let suit = warm * wet * (1.0 - steep) * (1.0 - smoothstep(3200.0, 3800.0, h));
-    let o1 = mix(sc_value(face, ci / 400.0, cj / 400.0, 40u), 0.5, smoothstep(100.0, 200.0, footprint));
-    let o2 = mix(sc_value(face, ci / 100.0, cj / 100.0, 41u), 0.5, smoothstep(25.0, 50.0, footprint));
-    let o3 = mix(sc_value(face, ci / 25.0, cj / 25.0, 42u), 0.5, smoothstep(6.0, 12.0, footprint));
-    let o4 = mix(sc_value(face, ci / 6.0, cj / 6.0, 43u), 0.5, smoothstep(1.5, 3.0, footprint));
+    let f1 = smoothstep(100.0, 200.0, footprint);
+    let f2 = smoothstep(25.0, 50.0, footprint);
+    let f3 = smoothstep(6.0, 12.0, footprint);
+    let f4 = smoothstep(1.5, 3.0, footprint);
+    let o1 = mix(sc_value(face, ci / 400.0, cj / 400.0, 40u), 0.5, f1);
+    let o2 = mix(sc_value(face, ci / 100.0, cj / 100.0, 41u), 0.5, f2);
+    let o3 = mix(sc_value(face, ci / 25.0, cj / 25.0, 42u), 0.5, f3);
+    let o4 = mix(sc_value(face, ci / 6.0, cj / 6.0, 43u), 0.5, f4);
     let n = 0.45 * o1 + 0.3 * o2 + 0.15 * o3 + 0.1 * o4;
+    // Octaves faded to their mean no longer cross the threshold locally, so
+    // widen the transitions by the faded amplitude: far away the result is
+    // the expected coverage instead of a hard contour of a coarse field.
+    let faded = 0.45 * f1 + 0.3 * f2 + 0.15 * f3 + 0.1 * f4;
+    let soft = 0.05 + 0.3 * faded;
     // Good climates are mostly forest with clearings; marginal ones patchy.
     let threshold = 1.0 - 0.72 * suit;
-    let core = smoothstep(threshold - 0.05, threshold + 0.05, n) * step(0.02, suit);
-    let fringe = smoothstep(threshold - 0.3, threshold - 0.03, n) * (1.0 - core);
+    let core = smoothstep(threshold - soft, threshold + soft, n) * smoothstep(0.0, 0.08, suit);
+    let fringe = smoothstep(threshold - 0.3 - soft, threshold - 0.03 + soft, n) * (1.0 - core);
     site.core = core;
     // Dense in the core, thinning through the fringe, lone trees elsewhere.
     site.tree = suit * (0.9 * core + 0.18 * fringe * fringe + 0.06 * fringe) + 0.025 * suit;
@@ -238,10 +247,14 @@ fn sc_cells(inst: Instance, st: vec2<f32>) -> vec2<f32> {
 // position `st` and view distance `d`: the forest field band-limited to the
 // drawn grid, near the camera only the darker forest floor (the drawn trees
 // carry the canopy), far away the full canopy.
-fn forest_cover(inst: Instance, st: vec2<f32>, normal_body: vec3<f32>, climate: vec2<f32>, ground: f32, d: f32) -> vec4<f32> {
+// `footprint`: base cells per pixel (screen-space derivative of `c`, taken
+// by the caller in uniform control flow). A per-node footprint would differ
+// between neighbouring nodes of different levels and turn the octave fades
+// into node-shaped blocks.
+fn forest_cover(inst: Instance, st: vec2<f32>, normal_body: vec3<f32>, climate: vec2<f32>, ground: f32, d: f32, footprint_px: f32) -> vec4<f32> {
     let c = sc_cells(inst, st);
-    let cells_per_unit = f32(1u << (SCATTER_CELL_BITS - 1u));
-    let footprint = inst.face_u.w * cells_per_unit / grid.draw.x;
+    // Fade each octave once it spans fewer than about eight pixels.
+    let footprint = 2.0 * footprint_px;
     let up_body = normalize(inst.n0.xyz + chart_diff(inst, st));
     let slope = acos(clamp(dot(normal_body, up_body), -1.0, 1.0));
     let site = sc_forest(sc_face(inst.n0.xyz), c.x, c.y, footprint, climate.x, climate.y, slope, ground);
