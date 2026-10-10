@@ -169,6 +169,23 @@ impl DetailNoise {
         (value, gradient)
     }
 
+    /// Band-limited fBm value with every octave seed xor `salt`: an
+    /// independent field on the same lattice (the GPU producer mirrors it
+    /// from the same octave origins with the seed xor `salt`).
+    pub fn value_salted(&self, p_m: DVec3, texel_m: Option<f64>, salt: u32) -> f64 {
+        self.octaves
+            .iter()
+            .map(|octave| {
+                let weight = texel_m.map_or(1.0, |t| octave_weight(octave.frequency_per_m, t));
+                if weight <= 0.0 {
+                    return 0.0;
+                }
+                let (v, _) = gradient_noise(p_m * octave.frequency_per_m, octave.seed ^ salt);
+                octave.amplitude_m * weight * v
+            })
+            .sum()
+    }
+
     /// Per-octave lattice split for a node centred at `centre_m` (body space,
     /// metres) whose texels are `texel_m`. Octaves with zero band-limit weight
     /// are omitted. Fails when a lattice coordinate leaves the integer range.

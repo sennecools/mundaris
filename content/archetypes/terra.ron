@@ -18,7 +18,8 @@
     continents: (
         // A 339 km body has a 2130 km circumference: a few continents.
         wavelength_km: (700.0, 1100.0),
-        octaves: 6,
+        // Down to about two Tier A texels at 512² (wavelength ~1.4–2.1 km).
+        octaves: 9,
         lacunarity: 2.0,
         gain: 0.5,
         warp_wavelength_km: (500.0, 900.0),
@@ -61,8 +62,19 @@
     snow: (
         material: "materials/snow/material.ron",
         temperature_c: -4.0,
-        blend_c: 3.0,
+        blend_c: 5.0,
         slope_deg: (35.0, 55.0),
+    ),
+    // Tier B climate detail: band-limited fBm on temperature and moisture so
+    // biome borders break up and refine as you approach (zero-mean, so the
+    // colour from orbit is unchanged).
+    climate_detail: (
+        base_wavelength_m: 20000.0,
+        min_wavelength_m: 64.0,
+        lacunarity: 2.0,
+        gain: 0.6,
+        temperature_c: 3.0,
+        moisture: 0.12,
     ),
     // Flat water below sea level until M3 (Water).
     water: (
@@ -71,5 +83,5 @@
         depth_scale_m: 120.0,
     ),
     // Measured for the canonical seed; gpu_terrain_colour.rs checks it (0.005).
-    average_colour: (0.103, 0.113, 0.105),
+    average_colour: (0.100, 0.112, 0.104),
 )

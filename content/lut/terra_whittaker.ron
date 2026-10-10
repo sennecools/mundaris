@@ -1,7 +1,8 @@
 // Terra biome LUT metadata (docs/ASTRUM_TERRAIN_PIPELINE.md §10.3): the axes of
 // lut/terra_whittaker.png and the recipe it is generated from. Whittaker-style
-// anchors in temperature × moisture, blended with Gaussian weights in linear
-// colour. Regenerate the PNG with
+// anchors in temperature × moisture, blended with wide normalised Gaussian
+// weights in linear colour that pass exactly through each anchor (soft
+// gradients without washing out the anchor colours). Regenerate the PNG with
 //   cargo run -p astrum_world --example biome_lut
 // A test checks the PNG still matches the recipe; once the PNG is painted by
 // hand, drop the recipe (set it to None) and the test skips the comparison.
@@ -17,8 +18,8 @@
     moisture: (0.0, 1.0),
     recipe: (
         size: 64,
-        sigma_temperature_c: 4.5,
-        sigma_moisture: 0.12,
+        sigma_temperature_c: 8.0,
+        sigma_moisture: 0.22,
         anchors: [
             (name: "polar_barren",         temperature_c: -25.0, moisture: 0.15, srgb: (0.50, 0.47, 0.42)),
             (name: "tundra",               temperature_c: -10.0, moisture: 0.55, srgb: (0.42, 0.40, 0.32)),

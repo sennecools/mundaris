@@ -72,39 +72,104 @@ impl LutMetadata {
     }
 
     /// Texels of the recipe, row-major (y = moisture), sRGB 8-bit.
+    ///
+    /// Colours blend with normalised Gaussian weights in linear colour, which
+    /// gives soft gradients for wide sigmas. So that a wide blend does not
+    /// wash every anchor towards its neighbours, the blended values are
+    /// solved for first (normalised Gaussian interpolation): the LUT passes
+    /// through each anchor colour and is smooth in between.
     pub fn generate(&self) -> Result<Vec<[u8; 3]>, TerrainError> {
         self.validate()?;
         let recipe = self.recipe.as_ref().ok_or(TerrainError::InvalidConfig)?;
         let n = recipe.size;
-        let anchors: Vec<_> = recipe
+        let points: Vec<(f64, f64)> = recipe
             .anchors
             .iter()
-            .map(|a| {
-                let c = [a.srgb.0, a.srgb.1, a.srgb.2].map(srgb_to_linear);
-                (a.temperature_c, a.moisture, c)
+            .map(|a| (a.temperature_c, a.moisture))
+            .collect();
+        let weights = |t: f64, m: f64| -> Vec<f64> {
+            let raw: Vec<f64> = points
+                .iter()
+                .map(|&(at, am)| {
+                    let dt = (t - at) / recipe.sigma_temperature_c;
+                    let dm = (m - am) / recipe.sigma_moisture;
+                    (-0.5 * (dt * dt + dm * dm)).exp()
+                })
+                .collect();
+            let total: f64 = raw.iter().sum();
+            raw.into_iter().map(|w| w / total).collect()
+        };
+        // Solve (W + λI) · values = anchor colours per linear channel, with
+        // W[i][j] the weight of anchor j at anchor i. The small ridge λ keeps
+        // the solve from overshooting into hues no anchor has, at the cost of
+        // anchors landing a little short of their exact colour.
+        let matrix: Vec<Vec<f64>> = points
+            .iter()
+            .enumerate()
+            .map(|(i, &(t, m))| {
+                let mut row = weights(t, m);
+                row[i] += ANCHOR_RIDGE;
+                row
             })
             .collect();
+        let mut values = vec![[0.0f64; 3]; points.len()];
+        for channel in 0..3 {
+            let target: Vec<f64> = recipe
+                .anchors
+                .iter()
+                .map(|a| srgb_to_linear([a.srgb.0, a.srgb.1, a.srgb.2][channel]))
+                .collect();
+            let solved = solve(matrix.clone(), target).ok_or(TerrainError::InvalidConfig)?;
+            for (value, s) in values.iter_mut().zip(solved) {
+                value[channel] = s;
+            }
+        }
         let mut texels = Vec::with_capacity((n * n) as usize);
         for j in 0..n {
             let m = axis_value(self.moisture, j, n);
             for i in 0..n {
                 let t = axis_value(self.temperature_c, i, n);
                 let mut sum = [0.0f64; 3];
-                let mut total = 0.0f64;
-                for &(at, am, colour) in &anchors {
-                    let dt = (t - at) / recipe.sigma_temperature_c;
-                    let dm = (m - am) / recipe.sigma_moisture;
-                    let w = (-0.5 * (dt * dt + dm * dm)).exp();
-                    total += w;
-                    for (s, c) in sum.iter_mut().zip(colour) {
-                        *s += w * c;
+                for (w, value) in weights(t, m).iter().zip(&values) {
+                    for (s, v) in sum.iter_mut().zip(value) {
+                        *s += w * v;
                     }
                 }
-                texels.push(sum.map(|s| encode_srgb8(s / total)));
+                texels.push(sum.map(encode_srgb8));
             }
         }
         Ok(texels)
     }
+}
+
+/// Ridge added to the anchor interpolation solve (see `generate`).
+const ANCHOR_RIDGE: f64 = 0.03;
+
+/// Gaussian elimination with partial pivoting; `None` if singular.
+fn solve(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>> {
+    let n = b.len();
+    for col in 0..n {
+        let pivot = (col..n).max_by(|&x, &y| a[x][col].abs().total_cmp(&a[y][col].abs()))?;
+        if a[pivot][col].abs() < 1e-12 {
+            return None;
+        }
+        a.swap(col, pivot);
+        b.swap(col, pivot);
+        for row in col + 1..n {
+            let f = a[row][col] / a[col][col];
+            let (upper, lower) = a.split_at_mut(row);
+            for (x, p) in lower[0][col..].iter_mut().zip(&upper[col][col..]) {
+                *x -= f * p;
+            }
+            b[row] -= f * b[col];
+        }
+    }
+    let mut x = vec![0.0; n];
+    for row in (0..n).rev() {
+        let s: f64 = (row + 1..n).map(|k| a[row][k] * x[k]).sum();
+        x[row] = (b[row] - s) / a[row][row];
+    }
+    Some(x)
 }
 
 fn axis_value((lo, hi): (f64, f64), index: u32, size: u32) -> f64 {

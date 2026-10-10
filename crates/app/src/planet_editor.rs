@@ -289,6 +289,10 @@ mod tests {
         let root = scratch_content("save");
         let mut editor = editor(&root);
         let before = std::fs::read_to_string(root.join("terrain/rust.ron")).unwrap();
+        let revision = |text: &str| -> u32 {
+            let line = text.lines().find(|l| l.trim_start().starts_with("revision:")).unwrap();
+            line.trim_start()["revision:".len()..].trim().trim_end_matches(',').parse().unwrap()
+        };
         editor.set_seed(0, 1234);
         editor.set_param(0, "equator_c", 33.5);
         editor.set_param(0, "rain", 0.031);
@@ -297,7 +301,7 @@ mod tests {
         let after = std::fs::read_to_string(root.join("terrain/rust.ron")).unwrap();
         assert!(after.contains("seed: 1234,"));
         assert!(after.contains("(\"equator_c\", 33.5)"));
-        assert!(after.contains("revision: 4,"), "revision bumped");
+        assert_eq!(revision(&after), revision(&before) + 1, "revision bumped");
         let comments = |text: &str| {
             text.lines()
                 .filter(|l| l.trim_start().starts_with("//"))

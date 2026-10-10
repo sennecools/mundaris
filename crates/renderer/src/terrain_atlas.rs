@@ -46,7 +46,7 @@ const READBACK_SLOTS: usize = 4;
 /// Tier A bake passes encoded per frame for a world source nobody waits on.
 const TIER_A_PASSES_PER_FRAME: usize = 24;
 /// Detail-noise octave origins per producer job (`OctaveOrigin` in the shader).
-pub const MAX_ATLAS_OCTAVES: usize = 16;
+pub const MAX_ATLAS_OCTAVES: usize = 24;
 const OCTAVE_BYTES: u64 = 48;
 const OCTAVE_BUFFER_BYTES: u64 = OCTAVE_BYTES * (MAX_ATLAS_OCTAVES * MAX_TILE_SLOTS) as u64;
 /// Height bounds are reported per cell of a 4x4 grid over each tile.
@@ -253,6 +253,10 @@ pub struct AtlasWorldSurface {
     pub water_shallow: [f32; 3],
     pub water_deep: [f32; 3],
     pub water_depth_scale_m: f32,
+    /// Largest Tier B climate-detail offsets (unit-amplitude octaves in the
+    /// job scale by these): temperature in °C, moisture.
+    pub climate_temperature_c: f32,
+    pub climate_moisture: f32,
 }
 
 /// Words before the LUT texels in the packed surface buffer.
@@ -268,8 +272,8 @@ impl AtlasWorldSurface {
         let f = |v: f32| v.to_bits();
         let mut words: Vec<u32> = vec![
             n,
-            0,
-            0,
+            f(self.climate_temperature_c),
+            f(self.climate_moisture),
             0,
             f(self.temperature_c[0]),
             f(self.temperature_c[1]),
@@ -384,6 +388,10 @@ pub enum AtlasTileKind {
         texel_fraction: [f32; 2],
         /// Columns d texel / d s and d texel / d t.
         texel_jacobian: [[f32; 2]; 2],
+        /// Climate-detail octaves stored after the height-detail octaves in
+        /// the job's `octaves` (temperature from their seeds, moisture from
+        /// the seeds xor the moisture salt).
+        climate_octaves: u32,
     },
 }
 
@@ -2404,7 +2412,9 @@ fn pack_tile(out: &mut Vec<u8>, job: &AtlasProduceJob) {
             detail_layers,
         } => (0u32, macro_layers.len() as u32, detail_layers.len() as u32),
         AtlasTileKind::Fields { .. } => (1, 0, 0),
-        AtlasTileKind::World { .. } => (2, 0, 0),
+        AtlasTileKind::World {
+            climate_octaves, ..
+        } => (2, 0, *climate_octaves),
     };
     for value in [job.layer, kind, macro_count, detail_count] {
         out.extend_from_slice(&value.to_le_bytes());
@@ -2476,16 +2486,19 @@ fn pack_tile(out: &mut Vec<u8>, job: &AtlasProduceJob) {
         out.extend(f32_bytes(value));
     }
     out.extend(f32_bytes(&weights));
-    let (mip_offset, mip_cells, base_cells) = match job.kind {
+    let (mip_offset, mip_cells, base_cells, climate) = match job.kind {
         AtlasTileKind::World {
             mip_offset,
             mip_cells,
             base_cells,
+            climate_octaves,
             ..
-        } => (mip_offset, mip_cells, base_cells),
-        _ => (0, 0, 0),
+        } => (mip_offset, mip_cells, base_cells, climate_octaves),
+        _ => (0, 0, 0, 0),
     };
-    for value in [job.octaves.len() as u32, base_cells, mip_offset, mip_cells] {
+    // noise.x counts the height-detail octaves; climate octaves follow them.
+    let height_octaves = (job.octaves.len() as u32).saturating_sub(climate);
+    for value in [height_octaves, base_cells, mip_offset, mip_cells] {
         out.extend_from_slice(&value.to_le_bytes());
     }
     debug_assert_eq!((out.len() - start) as u64, TILE_BYTES);
@@ -2730,6 +2743,7 @@ mod tests {
                     texel_origin: [-3, 7],
                     texel_fraction: [0.25, 0.5],
                     texel_jacobian: [[2.0, 0.0], [0.0, 2.0]],
+                    climate_octaves: 0,
                 },
                 octaves: Vec::new(),
             },

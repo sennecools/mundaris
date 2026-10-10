@@ -83,7 +83,7 @@ fn cube_n() -> u32 {
 }
 // Index of `tile` in the job list; its octave origins start at slot * MAX_OCTAVES.
 var<private> tile_slot: u32;
-const MAX_OCTAVES: u32 = 16u;
+const MAX_OCTAVES: u32 = 24u;
 
 // ---------------------------------------------------------------- chart
 
@@ -593,11 +593,32 @@ fn biome_colour(t: f32, m: f32) -> vec3<f32> {
 // Land colour everywhere, under the sea too: the draw lays the flat water
 // over it through the coast contour in the normal page's w, so the page
 // never blends water and land colours across a texel.
-fn world_albedo(d: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
+// Seed salt of the moisture detail field (`world_field::MOISTURE_SALT`).
+const MOISTURE_SALT: u32 = 0x6d6f6973u;
+
+// Tier B climate detail at chart-local `local` (metres): band-limited fBm from
+// the octaves stored after the height-detail octaves, temperature from their
+// seeds and moisture from the seeds xor MOISTURE_SALT, scaled by the
+// archetype's amplitudes (surface words 1 and 2).
+fn climate_detail(local: vec3<f32>) -> vec2<f32> {
+    var sum = vec2<f32>(0.0);
+    let first = tile_slot * MAX_OCTAVES + tile.noise.x;
+    let count = min(tile.info.w, MAX_OCTAVES - min(tile.noise.x, MAX_OCTAVES));
+    for (var k = 0u; k < count; k = k + 1u) {
+        var o = octaves[first + k];
+        sum.x += split_gradient_noise(o, local).x * o.amplitude.x;
+        o.seed = o.seed ^ MOISTURE_SALT;
+        sum.y += split_gradient_noise(o, local).x * o.amplitude.x;
+    }
+    return sum * vec2<f32>(surface_f32(1u), surface_f32(2u));
+}
+
+fn world_albedo(d: vec3<f32>, normal: vec3<f32>, local: vec3<f32>) -> vec3<f32> {
     cube_level_n = tile.noise.w;
     let stride = 6u * cube_level_n * cube_level_n;
-    let t = cube_sample(tile.noise.z + stride, d, false);
-    let m = cube_sample(tile.noise.z + 2u * stride, d, false);
+    let detail = climate_detail(local);
+    let t = cube_sample(tile.noise.z + stride, d, false) + detail.x;
+    let m = cube_sample(tile.noise.z + 2u * stride, d, false) + detail.y;
     let slope = acos(clamp(dot(normal, d), -1.0, 1.0));
     let snow = (1.0 - smoothstep(surface_f32(8u) - surface_f32(9u), surface_f32(8u) + surface_f32(9u), t))
         * (1.0 - smoothstep(surface_f32(10u), surface_f32(11u), slope));
@@ -627,8 +648,9 @@ fn page_albedo(st: vec2<f32>, value: vec4<f32>) -> vec4<f32> {
     if tile.info.y != 2u {
         return vec4<f32>(0.0);
     }
-    let d = normalize(chart_point(st).n);
-    return vec4<f32>(linear_to_srgb(world_albedo(d, value.xyz)), 1.0);
+    let p = chart_point(st);
+    let local = p.diff * tile.scale.x;
+    return vec4<f32>(linear_to_srgb(world_albedo(normalize(p.n), value.xyz, local)), 1.0);
 }
 
 // Page climate texel at `st`: temperature and moisture from the node's mip (as

@@ -8,7 +8,7 @@
 (
     schema: 1,
     id: "terra-world-map",
-    revision: 3,
+    revision: 4,
     identity: 1381323604,
     seed: 7,
     algorithm: "WorldV1",
@@ -30,11 +30,14 @@
     detail_noise: (
         version: 1,
         seed_salt: 1,
-        base_wavelength_m: 32.0,
+        // From about two world-map texels down to 0.5 m: fills the band
+        // between the Tier A texel (~1.3 km) and fine ground detail, and
+        // shapes coastlines below a texel. M2 (Shape) adds real landforms.
+        base_wavelength_m: 2048.0,
         min_wavelength_m: 0.5,
         lacunarity: 2.0,
         gain: 0.5,
-        amplitude_m: 1.0,
+        amplitude_m: 24.0,
     ),
     world: (
         archetype: "archetypes/terra.ron",

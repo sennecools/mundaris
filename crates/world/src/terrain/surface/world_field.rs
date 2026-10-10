@@ -28,7 +28,23 @@ pub struct WorldLook {
     pub water_shallow: [f64; 3],
     pub water_deep: [f64; 3],
     pub water_depth_scale_m: f64,
+    /// Tier B climate detail (temperature and moisture offsets); `None`
+    /// until bound to a body seed by `WorldDefinition::new`.
+    pub climate: Option<ClimateNoise>,
 }
+
+/// Compiled climate detail of one body: unit-amplitude band-limited fBm,
+/// temperature from the octave seeds, moisture from the seeds xor
+/// `MOISTURE_SALT`, scaled by the archetype's amplitudes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClimateNoise {
+    pub noise: crate::terrain::noise::DetailNoise,
+    pub temperature_c: f64,
+    pub moisture: f64,
+}
+
+/// Seed salt of the moisture detail field (mirrored by the GPU producer).
+pub const MOISTURE_SALT: u32 = 0x6d6f_6973;
 
 fn smoothstep(e0: f64, e1: f64, x: f64) -> f64 {
     let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
@@ -55,6 +71,7 @@ impl WorldLook {
             water_shallow: colour(archetype.water.shallow_linear),
             water_deep: colour(archetype.water.deep_linear),
             water_depth_scale_m: archetype.water.depth_scale_m,
+            climate: None,
         })
     }
 
@@ -70,8 +87,29 @@ impl WorldLook {
         .chain(self.snow_albedo)
         .chain(self.water_shallow)
         .chain(self.water_deep)
+        .chain(
+            self.climate
+                .iter()
+                .flat_map(|c| [c.temperature_c, c.moisture])
+                .chain(
+                    self.climate
+                        .iter()
+                        .flat_map(|c| c.noise.octaves().iter().map(|o| o.frequency_per_m)),
+                ),
+        )
         .fold(self.lut.identity(), |hash, v| {
             (hash ^ v.to_bits()).wrapping_mul(0x100_0000_01b3)
+        })
+    }
+
+    /// Tier B climate detail at body point `p_m` for texels of `texel_m`:
+    /// (temperature offset in °C, moisture offset). Zero without detail.
+    pub fn climate_offsets(&self, p_m: DVec3, texel_m: f64) -> (f64, f64) {
+        self.climate.as_ref().map_or((0.0, 0.0), |c| {
+            (
+                c.temperature_c * c.noise.value_salted(p_m, Some(texel_m), 0),
+                c.moisture * c.noise.value_salted(p_m, Some(texel_m), MOISTURE_SALT),
+            )
         })
     }
 
@@ -126,6 +164,13 @@ impl WorldDefinition {
         for (name, value) in overrides {
             params.set(name, *value)?;
         }
+        let detail = &archetype.climate_detail;
+        let mut look = look;
+        look.climate = Some(ClimateNoise {
+            noise: crate::terrain::noise::DetailNoise::new(&detail.noise_definition(), body_seed)?,
+            temperature_c: detail.temperature_c,
+            moisture: detail.moisture,
+        });
         Ok(Self {
             archetype,
             params,

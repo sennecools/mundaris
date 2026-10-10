@@ -254,6 +254,7 @@ pub fn tile_kind(
         ProducerRecipe::Profile(profile) => Ok(profile_kind(profile, chart.n0, texel_m)),
         ProducerRecipe::Fields(fields) => fields_kind(fields, chart.n0, texel_m),
         ProducerRecipe::World(world) => {
+            let climate_octaves = climate_origins(recipe, address, chart, cells)?.len() as u32;
             let cells = world.field.inputs().face_cells as u32;
             let layout = astrum_renderer::tier_a::field_mip_layout(cells);
             let base_texel = 2.0 * world.radius_m / f64::from(cells);
@@ -274,6 +275,7 @@ pub fn tile_kind(
                 texel_origin: [whole.x as i32, whole.y as i32],
                 texel_fraction: (map.origin - whole).as_vec2().to_array(),
                 texel_jacobian: map.jacobian.map(|column| column.as_vec2().to_array()),
+                climate_octaves,
             })
         }
     }
@@ -342,14 +344,17 @@ pub fn detail_octaves(
     chart: &NodeChart,
     cells: u32,
 ) -> Result<Vec<AtlasOctave>> {
-    let Some(detail) = recipe.detail_noise() else {
-        return Ok(Vec::new());
-    };
     let texel_m =
         astrum_world::terrain::producer::tile_texel_m(recipe.radius_m(), address.level(), cells);
-    let origins = detail
-        .split(chart.n0 * recipe.radius_m(), texel_m)
-        .map_err(|_| anyhow::anyhow!("detail noise lattice exceeds the GPU integer range"))?;
+    let mut origins = match recipe.detail_noise() {
+        Some(detail) => detail
+            .split(chart.n0 * recipe.radius_m(), texel_m)
+            .map_err(|_| anyhow::anyhow!("detail noise lattice exceeds the GPU integer range"))?,
+        None => Vec::new(),
+    };
+    // World maps: climate-detail octaves follow the height-detail octaves
+    // (`AtlasTileKind::World::climate_octaves` counts them).
+    origins.extend(climate_origins(recipe, address, chart, cells)?);
     ensure!(
         origins.len() <= MAX_ATLAS_OCTAVES,
         "detail noise has more octaves than the GPU producer supports"
@@ -364,6 +369,28 @@ pub fn detail_octaves(
             amplitude_m: o.amplitude_m,
         })
         .collect())
+}
+
+/// Climate-detail octave origins of a world-map node (split like the height
+/// detail, §4.4); empty for other recipes.
+fn climate_origins(
+    recipe: &ProducerRecipe,
+    address: CubePatchAddress,
+    chart: &NodeChart,
+    cells: u32,
+) -> Result<Vec<astrum_world::terrain::noise::OctaveOrigin>> {
+    let ProducerRecipe::World(world) = recipe else {
+        return Ok(Vec::new());
+    };
+    let Some(climate) = world.field.look().climate.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let texel_m =
+        astrum_world::terrain::producer::tile_texel_m(recipe.radius_m(), address.level(), cells);
+    climate
+        .noise
+        .split(chart.n0 * recipe.radius_m(), texel_m)
+        .map_err(|_| anyhow::anyhow!("climate detail lattice exceeds the GPU integer range"))
 }
 
 /// Conservative absolute radial-offset bound of a recipe, used before any

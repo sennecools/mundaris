@@ -349,9 +349,11 @@ impl ProducerRecipe {
         let maps = recipe.field.maps()?;
         let n = direction.normalize();
         let (temperature, moisture) = maps.climate(maps.mip_for(texel_m, recipe.radius_m), n);
-        Ok(Some(recipe.field.look().land(
-            temperature,
-            moisture,
+        let look = recipe.field.look();
+        let (dt, dm) = look.climate_offsets(n * recipe.radius_m, texel_m);
+        Ok(Some(look.land(
+            temperature + dt,
+            moisture + dm,
             n,
             sample.normal,
         )))

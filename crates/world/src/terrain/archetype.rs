@@ -121,6 +121,51 @@ pub struct SnowRule {
     pub slope_deg: (f64, f64),
 }
 
+/// Climate detail at Tier B: band-limited fBm added to the world map's
+/// temperature and moisture before the biome LUT, so biome borders break up
+/// and refine as a node gets finer. It is zero-mean and band-limited like the
+/// height detail, so distant colour is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClimateDetail {
+    pub base_wavelength_m: f64,
+    pub min_wavelength_m: f64,
+    pub lacunarity: f64,
+    pub gain: f64,
+    /// Largest temperature and moisture offsets (all octaves aligned).
+    pub temperature_c: f64,
+    pub moisture: f64,
+}
+
+impl ClimateDetail {
+    /// Unit-amplitude noise definition (amplitudes sum to 1 over all octaves).
+    pub fn noise_definition(&self) -> crate::terrain::noise::DetailNoiseDefinition {
+        let mut total = 0.0;
+        let mut wavelength = self.base_wavelength_m;
+        let mut amplitude = 1.0;
+        while wavelength >= self.min_wavelength_m * (1.0 - 1.0e-9) && total < 1e6 {
+            total += amplitude;
+            amplitude *= self.gain;
+            wavelength /= self.lacunarity;
+        }
+        crate::terrain::noise::DetailNoiseDefinition {
+            version: 1,
+            seed_salt: 0xc11a_7e00,
+            base_wavelength_m: self.base_wavelength_m,
+            min_wavelength_m: self.min_wavelength_m,
+            lacunarity: self.lacunarity,
+            gain: self.gain,
+            amplitude_m: 1.0 / total.max(1.0),
+        }
+    }
+
+    fn valid(&self) -> bool {
+        self.noise_definition().validate().is_ok()
+            && (0.0..=50.0).contains(&self.temperature_c)
+            && (0.0..=1.0).contains(&self.moisture)
+    }
+}
+
 /// Flat water of M1 (World map and planet editor): opaque, tinted from the
 /// shallow to the deep colour as `1 - exp(-depth / depth_scale_m)`. Real
 /// water shading is M3 (Water).
@@ -178,6 +223,7 @@ pub struct PlanetArchetype {
     /// root.
     pub biome_lut: String,
     pub snow: SnowRule,
+    pub climate_detail: ClimateDetail,
     pub water: WaterLook,
     /// Linear colour of the whole body seen as a few pixels (§6.1).
     pub average_colour: (f32, f32, f32),
@@ -232,6 +278,7 @@ impl PlanetArchetype {
             && m.precipitation_scale.is_finite()
             && m.precipitation_scale > 0.0
             && !self.biome_lut.is_empty()
+            && self.climate_detail.valid()
             && !self.snow.material.is_empty()
             && self.snow.temperature_c.is_finite()
             && self.snow.blend_c.is_finite()

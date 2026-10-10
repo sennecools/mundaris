@@ -82,5 +82,10 @@ pub fn surface(look: &WorldLook) -> AtlasWorldSurface {
         water_shallow: v3(look.water_shallow),
         water_deep: v3(look.water_deep),
         water_depth_scale_m: look.water_depth_scale_m as f32,
+        climate_temperature_c: look
+            .climate
+            .as_ref()
+            .map_or(0.0, |c| c.temperature_c as f32),
+        climate_moisture: look.climate.as_ref().map_or(0.0, |c| c.moisture as f32),
     }
 }

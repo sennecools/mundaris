@@ -206,3 +206,51 @@ fn production_size_bake_is_frame_split_stable_with_full_mip_chains() {
         worst[0], worst[1], worst[2]
     );
 }
+
+/// Determinism under concurrency: the same bake repeated on two devices at
+/// once must be bit-identical every time. Ignored by default (slow); run with
+/// `--ignored` when changing the bake schedule.
+#[test]
+#[ignore]
+fn repeated_concurrent_bakes_are_bit_identical() {
+    let archetype = terra();
+    let inputs = TierAInputs {
+        params: archetype.sample(7),
+        stages: archetype.stages.clone(),
+        radius_m: 338_950.0,
+        pole: DVec3::Y,
+        face_cells: 512,
+    };
+    let packed = bake_inputs(&inputs);
+    let worker = move || {
+        let context = common::gpu().expect("adapter");
+        let first = astrum_renderer::tier_a::tier_a_for_validation(
+            &context.device,
+            &context.queue,
+            &packed,
+        )
+        .unwrap();
+        let mut mismatches = Vec::new();
+        for round in 0..8 {
+            let again = astrum_renderer::tier_a::tier_a_for_validation(
+                &context.device,
+                &context.queue,
+                &packed,
+            )
+            .unwrap();
+            let len = 6 * 512 * 512;
+            for (run, (a, b)) in first.fields.chunks(len).zip(again.fields.chunks(len)).enumerate() {
+                let diff = a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+                if diff > 0 {
+                    mismatches.push(format!("round {round} run {run}: {diff}"));
+                }
+            }
+        }
+        mismatches
+    };
+    let a = std::thread::spawn(worker);
+    let b = std::thread::spawn(worker);
+    let (a, b) = (a.join().unwrap(), b.join().unwrap());
+    println!("thread A mismatches: {a:?}\nthread B mismatches: {b:?}");
+    assert!(a.is_empty() && b.is_empty());
+}
