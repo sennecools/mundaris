@@ -117,10 +117,30 @@ fn vs_main(@location(0) vertex: vec3<f32>, @builtin(instance_index) index: u32) 
     // exactly the line the finer side snaps to. The coarser rule wins at corners.
     let edge_bits = select(0u, 1u, g.x < 0.5) | select(0u, 2u, g.x > cells - 0.5)
         | select(0u, 4u, g.y < 0.5) | select(0u, 8u, g.y > cells - 0.5);
-    if (u32(inst.b2v_z.w + 0.5) & edge_bits) != 0u {
+    let finer = u32(inst.b2v_z.w + 0.5);
+    let coarser = u32(inst.b2v_y.w + 0.5);
+    // The own/parent page blend reaches the same edge values over a quarter of
+    // the node instead of within one cell row, which drew a visible line along
+    // such edges (normals and colour switching pages). The geometry keeps the
+    // exact edge rule, so seams stay closed.
+    let ramp = max(0.25 * cells, 1.0);
+    let edge_distance = vec4<f32>(g.x, cells - g.x, g.y, cells - g.y);
+    var near_finer = 1.0e9;
+    var near_coarser = 1.0e9;
+    for (var k = 0u; k < 4u; k = k + 1u) {
+        if (finer & (1u << k)) != 0u {
+            near_finer = min(near_finer, edge_distance[k]);
+        }
+        if (coarser & (1u << k)) != 0u {
+            near_coarser = min(near_coarser, edge_distance[k]);
+        }
+    }
+    var page_morph = min(morph, smoothstep(0.0, ramp, near_finer));
+    page_morph = max(page_morph, 1.0 - smoothstep(0.0, ramp, near_coarser));
+    if (finer & edge_bits) != 0u {
         morph = 0.0;
     }
-    if (u32(inst.b2v_y.w + 0.5) & edge_bits) != 0u {
+    if (coarser & edge_bits) != 0u {
         morph = 1.0;
     }
     let morphed = st - fract(g * 0.5) * (2.0 / cells) * morph;
@@ -139,7 +159,7 @@ fn vs_main(@location(0) vertex: vec3<f32>, @builtin(instance_index) index: u32) 
     out.own_uv = normal_uv(own_st(inst, morphed));
     out.parent_uv = normal_uv(parent_st(inst, morphed));
     out.layers = vec2<i32>(i32(inst.own.x), i32(inst.parent.x));
-    out.blend = vec2<f32>(inst.morph.z, morph);
+    out.blend = vec2<f32>(inst.morph.z, page_morph);
     out.instance = index;
     out.height = height;
     out.ground = ground;
