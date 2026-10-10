@@ -47,6 +47,7 @@ fn main() {
         radius_m: 338_950.0,
         pole: DVec3::Y,
         face_cells: n,
+        landform_rules: Vec::new(),
     };
     let started = std::time::Instant::now();
     let fields = bake(&inputs).expect("bake");

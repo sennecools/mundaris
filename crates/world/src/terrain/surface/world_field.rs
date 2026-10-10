@@ -221,6 +221,11 @@ impl WorldDefinition {
             radius_m,
             pole: self.pole,
             face_cells: self.archetype.face_cells(radius_m) as usize,
+            landform_rules: self
+                .landforms
+                .as_ref()
+                .map(|l| l.set.bytecode().to_vec())
+                .unwrap_or_default(),
         }
     }
 

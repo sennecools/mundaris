@@ -66,6 +66,9 @@ pub struct TierAInputs {
     /// Body-fixed rotation axis (latitude reference).
     pub pole: DVec3,
     pub face_cells: usize,
+    /// Landform weight-rule set bytecode (`landform::expr::encode_set`);
+    /// empty: no landforms, the weight run stays zero.
+    pub landform_rules: Vec<u32>,
 }
 
 impl TierAInputs {
@@ -561,6 +564,29 @@ pub fn bake_full(inputs: &TierAInputs) -> Result<TierAOutput, TerrainError> {
             | (u32::from(s.class as u8) << 8)
             | (pack_unorm4([s.volcanic, 0.0, 0.0, 0.0]) << 16);
     }
+    // Landform weights (run 8): the rule bytecode over the stored result
+    // fields of each texel (packed bytes as stored, so the GPU pass reads
+    // the same inputs); four unorm8 weights.
+    if !inputs.landform_rules.is_empty() {
+        for k in 0..texels {
+            let fields = landform_rule_fields(
+                f64::from(elevation.data()[k]),
+                f64::from(temperature.data()[k]),
+                f64::from(moisture.data()[k]),
+                shape.boundary_coord.data()[k],
+                shape.aux0.data()[k],
+                shape.aux1.data()[k],
+                f64::from(slope_east.data()[k]).hypot(f64::from(slope_north.data()[k])),
+            );
+            let weights = crate::terrain::landform::expr::evaluate_set(
+                &inputs.landform_rules,
+                &fields,
+            )
+            .unwrap_or_default();
+            let lane = |i: usize| weights.get(i).copied().unwrap_or(0.0);
+            shape.landform.data_mut()[k] = pack_unorm4([lane(0), lane(1), lane(2), lane(3)]);
+        }
+    }
     let boundary_distance = cube_from(n, samples.iter().map(|s| s.distance_m));
 
     Ok(TierAOutput {
@@ -592,6 +618,41 @@ pub fn bake_full(inputs: &TierAInputs) -> Result<TierAOutput, TerrainError> {
     })
 }
 
+/// Landform weight-rule inputs (`landform::expr::field`) of one Tier A texel
+/// from its stored results: elevation (m), temperature (°C), moisture,
+/// `boundary_coord` (i32, 1/16 m), packed `aux0` and `aux1`, and the
+/// smoothed macro relief slope (rise over run). The GPU `landform_weights`
+/// pass mirrors it in f32.
+pub fn landform_rule_fields(
+    elevation: f64,
+    temperature: f64,
+    moisture: f64,
+    boundary_coord: i32,
+    aux0: u32,
+    aux1: u32,
+    slope_macro: f64,
+) -> crate::terrain::landform::expr::RuleFields {
+    use crate::terrain::landform::expr::field;
+    let [uplift, hardness, sediment, _] = unpack_unorm4(aux0);
+    let volcanic = unpack_unorm4(aux1)[2];
+    let m = moisture.clamp(0.0, 1.0);
+    let x = ((temperature + 15.0) / 20.0).clamp(0.0, 1.0);
+    let mut f = [0.0; field::COUNT];
+    f[field::UPLIFT as usize] = uplift;
+    f[field::SEDIMENT as usize] = sediment;
+    f[field::MOISTURE as usize] = m;
+    f[field::ARID as usize] = 1.0 - m;
+    f[field::TEMPERATURE as usize] = temperature;
+    f[field::COLD as usize] = 1.0 - x * x * (3.0 - 2.0 * x);
+    f[field::HARDNESS as usize] = hardness;
+    f[field::SLOPE_MACRO as usize] = slope_macro;
+    f[field::ELEVATION as usize] = elevation;
+    f[field::BOUNDARY_DISTANCE as usize] = (f64::from(boundary_coord) / BOUNDARY_UNITS_PER_M).abs();
+    f[field::VOLCANIC as usize] = volcanic;
+    f[field::OCEAN as usize] = if elevation < 0.0 { 1.0 } else { 0.0 };
+    f
+}
+
 /// Re-zero eroded elevation `h` at the second sea level `s2` (m), apply the
 /// shelf as a monotone depth remap and clamp to `±bound`.
 pub fn rezero(h: f64, s2: f64, bound: f64, shelf: bool, params: &PlanetParams) -> f64 {
@@ -617,6 +678,7 @@ pub(crate) mod tests {
             radius_m: 338_950.0,
             pole: DVec3::Y,
             face_cells: n,
+            landform_rules: Vec::new(),
         }
     }
 

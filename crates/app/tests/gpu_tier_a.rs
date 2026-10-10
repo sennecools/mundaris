@@ -53,6 +53,7 @@ fn inputs(n: usize, seed: u64) -> TierAInputs {
         radius_m: RADIUS_M,
         pole: DVec3::Y,
         face_cells: n,
+        landform_rules: Vec::new(),
     }
 }
 
@@ -745,9 +746,92 @@ fn repeated_concurrent_bakes_are_bit_identical() {
         }
         mismatches
     };
-    let a = std::thread::spawn(worker);
+    let a = std::thread::spawn(worker.clone());
     let b = std::thread::spawn(worker);
     let (a, b) = (a.join().unwrap(), b.join().unwrap());
     println!("thread A mismatches: {a:?}\nthread B mismatches: {b:?}");
     assert!(a.is_empty() && b.is_empty());
+}
+
+/// The content's terra landform set (rules only matter here).
+fn terra_landform_rules() -> Vec<u32> {
+    use astrum_world::terrain::landform::{
+        LandformError, LandformSet, LandformSetFile, RecipeFile,
+    };
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content/landforms");
+    let file: LandformSetFile =
+        ron::from_str(&std::fs::read_to_string(dir.join("terra.ron")).unwrap()).unwrap();
+    LandformSet::compile(&file, |path| {
+        let text = std::fs::read_to_string(dir.join(path)).map_err(|e| LandformError::Load {
+            path: path.into(),
+            message: e.to_string(),
+        })?;
+        ron::from_str::<RecipeFile>(&text).map_err(|e| LandformError::Load {
+            path: path.into(),
+            message: e.to_string(),
+        })
+    })
+    .unwrap()
+    .bytecode()
+    .to_vec()
+}
+
+/// Landform weights (run 8): the GPU rule interpreter matches the CPU rule
+/// oracle (`tier_a::landform_rule_fields`, `expr::evaluate_set`) on the GPU's
+/// own stored result runs within one unorm8 step per weight, and the weights
+/// are normalised (M2 Shape 6b). Bakes are not compared here: erosion, and
+/// with it sediment, only agrees statistically.
+#[test]
+fn gpu_landform_weights_match_the_cpu_oracle() {
+    let Some(context) = common::gpu() else {
+        return;
+    };
+    let mut input = inputs(128, 7);
+    input.landform_rules = terra_landform_rules();
+    let gpu = TierAValidation::new(&context.device)
+        .bake_with_scratch(
+            &context.device,
+            &context.queue,
+            &bake_inputs(&input),
+            usize::MAX,
+        )
+        .unwrap();
+    let words = gpu.run_words(8);
+    let mut worst = 0u32;
+    let mut used = [0u64; 4];
+    let slope = |s: TierAScratch| gpu.scratch_f32(s);
+    let (east, north) = (
+        slope(TierAScratch::SlopeEast).expect("slope scratch"),
+        slope(TierAScratch::SlopeNorth).expect("slope scratch"),
+    );
+    let (bc, aux0, aux1) = (gpu.run_words(5), gpu.run_words(6), gpu.run_words(7));
+    for (k, g) in words.iter().enumerate() {
+        let fields = astrum_world::terrain::tier_a::landform_rule_fields(
+            f64::from(gpu.run(0)[k]),
+            f64::from(gpu.run(1)[k]),
+            f64::from(gpu.run(2)[k]),
+            bc[k] as i32,
+            aux0[k],
+            aux1[k],
+            f64::from(east[k]).hypot(f64::from(north[k])),
+        );
+        let w = astrum_world::terrain::landform::expr::evaluate_set(&input.landform_rules, &fields)
+            .unwrap();
+        let lane = |i: usize| w.get(i).copied().unwrap_or(0.0);
+        let c = &astrum_world::terrain::tier_a::pack_unorm4([lane(0), lane(1), lane(2), lane(3)]);
+        let mut sum = 0u32;
+        for (lane, total) in used.iter_mut().enumerate() {
+            let (a, b) = ((g >> (8 * lane)) & 0xff, (c >> (8 * lane)) & 0xff);
+            worst = worst.max(a.abs_diff(b));
+            sum += a;
+            *total += u64::from(a);
+        }
+        assert!((250..=260).contains(&sum), "weights sum to {sum}/255");
+    }
+    println!("landform weights: max byte difference {worst}, lane totals {used:?}");
+    assert!(worst <= 1, "weights differ by {worst} unorm8 steps");
+    assert!(
+        used[..3].iter().all(|&u| u > 0),
+        "every terra landform appears"
+    );
 }

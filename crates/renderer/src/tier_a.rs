@@ -121,7 +121,7 @@ pub mod stage {
 
 /// Plain bake inputs, already converted to the shader's units (radians,
 /// frequencies in cycles per unit direction, lengths in metres).
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct TierABakeInputs {
     pub face_cells: u32,
     pub stages: u32,
@@ -216,6 +216,8 @@ pub struct TierABakeInputs {
     pub sediment_depth_m: f32,
     /// Erosion cascade, coarse to fine: (face-cell divisor, iterations).
     pub erosion_cascade: [[u32; 2]; 3],
+    /// Landform weight-rule set bytecode; empty: the weight run stays zero.
+    pub landform_rules: Vec<u32>,
 }
 
 impl TierABakeInputs {
@@ -657,6 +659,7 @@ impl Layout {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage {
+    LandformWeights,
     Tectonics,
     Continents,
     SeaLevel,
@@ -683,7 +686,7 @@ enum Stage {
     FieldMip,
 }
 
-const ENTRY_POINTS: [(Stage, &str); 24] = [
+const ENTRY_POINTS: [(Stage, &str); 25] = [
     (Stage::Tectonics, "tectonics"),
     (Stage::Continents, "continents"),
     (Stage::SeaLevel, "sea_level"),
@@ -707,6 +710,7 @@ const ENTRY_POINTS: [(Stage, &str); 24] = [
     (Stage::Histogram2, "histogram_2"),
     (Stage::SeaLevel2, "sea_level_2"),
     (Stage::FinishShape, "finish_shape"),
+    (Stage::LandformWeights, "landform_weights"),
     (Stage::FieldMip, "field_mip"),
 ];
 
@@ -1122,8 +1126,24 @@ fn schedule(
             result(run::AUX0),
         ],
     ));
-    // Landform weights (result run 8): reserved for the landform-weight
-    // interpreter; the run stays zero until the rule bytecode exists.
+    // Landform weights (result run 8) from the set's rule bytecode.
+    if !inputs.landform_rules.is_empty() {
+        s.push(PassSpec::new(
+            Stage::LandformWeights,
+            n,
+            &[
+                result(run::ELEVATION),
+                result(run::TEMPERATURE),
+                result(run::MOISTURE),
+                result(run::BOUNDARY_COORD),
+                result(run::AUX0),
+                result(run::AUX1),
+                l.slope[0],
+                l.slope[1],
+                result(run::LANDFORM),
+            ],
+        ));
+    }
 
     let mips = field_mip_layout(n);
     for level in 0..mips.len() - 1 {
@@ -1200,6 +1220,14 @@ impl TierAPipelines {
                     },
                 ),
                 entry(4, uniform),
+                entry(
+                    5,
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1291,6 +1319,19 @@ impl TierABake {
             mapped_at_creation: false,
         });
         queue.write_buffer(&plates, 0, &inputs.packed_plates());
+        // Landform rules (at least one word: empty sets bind a zero word).
+        let mut rule_words = inputs.landform_rules.clone();
+        if rule_words.is_empty() {
+            rule_words.push(0);
+        }
+        let rule_bytes: Vec<u8> = rule_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let landform_rules = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Tier A landform rules"),
+            size: rule_bytes.len() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&landform_rules, 0, &rule_bytes);
         let passes = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Tier A bake passes"),
             size: PASS_STRIDE * schedule.len() as u64,
@@ -1330,6 +1371,10 @@ impl TierABake {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: plates.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: landform_rules.as_entire_binding(),
                 },
             ],
         });

@@ -236,6 +236,32 @@ impl CubeMap<f32> {
         (sum / total, g - direction * direction.dot(g))
     }
 
+    /// Uniform cubic B-spline of `face` at chart (u, v): smooth (C²) and
+    /// non-overshooting (convex weights), so interpolated landform weights
+    /// stay in [0, 1] and keep their sum.
+    fn bspline_on(&self, face: usize, u: f64, v: f64) -> f64 {
+        let n = self.n as f64;
+        let fx = (u + 1.0) * 0.5 * n - 0.5;
+        let fy = (v + 1.0) * 0.5 * n - 0.5;
+        let (x0, y0) = (fx.floor() as i64, fy.floor() as i64);
+        let (wx, wy) = (
+            bspline_weights(fx - x0 as f64),
+            bspline_weights(fy - y0 as f64),
+        );
+        let mut sum = 0.0;
+        for (j, wj) in wy.iter().enumerate() {
+            for (i, wi) in wx.iter().enumerate() {
+                sum += wi * wj * self.value_across(face, x0 - 1 + i as i64, y0 - 1 + j as i64);
+            }
+        }
+        sum
+    }
+
+    /// Cubic B-spline sample at `direction`, continuous across face edges.
+    pub fn bspline(&self, direction: DVec3) -> f64 {
+        self.across_faces(direction, |f, u, v| self.bspline_on(f, u, v))
+    }
+
     /// Bilinear sample at `direction`, continuous across face edges.
     pub fn bilinear(&self, direction: DVec3) -> f64 {
         self.across_faces(direction, |f, u, v| self.bilinear_on(f, u, v))
@@ -247,6 +273,18 @@ impl CubeMap<f32> {
     pub fn bicubic(&self, direction: DVec3) -> f64 {
         self.across_faces(direction, |f, u, v| self.bicubic_on(f, u, v))
     }
+}
+
+/// Uniform cubic B-spline weights of the four taps around fraction `t`.
+pub fn bspline_weights(t: f64) -> [f64; 4] {
+    let (t2, t3) = (t * t, t * t * t);
+    let s = 1.0 - t;
+    [
+        s * s * s / 6.0,
+        (3.0 * t3 - 6.0 * t2 + 4.0) / 6.0,
+        (-3.0 * t3 + 3.0 * t2 + 3.0 * t + 1.0) / 6.0,
+        t3 / 6.0,
+    ]
 }
 
 /// Unit direction through the centre of texel (i, j) on face number `face`.

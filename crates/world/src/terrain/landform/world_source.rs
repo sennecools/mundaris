@@ -1,21 +1,24 @@
-//! PROTOTYPE (M2 Shape Step 6a): Tier A fields of a baked world map as the
-//! landform [`FieldSource`] and weight-rule inputs, and the CPU composition
-//! `Σ wᵢ·landformᵢ` added on top of the macro elevation.
+//! Tier A fields of a baked world map as the landform [`FieldSource`], the
+//! baked landform weights, and the CPU composition `Σ wᵢ·landformᵢ` added on
+//! top of the macro elevation (M2 Shape). The GPU producer
+//! (`landform_eval.wgsl`) mirrors it.
 //!
-//! Prototype shortcuts (hardened in Step 6b): weights are evaluated per
-//! sample from level-0 fields instead of the Tier A weight run and its
-//! B-spline lookup; field gradients are the analytic gradients of the bicubic
-//! level-0 maps; the weight gradient is left out of the
-//! composed gradient; the landform seed comes from the continent seed.
+//! - Fields: level-0 maps, bicubic, with analytic gradients
+//!   (`CubeMap::bicubic_gradient`).
+//! - Weights: the Tier A weight run (rules evaluated per texel in the bake,
+//!   `tier_a::landform_rule_fields`), sampled with a cubic B-spline, which
+//!   never overshoots and keeps normalised weights summing to one.
+//! - The weight gradient is left out of the composed gradient (weights vary
+//!   over Tier A texels, ~1 km; relief gradients dominate the normal).
 use super::eval::{Dual, FieldSource, LandformParams};
-use super::expr::{RuleFields, field};
 use super::schema::RecipeField;
 use super::set::LandformSet;
 use crate::terrain::surface::world_field::WorldMaps;
 use crate::terrain::world_map::CubeMap;
 use glam::DVec3;
 
-/// Level-0 Tier A fields sampled bicubically at body positions.
+/// Level-0 Tier A fields sampled bicubically at body positions, and the
+/// four landform weight lanes.
 #[derive(Debug)]
 pub struct MapsFields {
     radius_m: f64,
@@ -29,6 +32,8 @@ pub struct MapsFields {
     volcanic: CubeMap<f32>,
     /// `boundary_coord` in metres.
     boundary_m: CubeMap<f32>,
+    /// Landform weights (unorm8 lanes of the weight run) as 0..1.
+    weights: [CubeMap<f32>; 4],
 }
 
 impl MapsFields {
@@ -42,11 +47,14 @@ impl MapsFields {
             }
             out
         };
-        let aux1 = &shape.aux1_mips[0];
-        let mut volcanic = CubeMap::new(aux1.n(), 0.0f32);
-        for (o, w) in volcanic.data_mut().iter_mut().zip(aux1.data()) {
-            *o = ((w >> 16) & 0xff) as f32 / 255.0;
-        }
+        let byte = |source: &CubeMap<u32>, lane: u32| {
+            let mut out = CubeMap::new(source.n(), 0.0f32);
+            for (o, w) in out.data_mut().iter_mut().zip(source.data()) {
+                *o = ((w >> (8 * lane)) & 0xff) as f32 / 255.0;
+            }
+            out
+        };
+        let landform = &shape.landform_mips[0];
         Some(Self {
             radius_m,
             elevation: maps.elevation_mips[0].clone(),
@@ -56,8 +64,9 @@ impl MapsFields {
             hardness: shape.hardness_mips[0].clone(),
             sediment: shape.sediment_mips[0].clone(),
             flow: shape.flow_mips[0].clone(),
-            volcanic,
+            volcanic: byte(&shape.aux1_mips[0], 2),
             boundary_m: convert(&shape.boundary_coord_mips[0]),
+            weights: std::array::from_fn(|lane| byte(landform, lane as u32)),
         })
     }
 
@@ -77,35 +86,13 @@ impl MapsFields {
 
     /// Value and body-space gradient (per metre) of `map` at direction `d`.
     fn sample(&self, map: &CubeMap<f32>, d: DVec3) -> Dual {
-        // Analytic Catmull-Rom gradient (`CubeMap::bicubic_gradient`); the
-        // GPU producer mirrors it.
         let (value, gradient) = map.bicubic_gradient(d);
         Dual::new(value, gradient / self.radius_m)
     }
 
-    /// Weight-rule inputs at direction `d`.
-    pub fn rule_fields(&self, d: DVec3) -> RuleFields {
-        let mut f = [0.0; field::COUNT];
-        let elevation = self.sample(&self.elevation, d);
-        let t = self.temperature.bicubic(d);
-        let m = self.moisture.bicubic(d).clamp(0.0, 1.0);
-        let cold = {
-            let x = ((t + 15.0) / 20.0).clamp(0.0, 1.0);
-            1.0 - x * x * (3.0 - 2.0 * x)
-        };
-        f[field::UPLIFT as usize] = self.uplift.bicubic(d).clamp(0.0, 1.0);
-        f[field::SEDIMENT as usize] = self.sediment.bicubic(d).clamp(0.0, 1.0);
-        f[field::MOISTURE as usize] = m;
-        f[field::ARID as usize] = 1.0 - m;
-        f[field::TEMPERATURE as usize] = t;
-        f[field::COLD as usize] = cold;
-        f[field::HARDNESS as usize] = self.hardness.bicubic(d).clamp(0.0, 1.0);
-        f[field::SLOPE_MACRO as usize] = elevation.gradient.length();
-        f[field::ELEVATION as usize] = elevation.value;
-        f[field::BOUNDARY_DISTANCE as usize] = self.boundary_m.bicubic(d).abs();
-        f[field::VOLCANIC as usize] = self.volcanic.bicubic(d).clamp(0.0, 1.0);
-        f[field::OCEAN as usize] = if elevation.value < 0.0 { 1.0 } else { 0.0 };
-        f
+    /// The four landform weights at direction `d` (B-spline of the run).
+    pub fn weights(&self, d: DVec3) -> [f64; 4] {
+        std::array::from_fn(|lane| self.weights[lane].bspline(d))
     }
 }
 
@@ -124,7 +111,7 @@ pub fn compose(
     d: DVec3,
     texel_m: f64,
 ) -> Dual {
-    let weights = set.weights(&fields.rule_fields(d));
+    let weights = fields.weights(d);
     let p = d * fields.radius_m;
     let mut sum = Dual::default();
     for ((landform, param), w) in set.landforms().iter().zip(params).zip(weights) {

@@ -132,6 +132,7 @@ pub fn bake_inputs(inputs: &TierAInputs) -> TierABakeInputs {
         erosion_cascade: p
             .erosion_cascade
             .map(|(divisor, iterations)| [divisor, iterations]),
+        landform_rules: inputs.landform_rules.clone(),
     }
 }
 

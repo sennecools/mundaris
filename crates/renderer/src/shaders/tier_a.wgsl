@@ -76,6 +76,8 @@ const BOUNDARY_UNITS_PER_M: f32 = 16.0;
 @group(0) @binding(2) var<storage, read_write> stats: array<atomic<u32>>;
 @group(0) @binding(3) var<uniform> pass_info: Pass;
 @group(0) @binding(4) var<uniform> plates: array<Plate, 32>;
+// Landform weight-rule set bytecode (`landform::expr::encode_set`).
+@group(0) @binding(5) var<storage, read> landform_rules: array<u32>;
 
 fn cube_field(index: u32) -> f32 {
     return bitcast<f32>(fields[index]);
@@ -1078,8 +1080,142 @@ fn finish_shape(@builtin(global_invocation_id) id: vec3<u32>) {
     fields[o(8u) + t.k] = pack4x8unorm(vec4<f32>(read_f(o(2u), t.k), read_f(o(3u), t.k), sediment, flow));
 }
 
-// Landform weights (run 8): reserved. The weight rules arrive as bytecode
-// with the landform definitions; until then every weight stays zero.
+// Landform weights (run 8; M2 Shape): the set's rule bytecode
+// (`landform::expr`, binding 5) over each texel's stored results, written as
+// four unorm8 weights. Mirrors `tier_a::landform_rule_fields` and
+// `expr::evaluate_set` in f32. o0 elevation, o1 temperature, o2 moisture,
+// o3 boundary_coord, o4 aux0, o5 aux1, o6/o7 smoothed slope east/north,
+// o8 weights (out).
+var<private> lw_fields: array<f32, 12>;
+
+fn lw_smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
+    if e0 == e1 {
+        return select(1.0, 0.0, x < e0);
+    }
+    let t = clamp((x - e0) / (e1 - e0), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+fn lw_bump(x: f32, a: f32, b: f32) -> f32 {
+    if b <= a {
+        return 0.0;
+    }
+    let t = (2.0 * x - a - b) / (b - a);
+    if abs(t) < 1.0 {
+        let s = 1.0 - t * t;
+        return s * s;
+    }
+    return 0.0;
+}
+
+// One rule at word `code` of the set (validated on the CPU).
+fn lw_rule(code: u32) -> f32 {
+    var stack: array<f32, 16>;
+    var top = 0u;
+    var at = code;
+    for (var i = 0u; i < 64u; i = i + 1u) {
+        let word = landform_rules[at];
+        at = at + 1u;
+        let opcode = word & 255u;
+        if opcode == 0u {
+            return stack[0];
+        }
+        if opcode == 1u {
+            stack[top] = bitcast<f32>(landform_rules[at]);
+            at = at + 1u;
+            top = top + 1u;
+            continue;
+        }
+        if opcode == 2u {
+            stack[top] = lw_fields[min(word >> 8u, 11u)];
+            top = top + 1u;
+            continue;
+        }
+        if opcode == 7u || opcode == 10u {
+            let a = stack[top - 1u];
+            stack[top - 1u] = select(abs(a), -a, opcode == 7u);
+            continue;
+        }
+        if opcode >= 12u {
+            let a = stack[top - 3u];
+            let b = stack[top - 2u];
+            let c = stack[top - 1u];
+            var r = 0.0;
+            switch opcode {
+                case 12u: { r = min(max(a, b), c); }
+                case 13u: { r = a + (b - a) * c; }
+                case 14u: { r = lw_smoothstep(a, b, c); }
+                default: { r = lw_bump(a, b, c); }
+            }
+            top = top - 2u;
+            stack[top - 1u] = r;
+            continue;
+        }
+        let a = stack[top - 2u];
+        let b = stack[top - 1u];
+        var r = 0.0;
+        switch opcode {
+            case 3u: { r = a + b; }
+            case 4u: { r = a - b; }
+            case 5u: { r = a * b; }
+            case 6u: { r = select(0.0, a / b, b != 0.0); }
+            case 8u: { r = min(a, b); }
+            case 9u: { r = max(a, b); }
+            default: { r = select(0.0, pow(a, b), a > 0.0); }
+        }
+        top = top - 1u;
+        stack[top - 1u] = r;
+    }
+    return 0.0;
+}
+
+@compute @workgroup_size(256)
+fn landform_weights(@builtin(global_invocation_id) id: vec3<u32>) {
+    let t = texel(id);
+    if !t.valid {
+        return;
+    }
+    let elevation = read_f(o(0u), t.k);
+    let temperature = read_f(o(1u), t.k);
+    let m = clamp(read_f(o(2u), t.k), 0.0, 1.0);
+    let bc = f32(bitcast<i32>(fields[o(3u) + t.k])) / BOUNDARY_UNITS_PER_M;
+    let aux0 = unpack4x8unorm(fields[o(4u) + t.k]);
+    let aux1 = unpack4x8unorm(fields[o(5u) + t.k]);
+    let slope = length(vec2<f32>(read_f(o(6u), t.k), read_f(o(7u), t.k)));
+    let x = clamp((temperature + 15.0) / 20.0, 0.0, 1.0);
+    lw_fields[0] = aux0.x;
+    lw_fields[1] = aux0.z;
+    lw_fields[2] = m;
+    lw_fields[3] = 1.0 - m;
+    lw_fields[4] = temperature;
+    lw_fields[5] = 1.0 - x * x * (3.0 - 2.0 * x);
+    lw_fields[6] = aux0.y;
+    lw_fields[7] = slope;
+    lw_fields[8] = elevation;
+    lw_fields[9] = abs(bc);
+    lw_fields[10] = aux1.z;
+    lw_fields[11] = select(0.0, 1.0, elevation < 0.0);
+    // Set header: version, count, flags (bit 0 normalise), fallback, offsets.
+    let count = min(landform_rules[1], 4u);
+    let fallback = landform_rules[3];
+    var w = vec4<f32>(0.0);
+    var sum = 0.0;
+    for (var i = 0u; i < count; i = i + 1u) {
+        var r = lw_rule(landform_rules[4u + i]);
+        if !(r >= 0.0) {
+            r = 0.0;
+        }
+        r = min(r, 1.0);
+        w[i] = r;
+        sum += r;
+    }
+    let lift = max(0.0625 - sum, 0.0);
+    w[min(fallback, 3u)] += lift;
+    if (landform_rules[2] & 1u) != 0u {
+        w = w / (sum + lift);
+    }
+    fields[o(8u) + t.k] = pack4x8unorm(w);
+}
 
 // ---------------------------------------------------------------- field mips
 

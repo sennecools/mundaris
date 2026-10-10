@@ -103,10 +103,21 @@ fn main() {
             radius,
         )
     {
-        let f = fields.rule_fields(centre);
+        use astrum_world::terrain::landform::{FieldSource, RecipeField};
+        let at = |f| fields.field(f, centre * radius);
+        let elevation = at(RecipeField::Elevation);
+        let w = fields.weights(centre);
         eprintln!(
-            "centre fields: uplift {:.2} sediment {:.2} moisture {:.2} temperature {:.1} hardness {:.2} macro slope {:.3} elevation {:.0} m |boundary| {:.0} m",
-            f[0], f[1], f[2], f[4], f[6], f[7], f[8], f[9]
+            "centre fields: uplift {:.2} sediment {:.2} moisture {:.2} temperature {:.1} hardness {:.2} macro slope {:.3} elevation {:.0} m |boundary| {:.0} m; weights {:.2?}",
+            at(RecipeField::Uplift).value,
+            at(RecipeField::Sediment).value,
+            at(RecipeField::Moisture).value,
+            at(RecipeField::Temperature).value,
+            at(RecipeField::Hardness).value,
+            elevation.gradient.length(),
+            elevation.value,
+            at(RecipeField::BoundaryCoord).value.abs(),
+            w
         );
     }
     let east = centre.any_orthonormal_vector();

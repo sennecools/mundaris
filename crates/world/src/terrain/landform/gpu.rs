@@ -1,16 +1,16 @@
 //! Packed `u32` form of a landform set for the GPU producer's interpreter
-//! (`renderer/src/shaders/landform_eval.wgsl`; M2 Shape Step 6a).
+//! (`renderer/src/shaders/landform_eval.wgsl`; M2 Shape).
 //!
-//! PROTOTYPE: the producer interprets this buffer per sample. Step 6b
-//! replaces the recipe interpreter with generated WGSL; the weight bytecode
-//! moves into the Tier A bake.
+//! The producer interprets the recipe programs per sample. The weight rules
+//! are not in this block: the Tier A bake evaluates them per texel into its
+//! weight run (`tier_a::landform_rule_fields`), which the producer samples.
 //!
 //! Layout (word offsets relative to the block start):
 //!
 //! | word | content |
 //! |---|---|
 //! | 0 | landform count `N` (0: no landforms) |
-//! | 1 | offset of the weight bytecode ([`super::expr::encode_set`] verbatim) |
+//! | 1 | bit mask of the fields recipe `Field` ops read (`RecipeField::id` bits), plus bits 0–3 (shape overlay) |
 //! | 2, 3 | zero |
 //! | 4 + 4i .. | landform `i`: amplitude (f32 bits), seed, program offset, op count |
 //!
@@ -133,8 +133,7 @@ pub fn pack_set(set: &LandformSet, params: &[LandformParams]) -> Result<Vec<u32>
     }
     let mut words = vec![0u32; HEADER_WORDS + 4 * n];
     words[0] = n as u32;
-    words[1] = words.len() as u32;
-    words.extend_from_slice(set.bytecode());
+    words[1] = 0xf;
     for (i, (landform, p)) in set.landforms().iter().zip(params).enumerate() {
         let ops = landform.program.ops();
         if ops.len() > MAX_GPU_OPS {
@@ -155,7 +154,10 @@ pub fn pack_set(set: &LandformSet, params: &[LandformParams]) -> Result<Vec<u32>
                     words.push(opcode::STACK);
                     words.extend_from_slice(&pack_stack(s));
                 }
-                Op::Field(field) => words.push(header(opcode::FIELD, &[field.id() as usize])),
+                Op::Field(field) => {
+                    words[1] |= 1 << field.id();
+                    words.push(header(opcode::FIELD, &[field.id() as usize]));
+                }
                 Op::Const(v) => words.extend([opcode::CONST, f(*v)]),
                 Op::Add(a, b) => words.push(header(opcode::ADD, &[*a, *b])),
                 Op::Multiply(a, b) => words.push(header(opcode::MULTIPLY, &[*a, *b])),

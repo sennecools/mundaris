@@ -10,8 +10,6 @@
 var<private> lf_base: u32;
 // Value registers of one program: (value, gradient per metre in body axes).
 var<private> lf_reg: array<vec4<f32>, 16>;
-// Weight-rule inputs (`landform::expr::field`).
-var<private> lf_rule_fields: array<f32, 12>;
 // Per-octave (effective frequency, gradient contribution) of a stack.
 var<private> lf_contrib: array<vec4<f32>, 24>;
 
@@ -52,6 +50,7 @@ fn lf_field_run(field: u32) -> vec2<u32> {
         case 5u: { return vec2<u32>(1u, 0u); }
         case 6u: { return vec2<u32>(7u, 4u); }
         case 7u: { return vec2<u32>(0u, 0u); }
+        case 9u, 10u, 11u, 12u: { return vec2<u32>(8u, field - 7u); }
         default: { return vec2<u32>(5u, 1u); }
     }
 }
@@ -78,7 +77,7 @@ fn lf4_fetch(index: u32) -> vec4<f32> {
     var out = vec4<f32>(0.0);
     for (var c = 0u; c < 4u; c = c + 1u) {
         let id = lf4_ids[c];
-        if id > 8u {
+        if id > 12u {
             continue;
         }
         let rd = lf_field_run(id);
@@ -231,15 +230,21 @@ fn lf4_field(ids: vec4<u32>, d: vec3<f32>) -> array<vec4<f32>, 4> {
     return out;
 }
 
-// Fill `lf_cache` with every field at direction `d` (three passes of four
-// lanes).
-fn lf_fill_cache(d: vec3<f32>) {
+// Fill `lf_cache` at direction `d` with the fields in bit mask `used`
+// (`RecipeField::id` bits, `landform::gpu` header word 1): passes of four
+// lanes, skipping groups no recipe reads. Group 0 (uplift, sediment, flow,
+// hardness) always runs: the shape overlay page reads it.
+fn lf_fill_cache(d: vec3<f32>, used: u32) {
     var groups = array<vec4<u32>, 3>(
-        vec4<u32>(7u, 0u, 1u, 2u),
-        vec4<u32>(3u, 8u, 4u, 5u),
+        vec4<u32>(0u, 1u, 2u, 3u),
+        vec4<u32>(4u, 5u, 7u, 8u),
         vec4<u32>(6u, 99u, 99u, 99u),
     );
+    var masks = array<u32, 3>(0xfu, 0x1b0u, 0x40u);
     for (var gi = 0u; gi < 3u; gi = gi + 1u) {
+        if gi > 0u && (used & masks[gi]) == 0u {
+            continue;
+        }
         let ids = groups[gi];
         let f = lf4_field(ids, d);
         for (var c = 0u; c < 4u; c = c + 1u) {
@@ -275,141 +280,60 @@ fn lf_clamp_field(field: u32, f: vec4<f32>) -> vec4<f32> {
 
 // ---------------------------------------------------------------- weights
 
-fn lf_smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
-    if e0 == e1 {
-        return select(1.0, 0.0, x < e0);
+// cube_bicubic_on with cubic B-spline weights for the four lanes
+// (`CubeMap::bspline_on`).
+fn lf4_bspline_on(face: u32, u: f32, v: f32) -> vec4<f32> {
+    let n = f32(tile.noise.y);
+    let fx = (u + 1.0) * 0.5 * n - 0.5;
+    let fy = (v + 1.0) * 0.5 * n - 0.5;
+    let x0 = i32(floor(fx));
+    let y0 = i32(floor(fy));
+    let tx = fx - floor(fx);
+    let ty = fy - floor(fy);
+    let sx = 1.0 - tx;
+    let sy = 1.0 - ty;
+    let wx = vec4<f32>(sx * sx * sx, 3.0 * tx * tx * tx - 6.0 * tx * tx + 4.0,
+        -3.0 * tx * tx * tx + 3.0 * tx * tx + 3.0 * tx + 1.0, tx * tx * tx) / 6.0;
+    let wy = vec4<f32>(sy * sy * sy, 3.0 * ty * ty * ty - 6.0 * ty * ty + 4.0,
+        -3.0 * ty * ty * ty + 3.0 * ty * ty + 3.0 * ty + 1.0, ty * ty * ty) / 6.0;
+    var sum = vec4<f32>(0.0);
+    for (var j = 0; j < 4; j = j + 1) {
+        for (var i = 0; i < 4; i = i + 1) {
+            sum += wx[i] * wy[j] * lf4_across(face, x0 - 1 + i, y0 - 1 + j);
+        }
     }
-    let t = clamp((x - e0) / (e1 - e0), 0.0, 1.0);
-    return t * t * (3.0 - 2.0 * t);
+    return sum;
 }
 
-fn lf_bump(x: f32, a: f32, b: f32) -> f32 {
-    if b <= a {
-        return 0.0;
-    }
-    let t = (2.0 * x - a - b) / (b - a);
-    if abs(t) < 1.0 {
-        let s = 1.0 - t * t;
-        return s * s;
-    }
-    return 0.0;
-}
-
-// Rule inputs (`MapsFields::rule_fields`) from the field cache: uplift,
-// sediment, moisture, temperature, hardness, |boundary|, volcanic, elevation.
-fn lf_fill_rule_fields() {
-    let elevation = lf_cache[7];
-    var ids = array<u32, 7>(0u, 1u, 4u, 5u, 3u, 8u, 6u);
-    var v: array<f32, 7>;
-    for (var i = 0u; i < 7u; i = i + 1u) {
-        v[i] = lf_cache[ids[i]].x;
-    }
-    let t = v[3];
-    let m = clamp(v[2], 0.0, 1.0);
-    let x = clamp((t + 15.0) / 20.0, 0.0, 1.0);
-    lf_rule_fields[0] = clamp(v[0], 0.0, 1.0);
-    lf_rule_fields[1] = clamp(v[1], 0.0, 1.0);
-    lf_rule_fields[2] = m;
-    lf_rule_fields[3] = 1.0 - m;
-    lf_rule_fields[4] = t;
-    lf_rule_fields[5] = 1.0 - x * x * (3.0 - 2.0 * x);
-    lf_rule_fields[6] = clamp(v[4], 0.0, 1.0);
-    lf_rule_fields[7] = length(elevation.yzw);
-    lf_rule_fields[8] = elevation.x;
-    lf_rule_fields[9] = abs(v[5]);
-    lf_rule_fields[10] = clamp(v[6], 0.0, 1.0);
-    lf_rule_fields[11] = select(0.0, 1.0, elevation.x < 0.0);
-}
-
-// One rule of the set bytecode at `code` (`expr::evaluate`; validated on
-// the CPU, so no checks here).
-fn lf_rule(code: u32) -> f32 {
-    var stack: array<f32, 16>;
-    var top = 0u;
-    var at = code;
-    for (var i = 0u; i < 64u; i = i + 1u) {
-        let word = lf_word(at);
-        at = at + 1u;
-        let opcode = word & 255u;
-        if opcode == 0u {
-            return stack[0];
-        }
-        if opcode == 1u {
-            stack[top] = lf_f32(at);
-            at = at + 1u;
-            top = top + 1u;
+// The four landform weights at `d` (`MapsFields::weights`): the Tier A weight
+// run (rules evaluated per texel in the bake) as a cubic B-spline, which
+// never overshoots and keeps normalised weights summing to one.
+fn lf_weights(d: vec3<f32>) -> vec4<f32> {
+    lf4_ids = vec4<u32>(9u, 10u, 11u, 12u);
+    let band = 1.0 / f32(tile.noise.y);
+    var sum = vec4<f32>(0.0);
+    var total = 0.0;
+    for (var f = 0u; f < 6u; f = f + 1u) {
+        let b = face_basis(f);
+        let w = dot(d, b[0]);
+        if w <= 0.0 {
             continue;
         }
-        if opcode == 2u {
-            stack[top] = lf_rule_fields[min(word >> 8u, 11u)];
-            top = top + 1u;
+        let u = dot(d, b[1]) / w;
+        let v = dot(d, b[2]) / w;
+        let t = (1.0 - max(abs(u), abs(v)) + band) / (2.0 * band);
+        if t <= 0.0 {
             continue;
         }
-        if opcode == 7u || opcode == 10u {
-            let a = stack[top - 1u];
-            stack[top - 1u] = select(abs(a), -a, opcode == 7u);
-            continue;
+        let value = lf4_bspline_on(f, u, v);
+        if t >= 1.0 {
+            return value;
         }
-        if opcode >= 12u {
-            let a = stack[top - 3u];
-            let b = stack[top - 2u];
-            let c = stack[top - 1u];
-            var r = 0.0;
-            switch opcode {
-                case 12u: { r = min(max(a, b), c); }
-                case 13u: { r = a + (b - a) * c; }
-                case 14u: { r = lf_smoothstep(a, b, c); }
-                default: { r = lf_bump(a, b, c); }
-            }
-            top = top - 2u;
-            stack[top - 1u] = r;
-            continue;
-        }
-        let a = stack[top - 2u];
-        let b = stack[top - 1u];
-        var r = 0.0;
-        switch opcode {
-            case 3u: { r = a + b; }
-            case 4u: { r = a - b; }
-            case 5u: { r = a * b; }
-            case 6u: { r = select(0.0, a / b, b != 0.0); }
-            case 8u: { r = min(a, b); }
-            case 9u: { r = max(a, b); }
-            default: { r = select(0.0, pow(a, b), a > 0.0); }
-        }
-        top = top - 1u;
-        stack[top - 1u] = r;
+        let weight = t * t * (3.0 - 2.0 * t);
+        sum += weight * value;
+        total += weight;
     }
-    return 0.0;
-}
-
-// Weight of landform `index` (`expr::evaluate_set`): rules clamped to
-// [0, 1], the fallback lifted to FALLBACK_FLOOR, optionally normalised.
-fn lf_weight(code: u32, index: u32) -> f32 {
-    let count = lf_word(code + 1u);
-    let fallback = lf_word(code + 3u);
-    var sum = 0.0;
-    var own = 0.0;
-    for (var i = 0u; i < count; i = i + 1u) {
-        var w = lf_rule(code + lf_word(code + 4u + i));
-        // Non-finite → 0 (NaN fails both comparisons).
-        if !(w >= 0.0) {
-            w = 0.0;
-        }
-        w = min(w, 1.0);
-        sum += w;
-        if i == index {
-            own = w;
-        }
-    }
-    let lift = max(0.0625 - sum, 0.0);
-    if index == fallback {
-        own += lift;
-    }
-    if (lf_word(code + 2u) & 1u) != 0u {
-        return own / (sum + lift);
-    }
-    return own;
+    return sum / max(total, 1.0e-30);
 }
 
 // ---------------------------------------------------------------- stacks
@@ -755,13 +679,12 @@ fn landform_relief(local: vec3<f32>, d: vec3<f32>) -> vec4<f32> {
     if tile.info.y != 2u || tile.noise.y == 0u || count == 0u {
         return vec4<f32>(0.0);
     }
-    let code = lf_word(1u);
-    lf_fill_cache(d);
+    lf_fill_cache(d, lf_word(1u));
     lf_cache_valid = true;
-    lf_fill_rule_fields();
+    let weights = lf_weights(d);
     var sum = vec4<f32>(0.0);
-    for (var i = 0u; i < count; i = i + 1u) {
-        let w = lf_weight(code, i);
+    for (var i = 0u; i < min(count, 4u); i = i + 1u) {
+        let w = weights[i];
         if w <= 0.0 {
             continue;
         }
