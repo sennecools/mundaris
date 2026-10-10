@@ -310,8 +310,67 @@ pub fn crown_areas(mesh: &crate::Mesh) -> [f64; 2] {
     [area(0, 1), 0.5 * (area(0, 2) + area(1, 2))]
 }
 
-/// Canopy colour seen from afar (far tint albedo).
+/// Mean albedo (linear, as the flora shader decodes it: rgb² × a) of what a
+/// mesh shows from straight above: the topmost triangle per pixel of a 256²
+/// raster.
+pub fn crown_top_color(mesh: &crate::Mesh) -> [f64; 3] {
+    const N: usize = 256;
+    let p: Vec<[f64; 3]> = mesh.vertices.iter().map(|v| v.position.map(|x| x as f64)).collect();
+    let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
+    for q in &p {
+        for a in 0..2 {
+            lo[a] = lo[a].min(q[a]);
+            hi[a] = hi[a].max(q[a]);
+        }
+    }
+    let cell = ((hi[0] - lo[0]).max(hi[1] - lo[1]) / N as f64).max(1e-6);
+    let mut top = vec![f64::MIN; N * N];
+    let mut col = vec![[0.0f64; 3]; N * N];
+    let albedo = |v: &crate::FloraVertex| {
+        let a = v.color[3] as f64 / 255.0;
+        [0, 1, 2].map(|i| (v.color[i] as f64 / 255.0).powi(2) * a)
+    };
+    let edge = |a: [f64; 2], b: [f64; 2], x: f64, y: f64| (b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0]);
+    for t in mesh.indices.as_chunks::<3>().0 {
+        let v = [0, 1, 2].map(|i| {
+            let q = p[t[i] as usize];
+            [(q[0] - lo[0]) / cell, (q[1] - lo[1]) / cell]
+        });
+        let d = edge(v[0], v[1], v[2][0], v[2][1]);
+        if d.abs() < 1e-12 {
+            continue;
+        }
+        let z = (p[t[0] as usize][2] + p[t[1] as usize][2] + p[t[2] as usize][2]) / 3.0;
+        let c = t.map(|i| albedo(&mesh.vertices[i as usize]));
+        let c = [0, 1, 2].map(|a| (c[0][a] + c[1][a] + c[2][a]) / 3.0);
+        let lo_x = v.iter().map(|q| q[0]).fold(f64::MAX, f64::min).floor().max(0.0) as usize;
+        let hi_x = (v.iter().map(|q| q[0]).fold(f64::MIN, f64::max).ceil() as usize).min(N);
+        let lo_y = v.iter().map(|q| q[1]).fold(f64::MAX, f64::min).floor().max(0.0) as usize;
+        let hi_y = (v.iter().map(|q| q[1]).fold(f64::MIN, f64::max).ceil() as usize).min(N);
+        for y in lo_y..hi_y {
+            for x in lo_x..hi_x {
+                let (cx, cy) = (x as f64 + 0.5, y as f64 + 0.5);
+                let inside = [edge(v[1], v[2], cx, cy), edge(v[2], v[0], cx, cy), edge(v[0], v[1], cx, cy)]
+                    .iter()
+                    .all(|&w| w * d.signum() >= 0.0);
+                if inside && z > top[y * N + x] {
+                    top[y * N + x] = z;
+                    col[y * N + x] = c;
+                }
+            }
+        }
+    }
+    let hits: Vec<&[f64; 3]> = (0..N * N).filter(|&i| top[i] > f64::MIN).map(|i| &col[i]).collect();
+    let n = hits.len().max(1) as f64;
+    [0, 1, 2].map(|a| hits.iter().map(|c| c[a]).sum::<f64>() / n)
+}
+
+/// Canopy colour seen from afar (far tint albedo): the measured top-view
+/// albedo of the grown LOD0 when known, else the organ/tip mix.
 pub fn canopy_color(sp: &SpeciesFile) -> [f64; 3] {
+    if let Some(c) = sp.crown_color {
+        return c.map(|v| CANOPY_RADIANCE * v);
+    }
     let o = sp.look.organ;
     let t = sp.look.organ_tip;
     // The organ/tip mix is the mean albedo of the baked impostors (within
@@ -368,6 +427,8 @@ pub fn species_wgsl(species: &[SpeciesFile], rocks: &[crate::palette::PlanetRock
     out.push_str(&format!("const FL_SPECIES: u32 = {n}u;\n"));
     out.push_str(&format!("const FL_CANOPY_MASK: u32 = {canopy}u;\n"));
     out.push_str(&format!("const FL_SHRUB_MASK: u32 = {shrub}u;\n"));
+    let stylised = species.first().is_some_and(|s| s.style == crate::genome::FoliageStyle::Stylised);
+    out.push_str(&format!("// Planet foliage style (grass clumps follow it).\nconst FL_STYLISED: bool = {stylised};\n"));
     out.push_str(
         "struct FlNiche {\n    t: vec3<f32>,\n    m: vec3<f32>,\n    h: vec3<f32>,\n    slope: vec2<f32>,\n    soil: f32,\n    prior: f32,\n    scale: vec2<f32>,\n    far_kind: u32,\n    color: vec3<f32>,\n    // Expected crown area (m2) of one plant from above and from the side.\n    crown: vec2<f32>,\n}\n",
     );

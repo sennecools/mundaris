@@ -76,6 +76,10 @@ pub struct PlanetLife {
     /// species files serving as tree/shrub templates; 0 = authored only.
     #[serde(default)]
     pub generated_species: u32,
+    /// Foliage build for every species on this planet (one value to flip
+    /// for a side-by-side with the realistic leaves).
+    #[serde(default)]
+    pub foliage: crate::genome::FoliageStyle,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -382,8 +386,48 @@ impl Palette {
             leaf[0] -= 0.03;
             leaf[1] *= 0.85;
         }
-        let tip = [leaf[0] + 0.07, leaf[1] * 1.15, (leaf[2] + 4.0 * st.signed(1, 0)).rem_euclid(360.0)];
-        let bark = [self.bark[0] + 0.04 * st.signed(2, 0), self.bark[1], (self.bark[2] + 12.0 * st.signed(3, 0)).rem_euclid(360.0)];
+        // Strangeness carries the woody species into the planet's alien hue
+        // families too (none at 0.4, most of the way at 0.7): canopy trees
+        // take the family nearest amber/orange (art direction 2026-10-10,
+        // NMS 2016 crowns), shrubs a seeded family; chroma rises toward the
+        // realism dial's cap.
+        let alien = crate::niche::smoothstep(0.4, 0.75, p.strangeness);
+        if alien > 0.0 {
+            let fam = self.hue_families(p);
+            let dist = |a: f64, b: f64| ((a - b + 540.0).rem_euclid(360.0) - 180.0).abs();
+            let target = if n.layer == Layer::Canopy {
+                *fam.iter().min_by(|a, b| dist(**a, 45.0).total_cmp(&dist(**b, 45.0))).unwrap()
+            } else {
+                fam[(st.unit(5, 0) * 3.0) as usize % 3]
+            };
+            let target = (target + 12.0 * st.signed(6, 0)).rem_euclid(360.0);
+            let dh = (target - leaf[2] + 540.0).rem_euclid(360.0) - 180.0;
+            leaf[2] = (leaf[2] + alien * dh).rem_euclid(360.0);
+            leaf[1] = leaf[1].max(alien * 0.8 * chroma_cap(p.realism()));
+        }
+        let mut tip = [leaf[0] + 0.07, leaf[1] * 1.15, (leaf[2] + 4.0 * st.signed(1, 0)).rem_euclid(360.0)];
+        let mut bark = [self.bark[0] + 0.04 * st.signed(2, 0), self.bark[1], (self.bark[2] + 12.0 * st.signed(3, 0)).rem_euclid(360.0)];
+        if p.foliage == crate::genome::FoliageStyle::Stylised {
+            // Stylised look (art direction 2026-10-10, NMS 2016 reference):
+            // saturated deeper base, bright warm tips (hue pulled up to 10°
+            // toward yellow-orange), dark cool blue-violet bark. Independent
+            // of the strangeness dial (hues stay the planet's).
+            leaf = [leaf[0] - 0.03, (leaf[1] * 1.3).min(0.15), leaf[2]];
+            let warm = ((75.0 - leaf[2] + 540.0).rem_euclid(360.0) - 180.0).clamp(-10.0, 10.0);
+            tip = [leaf[0] + 0.11, (leaf[1] * 1.2).min(0.17), (tip[2] + warm).rem_euclid(360.0)];
+            let cool = ((285.0 - bark[2] + 540.0).rem_euclid(360.0) - 180.0) * 0.7;
+            bark = [bark[0] - 0.08, 0.05, (bark[2] + cool).rem_euclid(360.0)];
+            // Keep the hue: lower chroma until the colour fits sRGB instead
+            // of clipping a channel (clipping turns olive into yellow).
+            let fit = |mut c: [f64; 3]| {
+                while c[1] > 0.0 && from_lch(c).iter().any(|v| !(0.0..=1.0).contains(v)) {
+                    c[1] = (c[1] - 0.005).max(0.0);
+                }
+                c
+            };
+            leaf = fit(leaf);
+            tip = fit(tip);
+        }
         let accent = [self.accent[0], self.accent[1], (self.accent[2] + 20.0 * st.signed(4, 0)).rem_euclid(360.0)];
         let f = |lch: [f64; 3]| from_lch(lch).map(|v| v.clamp(0.0, 1.0) as f32);
         Look { bark: f(bark), organ: f(leaf), organ_tip: f(tip), accent: f(accent) }
@@ -398,6 +442,7 @@ pub fn apply(species: &mut [SpeciesFile], planet: &PlanetLife) {
             Some(l) => l.clone(),
             None => palette.species_look(planet, sp),
         };
+        sp.style = planet.foliage;
     }
 }
 
@@ -466,6 +511,7 @@ mod tests {
             geology_age: 0.5,
             rocks: Vec::new(),
             generated_species: 0,
+            foliage: Default::default(),
         }
     }
 

@@ -357,10 +357,59 @@ fn rock_color(sdf: &RockSdf, p: DVec3, n: DVec3, w: &Weathering) -> [f32; 3] {
     [0, 1, 2].map(|a| c[a] + (w.moss[a] - c[a]) * moss)
 }
 
-/// A grown rock variant: three LOD meshes.
+/// A grown rock variant: three LOD meshes (realistic surface).
 pub fn grow_rock(rock: &RockFile, seed: u64, w: &Weathering) -> [Mesh; LOD_COUNT] {
+    grow_rock_style(rock, seed, w, crate::genome::FoliageStyle::Realistic)
+}
+
+/// Stylised rock grids: coarser, so the surface nets give chunky facets.
+pub const ROCK_GRID_STYLISED: [usize; LOD_COUNT] = [10, 7, 5];
+
+/// A grown rock variant in the planet's style. Stylised (art direction
+/// 2026-10-10): chunky flat-shaded facets with simple colour patches.
+pub fn grow_rock_style(rock: &RockFile, seed: u64, w: &Weathering, style: crate::genome::FoliageStyle) -> [Mesh; LOD_COUNT] {
     let sdf = RockSdf::new(rock, seed, w);
-    std::array::from_fn(|l| mesh_rock(&sdf, ROCK_GRID[l], w))
+    match style {
+        crate::genome::FoliageStyle::Realistic => std::array::from_fn(|l| mesh_rock(&sdf, ROCK_GRID[l], w)),
+        crate::genome::FoliageStyle::Stylised => std::array::from_fn(|l| facet(&mesh_rock(&sdf, ROCK_GRID_STYLISED[l], w), &sdf, w)),
+    }
+}
+
+/// Flat-shaded copy of a mesh with flat colour patches (art direction
+/// 2026-10-10): each face takes its corners' mean colour with the brightness
+/// snapped to three steps around the rock's mean, large warm patches from
+/// low-frequency noise, and a cap on upward faces (moss where the rock is
+/// wet, warm dust where dry).
+fn facet(m: &Mesh, sdf: &RockSdf, w: &Weathering) -> Mesh {
+    let dec = |v: &FloraVertex| v.color.map(|c| (c as f32 / 255.0).powi(2));
+    let lum = |c: [f32; 4]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    let mean = m.vertices.iter().map(|v| lum(dec(v))).sum::<f32>() / m.vertices.len().max(1) as f32;
+    let size = sdf.rock.size_m.max(1e-3);
+    let mut out = Mesh::default();
+    for t in m.indices.as_chunks::<3>().0 {
+        let vs = t.map(|i| &m.vertices[i as usize]);
+        let p = vs.map(|v| DVec3::from(v.position.map(|x| x as f64)));
+        let n = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or(DVec3::Z);
+        let mid = (p[0] + p[1] + p[2]) / 3.0;
+        let c = vs.iter().map(|v| dec(v)).fold([0.0f32; 4], |a, b| [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]]).map(|x| x / 3.0);
+        let l = lum(c).max(1e-4);
+        let step = ((l / mean.max(1e-4) - 1.0) / 0.18).round().clamp(-1.0, 1.0);
+        let k = mean * (1.0 + 0.16 * step) / l;
+        let mut col = [c[0] * k, c[1] * k, c[2] * k];
+        // Large flat patches: warmer and lighter where the noise is high.
+        if noise3(sdf.seed ^ 21, mid / (0.45 * size)) > 0.25 {
+            col = [col[0] * 1.25, col[1] * 1.08, col[2] * 0.85];
+        }
+        // Cap on upward faces, ragged by noise.
+        if n.z > 0.5 && noise3(sdf.seed ^ 22, mid / (0.3 * size)) > -0.35 {
+            col = if w.moss_cover > 0.3 { w.moss } else { [col[0] * 1.3, col[1] * 1.18, col[2] * 0.95] };
+        }
+        for (v, q) in vs.iter().zip(p) {
+            let id = out.push(q, n, col, c[3], DVec3::ZERO, v.wind);
+            out.indices.push(id);
+        }
+    }
+    out
 }
 
 /// Load every rock archetype of a directory, sorted by file name.
@@ -383,8 +432,20 @@ pub fn load_rocks_dir(dir: &std::path::Path) -> Result<Vec<RockFile>, String> {
 /// Mesh checks for the rock scorer: closed surface (every edge shared by
 /// exactly two triangles), no degenerate triangles, upward base.
 pub fn closed_edges_fraction(m: &Mesh) -> f64 {
+    // Weld by position first (flat-shaded meshes repeat corners per face).
+    let mut ids: std::collections::HashMap<[i64; 3], u32> = std::collections::HashMap::new();
+    let weld: Vec<u32> = m
+        .vertices
+        .iter()
+        .map(|v| {
+            let key = v.position.map(|x| (x as f64 * 1e5).round() as i64);
+            let n = ids.len() as u32;
+            *ids.entry(key).or_insert(n)
+        })
+        .collect();
     let mut edges: std::collections::BTreeMap<(u32, u32), u32> = std::collections::BTreeMap::new();
     for t in m.indices.chunks(3) {
+        let t = [weld[t[0] as usize], weld[t[1] as usize], weld[t[2] as usize]];
         for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
             *edges.entry((a.min(b), a.max(b))).or_default() += 1;
         }

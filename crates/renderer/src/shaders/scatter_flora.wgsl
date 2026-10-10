@@ -38,6 +38,20 @@ fn fl_keep(px: vec2<f32>, seed: u32, fade: f32, split: f32) -> bool {
     return select(d >= 1.0 + split, (d < split), (split > 0.0));
 }
 
+// Main pass under MSAA: the fragment runs per sample (sample_index), and
+// each sample shifts the pixel's dither thresholds by i·golden ratio, so a
+// 4× pixel resolves fades in quarter steps instead of an on/off stipple. The
+// split thresholds are the same for both tiers, so their samples stay
+// complementary. With one sample it equals fl_keep.
+fn fl_keep_sample(px: vec2<f32>, seed: u32, fade: f32, split: f32, si: u32) -> bool {
+    let o = f32(si) * 0.618034;
+    if fract(fl_dither(px, seed) + o) >= fade {
+        return false;
+    }
+    let d = fract(fl_dither(px.yx + vec2<f32>(17.0, 31.0), seed ^ 0x2c1b3c6du) + o);
+    return select(d >= 1.0 + split, (d < split), (split > 0.0));
+}
+
 struct FloraIn {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec4<f32>,
@@ -86,8 +100,8 @@ fn vs_flora(v: FloraIn, @builtin(instance_index) index: u32) -> FloraOut {
 }
 
 @fragment
-fn fs_flora(input: FloraOut) -> SceneOut {
-    if !fl_keep(input.clip_position.xy, bitcast<u32>(input.fade.z), input.fade.x, input.fade.y) {
+fn fs_flora(input: FloraOut, @builtin(sample_index) si: u32) -> SceneOut {
+    if !fl_keep_sample(input.clip_position.xy, bitcast<u32>(input.fade.z), input.fade.x, input.fade.y, si) {
         discard;
     }
     var n = normalize(input.normal);
@@ -207,9 +221,9 @@ fn fl_impostor_sample(input: ImpostorOut) -> vec4<f32> {
 }
 
 @fragment
-fn fs_impostor(input: ImpostorOut) -> SceneOut {
+fn fs_impostor(input: ImpostorOut, @builtin(sample_index) si: u32) -> SceneOut {
     let a = fl_impostor_sample(input);
-    if a.a < 0.5 || !fl_keep(input.clip_position.xy, bitcast<u32>(input.fade.z), input.fade.x, input.fade.y) {
+    if a.a < 0.5 || !fl_keep_sample(input.clip_position.xy, bitcast<u32>(input.fade.z), input.fade.x, input.fade.y, si) {
         discard;
     }
     let nt = textureSampleLevel(flora_normal, flora_sampler, input.uv, i32(input.layer), 0.0).xyz * 2.0 - 1.0;

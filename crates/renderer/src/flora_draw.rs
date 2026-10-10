@@ -24,7 +24,7 @@ use std::sync::{Arc, OnceLock};
 use astrum_flora::hash::{derive, name_key};
 use astrum_flora::impostor::{ATLAS, Impostor, bake};
 use astrum_flora::palette::{Palette, PlanetRock, from_lch, load_planet};
-use astrum_flora::rock::{RockFile, Weathering, grow_rock};
+use astrum_flora::rock::{RockFile, Weathering, grow_rock_style};
 use astrum_flora::scatter::{MAX_ROCKS, MAX_SPECIES, species_wgsl, splice_species};
 use astrum_flora::{Kit, LOD_COUNT, Mesh, SpeciesFile, grow_meshes, load_species_for_body, variant_seed};
 use wgpu::util::DeviceExt;
@@ -125,6 +125,7 @@ fn grow_all() -> Grown {
         }
     };
     let kit = Kit::builtin();
+    let style = planet.as_ref().map(|p| p.foliage).unwrap_or_default();
     let started = std::time::Instant::now();
     // Grow and bake every (entry, variant) on its own thread.
     let jobs: Vec<(usize, usize)> = (0..species.len())
@@ -145,7 +146,7 @@ fn grow_all() -> Grown {
                         grow_meshes(sp, kit, variant_seed(sp, v as u32)).1
                     } else {
                         let rock = &rocks[e - MAX_SPECIES].1;
-                        grow_rock(rock, derive(name_key(&rock.name), v as u64), &w)
+                        grow_rock_style(rock, derive(name_key(&rock.name), v as u64), &w, style)
                     };
                     let imp = bake(&lods[1]);
                     (lods, imp)
@@ -217,10 +218,14 @@ fn grow_all() -> Grown {
 /// species loaded).
 pub(crate) fn species_shader(shader: &str) -> String {
     let g = grown();
-    if g.species.is_empty() {
-        return shader.to_string();
+    let mut out = if g.species.is_empty() { shader.to_string() } else { splice_species(shader, &species_wgsl(&g.species, &g.rocks)) };
+    // Debug (measurement): ASTRUM_FLORA_FULL_M overrides the full-density
+    // view distance of the plant thinning (SCATTER_FULL_M, metres).
+    if let Some(m) = std::env::var("ASTRUM_FLORA_FULL_M").ok().and_then(|v| v.parse::<f32>().ok()) {
+        out = out.replace("const SCATTER_FULL_M: f32 = 350.0;", &format!("const SCATTER_FULL_M: f32 = {m:.1};"));
+        tracing::info!("flora: SCATTER_FULL_M overridden to {m} m");
     }
-    splice_species(shader, &species_wgsl(&g.species, &g.rocks))
+    out
 }
 
 fn grown() -> Arc<Grown> {

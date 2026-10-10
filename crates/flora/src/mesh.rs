@@ -186,6 +186,9 @@ enum OrganLod {
     /// to preserve area.
     Thin(f64),
     Clumps,
+    /// Stylised foliage: the organs grouped into about `count` soft puffs
+    /// (icospheres with `detail` subdivisions).
+    Puffs { count: usize, detail: u32 },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -216,6 +219,29 @@ const LODS: [LodPlan; LOD_COUNT] = [
         budget: 0.06,
         branch_share: 0.35,
         organs: OrganLod::Clumps,
+    },
+];
+
+/// Stylised LODs (art direction 2026-10-10): chunky branches from the coarse
+/// tube levels (twigs vanish inside the puffs), foliage as a few big puffs.
+const STYLISED_LODS: [LodPlan; LOD_COUNT] = [
+    LodPlan {
+        first_level: 3,
+        budget: 0.5,
+        branch_share: 0.35,
+        organs: OrganLod::Puffs { count: 34, detail: 1 },
+    },
+    LodPlan {
+        first_level: 4,
+        budget: 0.15,
+        branch_share: 0.3,
+        organs: OrganLod::Puffs { count: 14, detail: 0 },
+    },
+    LodPlan {
+        first_level: 4,
+        budget: 0.05,
+        branch_share: 0.25,
+        organs: OrganLod::Puffs { count: 5, detail: 0 },
     },
 ];
 
@@ -273,7 +299,11 @@ fn axes(sk: &Skeleton) -> Vec<Vec<u32>> {
 /// Build all LODs.
 pub fn build_lods(sk: &Skeleton, species: &SpeciesFile, kit: &Kit, seed: u64) -> [Mesh; LOD_COUNT] {
     let budget = triangle_budget(&species.genome) as f64;
-    std::array::from_fn(|l| build_lod(sk, species, kit, seed, &LODS[l], budget))
+    let plans = match species.style {
+        crate::genome::FoliageStyle::Realistic => &LODS,
+        crate::genome::FoliageStyle::Stylised => &STYLISED_LODS,
+    };
+    std::array::from_fn(|l| build_lod(sk, species, kit, seed, &plans[l], budget))
 }
 
 fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
@@ -297,6 +327,8 @@ fn branches(sk: &Skeleton, sp: &SpeciesFile, spec: &LodSpec) -> Mesh {
         .map(|n| n.radius)
         .unwrap_or(g.tip_radius_m)
         .max(1e-6);
+    // Stylised trunks are chunkier (art direction 2026-10-10).
+    let girth = if sp.style == crate::genome::FoliageStyle::Stylised { 1.8 } else { 1.0 };
     for (ai, chain) in axes(sk).iter().enumerate() {
         let first = &sk.nodes[chain[1] as usize];
         if first.order > spec.max_order {
@@ -305,7 +337,7 @@ fn branches(sk: &Skeleton, sp: &SpeciesFile, spec: &LodSpec) -> Mesh {
         if first.order > 0 && first.radius < spec.min_radius_tips * g.tip_radius_m {
             continue;
         }
-        tube(&mut m, sk, g, sp.look.bark, chain, spec, base_r, ai as u32);
+        tube(&mut m, sk, g, sp.look.bark, chain, spec, base_r, ai as u32, girth);
     }
     for e in &sk.extras {
         match *e {
@@ -350,6 +382,7 @@ fn tube(
     spec: &LodSpec,
     base_r: f64,
     axis_id: u32,
+    girth: f64,
 ) {
     let nodes = &sk.nodes;
     let order = nodes[chain[1] as usize].order;
@@ -396,7 +429,7 @@ fn tube(
         };
         u = (u - d * u.dot(d)).normalize_or(perp(d).0);
         let w = d.cross(u);
-        let r = radii[k];
+        let r = radii[k] * girth;
         let start = m.vertices.len() as u32;
         rings.push(start);
         // Bark darkens toward the base and inside the crown (cheap AO).
@@ -528,6 +561,13 @@ fn parts(
         OrganLod::Clumps => {
             // Fruits vanish at the clump level.
             clumps(m, sk, sp, budget);
+            return;
+        }
+        OrganLod::Puffs { count, detail } => {
+            // Fringe cards: the organ's spray (cluster) card when the kit has
+            // one, else the organ itself.
+            let card = kit.shape_named(&format!("{:?}Spray", g.organ)).or_else(|_| kit.shape_named("Spray")).ok().or(kit.organ(g.organ));
+            puffs(m, sk, sp, seed, count, detail, card);
             return;
         }
         OrganLod::Thin(k) => k,
@@ -712,6 +752,216 @@ fn ellipsoid(m: &mut Mesh, c: DVec3, r: DVec3, col: [f32; 3], pointed: bool) {
             let s1 = (s + 1) % seg;
             m.indices
                 .extend_from_slice(&[a + s, b + s, b + s1, a + s, b + s1, a + s1]);
+        }
+    }
+}
+
+/// Unit icosphere with `detail` midpoint subdivisions (0 = icosahedron).
+fn icosphere(detail: u32) -> (Vec<DVec3>, Vec<[u32; 3]>) {
+    let t = (1.0 + 5f64.sqrt()) / 2.0;
+    let mut v: Vec<DVec3> = [
+        [-1.0, t, 0.0],
+        [1.0, t, 0.0],
+        [-1.0, -t, 0.0],
+        [1.0, -t, 0.0],
+        [0.0, -1.0, t],
+        [0.0, 1.0, t],
+        [0.0, -1.0, -t],
+        [0.0, 1.0, -t],
+        [t, 0.0, -1.0],
+        [t, 0.0, 1.0],
+        [-t, 0.0, -1.0],
+        [-t, 0.0, 1.0],
+    ]
+    .iter()
+    .map(|p| DVec3::from(*p).normalize())
+    .collect();
+    let mut f: Vec<[u32; 3]> = vec![
+        [0, 11, 5],
+        [0, 5, 1],
+        [0, 1, 7],
+        [0, 7, 10],
+        [0, 10, 11],
+        [1, 5, 9],
+        [5, 11, 4],
+        [11, 10, 2],
+        [10, 7, 6],
+        [7, 1, 8],
+        [3, 9, 4],
+        [3, 4, 2],
+        [3, 2, 6],
+        [3, 6, 8],
+        [3, 8, 9],
+        [4, 9, 5],
+        [2, 4, 11],
+        [6, 2, 10],
+        [8, 6, 7],
+        [9, 8, 1],
+    ];
+    for _ in 0..detail {
+        let mut mid = std::collections::HashMap::new();
+        let mut split = |a: u32, b: u32, v: &mut Vec<DVec3>| {
+            *mid.entry((a.min(b), a.max(b))).or_insert_with(|| {
+                v.push(((v[a as usize] + v[b as usize]) * 0.5).normalize());
+                v.len() as u32 - 1
+            })
+        };
+        let mut next = Vec::with_capacity(f.len() * 4);
+        for &[a, b, c] in &f {
+            let ab = split(a, b, &mut v);
+            let bc = split(b, c, &mut v);
+            let ca = split(c, a, &mut v);
+            next.extend_from_slice(&[[a, ab, ca], [b, bc, ab], [c, ca, bc], [ab, bc, ca]]);
+        }
+        f = next;
+    }
+    (v, f)
+}
+
+/// Stylised foliage: the organs grouped by k-means into about `count` puffs
+/// (lumpy icospheres sized to their group). Normals blend the puff's own
+/// with the whole crown's, so the crown shades as one soft shape; colour
+/// runs from `organ` inside/below to `organ_tip` outside/above. At
+/// `detail` ≥ 1 the fruits stay as small chunky accents.
+#[allow(clippy::too_many_arguments)]
+fn puffs(m: &mut Mesh, sk: &Skeleton, sp: &SpeciesFile, seed: u64, count: usize, detail: u32, card: Option<&crate::kit::KitShape>) {
+    let organs: Vec<_> = sk.parts.iter().filter(|p| p.kind == PartKind::Organ).collect();
+    if organs.is_empty() {
+        return;
+    }
+    let rng = Stream::new(seed, domain::ORGAN);
+    let pts: Vec<DVec3> = organs.iter().map(|p| p.pos).collect();
+    let k = count.min(pts.len()).max(1);
+    // Farthest-point start from a seeded organ, then Lloyd iterations.
+    let mut centres = vec![pts[(rng.bits(0, 11) % pts.len() as u64) as usize]];
+    while centres.len() < k {
+        let far = pts
+            .iter()
+            .copied()
+            .max_by(|a, b| {
+                let da = centres.iter().map(|c| a.distance_squared(*c)).fold(f64::MAX, f64::min);
+                let db = centres.iter().map(|c| b.distance_squared(*c)).fold(f64::MAX, f64::min);
+                da.total_cmp(&db)
+            })
+            .unwrap();
+        centres.push(far);
+    }
+    let mut owner = vec![0usize; pts.len()];
+    for _ in 0..8 {
+        for (i, p) in pts.iter().enumerate() {
+            owner[i] = (0..k).min_by(|&a, &b| p.distance_squared(centres[a]).total_cmp(&p.distance_squared(centres[b]))).unwrap();
+        }
+        let mut sum = vec![DVec3::ZERO; k];
+        let mut n = vec![0.0; k];
+        for (i, p) in pts.iter().enumerate() {
+            sum[owner[i]] += *p;
+            n[owner[i]] += 1.0;
+        }
+        for c in 0..k {
+            if n[c] > 0.0 {
+                centres[c] = sum[c] / n[c];
+            }
+        }
+    }
+    let crown = pts.iter().copied().sum::<DVec3>() / pts.len() as f64;
+    let (mut lo, mut hi) = (DVec3::splat(f64::MAX), DVec3::splat(f64::MIN));
+    for p in &pts {
+        lo = lo.min(*p);
+        hi = hi.max(*p);
+    }
+    let span = (hi.z - lo.z).max(1e-3);
+    let pointed = sp.genome.crown_shape == crate::genome::CrownShape::Cone;
+    // Gradient inside the crown: deep shaded inner colour to bright warm
+    // tips, by height in the crown and by how much the surface faces out.
+    let gradient = |pos: DVec3, nrm: DVec3, crown_n: DVec3| {
+        let h = ((pos.z - lo.z) / span).clamp(0.0, 1.0);
+        let t = (0.55 * h + 0.45 * (0.5 + 0.5 * crown_n.dot(nrm))).clamp(0.0, 1.0);
+        let t = (t * t * (3.0 - 2.0 * t)) as f32;
+        lerp3(scale3(sp.look.organ, 0.55), scale3(sp.look.organ_tip, 1.25), t)
+    };
+    let (unit, faces) = icosphere(detail);
+    let wind = [2, 60, 0, class::ORGAN];
+    for (c, &centre) in centres.iter().enumerate() {
+        let members: Vec<usize> = (0..pts.len()).filter(|&i| owner[i] == c).collect();
+        if members.is_empty() {
+            continue;
+        }
+        let n = members.len() as f64;
+        let spread = (members.iter().map(|&i| pts[i].distance_squared(centre)).sum::<f64>() / n).sqrt();
+        let size = members.iter().map(|&i| organs[i].size).sum::<f64>() / n;
+        let r = 1.05 * spread + 0.8 * size;
+        let radii = DVec3::new(r, r, 0.85 * r);
+        let base = m.vertices.len() as u32;
+        let out_dir = (centre - crown).normalize_or(DVec3::Z);
+        for (vi, u) in unit.iter().enumerate() {
+            let lump = 1.0 + 0.34 * (rng.unit(c as u64 * 64 + vi as u64, 12) - 0.5);
+            let mut local = *u * radii * lump;
+            if pointed {
+                // Conifer tiers: each puff narrows into a short cone.
+                let up = u.z.max(0.0);
+                local.x *= 1.0 - 0.5 * up;
+                local.y *= 1.0 - 0.5 * up;
+                local.z += 0.45 * r * up;
+            }
+            let pos = centre + local;
+            let crown_n = (pos - crown).normalize_or(DVec3::Z);
+            let nrm = (0.5 * *u + 0.5 * crown_n).normalize();
+            let col = gradient(pos, nrm, crown_n);
+            // Faces turned into the crown are darker (cheap AO).
+            let ao = (0.6 + 0.4 * (0.5 + 0.5 * u.dot(out_dir))) as f32;
+            m.push(pos, nrm, col, ao, centre, wind);
+        }
+        for f in &faces {
+            m.indices.extend_from_slice(&[base + f[0], base + f[1], base + f[2]]);
+        }
+        // Ragged leafy edge: a fringe of enlarged organ cards poking out of
+        // the hull, shaded with the puff's rounded normal so they read as
+        // part of the clump, not as single leaves.
+        let Some(shape) = card else { continue };
+        // Up to 12 (LOD0) / 5 cards, within ~the hull's own triangle count.
+        let fringe = (faces.len() / shape.triangles.len().max(1)).clamp(2, if detail >= 1 { 12 } else { 5 });
+        let leaf = 2.6 * size.max(0.08 * r);
+        for k in 0..fringe {
+            let key = c as u64 * 1024 + k as u64;
+            // Direction on the puff, biased away from the crown centre and up.
+            let z = 2.0 * rng.unit(key, 14) - 1.0;
+            let a = rng.unit(key, 15) * std::f64::consts::TAU;
+            let s = (1.0 - z * z).max(0.0).sqrt();
+            let d = (DVec3::new(s * a.cos(), s * a.sin(), z) + 0.8 * out_dir + 0.3 * DVec3::Z).normalize_or(DVec3::Z);
+            let anchor = centre + d * radii * 0.85;
+            let (t1, _) = perp(d);
+            let tilt = rng.unit(key, 16) * std::f64::consts::TAU;
+            let tangent = t1 * tilt.cos() + d.cross(t1) * tilt.sin();
+            let fwd = (0.75 * d + 0.66 * tangent).normalize();
+            let nrm_card = d.cross(fwd).cross(fwd).normalize_or(d) * -1.0;
+            let side = nrm_card.cross(fwd);
+            let crown_n = (anchor - crown).normalize_or(DVec3::Z);
+            let shade_n = (0.5 * d + 0.5 * crown_n).normalize();
+            let col = gradient(anchor + d * leaf * 0.5, shade_n, crown_n);
+            let b = m.vertices.len() as u32;
+            for v in &shape.positions {
+                let p = anchor + (fwd * v[0] as f64 + side * v[1] as f64 + nrm_card * v[2] as f64) * leaf;
+                m.push(p, shade_n, col, 0.9, centre, wind);
+            }
+            for t in &shape.triangles {
+                m.indices.extend_from_slice(&[b + t[0] as u32, b + t[1] as u32, b + t[2] as u32]);
+            }
+        }
+    }
+    if detail >= 1 {
+        let (fu, ff) = icosphere(0);
+        let fruit_wind = [3, 60, 0, class::FRUIT];
+        for (i, p) in sk.parts.iter().filter(|p| p.kind == PartKind::Fruit).take(16).enumerate() {
+            let base = m.vertices.len() as u32;
+            let r = p.size * 0.6;
+            let lift = (p.pos - crown).normalize_or(DVec3::Z) * r;
+            for (vi, u) in fu.iter().enumerate() {
+                let lump = 1.0 + 0.2 * (rng.unit(9000 + i as u64 * 16 + vi as u64, 13) - 0.5);
+                m.push(p.pos + lift + *u * r * lump, *u, sp.look.accent, 1.0, p.pos, fruit_wind);
+            }
+            for f in &ff {
+                m.indices.extend_from_slice(&[base + f[0], base + f[1], base + f[2]]);
+            }
         }
     }
 }
