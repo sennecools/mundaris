@@ -277,6 +277,8 @@ impl GravityOrbitsDemo {
             ambient_lux: 0.0,
             ambient_color: [1.0; 3],
             bounce_fraction: 0.0,
+            sky_fraction: 0.0,
+            sky_color: [1.0; 3],
             occluders: Vec::new(),
         };
         light.sun_disk_radiance() * f64::from(self.controls.render_settings.lighting.sun_scale)
@@ -1685,6 +1687,8 @@ impl GravityOrbitsDemo {
             ambient_lux: self.lighting.ambient_lux,
             ambient_color: self.lighting.ambient_color,
             bounce_fraction: self.lighting.bounce_fraction,
+            sky_fraction: self.lighting.sky_fraction,
+            sky_color: self.lighting.sky_color,
             occluders: centres
                 .iter()
                 .enumerate()

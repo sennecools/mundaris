@@ -16,6 +16,7 @@ struct Lighting {
     depth_range: vec4<f32>,  // light depth range per cascade (m)
     occluders: array<vec4<f32>, 8>,
     cascades: array<mat4x4<f32>, 4>,
+    sky: vec4<f32>,          // rgb = sky colour × sky fraction of the sun (lux per lux), -
 }
 
 struct Exposure {
@@ -232,7 +233,15 @@ fn shade(p: vec3<f32>, n: vec3<f32>, up: vec3<f32>, albedo: vec3<f32>, brdf: f32
     // hemisphere. Flat shadowed ground stays dark; slopes keep their shape.
     let ground = max(dot(up, l), 0.0) * 0.5 * (1.0 - dot(n, up));
     let bounce = e * lighting.ambient.w * ground * disk;
-    let ambient = albedo / PI * (lighting.ambient.rgb + bounce);
+    // Sky light: the sunlit sky's irradiance on a horizontal surface, a
+    // fraction of the sun's normal illuminance that fades with elevation and
+    // through twilight; a surface sees the sky over (1 + n.up)/2 of its
+    // hemisphere. Shadowed upward-facing ground keeps its sky light (AO and
+    // the canopy occlusion of GTAO still apply to it).
+    let elevation = dot(up, l);
+    let sky_level = smoothstep(-0.1, 0.05, elevation) * sqrt(max(elevation, 0.02));
+    let sky = e * lighting.sky.rgb * sky_level * 0.5 * (1.0 + dot(n, up)) * disk;
+    let ambient = albedo / PI * (lighting.ambient.rgb + bounce + sky);
     if mode == VIEW_SHADOWS {
         var tint = array<vec3<f32>, 5>(
             vec3<f32>(1.0, 0.35, 0.3), vec3<f32>(0.35, 1.0, 0.35),

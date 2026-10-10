@@ -163,6 +163,8 @@ pub struct LightingSettings {
     pub sun_scale: f32,
     /// Multiplier on the authored ambient illuminance.
     pub ambient_scale: f32,
+    /// Multiplier on the authored sky light (0 = off).
+    pub sky_scale: f32,
     /// Place the sun at a fixed local elevation/azimuth above the nearest
     /// body instead of at the star (terrain review); illuminance unchanged.
     pub studio_sun: bool,
@@ -234,6 +236,7 @@ impl Default for RenderSettings {
             lighting: LightingSettings {
                 sun_scale: 1.0,
                 ambient_scale: 1.0,
+                sky_scale: 1.0,
                 studio_sun: false,
                 sun_elevation_deg: 15.0,
                 sun_azimuth_deg: 100.0,
@@ -273,6 +276,7 @@ impl RenderSettings {
             self.ao.intensity,
             self.lighting.sun_scale,
             self.lighting.ambient_scale,
+            self.lighting.sky_scale,
             self.lighting.sun_elevation_deg,
             self.lighting.sun_azimuth_deg,
             self.overlays.line_width_scale,
@@ -319,7 +323,9 @@ impl RenderSettings {
             "ambient occlusion parameters out of range",
         )?;
         check(
-            self.lighting.sun_scale >= 0.0 && self.lighting.ambient_scale >= 0.0,
+            self.lighting.sun_scale >= 0.0
+                && self.lighting.ambient_scale >= 0.0
+                && self.lighting.sky_scale >= 0.0,
             "lighting scales must be non-negative",
         )?;
         check(

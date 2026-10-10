@@ -200,6 +200,12 @@ pub const SPECS: &[SettingSpec] = &[
         float(0.0, 10.0, "×"),
     ),
     spec(
+        "render.lighting.sky_scale",
+        "Lighting",
+        "Sky light",
+        float(0.0, 4.0, "×"),
+    ),
+    spec(
         "render.shadows.enabled",
         "Shadows",
         "Sun shadows",
@@ -340,6 +346,7 @@ pub fn get(state: &RenderState, index: usize) -> SettingValue {
         "render.lighting.sun_azimuth" => f(s.lighting.sun_azimuth_deg),
         "render.lighting.sun_scale" => f(s.lighting.sun_scale),
         "render.lighting.ambient_scale" => f(s.lighting.ambient_scale),
+        "render.lighting.sky_scale" => f(s.lighting.sky_scale),
         "render.shadows.enabled" => Bool(s.shadows.enabled),
         "render.shadows.eclipses" => Bool(s.shadows.eclipses),
         "render.shadows.cascades" => Choice(s.shadows.cascades.clamp(1, 4) as usize - 1),
@@ -413,6 +420,7 @@ pub fn set(state: &mut RenderState, index: usize, value: SettingValue) -> Result
         "render.lighting.sun_azimuth" => s.lighting.sun_azimuth_deg = f(value),
         "render.lighting.sun_scale" => s.lighting.sun_scale = f(value),
         "render.lighting.ambient_scale" => s.lighting.ambient_scale = f(value),
+        "render.lighting.sky_scale" => s.lighting.sky_scale = f(value),
         "render.shadows.enabled" => s.shadows.enabled = b(value),
         "render.shadows.eclipses" => s.shadows.eclipses = b(value),
         "render.shadows.cascades" => s.shadows.cascades = c(value) as u32 + 1,

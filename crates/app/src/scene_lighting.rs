@@ -36,6 +36,15 @@ struct AmbientContent {
     illuminance_lux: f64,
     color: [f32; 3],
     bounce_fraction: f64,
+    /// Sky light at high sun as a fraction of the sun's illuminance (0 = airless).
+    #[serde(default)]
+    sky_fraction: f64,
+    #[serde(default = "white")]
+    sky_color: [f32; 3],
+}
+
+fn white() -> [f32; 3] {
+    [1.0; 3]
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,6 +64,8 @@ pub struct SceneLighting {
     pub ambient_lux: f64,
     pub ambient_color: [f32; 3],
     pub bounce_fraction: f64,
+    pub sky_fraction: f64,
+    pub sky_color: [f32; 3],
     materials: BTreeMap<String, SurfaceMaterial>,
     pub sha256: String,
 }
@@ -100,6 +111,10 @@ impl SceneLighting {
             (0.0..=1.0).contains(&ambient.bounce_fraction),
             "bounce fraction must be within 0..1"
         );
+        ensure!(
+            (0.0..=1.0).contains(&ambient.sky_fraction),
+            "sky fraction must be within 0..1"
+        );
         let mut materials = BTreeMap::new();
         for (body, material) in &content.bodies {
             let brdf = Brdf::from_name(&material.brdf)
@@ -119,6 +134,8 @@ impl SceneLighting {
             ambient_lux: ambient.illuminance_lux,
             ambient_color: chromaticity(ambient.color, "ambient")?,
             bounce_fraction: ambient.bounce_fraction,
+            sky_fraction: ambient.sky_fraction,
+            sky_color: chromaticity(ambient.sky_color, "sky")?,
             materials,
             sha256: format!("{:x}", Sha256::digest(bytes)),
         })

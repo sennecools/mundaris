@@ -100,6 +100,8 @@ fn hdr_frame_validates_and_lights_a_sphere_on_the_software_adapter() {
                 ambient_lux: 1.0,
                 ambient_color: [1.0; 3],
                 bounce_fraction: 0.01,
+                sky_fraction: 0.1,
+                sky_color: [0.6, 0.72, 1.0],
                 occluders: vec![(DVec3::new(0.0, 0.0, -10.0), 3.0)],
             })
             .unwrap();

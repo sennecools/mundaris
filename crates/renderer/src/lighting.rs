@@ -94,6 +94,12 @@ pub struct FrameLighting {
     /// Albedo of the sunlit ground that bounces light into shadows (a
     /// single-bounce flat-ground model until GI).
     pub bounce_fraction: f64,
+    /// Sky light: horizontal sky illuminance as a fraction of the sun's
+    /// normal illuminance at high sun (fades through twilight), applied over
+    /// the upper hemisphere by n.up. 0 = airless.
+    pub sky_fraction: f64,
+    /// Linear sky light chromaticity (max component 1).
+    pub sky_color: [f32; 3],
     /// Bodies that can block the sun: view-space centres and radii.
     pub occluders: Vec<(DVec3, f64)>,
 }
@@ -113,10 +119,13 @@ impl FrameLighting {
             && self.ambient_lux >= 0.0
             && self.bounce_fraction.is_finite()
             && (0.0..=1.0).contains(&self.bounce_fraction)
+            && self.sky_fraction.is_finite()
+            && (0.0..=1.0).contains(&self.sky_fraction)
             && self
                 .sun_color
                 .iter()
                 .chain(&self.ambient_color)
+                .chain(&self.sky_color)
                 .all(|c| c.is_finite() && *c >= 0.0)
             && self
                 .occluders
@@ -302,7 +311,7 @@ pub fn disk_visible_fraction(rs: f64, ro: f64, d: f64) -> f64 {
 }
 
 /// Byte size of the shader `Lighting` uniform.
-pub(crate) const LIGHTING_BYTES: usize = 512;
+pub(crate) const LIGHTING_BYTES: usize = 528;
 
 /// Pack the `Lighting` uniform shared by `lighting.wgsl` users.
 #[allow(clippy::too_many_arguments)] // One flat GPU record.
@@ -388,6 +397,18 @@ pub(crate) fn pack_lighting(
         for (i, matrix) in c.view_to_clip.iter().enumerate() {
             floats[64 + i * 16..64 + i * 16 + 16].copy_from_slice(&matrix.to_cols_array());
         }
+    }
+    if let Some(l) = lighting {
+        // Row 32 (after the cascade matrices): sky light.
+        let sky = (l.sky_fraction
+            * f64::from(settings.lighting.ambient_scale)
+            * f64::from(settings.lighting.sky_scale)) as f32;
+        floats[128..132].copy_from_slice(&[
+            l.sky_color[0] * sky,
+            l.sky_color[1] * sky,
+            l.sky_color[2] * sky,
+            0.0,
+        ]);
     }
     floats.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
@@ -504,6 +525,8 @@ mod tests {
             ambient_lux: 0.0,
             ambient_color: [1.0; 3],
             bounce_fraction: 0.0,
+            sky_fraction: 0.0,
+            sky_color: [1.0; 3],
             occluders: Vec::new(),
         };
         let l = lighting.sun_disk_radiance();
