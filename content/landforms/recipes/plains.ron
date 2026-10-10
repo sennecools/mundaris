@@ -6,6 +6,9 @@ Recipe(
     graph: [
         ("base", Fbm(base_wavelength_m: 2048.0, min_wavelength_m: 64.0, gain: 0.45, salt: 21)),
         ("flatten", Curve(input: Field(Sediment), points: [(0.0, 1.0), (1.0, 0.3)])),
-        ("out", Multiply(a: "base", b: "flatten")),
+        // Ground lumps 64 m – 1 m (prototype 2026-10-10); factor 0.1: about 0.25 m RMS.
+        ("ground", Fbm(base_wavelength_m: 64.0, min_wavelength_m: 1.0, gain: 0.55, salt: 22)),
+        ("relief", Add(a: "base", b: Scale(input: "ground", factor: 0.1))),
+        ("out", Multiply(a: "relief", b: "flatten")),
     ],
 )
