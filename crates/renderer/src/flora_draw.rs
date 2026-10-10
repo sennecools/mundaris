@@ -225,6 +225,14 @@ pub(crate) fn species_shader(shader: &str) -> String {
         out = out.replace("const SCATTER_FULL_M: f32 = 350.0;", &format!("const SCATTER_FULL_M: f32 = {m:.1};"));
         tracing::info!("flora: SCATTER_FULL_M overridden to {m} m");
     }
+    // Debug (measurement): ASTRUM_FLORA_PER_SAMPLE=0 shades flora per pixel
+    // (sample index 0 for the dither) instead of per MSAA sample.
+    if std::env::var("ASTRUM_FLORA_PER_SAMPLE").is_ok_and(|v| v == "0") {
+        for f in ["fs_flora(input: FloraOut", "fs_impostor(input: ImpostorOut"] {
+            out = out.replace(&format!("{f}, @builtin(sample_index) si: u32) -> SceneOut {{"), &format!("{f}) -> SceneOut {{\n    let si = 0u;"));
+        }
+        tracing::info!("flora: per-pixel shading (ASTRUM_FLORA_PER_SAMPLE=0)");
+    }
     out
 }
 
