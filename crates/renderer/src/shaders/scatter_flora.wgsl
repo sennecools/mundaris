@@ -71,8 +71,7 @@ struct FloraOut {
     @location(4) @interpolate(flat) fade: vec3<f32>,
 }
 
-@vertex
-fn vs_flora(v: FloraIn, @builtin(instance_index) index: u32) -> FloraOut {
+fn fl_vs_flora(v: FloraIn, index: u32) -> FloraOut {
     let p = plants[fl_bucket_base(v.bucket) + index];
     let scale = p.base.w;
     let e1 = p.e1.xyz;
@@ -99,17 +98,72 @@ fn vs_flora(v: FloraIn, @builtin(instance_index) index: u32) -> FloraOut {
     return out;
 }
 
-@fragment
-fn fs_flora(input: FloraOut, @builtin(sample_index) si: u32) -> SceneOut {
-    if !fl_keep_sample(input.clip_position.xy, bitcast<u32>(input.fade.z), input.fade.x, input.fade.y, si) {
-        discard;
+// Per-sample shading (sample_index) costs up to the MSAA count per fragment,
+// so the main pass draws every bucket twice: a per-pixel pipeline for
+// instances that are not fading and a per-sample one for those inside a
+// rank fade or tier cross-fade; each vertex stage drops the other set.
+// 0 = all per pixel, 1 = fading instances per sample, 2 = all per sample
+// (ASTRUM_FLORA_PER_SAMPLE overrides it for measurements).
+const FLORA_PER_SAMPLE: u32 = 1u;
+
+fn fl_fading(fade: vec3<f32>) -> bool {
+    return fade.x < 0.999 || abs(fade.y) < 0.999;
+}
+
+// True when this instance belongs to `per_sample` (the per-sample pass) or
+// not (the per-pixel pass).
+fn fl_in_pass(fade: vec3<f32>, per_sample: bool) -> bool {
+    let ps = FLORA_PER_SAMPLE == 2u || (FLORA_PER_SAMPLE == 1u && fl_fading(fade));
+    return ps == per_sample;
+}
+
+// Shadow pass and anything outside the split: every instance.
+@vertex
+fn vs_flora(v: FloraIn, @builtin(instance_index) index: u32) -> FloraOut {
+    return fl_vs_flora(v, index);
+}
+
+@vertex
+fn vs_flora_px(v: FloraIn, @builtin(instance_index) index: u32) -> FloraOut {
+    var out = fl_vs_flora(v, index);
+    if !fl_in_pass(out.fade, false) {
+        out.clip_position = vec4<f32>(2.0, 2.0, 2.0, 1.0);
     }
+    return out;
+}
+
+@vertex
+fn vs_flora_ps(v: FloraIn, @builtin(instance_index) index: u32) -> FloraOut {
+    var out = fl_vs_flora(v, index);
+    if !fl_in_pass(out.fade, true) {
+        out.clip_position = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+    }
+    return out;
+}
+
+fn fl_shade_flora(input: FloraOut) -> SceneOut {
     var n = normalize(input.normal);
     // Organs are two-sided cards: light the side that faces the viewer.
     if dot(n, input.view_pos) > 0.0 {
         n = -n;
     }
     return shade(input.view_pos, n, input.up, input.albedo, 0.0, true);
+}
+
+@fragment
+fn fs_flora_px(input: FloraOut) -> SceneOut {
+    if !fl_keep(input.clip_position.xy, bitcast<u32>(input.fade.z), input.fade.x, input.fade.y) {
+        discard;
+    }
+    return fl_shade_flora(input);
+}
+
+@fragment
+fn fs_flora(input: FloraOut, @builtin(sample_index) si: u32) -> SceneOut {
+    if !fl_keep_sample(input.clip_position.xy, bitcast<u32>(input.fade.z), input.fade.x, input.fade.y, si) {
+        discard;
+    }
+    return fl_shade_flora(input);
 }
 
 // Shadow casters: same instances, same dither.
@@ -201,7 +255,21 @@ fn vs_impostor_common(v: ImpostorIn, index: u32, toward: vec3<f32>) -> ImpostorO
 @vertex
 fn vs_impostor(v: ImpostorIn, @builtin(instance_index) index: u32) -> ImpostorOut {
     let p = plants[fl_bucket_base(v.corner_bucket >> 8u) + index];
-    return vs_impostor_common(v, index, normalize(-p.base.xyz));
+    var out = vs_impostor_common(v, index, normalize(-p.base.xyz));
+    if !fl_in_pass(out.fade, false) {
+        out.clip_position = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+    }
+    return out;
+}
+
+@vertex
+fn vs_impostor_ps(v: ImpostorIn, @builtin(instance_index) index: u32) -> ImpostorOut {
+    let p = plants[fl_bucket_base(v.corner_bucket >> 8u) + index];
+    var out = vs_impostor_common(v, index, normalize(-p.base.xyz));
+    if !fl_in_pass(out.fade, true) {
+        out.clip_position = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+    }
+    return out;
 }
 
 // Shadow pass: face the light (the cascade's depth axis in view space).
@@ -220,15 +288,28 @@ fn fl_impostor_sample(input: ImpostorOut) -> vec4<f32> {
     return textureSampleLevel(flora_albedo, flora_sampler, input.uv, i32(input.layer), 0.0);
 }
 
+fn fl_shade_impostor(input: ImpostorOut, a: vec4<f32>) -> SceneOut {
+    let nt = textureSampleLevel(flora_normal, flora_sampler, input.uv, i32(input.layer), 0.0).xyz * 2.0 - 1.0;
+    let n = normalize(input.e1 * nt.x + input.e2 * nt.y + input.up * nt.z);
+    return shade(input.view_pos, n, input.up, a.rgb * input.tint, 0.0, true);
+}
+
+@fragment
+fn fs_impostor_px(input: ImpostorOut) -> SceneOut {
+    let a = fl_impostor_sample(input);
+    if a.a < 0.5 || !fl_keep(input.clip_position.xy, bitcast<u32>(input.fade.z), input.fade.x, input.fade.y) {
+        discard;
+    }
+    return fl_shade_impostor(input, a);
+}
+
 @fragment
 fn fs_impostor(input: ImpostorOut, @builtin(sample_index) si: u32) -> SceneOut {
     let a = fl_impostor_sample(input);
     if a.a < 0.5 || !fl_keep_sample(input.clip_position.xy, bitcast<u32>(input.fade.z), input.fade.x, input.fade.y, si) {
         discard;
     }
-    let nt = textureSampleLevel(flora_normal, flora_sampler, input.uv, i32(input.layer), 0.0).xyz * 2.0 - 1.0;
-    let n = normalize(input.e1 * nt.x + input.e2 * nt.y + input.up * nt.z);
-    return shade(input.view_pos, n, input.up, a.rgb * input.tint, 0.0, true);
+    return fl_shade_impostor(input, a);
 }
 
 @fragment

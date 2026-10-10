@@ -225,13 +225,11 @@ pub(crate) fn species_shader(shader: &str) -> String {
         out = out.replace("const SCATTER_FULL_M: f32 = 350.0;", &format!("const SCATTER_FULL_M: f32 = {m:.1};"));
         tracing::info!("flora: SCATTER_FULL_M overridden to {m} m");
     }
-    // Debug (measurement): ASTRUM_FLORA_PER_SAMPLE=0 shades flora per pixel
-    // (sample index 0 for the dither) instead of per MSAA sample.
-    if std::env::var("ASTRUM_FLORA_PER_SAMPLE").is_ok_and(|v| v == "0") {
-        for f in ["fs_flora(input: FloraOut", "fs_impostor(input: ImpostorOut"] {
-            out = out.replace(&format!("{f}, @builtin(sample_index) si: u32) -> SceneOut {{"), &format!("{f}) -> SceneOut {{\n    let si = 0u;"));
-        }
-        tracing::info!("flora: per-pixel shading (ASTRUM_FLORA_PER_SAMPLE=0)");
+    // Debug (measurement): ASTRUM_FLORA_PER_SAMPLE = 0 (all per pixel),
+    // 1 (fading instances per sample, the default) or 2 (all per sample).
+    if let Some(mode) = std::env::var("ASTRUM_FLORA_PER_SAMPLE").ok().and_then(|v| v.parse::<u32>().ok()).filter(|m| *m <= 2) {
+        out = out.replace("const FLORA_PER_SAMPLE: u32 = 1u;", &format!("const FLORA_PER_SAMPLE: u32 = {mode}u;"));
+        tracing::info!("flora: per-sample mode {mode} (ASTRUM_FLORA_PER_SAMPLE)");
     }
     out
 }
@@ -284,6 +282,9 @@ pub(crate) struct FloraDraw {
     pipeline: crate::aa::MsaaPipeline,
     shadow_pipeline: wgpu::RenderPipeline,
     impostor_pipeline: crate::aa::MsaaPipeline,
+    /// Per-sample variants for fading instances (scatter_flora.wgsl).
+    pipeline_ps: crate::aa::MsaaPipeline,
+    impostor_pipeline_ps: crate::aa::MsaaPipeline,
     impostor_shadow_pipeline: wgpu::RenderPipeline,
     prefix: wgpu::ComputePipeline,
     scatter: wgpu::ComputePipeline,
@@ -521,9 +522,11 @@ impl FloraDraw {
                 cache: None,
             })
         };
-        let pipeline = main("Flora grown plants (prototype)", "vs_flora", "fs_flora", false);
+        let pipeline = main("Flora grown plants (prototype)", "vs_flora_px", "fs_flora_px", false);
+        let pipeline_ps = main("Flora grown plants, fading (prototype)", "vs_flora_ps", "fs_flora", false);
         let impostor_pipeline =
-            main("Flora impostors (prototype)", "vs_impostor", "fs_impostor", true);
+            main("Flora impostors (prototype)", "vs_impostor", "fs_impostor_px", true);
+        let impostor_pipeline_ps = main("Flora impostors, fading (prototype)", "vs_impostor_ps", "fs_impostor", true);
         let shadow_pipeline =
             shadow("Flora sun shadow casters (prototype)", "vs_flora", "fs_flora_shadow", std::slice::from_ref(&mesh_layout));
         let impostor_shadow_pipeline = shadow(
@@ -556,6 +559,8 @@ impl FloraDraw {
             pipeline,
             shadow_pipeline,
             impostor_pipeline,
+            pipeline_ps,
+            impostor_pipeline_ps,
             impostor_shadow_pipeline,
             prefix,
             scatter,
@@ -700,11 +705,15 @@ impl FloraDraw {
     pub(crate) fn set_samples(&mut self, device: &wgpu::Device, samples: u32) {
         self.pipeline.set_samples(device, samples);
         self.impostor_pipeline.set_samples(device, samples);
+        self.pipeline_ps.set_samples(device, samples);
+        self.impostor_pipeline_ps.set_samples(device, samples);
     }
 
     /// Main pass; groups 0–2 are the scatter draw's, group 3 is set here.
     pub(crate) fn draw(&self, pass: &mut wgpu::RenderPass<'_>, plant_args: &wgpu::Buffer) {
+        // Solid instances per pixel, fading ones per sample.
         self.draws(pass, plant_args, self.pipeline.get(), self.impostor_pipeline.get());
+        self.draws(pass, plant_args, self.pipeline_ps.get(), self.impostor_pipeline_ps.get());
     }
 
     /// Sun shadow pass; groups 0–2 as for the scatter shadow draw.
