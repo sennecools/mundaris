@@ -84,25 +84,31 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) index: 
     let a = f32(blade) * 1.0471976 + sc_rand(seed, blade, 1u) * 0.8;
     let out_dir = e1 * cos(a) + e2 * sin(a);
     let side = e1 * -sin(a) + e2 * cos(a);
-    let height = (0.35 + 0.4 * sc_rand(seed, blade, 2u)) * scale;
+    // Stylised clumps (art direction 2026-10-10): broader, shorter blades
+    // leaning out into a rounded tuft, soft outward normals, a stronger
+    // root-to-tip gradient.
+    let width = select(0.06, 0.13, FL_STYLISED);
+    let lean = select(0.18, 0.45, FL_STYLISED);
+    let height = (0.35 + 0.4 * sc_rand(seed, blade, 2u)) * scale * select(1.0, 0.8, FL_STYLISED);
     let root = out_dir * (0.04 + 0.1 * sc_rand(seed, blade, 3u)) * scale;
     var local = root;
     if corner == 0u {
-        local = root - side * 0.06 * scale;
+        local = root - side * width * scale;
     } else if corner == 1u {
-        local = root + side * 0.06 * scale;
+        local = root + side * width * scale;
     } else {
-        local = root + out_dir * (0.18 * height) + up * height;
+        local = root + out_dir * (lean * height) + up * height;
     }
     let view_position = p.base.xyz + local;
     var out: ScatterOut;
     out.clip_position = projection.matrix * vec4<f32>(view_position, 1.0);
     out.view_pos = view_position;
-    out.normal = normalize(up + out_dir * 0.35);
+    out.normal = normalize(up + out_dir * select(0.35, 0.8, FL_STYLISED));
     out.up = up;
     // Colour packed by the cull pass (sqrt-encoded linear); darker roots.
     let c = unpack4x8unorm(p.info.z).rgb;
-    let shade = select(0.55, 1.0, corner == 2u) * (0.9 + 0.2 * sc_unit(p.info.w));
+    let tip = select(1.0, 1.2, FL_STYLISED);
+    let shade = select(select(0.55, 0.65, FL_STYLISED), tip, corner == 2u) * (0.9 + 0.2 * sc_unit(p.info.w));
     out.albedo = c * c * shade;
     return out;
 }

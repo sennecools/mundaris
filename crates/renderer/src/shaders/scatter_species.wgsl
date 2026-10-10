@@ -5,6 +5,8 @@
 const FL_SPECIES: u32 = 3u;
 const FL_CANOPY_MASK: u32 = 5u;
 const FL_SHRUB_MASK: u32 = 2u;
+// Planet foliage style (grass clumps follow it).
+const FL_STYLISED: bool = true;
 struct FlNiche {
     t: vec3<f32>,
     m: vec3<f32>,

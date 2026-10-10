@@ -368,6 +368,8 @@ pub fn species_wgsl(species: &[SpeciesFile], rocks: &[crate::palette::PlanetRock
     out.push_str(&format!("const FL_SPECIES: u32 = {n}u;\n"));
     out.push_str(&format!("const FL_CANOPY_MASK: u32 = {canopy}u;\n"));
     out.push_str(&format!("const FL_SHRUB_MASK: u32 = {shrub}u;\n"));
+    let stylised = species.first().is_some_and(|s| s.style == crate::genome::FoliageStyle::Stylised);
+    out.push_str(&format!("// Planet foliage style (grass clumps follow it).\nconst FL_STYLISED: bool = {stylised};\n"));
     out.push_str(
         "struct FlNiche {\n    t: vec3<f32>,\n    m: vec3<f32>,\n    h: vec3<f32>,\n    slope: vec2<f32>,\n    soil: f32,\n    prior: f32,\n    scale: vec2<f32>,\n    far_kind: u32,\n    color: vec3<f32>,\n    // Expected crown area (m2) of one plant from above and from the side.\n    crown: vec2<f32>,\n}\n",
     );
