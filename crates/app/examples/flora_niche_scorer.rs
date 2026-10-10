@@ -1,3 +1,4 @@
+#![allow(clippy::needless_range_loop, clippy::type_complexity)] // scorer: index-parallel tables
 //! Flora niche scorer: where each species grows on Rust, from the CPU
 //! reference of the GPU placement field (astrum_flora::scatter) sampled on
 //! the Tier A world map (CPU oracle: climate, elevation, slope, sediment).
@@ -212,8 +213,8 @@ fn main() {
             let a = golden * i as f64;
             let d = DVec3::new(rr * a.cos(), rr * a.sin(), z);
             let pos = d * (radius + s.site.height_m + 30.0);
-            let q = horizon_quat(d, 0.12);
-            let _ = writeln!(poses, "  {{\"name\": \"{name}\", \"position_body_m\": [{:.3}, {:.3}, {:.3}], \"orientation_xyzw\": [{:.6}, {:.6}, {:.6}, {:.6}], \"site\": \"T {:.1} M {:.2} h {:.0} slope {:.1} sed {:.2}\"}},", pos.x, pos.y, pos.z, q.x, q.y, q.z, q.w, s.site.temperature_c, s.site.moisture, s.site.height_m, s.site.slope.to_degrees(), s.site.sediment);
+            let q = horizon_quat(d, 0.12).normalize();
+            let _ = writeln!(poses, "  {{\"name\": \"{name}\", \"position_body_m\": [{:.3}, {:.3}, {:.3}], \"orientation_xyzw\": [{:.15}, {:.15}, {:.15}, {:.15}], \"site\": \"T {:.1} M {:.2} h {:.0} slope {:.1} sed {:.2}\"}},", pos.x, pos.y, pos.z, q.x, q.y, q.z, q.w, s.site.temperature_c, s.site.moisture, s.site.height_m, s.site.slope.to_degrees(), s.site.sediment);
         } else {
             println!("no sample for band {name}");
         }

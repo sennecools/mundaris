@@ -35,7 +35,8 @@ struct Grid {
 @group(1) @binding(5) var albedo_atlas: texture_2d_array<f32>;
 // Page climate: temperature °C, moisture, wind east, wind north (zero off world maps).
 @group(1) @binding(6) var climate_atlas: texture_2d_array<f32>;
-// Shape overlay page (M2): uplift, hardness, sediment, flow (fragment only).
+// Shape overlay page (M2): uplift, hardness, sediment, flow (overlays; the
+// flora placement reads sediment as soil depth).
 @group(1) @binding(7) var shape_atlas: texture_2d_array<f32>;
 
 fn height_at(layer: i32, st: vec2<f32>) -> f32 {
@@ -253,7 +254,11 @@ fn fs_main(input: VertexOut) -> SceneOut {
         let own_c = textureSampleLevel(climate_atlas, normal_sampler, input.own_uv, input.layers.x, 0.0);
         let parent_c = textureSampleLevel(climate_atlas, normal_sampler, input.parent_uv, input.layers.y, 0.0);
         let climate = mix(mix(parent_c, own_c, input.blend.x), parent_c, input.blend.y);
-        let canopy = forest_cover(inst, input.grid_st, normalize(sampled.xyz), climate.xy, input.ground, length(input.view_pos), cell_footprint);
+        // Flora: sediment is the niches' soil input (same blend as climate).
+        let own_s = textureSampleLevel(shape_atlas, normal_sampler, input.own_uv, input.layers.x, 0.0).z;
+        let parent_s = textureSampleLevel(shape_atlas, normal_sampler, input.parent_uv, input.layers.y, 0.0).z;
+        let sediment = mix(mix(parent_s, own_s, input.blend.x), parent_s, input.blend.y);
+        let canopy = forest_cover(inst, input.grid_st, normalize(sampled.xyz), climate.xy, sediment, input.ground, length(input.view_pos), cell_footprint);
         land_albedo = mix(land_albedo, canopy.rgb, canopy.a);
         let detail = ground_detail(inst, input.grid_st, cell_footprint);
         let tint = mix(vec3<f32>(0.95, 1.04, 0.9), vec3<f32>(1.05, 0.97, 1.06), detail.y);

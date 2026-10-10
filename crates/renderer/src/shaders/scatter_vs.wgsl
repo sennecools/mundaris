@@ -15,7 +15,8 @@ struct ScatterOut {
 @vertex
 fn vs_scatter(@builtin(vertex_index) vertex: u32, @builtin(instance_index) index: u32) -> ScatterOut {
     let p = plants[index];
-    let kind = p.info.x;
+    let kind = p.info.x & 0xffu;
+    let species = p.info.x >> 8u;
     let seed = p.info.y;
     let scale = p.base.w;
     let spread = p.e1.w;
@@ -49,6 +50,9 @@ fn vs_scatter(@builtin(vertex_index) vertex: u32, @builtin(instance_index) index
         out.albedo = vec3<f32>(0.2, 0.19, 0.17) * tint;
     } else if tri >= 24u {
         out.albedo = vec3<f32>(0.075, 0.05, 0.03);
+    } else if species > 0u {
+        // Far stand-in of a grown species: its canopy colour.
+        out.albedo = fl_niche(species - 1u).color * tint * shift;
     } else if kind == 0u {
         out.albedo = vec3<f32>(0.022, 0.05, 0.028) * tint * shift;
     } else if kind == 1u {

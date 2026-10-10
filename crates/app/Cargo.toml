@@ -42,6 +42,9 @@ required-features = ["developer-tools"]
 [dev-dependencies]
 criterion.workspace = true
 pollster.workspace = true
+# Flora examples (crates/app/examples/flora_*.rs).
+astrum_flora = { path = "../flora" }
+png.workspace = true
 
 [[bench]]
 name = "trail_history"

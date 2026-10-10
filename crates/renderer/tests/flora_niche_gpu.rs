@@ -144,7 +144,7 @@ fn gpu_forest_field_matches_the_cpu_reference() {
     queue.submit([enc.finish()]);
     read.slice(..).map_async(wgpu::MapMode::Read, |r| r.unwrap());
     device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-    let data: Vec<f32> = read.slice(..).get_mapped_range().unwrap().chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+    let data: Vec<f32> = read.slice(..).get_mapped_range().unwrap().as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
 
     let tol = 2e-3;
     let mut worst = 0.0f64;

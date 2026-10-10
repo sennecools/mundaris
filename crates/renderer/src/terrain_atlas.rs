@@ -17,6 +17,8 @@ use std::sync::{
 const DRAW_SHADER: &str = concat!(
     include_str!("shaders/lighting.wgsl"),
     include_str!("shaders/terrain_atlas.wgsl"),
+    include_str!("shaders/scatter_species.wgsl"),
+    include_str!("shaders/scatter_niche.wgsl"),
     include_str!("shaders/scatter_draw.wgsl"),
     include_str!("shaders/scatter_vs.wgsl"),
     include_str!("shaders/scatter_flora.wgsl")
@@ -25,6 +27,8 @@ const DRAW_SHADER: &str = concat!(
 const CULL_SHADER: &str = concat!(
     include_str!("shaders/lighting.wgsl"),
     include_str!("shaders/terrain_atlas.wgsl"),
+    include_str!("shaders/scatter_species.wgsl"),
+    include_str!("shaders/scatter_niche.wgsl"),
     include_str!("shaders/scatter_draw.wgsl"),
     include_str!("shaders/scatter_cull.wgsl")
 );
@@ -1005,7 +1009,7 @@ impl TerrainAtlasRenderer {
         // Draw resources.
         let draw_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Terrain atlas draw"),
-            source: wgpu::ShaderSource::Wgsl(DRAW_SHADER.into()),
+            source: wgpu::ShaderSource::Wgsl(crate::flora_draw::species_shader(DRAW_SHADER).into()),
         });
         // Compute too: the plant culling pass reads the draw resources.
         let vertex_fragment =
@@ -1082,7 +1086,7 @@ impl TerrainAtlasRenderer {
                 // Shape overlay page (M2 editor overlays).
                 wgpu::BindGroupLayoutEntry {
                     binding: 7,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: vertex_fragment,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         view_dimension: wgpu::TextureViewDimension::D2Array,
@@ -1290,7 +1294,7 @@ impl TerrainAtlasRenderer {
         });
         let cull_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Terrain plants cull"),
-            source: wgpu::ShaderSource::Wgsl(CULL_SHADER.into()),
+            source: wgpu::ShaderSource::Wgsl(crate::flora_draw::species_shader(CULL_SHADER).into()),
         });
         let started = std::time::Instant::now();
         let scatter_cull = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {

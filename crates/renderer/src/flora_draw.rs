@@ -1,40 +1,38 @@
 //! PROTOTYPE (flora lane): grown species meshes for the M5 scatter.
 //!
-//! At start-up the species in `content/flora/species/*.ron` that claim an M5
-//! forest role (conifer, broadleaf, shrub) are grown on the CPU
+//! At start-up the species in `content/flora/species/*.ron` (file order, at
+//! most `astrum_flora::scatter::MAX_SPECIES`) are grown on the CPU
 //! (`astrum_flora`, two variants each, three LODs) and uploaded into one
-//! vertex and one index buffer. The plant cull pass (`scatter_cull.wgsl`)
-//! routes trees and shrubs of those kinds into per-(kind, variant, LOD)
-//! buckets; each bucket is one indexed indirect draw whose arguments live in
-//! the shared plant argument buffer from word [`ARGS_WORD`]. Kinds without
-//! a grown species, boulders and far plants keep the procedural shapes.
+//! vertex and one index buffer. Their climate niches are compiled into the
+//! draw and cull shaders ([`species_shader`] splices the generated table over
+//! `scatter_species.wgsl`), so placement (`scatter_niche.wgsl`) picks the
+//! species per site. The cull pass (`scatter_cull.wgsl`) routes plants of a
+//! grown species into per-(species, variant, LOD) buckets; each bucket is
+//! one indexed indirect draw whose arguments live in the shared plant
+//! argument buffer from word [`ARGS_WORD`]. Boulders and far plants keep the
+//! procedural shapes (tinted with their species' canopy colour).
 //!
 //! `ASTRUM_NO_FLORA=1` keeps every plant procedural (A/B captures).
 //!
 //! Prototype debt: no hot reload, no wind animation, fixed LOD distances and
-//! bucket capacities in WGSL, species chosen by role instead of ecology,
-//! growth blocks start-up (cached per process).
+//! bucket capacities in WGSL, growth blocks start-up (cached per process).
 
 use std::sync::{Arc, OnceLock};
 
-use astrum_flora::genome::Role;
-use astrum_flora::{
-    Kit, LOD_COUNT, Mesh, SpeciesFile, grow_meshes, load_species_dir, variant_seed,
-};
+use astrum_flora::scatter::{MAX_SPECIES, species_wgsl, splice_species};
+use astrum_flora::{Kit, LOD_COUNT, Mesh, SpeciesFile, grow_meshes, load_species_dir, variant_seed};
 use wgpu::util::DeviceExt;
 
-/// Grown variants per kind (`FLORA_VARIANTS` in scatter_cull.wgsl).
+/// Grown variants per species (`FLORA_VARIANTS` in scatter_cull.wgsl).
 pub const VARIANTS: usize = 2;
-/// M5 kinds that can be grown: 0 conifer, 1 broadleaf, 2 shrub.
-pub const KINDS: usize = 3;
-pub const BUCKETS: usize = KINDS * VARIANTS * LOD_COUNT;
+pub const BUCKETS: usize = MAX_SPECIES * VARIANTS * LOD_COUNT;
 /// First word of the flora draw arguments (`FLORA_ARGS_WORD`).
 pub const ARGS_WORD: usize = 16;
-/// Word holding the kind mask (`FLORA_MASK_WORD`).
+/// Word holding the species mask (`FLORA_MASK_WORD`).
 pub const MASK_WORD: usize = 5;
 /// Size of the shared plant argument buffer once flora is included.
-pub const ARGS_BYTES: u64 = 512;
-const FAR_CAPACITY: u32 = 131_072;
+pub const ARGS_BYTES: u64 = 1024;
+const FAR_CAPACITY: u32 = 98_304;
 const CAPACITY: [u32; LOD_COUNT] = [1024, 4096, 8192];
 /// GPU vertex: the 36-byte flora vertex plus the bucket's first instance slot.
 const VERTEX_BYTES: u64 = 40;
@@ -45,73 +43,46 @@ fn bucket_base(bucket: usize) -> u32 {
     FAR_CAPACITY + (bucket / LOD_COUNT) as u32 * CAPACITY.iter().sum::<u32>() + before
 }
 
-/// CPU meshes of every bucket, grown once per process.
+/// Species and CPU meshes of every bucket, grown once per process.
 struct Grown {
-    /// Per kind: the species name, if any.
-    species: [Option<String>; KINDS],
+    species: Vec<SpeciesFile>,
     vertices: Vec<u8>,
     indices: Vec<u32>,
     /// Per bucket: (index count, first index, base vertex).
     ranges: Vec<(u32, u32, i32)>,
 }
 
-fn role_kind(role: Role) -> Option<usize> {
-    match role {
-        Role::Conifer => Some(0),
-        Role::Broadleaf => Some(1),
-        Role::Shrub => Some(2),
-        Role::Unplaced => None,
-    }
-}
-
 fn grow_all() -> Grown {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content/flora/species");
-    let species: Vec<SpeciesFile> = match load_species_dir(&dir) {
+    let mut species: Vec<SpeciesFile> = match load_species_dir(&dir) {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!("flora: {e}; using procedural plants");
+            tracing::warn!("flora: {e}; using the built-in niche table and procedural plants");
             Vec::new()
         }
     };
-    let mut by_kind: [Option<&SpeciesFile>; KINDS] = [None; KINDS];
-    for s in &species {
-        if let Some(k) = role_kind(s.role) {
-            by_kind[k].get_or_insert(s);
-        }
+    if species.len() > MAX_SPECIES {
+        tracing::warn!("flora: {} species, only the first {MAX_SPECIES} are used", species.len());
+        species.truncate(MAX_SPECIES);
     }
     let kit = Kit::builtin();
     let started = std::time::Instant::now();
-    // Grow every (kind, variant) on its own thread; results in bucket order.
-    let plants: Vec<Option<[Mesh; LOD_COUNT]>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..KINDS * VARIANTS)
-            .map(|kv| {
-                let sp = by_kind[kv / VARIANTS];
+    // Grow every (species, variant) on its own thread; results in bucket order.
+    let plants: Vec<[Mesh; LOD_COUNT]> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..species.len() * VARIANTS)
+            .map(|sv| {
+                let sp = &species[sv / VARIANTS];
                 let kit = &kit;
-                scope.spawn(move || {
-                    sp.map(|sp| grow_meshes(sp, kit, variant_seed(sp, (kv % VARIANTS) as u32)).1)
-                })
+                scope.spawn(move || grow_meshes(sp, kit, variant_seed(sp, (sv % VARIANTS) as u32)).1)
             })
             .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("flora growth thread"))
-            .collect()
+        handles.into_iter().map(|h| h.join().expect("flora growth thread")).collect()
     });
-    let mut g = Grown {
-        species: std::array::from_fn(|k| by_kind[k].map(|s| s.name.clone())),
-        vertices: Vec::new(),
-        indices: Vec::new(),
-        ranges: Vec::with_capacity(BUCKETS),
-    };
+    let mut g = Grown { species, vertices: Vec::new(), indices: Vec::new(), ranges: Vec::with_capacity(BUCKETS) };
     let mut tris = 0usize;
-    for (kv, plant) in plants.iter().enumerate() {
-        for lod in 0..LOD_COUNT {
-            let bucket = kv * LOD_COUNT + lod;
-            let Some(p) = plant else {
-                g.ranges.push((0, 0, 0));
-                continue;
-            };
-            let mesh = &p[lod];
+    for (sv, plant) in plants.iter().enumerate() {
+        for (lod, mesh) in plant.iter().enumerate() {
+            let bucket = sv * LOD_COUNT + lod;
             let base_vertex = (g.vertices.len() as u64 / VERTEX_BYTES) as i32;
             let first_index = g.indices.len() as u32;
             let slot = bucket_base(bucket);
@@ -120,20 +91,31 @@ fn grow_all() -> Grown {
                 g.vertices.extend_from_slice(&slot.to_le_bytes());
             }
             g.indices.extend_from_slice(&mesh.indices);
-            g.ranges
-                .push((mesh.indices.len() as u32, first_index, base_vertex));
+            g.ranges.push((mesh.indices.len() as u32, first_index, base_vertex));
             tris += mesh.triangles();
         }
     }
+    g.ranges.resize(BUCKETS, (0, 0, 0));
     tracing::info!(
         "flora: grew {:?} ({} meshes, {} triangles, {} KiB) in {:.0} ms",
-        g.species,
-        BUCKETS,
+        g.species.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+        plants.len() * LOD_COUNT,
         tris,
         (g.vertices.len() + g.indices.len() * 4) / 1024,
         started.elapsed().as_secs_f64() * 1e3
     );
     g
+}
+
+/// `shader` with the niche table generated from the loaded species spliced
+/// over the built-in one (pure string transform; unchanged when no species
+/// loaded).
+pub(crate) fn species_shader(shader: &str) -> String {
+    let g = grown();
+    if g.species.is_empty() {
+        return shader.to_string();
+    }
+    splice_species(shader, &species_wgsl(&g.species))
 }
 
 fn grown() -> Arc<Grown> {
@@ -175,12 +157,7 @@ impl FloraDraw {
         color_targets: &[Option<wgpu::ColorTargetState>],
     ) -> Self {
         let g = grown();
-        let mut mask = 0u32;
-        for (k, s) in g.species.iter().enumerate() {
-            if s.is_some() {
-                mask |= 1 << k;
-            }
-        }
+        let mask = (1u32 << g.species.len()) - 1;
         let mut args = vec![0u32; BUCKETS * 5];
         for (b, &(count, first, base)) in g.ranges.iter().enumerate() {
             args[b * 5] = count;

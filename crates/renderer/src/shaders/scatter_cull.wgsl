@@ -4,7 +4,7 @@
 // first vertex, first instance, then the staged node count).
 //
 // PROTOTYPE (flora lane): trees and shrubs of a kind with a grown species
-// (mask in plant_args[5], bit = kind) go to flora buckets instead: one
+// (mask in plant_args[5], bit = species) go to flora buckets instead: one
 // region of `plants_out` and one indexed indirect draw per (kind, variant,
 // LOD). Keep FLORA_* in step with crates/renderer/src/flora_draw.rs.
 
@@ -15,7 +15,7 @@
 @group(3) @binding(2) var<storage, read_write> grass_out: array<Plant>;
 
 // Procedural plants use slots [0, FLORA_FAR_CAPACITY); flora buckets follow.
-const FLORA_FAR_CAPACITY: u32 = 131072u;
+const FLORA_FAR_CAPACITY: u32 = 98304u;
 const FLORA_VARIANTS: u32 = 2u;
 const FLORA_LODS: u32 = 3u;
 const FLORA_MASK_WORD: u32 = 5u;
@@ -42,12 +42,13 @@ fn flora_base(bucket: u32) -> u32 {
 
 // Route a placed plant to a flora bucket; false when it stays procedural.
 fn flora_route(plant: Plant) -> bool {
-    let kind = plant.info.x;
+    let species = plant.info.x >> 8u;
     let mask = atomicLoad(&plant_args[FLORA_MASK_WORD]);
-    if kind >= 3u || (mask & (1u << kind)) == 0u {
+    if species == 0u || (mask & (1u << (species - 1u))) == 0u {
         return false;
     }
-    let reach = select(1.0, 0.5, kind == 2u) * (0.85 + 0.3 * sc_unit(plant.info.z ^ 0x9e3779b9u));
+    let kind = species - 1u;
+    let reach = select(1.0, 0.5, (plant.info.x & 0xffu) == 2u) * (0.85 + 0.3 * sc_unit(plant.info.z ^ 0x9e3779b9u));
     let d = length(plant.base.xyz) / reach;
     if d >= FLORA_FAR_M {
         return false;

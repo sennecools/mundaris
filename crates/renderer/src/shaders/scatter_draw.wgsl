@@ -20,12 +20,13 @@
 // lays the canopy colour (forest_cover) with a strength that rises as keep
 // falls, so forests read as forests from orbit.
 //
-// Forest field. Climate suitability sets how much of the land is forest; four
-// octaves of value noise (~4 km to ~60 m) against a suitability threshold make
-// large contiguous forests in good climates and patches in marginal ones. A
-// fringe outside each forest carries shrubs, small trees and lone trees;
-// trees shrink towards the forest edge and the cold tree line. Conifers take
-// over from broadleaf trees with cold.
+// Forest field (scatter_niche.wgsl): the species niches (content/flora/species,
+// compiled in as scatter_species.wgsl) set how much of the land is forest;
+// value noise against a suitability threshold makes large contiguous forests
+// in good climates and patches in marginal ones. A fringe outside each forest
+// carries shrubs, small trees and lone trees; trees shrink towards the edge of
+// their niche (treeline, dry or cold margins). Which species grows is drawn
+// from the niches that fit the site.
 
 const SCATTER_SIDE: u32 = 32u;
 const SCATTER_SLOTS: u32 = 1024u;
@@ -37,112 +38,6 @@ const SCATTER_FULL_M: f32 = 350.0;
 const SCATTER_MAX_DISTANCE_M: f32 = 16000.0;
 const SCATTER_DEG: f32 = 0.017453292;
 const SCATTER_MAX_LEVEL: u32 = 12u;
-
-fn sc_pcg3d(v_in: vec3<u32>) -> vec3<u32> {
-    var v = v_in * 1664525u + 1013904223u;
-    v.x += v.y * v.z;
-    v.y += v.z * v.x;
-    v.z += v.x * v.y;
-    v ^= v >> vec3<u32>(16u);
-    v.x += v.y * v.z;
-    v.y += v.z * v.x;
-    v.z += v.x * v.y;
-    return v;
-}
-
-fn sc_unit(bits: u32) -> f32 {
-    return f32(bits >> 8u) / 16777216.0;
-}
-
-fn sc_range(min_v: f32, max_v: f32, falloff: f32, x: f32) -> f32 {
-    let d = max(max(min_v - x, x - max_v), 0.0);
-    return clamp(1.0 - d / max(falloff, 1.0e-6), 0.0, 1.0);
-}
-
-// Smooth value noise in 0..1 over base-cell coordinates (x, y) of a face.
-fn sc_value(face: u32, x: f32, y: f32, salt: u32) -> f32 {
-    let i = floor(x);
-    let j = floor(y);
-    let f = vec2<f32>(x - i, y - j);
-    let w = f * f * (vec2<f32>(3.0) - 2.0 * f);
-    let c = vec2<u32>(u32(i), u32(j));
-    let k = face * 64u + salt;
-    let a = sc_unit(sc_pcg3d(vec3<u32>(c.x, c.y, k)).x);
-    let b = sc_unit(sc_pcg3d(vec3<u32>(c.x + 1u, c.y, k)).x);
-    let d = sc_unit(sc_pcg3d(vec3<u32>(c.x, c.y + 1u, k)).x);
-    let e = sc_unit(sc_pcg3d(vec3<u32>(c.x + 1u, c.y + 1u, k)).x);
-    return mix(mix(a, b, w.x), mix(d, e, w.x), w.y);
-}
-
-// Face id of a chart normal: dominant axis and sign (consistent per face).
-fn sc_face(n: vec3<f32>) -> u32 {
-    let a = abs(n);
-    if a.x >= a.y && a.x >= a.z {
-        return select(1u, 0u, n.x >= 0.0);
-    }
-    if a.y >= a.z {
-        return select(3u, 2u, n.y >= 0.0);
-    }
-    return select(5u, 4u, n.z >= 0.0);
-}
-
-// Plant probabilities of one base cell (they sum to at most 1).
-struct ForestSite {
-    tree: f32,
-    shrub: f32,
-    boulder: f32,
-    // 1 in a forest's core, 0 outside: trees shrink towards the edge.
-    core: f32,
-    // Share of conifers among trees.
-    conifer: f32,
-    // Tree-line stunting, 1 = full size.
-    stature: f32,
-}
-
-// Forest field at base-cell coordinates (ci, cj) of `face`. `footprint` is
-// the sample spacing in base cells: octaves finer than about four samples
-// fade to their mean (band limit for the far tint); 0 for single plants.
-fn sc_forest(face: u32, ci: f32, cj: f32, footprint: f32, t: f32, m: f32, slope: f32, h: f32) -> ForestSite {
-    var site: ForestSite;
-    let warm = sc_range(-7.0, 30.0, 6.0, t);
-    let wet = smoothstep(0.16, 0.42, m);
-    let steep = smoothstep(32.0 * SCATTER_DEG, 48.0 * SCATTER_DEG, slope);
-    let suit = warm * wet * (1.0 - steep) * (1.0 - smoothstep(3200.0, 3800.0, h));
-    let f1 = smoothstep(100.0, 200.0, footprint);
-    let f2 = smoothstep(25.0, 50.0, footprint);
-    let f3 = smoothstep(6.0, 12.0, footprint);
-    let f4 = smoothstep(1.5, 3.0, footprint);
-    let o1 = mix(sc_value(face, ci / 400.0, cj / 400.0, 40u), 0.5, f1);
-    let o2 = mix(sc_value(face, ci / 100.0, cj / 100.0, 41u), 0.5, f2);
-    let o3 = mix(sc_value(face, ci / 25.0, cj / 25.0, 42u), 0.5, f3);
-    let o4 = mix(sc_value(face, ci / 6.0, cj / 6.0, 43u), 0.5, f4);
-    let n = 0.45 * o1 + 0.3 * o2 + 0.15 * o3 + 0.1 * o4;
-    // Octaves faded to their mean no longer cross the threshold locally, so
-    // widen the transitions by the faded amplitude: far away the result is
-    // the expected coverage instead of a hard contour of a coarse field.
-    let faded = 0.45 * f1 + 0.3 * f2 + 0.15 * f3 + 0.1 * f4;
-    let soft = 0.05 + 0.3 * faded;
-    // Good climates are mostly forest with clearings; marginal ones patchy.
-    let threshold = 1.0 - 0.72 * suit;
-    let core = smoothstep(threshold - soft, threshold + soft, n) * smoothstep(0.0, 0.08, suit);
-    let fringe = smoothstep(threshold - 0.3 - soft, threshold - 0.03 + soft, n) * (1.0 - core);
-    site.core = core;
-    // Dense in the core, thinning through the fringe, lone trees elsewhere.
-    site.tree = suit * (0.9 * core + 0.18 * fringe * fringe + 0.06 * fringe) + 0.025 * suit;
-    let shrubby = sc_range(-3.0, 32.0, 6.0, t) * smoothstep(0.06, 0.3, m) * (1.0 - steep);
-    site.shrub = shrubby * (0.35 * fringe + 0.06 * core + 0.04);
-    let rock = smoothstep(25.0 * SCATTER_DEG, 45.0 * SCATTER_DEG, slope);
-    site.boulder = 0.02 + 0.25 * rock * (1.0 - smoothstep(60.0 * SCATTER_DEG, 70.0 * SCATTER_DEG, slope));
-    let total = site.tree + site.shrub + site.boulder;
-    if total > 1.0 {
-        site.tree /= total;
-        site.shrub /= total;
-        site.boulder /= total;
-    }
-    site.conifer = clamp(smoothstep(15.0, 5.0, t) + 0.3 * smoothstep(1800.0, 2800.0, h), 0.0, 1.0);
-    site.stature = mix(0.4, 1.0, smoothstep(-7.0, 1.0, t)) * mix(0.6, 1.0, core);
-    return site;
-}
 
 // keep(d): share of candidates shown at view distance `d` (m).
 fn sc_keep(d: f32) -> f32 {
@@ -290,21 +185,21 @@ fn sc_cells(inst: Instance, st: vec2<f32>) -> vec2<f32> {
 // by the caller in uniform control flow). A per-node footprint would differ
 // between neighbouring nodes of different levels and turn the octave fades
 // into node-shaped blocks.
-fn forest_cover(inst: Instance, st: vec2<f32>, normal_body: vec3<f32>, climate: vec2<f32>, ground: f32, d: f32, footprint_px: f32) -> vec4<f32> {
+fn forest_cover(inst: Instance, st: vec2<f32>, normal_body: vec3<f32>, climate: vec2<f32>, sediment: f32, ground: f32, d: f32, footprint_px: f32) -> vec4<f32> {
     let c = sc_cells(inst, st);
     // Fade each octave once it spans fewer than about eight pixels.
     let footprint = 2.0 * footprint_px;
     let up_body = normalize(inst.n0.xyz + chart_diff(inst, st));
     let slope = acos(clamp(dot(normal_body, up_body), -1.0, 1.0));
-    let site = sc_forest(sc_face(inst.n0.xyz), c.x, c.y, footprint, climate.x, climate.y, slope, ground);
-    var colour = mix(vec3<f32>(0.04, 0.07, 0.025), vec3<f32>(0.02, 0.04, 0.025), site.conifer);
+    let site = sc_forest(sc_face(inst.n0.xyz), c.x, c.y, footprint, FlSite(climate.x, climate.y, ground, slope, sediment));
+    var colour = site.color;
     // Canopy texture: crowns and gaps (~30 m) and clumps (~90 m), each fading
     // to its mean once the drawn grid is too coarse to carry it.
     let face = sc_face(inst.n0.xyz);
     let crowns = mix(sc_value(face, c.x / 3.0, c.y / 3.0, 44u), 0.5, smoothstep(0.75, 1.5, footprint));
     let clumps = mix(sc_value(face, c.x / 9.0, c.y / 9.0, 45u), 0.5, smoothstep(2.25, 4.5, footprint));
     colour *= 0.55 + 0.6 * crowns + 0.35 * (clumps - 0.5);
-    let cover = clamp(site.tree * site.stature + 0.4 * site.shrub, 0.0, 1.0);
+    let cover = site.cover;
     let far = 1.0 - sc_keep(d);
     return vec4<f32>(colour, cover * mix(0.7, 0.9, far));
 }
@@ -439,16 +334,27 @@ fn sc_place(index: u32) -> Placed {
     let up_body = normalize(inst.n0.xyz + diff);
     let normal_body = normalize(page_n.xyz);
     let slope = acos(clamp(dot(normal_body, up_body), -1.0, 1.0));
-    let site = sc_forest(face, f32(ci), f32(cj), 0.0, climate.x, climate.y, slope, ground);
+    let sediment = textureSampleLevel(shape_atlas, normal_sampler, own_uv, i32(inst.own.x), 0.0).z;
+    let fsite = FlSite(climate.x, climate.y, ground, slope, sediment);
+    let site = sc_forest(face, f32(ci), f32(cj), 0.0, fsite);
     let roll = sc_unit(h.z);
+    // kind: low byte = procedural far shape (0 conifer, 1 broadleaf, 2 shrub,
+    // 3 boulder), bits 8.. = species index + 1 (0 = none).
     var kind = 3u;
     var scale = 1.0;
-    if roll < site.tree {
-        kind = select(1u, 0u, sc_unit(h2.x) < site.conifer);
-        scale = mix(0.75, 1.3, sc_unit(h2.y)) * site.stature;
-    } else if roll < site.tree + site.shrub {
-        kind = 2u;
-        scale = mix(0.6, 1.4, sc_unit(h2.y));
+    if roll < site.tree + site.shrub {
+        let canopy = roll < site.tree;
+        let pick = fl_pick(select(FL_SHRUB_MASK, FL_CANOPY_MASK, canopy), fsite, sc_unit(h2.x));
+        if pick.x < 0.0 {
+            return out;
+        }
+        let k = u32(pick.x);
+        let n = fl_niche(k);
+        kind = n.far_kind | ((k + 1u) << 8u);
+        scale = mix(n.scale.x, n.scale.y, sc_unit(h2.y));
+        if canopy {
+            scale *= mix(0.45, 1.0, pick.y) * mix(0.6, 1.0, site.core);
+        }
     } else if roll < site.tree + site.shrub + site.boulder {
         kind = 3u;
         scale = mix(0.5, 2.2, sc_unit(h2.y) * sc_unit(h2.x));
@@ -460,7 +366,7 @@ fn sc_place(index: u32) -> Placed {
     // its crown spreads sideways (not up) so far forests close into a
     // canopy at true canopy height with a bumpy silhouette.
     var spread = 1.0;
-    if kind <= 2u {
+    if (kind & 0xffu) <= 2u {
         spread = clamp(1.25 * inverseSqrt(max(keep, 1.0e-6)), 1.0, 30.0);
     }
     let yaw = sc_unit(h2.z) * 6.2831853;
@@ -571,7 +477,8 @@ fn sc_place_grass(index: u32) -> Placed {
     let slope = acos(clamp(dot(normalize(page_n.xyz), up_body), -1.0, 1.0));
     // Forest field on the plant grid (8 m cells) for the shade of forest cores.
     let plant_cells = f32(1u << (SCATTER_CELL_BITS - 1u));
-    let site = sc_forest(face, (u + 1.0) * plant_cells, (v + 1.0) * plant_cells, 0.0, climate.x, climate.y, slope, ground);
+    let sediment = textureSampleLevel(shape_atlas, normal_sampler, own_uv, i32(inst.own.x), 0.0).z;
+    let site = sc_forest(face, (u + 1.0) * plant_cells, (v + 1.0) * plant_cells, 0.0, FlSite(climate.x, climate.y, ground, slope, sediment));
     let meadow = (1.0 - 0.75 * site.core)
         * smoothstep(-3.0, 4.0, climate.x)
         * smoothstep(0.06, 0.3, climate.y)
