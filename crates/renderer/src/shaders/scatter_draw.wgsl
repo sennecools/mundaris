@@ -170,9 +170,9 @@ fn sc_part(kind: u32, part: u32) -> Part {
         }
     } else if kind == 1u {
         if part == 0u {
-            p = Part(6.5, 4.4, 11.5);
+            p = Part(7.4, 4.1, 11.6);
         } else {
-            p = Part(6.5, 4.4, 3.0);
+            p = Part(7.4, 4.1, 3.4);
         }
     } else if kind == 2u {
         if part == 0u {
@@ -262,7 +262,7 @@ fn forest_cover(inst: Instance, st: vec2<f32>, normal_body: vec3<f32>, climate: 
     colour *= 0.55 + 0.6 * crowns + 0.35 * (clumps - 0.5);
     let cover = clamp(site.tree * site.stature + 0.4 * site.shrub, 0.0, 1.0);
     let far = 1.0 - sc_keep(d);
-    return vec4<f32>(colour, cover * mix(0.45, 0.9, far));
+    return vec4<f32>(colour, cover * mix(0.7, 0.9, far));
 }
 
 fn sc_hidden() -> ScatterOut {
@@ -420,16 +420,19 @@ fn vs_scatter(@builtin(vertex_index) vertex: u32, @builtin(instance_index) index
     out.normal = normalize(inst.b2v_x.xyz * n_body.x + inst.b2v_y.xyz * n_body.y + inst.b2v_z.xyz * n_body.z);
     out.up = normalize(inst.b2v_x.xyz * up_body.x + inst.b2v_y.xyz * up_body.y + inst.b2v_z.xyz * up_body.z);
     let tint = 0.8 + 0.4 * sc_unit(h2.x ^ h2.y);
+    // Per-plant hue: some greener, some olive or bluish.
+    let hue = sc_unit(h.y ^ h2.z);
+    let shift = vec3<f32>(1.0 + 0.25 * (hue - 0.5), 1.0, 1.0 - 0.3 * (hue - 0.5));
     if kind == 3u {
         out.albedo = vec3<f32>(0.2, 0.19, 0.17) * tint;
     } else if tri >= 16u {
         out.albedo = vec3<f32>(0.075, 0.05, 0.03);
     } else if kind == 0u {
-        out.albedo = vec3<f32>(0.022, 0.05, 0.028) * tint;
+        out.albedo = vec3<f32>(0.022, 0.05, 0.028) * tint * shift;
     } else if kind == 1u {
-        out.albedo = vec3<f32>(0.045, 0.085, 0.025) * tint;
+        out.albedo = vec3<f32>(0.045, 0.085, 0.025) * tint * shift;
     } else {
-        out.albedo = vec3<f32>(0.055, 0.07, 0.03) * tint;
+        out.albedo = vec3<f32>(0.055, 0.07, 0.03) * tint * shift;
     }
     return out;
 }
