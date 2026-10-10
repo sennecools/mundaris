@@ -648,9 +648,7 @@ pub(crate) struct TerrainAtlasRenderer {
     _normal: wgpu::Texture,
     _albedo: wgpu::Texture,
     _climate: wgpu::Texture,
-    produce_heights: wgpu::ComputePipeline,
-    produce_normals: wgpu::ComputePipeline,
-    produce_collision: wgpu::ComputePipeline,
+    produce: wgpu::ComputePipeline,
     source_layout: wgpu::BindGroupLayout,
     produce_group: wgpu::BindGroup,
     tiles: wgpu::Buffer,
@@ -849,19 +847,17 @@ impl TerrainAtlasRenderer {
                 bind_group_layouts: &[Some(&produce_layout), Some(&source_layout)],
                 immediate_size: 0,
             });
-        let compute = |entry| {
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(entry),
-                layout: Some(&produce_pipeline_layout),
-                module: &produce_shader,
-                entry_point: Some(entry),
-                compilation_options: Default::default(),
-                cache: None,
-            })
-        };
-        let produce_heights = compute("produce_heights");
-        let produce_normals = compute("produce_normals");
-        let produce_collision = compute("produce_collision");
+        // One entry point for heights, normals and collision (mode in the
+        // high bits of the dispatch cells): the driver compiles the whole
+        // evaluation once instead of three times.
+        let produce = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Terrain atlas produce"),
+            layout: Some(&produce_pipeline_layout),
+            module: &produce_shader,
+            entry_point: Some("produce"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
         let tiles = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Terrain atlas producer jobs"),
             size: TILE_BYTES * MAX_TILE_SLOTS as u64,
@@ -969,9 +965,8 @@ impl TerrainAtlasRenderer {
             source: wgpu::ShaderSource::Wgsl(DRAW_SHADER.into()),
         });
         // Compute too: the plant culling pass reads the draw resources.
-        let vertex_fragment = wgpu::ShaderStages::VERTEX
-            | wgpu::ShaderStages::FRAGMENT
-            | wgpu::ShaderStages::COMPUTE;
+        let vertex_fragment =
+            wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE;
         let draw_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Terrain atlas draw resources"),
             entries: &[
@@ -1199,16 +1194,17 @@ impl TerrainAtlasRenderer {
             ],
             immediate_size: 0,
         });
-        let scatter_shadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Terrain plants shadow layout"),
-            bind_group_layouts: &[
-                Some(light_layout),
-                Some(&draw_layout),
-                Some(&empty_layout),
-                Some(&plants_ro_layout),
-            ],
-            immediate_size: 0,
-        });
+        let scatter_shadow_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Terrain plants shadow layout"),
+                bind_group_layouts: &[
+                    Some(light_layout),
+                    Some(&draw_layout),
+                    Some(&empty_layout),
+                    Some(&plants_ro_layout),
+                ],
+                immediate_size: 0,
+            });
         let cull_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Terrain plants cull layout"),
             bind_group_layouts: &[
@@ -1303,35 +1299,36 @@ impl TerrainAtlasRenderer {
             multiview_mask: None,
             cache: None,
         });
-        let scatter_shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Terrain scatter sun shadow casters (prototype)"),
-            layout: Some(&scatter_shadow_layout),
-            vertex: wgpu::VertexState {
-                module: &draw_shader,
-                entry_point: Some("vs_scatter"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            fragment: None,
-            primitive: wgpu::PrimitiveState {
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: crate::post::DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                stencil: Default::default(),
-                bias: wgpu::DepthBiasState {
-                    constant: 2,
-                    slope_scale: 1.5,
-                    clamp: 0.0,
+        let scatter_shadow_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Terrain scatter sun shadow casters (prototype)"),
+                layout: Some(&scatter_shadow_layout),
+                vertex: wgpu::VertexState {
+                    module: &draw_shader,
+                    entry_point: Some("vs_scatter"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
                 },
-            }),
-            multisample: Default::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+                fragment: None,
+                primitive: wgpu::PrimitiveState {
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: crate::post::DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: Default::default(),
+                    bias: wgpu::DepthBiasState {
+                        constant: 2,
+                        slope_scale: 1.5,
+                        clamp: 0.0,
+                    },
+                }),
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
+            });
         let shadow_capacity = 1024;
         let shadow_instances = instance_buffer(device, shadow_capacity);
         let shadow_group = self::draw_group(
@@ -1365,9 +1362,7 @@ impl TerrainAtlasRenderer {
             _normal: normal,
             _albedo: albedo,
             _climate: climate,
-            produce_heights,
-            produce_normals,
-            produce_collision,
+            produce,
             source_layout,
             produce_group,
             tiles,
@@ -1743,6 +1738,13 @@ impl TerrainAtlasRenderer {
         let mut push = |source: u64, words: [u32; 4], count: u32, pass: Pass| {
             let slot = dispatches.len();
             let offset = slot * DISPATCH_STRIDE as usize;
+            // Pass mode in the high bits of the cells word (produce shader).
+            let mut words = words;
+            words[2] |= match pass {
+                Pass::Heights => 0,
+                Pass::Normals => 1,
+                Pass::Collision => 2,
+            } << 16;
             for (i, value) in words.into_iter().enumerate() {
                 dispatch_bytes[offset + i * 4..offset + i * 4 + 4]
                     .copy_from_slice(&value.to_le_bytes());
@@ -1797,12 +1799,8 @@ impl TerrainAtlasRenderer {
                 label: Some("Terrain atlas producer"),
                 timestamp_writes: None,
             });
-            for &(source, slot, side, count, kind) in &dispatches {
-                pass.set_pipeline(match kind {
-                    Pass::Heights => &self.produce_heights,
-                    Pass::Normals => &self.produce_normals,
-                    Pass::Collision => &self.produce_collision,
-                });
+            for &(source, slot, side, count, _) in &dispatches {
+                pass.set_pipeline(&self.produce);
                 pass.set_bind_group(0, &self.produce_group, &[slot * DISPATCH_STRIDE as u32]);
                 pass.set_bind_group(1, &self.sources[&source].group, &[]);
                 let groups_xy = side.div_ceil(8);
@@ -1857,7 +1855,11 @@ impl TerrainAtlasRenderer {
     /// PROTOTYPE (M5 Life): place this frame's plants on the staged nodes
     /// (cs_scatter) into the plant buffer and its indirect draw arguments.
     fn cull_plants(&self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder) {
-        let staged = if scatter_enabled() { self.staged_instances } else { 0 };
+        let staged = if scatter_enabled() {
+            self.staged_instances
+        } else {
+            0
+        };
         let args = [72u32, 0, 0, 0, staged, 0, 0, 0];
         let bytes: Vec<u8> = args.iter().flat_map(|w| w.to_le_bytes()).collect();
         queue.write_buffer(&self.plant_args, 0, &bytes);
@@ -3199,13 +3201,70 @@ pub fn grid_mesh(cells: u32) -> (Vec<u8>, Vec<u32>) {
     (vertices, indices)
 }
 
+/// Diagnostic: seconds to create each producer compute pipeline from a
+/// salted copy of the producer shader (the salt changes a literal, so driver
+/// pipeline caches miss). `variant`: 0 full, 1 without landform relief, 2
+/// without the river carve, 3 without both. Pipelines use automatic layouts.
+#[doc(hidden)]
+pub fn producer_pipeline_compile_seconds(
+    device: &wgpu::Device,
+    salt: u32,
+    variant: u32,
+) -> Vec<(&'static str, f64)> {
+    let mut source = PRODUCE_SHADER.replace(
+        "    let p = chart_point(st);\n    var sample_value: HeightSample;",
+        &format!(
+            "    let p = chart_point(st);\n    var sample_value: HeightSample;\n    if tile.info.w == {salt}u {{ sample_value.height = 1.0; }}"
+        ),
+    );
+    if variant & 1 != 0 {
+        source = source.replace(
+            "let relief = landform_relief(p.diff * tile.scale.x, normalize(p.n));",
+            "let relief = vec4<f32>(0.0);",
+        );
+    }
+    if variant & 2 != 0 {
+        source = source.replace(
+            "let carve = river_carve(n, sample_value.height, sample_value.gradient, 0.75 * texel);",
+            "var carve = river_carve_none(sample_value.height, sample_value.gradient);",
+        );
+        source.push_str(
+            "\nfn river_carve_none(h: f32, g: vec3<f32>) -> RiverCarve { var c: RiverCarve; c.height = h; c.gradient = g; c.water = -1.0e30; return c; }\n",
+        );
+    }
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("Producer compile timing"),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    });
+    ["produce"]
+        .into_iter()
+        .map(|entry| {
+            let started = std::time::Instant::now();
+            let _pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(entry),
+                layout: None,
+                module: &module,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+            device.poll(wgpu::PollType::wait_indefinitely()).ok();
+            (entry, started.elapsed().as_secs_f64())
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn atlas_shaders_parse_and_validate() {
-        for (name, source) in [("produce", PRODUCE_SHADER), ("draw", DRAW_SHADER), ("cull", CULL_SHADER)] {
+        for (name, source) in [
+            ("produce", PRODUCE_SHADER),
+            ("draw", DRAW_SHADER),
+            ("cull", CULL_SHADER),
+        ] {
             let module = naga::front::wgsl::parse_str(source)
                 .unwrap_or_else(|error| panic!("{name}: {}", error.emit_to_string(source)));
             naga::valid::Validator::new(

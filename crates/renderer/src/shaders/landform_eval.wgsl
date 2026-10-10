@@ -56,25 +56,34 @@ fn lf_field_run(field: u32) -> vec2<u32> {
     }
 }
 
-// Bicubic level-0 value of `field` at unit direction `d` and its gradient
-// per metre (central differences over a quarter texel; `MapsFields`).
-fn lf_field(field: u32, d: vec3<f32>) -> vec4<f32> {
+// Bicubic level-0 value of `field` at unit direction `d`. The only
+// cube_sample call site of the landform code: drivers inline every call
+// site, so callers loop over this one (pipeline compile time).
+fn lf_value(field: u32, d: vec3<f32>) -> f32 {
     let saved = cube_level_n;
     cube_level_n = tile.noise.y;
     let rd = lf_field_run(field);
     cube_decode = rd.y;
-    let base = rd.x * 6u * cube_level_n * cube_level_n;
-    let delta = 0.5 / f32(cube_level_n);
-    let e1 = any_orthonormal(d);
-    let e2 = cross(d, e1);
-    let v = cube_sample(base, d, true);
-    let g1 = cube_sample(base, normalize(d + e1 * delta), true)
-        - cube_sample(base, normalize(d - e1 * delta), true);
-    let g2 = cube_sample(base, normalize(d + e2 * delta), true)
-        - cube_sample(base, normalize(d - e2 * delta), true);
+    let v = cube_sample(rd.x * 6u * cube_level_n * cube_level_n, d, true);
     cube_decode = 0u;
     cube_level_n = saved;
-    return vec4<f32>(v, (e1 * g1 + e2 * g2) / (2.0 * delta * tile.scale.x));
+    return v;
+}
+
+// Bicubic level-0 value of `field` at unit direction `d` and its gradient
+// per metre (central differences over a quarter texel; `MapsFields`).
+fn lf_field(field: u32, d: vec3<f32>) -> vec4<f32> {
+    let delta = 0.5 / f32(tile.noise.y);
+    let e1 = any_orthonormal(d);
+    let e2 = cross(d, e1);
+    var offsets = array<vec3<f32>, 5>(vec3<f32>(0.0), e1, -e1, e2, -e2);
+    var s: array<f32, 5>;
+    for (var i = 0u; i < 5u; i = i + 1u) {
+        s[i] = lf_value(field, normalize(d + offsets[i] * delta));
+    }
+    let g1 = s[1] - s[2];
+    let g2 = s[3] - s[4];
+    return vec4<f32>(s[0], (e1 * g1 + e2 * g2) / (2.0 * delta * tile.scale.x));
 }
 
 // `RecipeField::range`.
@@ -100,17 +109,6 @@ fn lf_clamped_field(field: u32, d: vec3<f32>) -> vec4<f32> {
     return f;
 }
 
-fn lf_value(field: u32, d: vec3<f32>) -> f32 {
-    let saved = cube_level_n;
-    cube_level_n = tile.noise.y;
-    let rd = lf_field_run(field);
-    cube_decode = rd.y;
-    let v = cube_sample(rd.x * 6u * cube_level_n * cube_level_n, d, true);
-    cube_decode = 0u;
-    cube_level_n = saved;
-    return v;
-}
-
 // ---------------------------------------------------------------- weights
 
 fn lf_smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
@@ -133,23 +131,30 @@ fn lf_bump(x: f32, a: f32, b: f32) -> f32 {
     return 0.0;
 }
 
-// Rule inputs at direction `d` (`MapsFields::rule_fields`).
+// Rule inputs at direction `d` (`MapsFields::rule_fields`). Values come from
+// one lf_value call site in a loop (pipeline compile time): uplift,
+// sediment, moisture, temperature, hardness, |boundary|, volcanic.
 fn lf_fill_rule_fields(d: vec3<f32>) {
     let elevation = lf_field(7u, d);
-    let t = lf_value(5u, d);
-    let m = clamp(lf_value(4u, d), 0.0, 1.0);
+    var ids = array<u32, 7>(0u, 1u, 4u, 5u, 3u, 8u, 6u);
+    var v: array<f32, 7>;
+    for (var i = 0u; i < 7u; i = i + 1u) {
+        v[i] = lf_value(ids[i], d);
+    }
+    let t = v[3];
+    let m = clamp(v[2], 0.0, 1.0);
     let x = clamp((t + 15.0) / 20.0, 0.0, 1.0);
-    lf_rule_fields[0] = clamp(lf_value(0u, d), 0.0, 1.0);
-    lf_rule_fields[1] = clamp(lf_value(1u, d), 0.0, 1.0);
+    lf_rule_fields[0] = clamp(v[0], 0.0, 1.0);
+    lf_rule_fields[1] = clamp(v[1], 0.0, 1.0);
     lf_rule_fields[2] = m;
     lf_rule_fields[3] = 1.0 - m;
     lf_rule_fields[4] = t;
     lf_rule_fields[5] = 1.0 - x * x * (3.0 - 2.0 * x);
-    lf_rule_fields[6] = clamp(lf_value(3u, d), 0.0, 1.0);
+    lf_rule_fields[6] = clamp(v[4], 0.0, 1.0);
     lf_rule_fields[7] = length(elevation.yzw);
     lf_rule_fields[8] = elevation.x;
-    lf_rule_fields[9] = abs(lf_value(8u, d));
-    lf_rule_fields[10] = clamp(lf_value(6u, d), 0.0, 1.0);
+    lf_rule_fields[9] = abs(v[5]);
+    lf_rule_fields[10] = clamp(v[6], 0.0, 1.0);
     lf_rule_fields[11] = select(0.0, 1.0, elevation.x < 0.0);
 }
 

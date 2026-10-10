@@ -527,17 +527,22 @@ fn evaluate_world(p: ChartPoint, st: vec2<f32>) -> HeightSample {
     let delta = 0.5 / f32(cube_level_n);
     let e1 = any_orthonormal(d);
     let e2 = cross(d, e1);
-    let o1 = cube_split_offset(face, d, e1, delta);
-    let o2 = cube_split_offset(face, d, -e1, delta);
-    let o3 = cube_split_offset(face, d, e2, delta);
-    let o4 = cube_split_offset(face, d, -e2, delta);
     var out: HeightSample;
-    out.height = cube_sample_split(base, face, cell, local, d);
-    let g1 = cube_sample_split(base, face, cell, local + o1, normalize(d + e1 * delta))
-        - cube_sample_split(base, face, cell, local + o2, normalize(d - e1 * delta));
-    let g2 = cube_sample_split(base, face, cell, local + o3, normalize(d + e2 * delta))
-        - cube_sample_split(base, face, cell, local + o4, normalize(d - e2 * delta));
-    out.gradient = (e1 * g1 + e2 * g2) / (2.0 * delta);
+    // One cube_sample_split call site in a loop: drivers inline every call
+    // site (pipeline compile time). Sample 0 is the centre; 1–4 are ±e1, ±e2.
+    var dirs = array<vec3<f32>, 5>(vec3<f32>(0.0), e1, -e1, e2, -e2);
+    var s: array<f32, 5>;
+    for (var i = 0u; i < 5u; i = i + 1u) {
+        var offset = vec2<f32>(0.0);
+        var at = d;
+        if i > 0u {
+            offset = cube_split_offset(face, d, dirs[i], delta);
+            at = normalize(d + dirs[i] * delta);
+        }
+        s[i] = cube_sample_split(base, face, cell, local + offset, at);
+    }
+    out.height = s[0];
+    out.gradient = (e1 * (s[1] - s[2]) + e2 * (s[3] - s[4])) / (2.0 * delta);
     return out;
 }
 
@@ -760,7 +765,7 @@ fn page_water(st: vec2<f32>, value: vec4<f32>) -> f32 {
     let up = normalize(chart_point(st).n);
     let c = clamp(dot(value.xyz, up), 1.0e-3, 1.0);
     let slope = max(sqrt(1.0 - c * c) / c, 1.0e-3);
-    let texel = tile.scale.x * tile.face_u.w / f32(dispatch.cells);
+    let texel = tile.scale.x * tile.face_u.w / f32(dispatch_cells);
     let sea = clamp(-value.w / (slope * texel * WATER_CONTOUR_TEXELS), -1.0, 1.0);
     if sample_water_depth > -1.0e29 {
         // Lakes and rivers: the same contour against the carved ground.
@@ -827,7 +832,7 @@ fn evaluate(st: vec2<f32>) -> vec4<f32> {
     // river ribbons as flat water (river_carve.wgsl).
     sample_water_depth = -1.0e30;
     if tile.info.y == 2u {
-        let texel = tile.scale.x * tile.face_u.w / f32(dispatch.cells);
+        let texel = tile.scale.x * tile.face_u.w / f32(dispatch_cells);
         let carve = river_carve(n, sample_value.height, sample_value.gradient, 0.75 * texel);
         sample_value.height = carve.height;
         sample_value.gradient = carve.gradient;
@@ -860,22 +865,46 @@ fn ordered(value: f32) -> u32 {
     return bits | 0x80000000u;
 }
 
+// Cells of the dispatch (`dispatch.cells` low 16 bits; the high bits hold the
+// pass mode).
+var<private> dispatch_cells: u32;
+
+// The one producer entry point: drivers compile the whole evaluation per
+// entry point, so heights, normals and collision share one pipeline and one
+// evaluate() call site (pipeline compile time). Mode = dispatch.cells >> 16:
+// 0 heights (and normals when the side matches the geometry grid plus
+// apron), 1 normals, 2 collision pages ((cells + 1)^2 samples at st = id /
+// cells, read back to the CPU heightfield colliders; `dispatch.bounds_base`
+// is the group's first page).
 @compute @workgroup_size(8, 8, 1)
-fn produce_heights(@builtin(global_invocation_id) id: vec3<u32>) {
+fn produce(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= dispatch.side || id.y >= dispatch.side {
         return;
     }
+    let mode = dispatch.cells >> 16u;
+    dispatch_cells = dispatch.cells & 0xffffu;
     tile = tiles[dispatch.base + id.z];
-    let st = (vec2<f32>(id.xy) - vec2<f32>(1.0)) / f32(dispatch.cells);
+    var st = (vec2<f32>(id.xy) - vec2<f32>(1.0)) / f32(dispatch_cells);
+    if mode == 2u {
+        st = vec2<f32>(id.xy) / f32(dispatch_cells);
+    }
     let value = evaluate(st);
+    if mode == 2u {
+        let side = dispatch.side;
+        collision_out[(dispatch.bounds_base + id.z) * side * side + id.y * side + id.x] =
+            vec4<f32>(value.w, value.xyz);
+        return;
+    }
     let layer = i32(tile.info.x);
-    textureStore(height_out, vec2<i32>(id.xy), layer, vec4<f32>(value.w, 0.0, 0.0, 0.0));
-    if dispatch.side == dispatch.cells + 3u {
-        // Normal map at geometry resolution shares this evaluation.
+    if mode == 1u || dispatch.side == dispatch_cells + 3u {
         textureStore(normal_out, vec2<i32>(id.xy), layer, vec4<f32>(value.xyz, page_water(st, value)));
         textureStore(albedo_out, vec2<i32>(id.xy), layer, page_albedo(st, value));
         textureStore(climate_out, vec2<i32>(id.xy), layer, page_climate(st));
     }
+    if mode == 1u {
+        return;
+    }
+    textureStore(height_out, vec2<i32>(id.xy), layer, vec4<f32>(value.w, 0.0, 0.0, 0.0));
     // 4x4 min/max grid over the chart; samples on shared cell edges and the
     // border apron count towards every adjacent cell.
     let base = (dispatch.bounds_base + id.z) * 32u;
@@ -890,32 +919,4 @@ fn produce_heights(@builtin(global_invocation_id) id: vec3<u32>) {
             atomicMax(&bounds[slot + 1u], key);
         }
     }
-}
-
-@compute @workgroup_size(8, 8, 1)
-fn produce_normals(@builtin(global_invocation_id) id: vec3<u32>) {
-    if id.x >= dispatch.side || id.y >= dispatch.side {
-        return;
-    }
-    tile = tiles[dispatch.base + id.z];
-    let st = (vec2<f32>(id.xy) - vec2<f32>(1.0)) / f32(dispatch.cells);
-    let value = evaluate(st);
-    textureStore(normal_out, vec2<i32>(id.xy), i32(tile.info.x), vec4<f32>(value.xyz, page_water(st, value)));
-    textureStore(albedo_out, vec2<i32>(id.xy), i32(tile.info.x), page_albedo(st, value));
-    textureStore(climate_out, vec2<i32>(id.xy), i32(tile.info.x), page_climate(st));
-}
-
-// Collision page: (cells + 1)^2 samples at st = id / cells, read back to the
-// CPU heightfield colliders. `dispatch.bounds_base` is the group's first page.
-@compute @workgroup_size(8, 8, 1)
-fn produce_collision(@builtin(global_invocation_id) id: vec3<u32>) {
-    if id.x >= dispatch.side || id.y >= dispatch.side {
-        return;
-    }
-    tile = tiles[dispatch.base + id.z];
-    let st = vec2<f32>(id.xy) / f32(dispatch.cells);
-    let value = evaluate(st);
-    let side = dispatch.side;
-    collision_out[(dispatch.bounds_base + id.z) * side * side + id.y * side + id.x] =
-        vec4<f32>(value.w, value.xyz);
 }
