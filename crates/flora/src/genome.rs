@@ -37,6 +37,9 @@ pub struct SpeciesFile {
     /// (`scatter::crown_areas`), set by `measure_crowns`. Not stored.
     #[serde(skip)]
     pub crown: Option<[f64; 2]>,
+    /// Foliage build, from the planet file (`palette::apply`). Not stored.
+    #[serde(skip)]
+    pub style: FoliageStyle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,6 +210,18 @@ pub struct Genome {
     pub fruit_size_m: f64,
     /// Chance per tip, 0..1.
     pub fruit_chance: f64,
+}
+
+/// How foliage is built (art direction 2026-10-10: stylised by default; the
+/// realistic leaves stay selectable for comparison).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FoliageStyle {
+    /// A few big soft clumps with rounded normals and a gradient inside the
+    /// crown; chunky, lower-poly branches.
+    #[default]
+    Stylised,
+    /// Individual kit organs (leaves, needles) on the full branch tree.
+    Realistic,
 }
 
 /// Species colours (linear RGB), from the planet palette (`palette.rs`).

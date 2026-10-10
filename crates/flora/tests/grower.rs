@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use astrum_flora::genome::{GrowthForm, OrganKind};
+use astrum_flora::genome::{FoliageStyle, GrowthForm, OrganKind};
 use astrum_flora::metrics::Bands;
 use astrum_flora::params::{ParamKind, ParamValue, Params};
 use astrum_flora::{Genome, Kit, SpeciesFile, grow_plant, load_species_dir, variant_seed};
@@ -54,7 +54,7 @@ fn same_seed_same_bytes() {
 /// `powf`/`sin`/`cos`, which are not guaranteed bit-identical across
 /// platforms (genesis §9.3 determinism scope is still open). Update the
 /// constant deliberately when the grower changes.
-const GOLDEN_BUSHEL_12345: u64 = 0xb3ec_b707_4235_e5d7;
+const GOLDEN_BUSHEL_12345: u64 = 0x1072_207c_3f6f_2bbd;
 
 #[test]
 fn golden_seed() {
@@ -75,11 +75,15 @@ fn golden_seed() {
 #[test]
 fn species_pass_scorer_bands() {
     let kit = Kit::builtin();
-    for sp in species() {
-        for v in 0..3 {
-            let p = grow_plant(&sp, &kit, variant_seed(&sp, v));
-            let fails = p.metrics.failures(&Bands::HERO);
-            assert!(fails.is_empty(), "{} v{v}: {fails:?}", sp.name);
+    // Both foliage styles (the realistic leaves stay selectable).
+    for style in [FoliageStyle::Stylised, FoliageStyle::Realistic] {
+        for mut sp in species() {
+            sp.style = style;
+            for v in 0..3 {
+                let p = grow_plant(&sp, &kit, variant_seed(&sp, v));
+                let fails = p.metrics.failures(&Bands::for_style(sp.style));
+                assert!(fails.is_empty(), "{} {style:?} v{v}: {fails:?}", sp.name);
+            }
         }
     }
 }

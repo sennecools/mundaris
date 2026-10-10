@@ -88,7 +88,7 @@ fn main() {
             let col = *v as usize;
             draw_cell(&mut c, col, &p.lods[0]);
             let m = &p.metrics;
-            let fails = m.failures(&Bands::HERO);
+            let fails = m.failures(&Bands::for_style(sp.style));
             let x = col * CELL_W + 6;
             let y = CELL_H + 4;
             text(

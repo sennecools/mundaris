@@ -32,4 +32,7 @@ PlanetLife(
         (name: "granite", hardness: (min: 0.55, max: 1.0, falloff: 0.1)),
         (name: "sandstone", hardness: (min: 0.0, max: 0.5, falloff: 0.1)),
     ],
+    // Foliage build (art direction 2026-10-10): Stylised = a few big soft
+    // clumps per crown; Realistic = the individual leaves, for comparison.
+    foliage: Stylised,
 )

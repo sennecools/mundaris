@@ -214,6 +214,7 @@ pub fn generate(planet: &PlanetLife, templates: &[SpeciesFile], count: usize) ->
             look_override: None,
             look: palette.alien_look(planet, key),
             crown: None,
+            style: planet.foliage,
         };
         out.push(sp);
     }

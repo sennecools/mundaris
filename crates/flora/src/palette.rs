@@ -76,6 +76,10 @@ pub struct PlanetLife {
     /// species files serving as tree/shrub templates; 0 = authored only.
     #[serde(default)]
     pub generated_species: u32,
+    /// Foliage build for every species on this planet (one value to flip
+    /// for a side-by-side with the realistic leaves).
+    #[serde(default)]
+    pub foliage: crate::genome::FoliageStyle,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -398,6 +402,7 @@ pub fn apply(species: &mut [SpeciesFile], planet: &PlanetLife) {
             Some(l) => l.clone(),
             None => palette.species_look(planet, sp),
         };
+        sp.style = planet.foliage;
     }
 }
 
@@ -466,6 +471,7 @@ mod tests {
             geology_age: 0.5,
             rocks: Vec::new(),
             generated_species: 0,
+            foliage: Default::default(),
         }
     }
 

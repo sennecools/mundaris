@@ -355,6 +355,24 @@ impl Bands {
         crown_fill: (0.25, 0.92),
         crown_solidity_min: 0.6,
     };
+
+    /// Stylised foliage (art direction 2026-10-10): smooth puff silhouettes
+    /// (box-counting dimension near 1), full crowns, lower poly.
+    pub const STYLISED: Bands = Bands {
+        max_triangles: [6_500, 1_500, 600],
+        max_intersecting_fraction: 0.03,
+        fractal_dimension: (0.9, 1.2),
+        crown_fill: (0.5, 0.92),
+        crown_solidity_min: 0.9,
+    };
+
+    /// Bands for a species' foliage style.
+    pub fn for_style(style: crate::genome::FoliageStyle) -> Bands {
+        match style {
+            crate::genome::FoliageStyle::Stylised => Self::STYLISED,
+            crate::genome::FoliageStyle::Realistic => Self::HERO,
+        }
+    }
 }
 
 impl PlantMetrics {
