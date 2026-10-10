@@ -25,13 +25,42 @@ use astrum_math::{
     surface::{CubeFace, CubePatchAddress, SurfaceLocation},
 };
 use astrum_renderer::TerrainAtlasConfig;
-use astrum_world::terrain::{SurfaceGenerator, noise, producer::tile_texel_m};
+use astrum_world::terrain::{
+    SurfaceGenerator, noise,
+    producer::{ProducerRecipe, tile_texel_m},
+};
 use glam::DVec3;
 
 const HEIGHT_TOLERANCE_M: f64 = 1.0e-3;
 const HEIGHT_TOLERANCE_RELATIVE: f64 = 1.0e-6;
 const HEIGHT_TOLERANCE_TEXEL_FRACTION: f64 = 1.0e-5;
 const NORMAL_TOLERANCE_DEG: f64 = 0.75;
+/// f32 accumulation over landform recipes (kilometre amplitudes summed over
+/// many octaves): allowance per metre of the body's landform bound.
+const HEIGHT_TOLERANCE_LANDFORM: f64 = 4.0e-6;
+
+/// Direction of the highest terrain at a 20 km footprint (Fibonacci search):
+/// landform bodies also check a node path down to a mountain range.
+fn highest_direction(recipe: &ProducerRecipe) -> DVec3 {
+    let samples = 2000;
+    let golden = std::f64::consts::PI * (3.0 - 5.0f64.sqrt());
+    (0..samples)
+        .map(|k| {
+            let y = 1.0 - 2.0 * (k as f64 + 0.5) / samples as f64;
+            let r = (1.0 - y * y).sqrt();
+            let a = golden * k as f64;
+            DVec3::new(r * a.cos(), y, r * a.sin())
+        })
+        .max_by(|a, b| {
+            let h = |d: &DVec3| {
+                recipe
+                    .evaluate(*d, 20_000.0)
+                    .map_or(f64::MIN, |s| s.height_m)
+            };
+            h(a).total_cmp(&h(b))
+        })
+        .unwrap()
+}
 
 fn node_on_path(direction: DVec3, level: u8) -> CubePatchAddress {
     let (face, uv) = SurfaceLocation::new(Direction3::try_new(direction).unwrap()).face_uv();
@@ -110,7 +139,6 @@ fn gpu_tiles_match_the_cpu_oracle_within_documented_tolerances() {
         layers: 32,
         normal_scale: policy.normal_scale,
     };
-    let nodes = node_set(camera, finest_data_level);
     let mut checked_bodies = 0;
     for (_, body) in loaded.system.bodies().filter(|(_, b)| b.has_surface()) {
         let definition = body.surface_definition().unwrap();
@@ -125,6 +153,17 @@ fn gpu_tiles_match_the_cpu_oracle_within_documented_tolerances() {
             .producer_recipe()
             .unwrap();
         common::provide_gpu_world(&context, &recipe);
+        let mut nodes = node_set(camera, finest_data_level);
+        let landform_bound = definition.world().map_or(0.0, |w| w.landform_bound_m());
+        if landform_bound > 0.0 {
+            let peak = highest_direction(&recipe);
+            for level in (0..=finest_data_level).step_by(2) {
+                nodes.push(node_on_path(peak, level));
+            }
+            nodes.push(node_on_path(peak, finest_data_level));
+            nodes.sort_by_key(|n| (n.level(), n.face() as u8, n.coordinates()));
+            nodes.dedup();
+        }
         let tiles = common::produce(&context, config, &recipe, radius, &nodes);
         let (mut worst_height, mut worst_normal_1x, mut worst_normal_2x) = (0.0f64, 0.0f64, 0.0f64);
         // (ratio to tolerance, node, |dh|, slope at that texel)
@@ -149,7 +188,8 @@ fn gpu_tiles_match_the_cpu_oracle_within_documented_tolerances() {
                     let error = (gpu - reference.height_m).abs();
                     let slope = reference.gradient_m.length() / radius;
                     let allowed = HEIGHT_TOLERANCE_M.max(HEIGHT_TOLERANCE_TEXEL_FRACTION * texel)
-                        + HEIGHT_TOLERANCE_RELATIVE * reference.height_m.abs();
+                        + HEIGHT_TOLERANCE_RELATIVE * reference.height_m.abs()
+                        + HEIGHT_TOLERANCE_LANDFORM * landform_bound;
                     if error > allowed {
                         failures.push(format!(
                             "{node:?} texel ({i},{j}): |dh| {error} m > {allowed} m"
