@@ -141,6 +141,12 @@ pub struct TierABakeInputs {
     pub ocean_depth_m: f32,
     pub shelf_depth_m: f32,
     pub shelf_fraction: f32,
+    /// Shoreface depth (m) and fraction of the shelf (`tier_a::shelf_depth`).
+    pub shoreface_depth_m: f32,
+    pub shoreface_fraction: f32,
+    /// Coastal land rise (m) and its height scale (m) (`tier_a::coast_rise`).
+    pub coast_rise_m: f32,
+    pub coast_rise_scale_m: f32,
     pub equator_c: f32,
     pub pole_c: f32,
     pub axial_tilt_rad: f32,
@@ -363,8 +369,9 @@ impl TierABakeInputs {
                 0.0,
             ]),
             u([self.hardness_seed, 0, 0, 0]),
+            // x: coastal rise (the smoothing step travels in the pass scalars).
             f([
-                self.smoothing_step_rad,
+                self.coast_rise_m,
                 self.wind_deflection,
                 self.deflection_slope,
                 self.wind_slowdown,
@@ -373,7 +380,7 @@ impl TierABakeInputs {
                 self.orographic_rain,
                 self.lee_drying,
                 self.orographic_slope,
-                0.0,
+                self.coast_rise_scale_m,
             ]),
             f([
                 self.erosion_strength,
@@ -387,7 +394,12 @@ impl TierABakeInputs {
                 self.erosion_slope_exponent,
                 self.erosion_flow_exponent,
             ]),
-            f([self.thermal_rate, self.sediment_depth_m, 0.0, 0.0]),
+            f([
+                self.thermal_rate,
+                self.sediment_depth_m,
+                self.shoreface_depth_m,
+                self.shoreface_fraction,
+            ]),
         ]
         .concat()
     }

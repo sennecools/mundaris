@@ -262,13 +262,18 @@ fn gpu_tier_a_without_erosion_matches_pointwise_with_mips() {
              temperature {:.5} C, moisture {:.2e}",
             cpu.diagnostics.sea_level_m, gpu.sea_level_m, errors[0], errors[1], errors[2]
         );
+        // A second-sea-level difference is amplified by the remap's slope
+        // at the coast (coastal rise).
+        // (temperature follows elevation through the lapse rate).
+        let amplify = astrum_world::terrain::tier_a::rezero_max_slope(&input.params);
+        let tolerance = ELEVATION_TOLERANCE_M * amplify;
         assert!(
-            errors[0] <= ELEVATION_TOLERANCE_M,
-            "elevation {}",
+            errors[0] <= tolerance,
+            "elevation {} > {tolerance}",
             errors[0]
         );
         assert!(
-            errors[1] <= TEMPERATURE_TOLERANCE_C,
+            errors[1] <= TEMPERATURE_TOLERANCE_C * amplify,
             "temperature {}",
             errors[1]
         );
@@ -282,8 +287,8 @@ fn gpu_tier_a_without_erosion_matches_pointwise_with_mips() {
         // builder; integer and packed fields against the CPU's own (exact)
         // integer mips of the GPU's level 0.
         let float_fields = [
-            (&f.elevation, ELEVATION_TOLERANCE_M),
-            (&f.temperature, TEMPERATURE_TOLERANCE_C),
+            (&f.elevation, ELEVATION_TOLERANCE_M * amplify),
+            (&f.temperature, TEMPERATURE_TOLERANCE_C * amplify),
             (&f.moisture, MOISTURE_TOLERANCE),
         ];
         for (field, (map, tolerance)) in float_fields.into_iter().enumerate() {

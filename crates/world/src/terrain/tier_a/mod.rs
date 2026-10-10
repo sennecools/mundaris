@@ -255,13 +255,30 @@ fn deep(t: f64) -> f64 {
 }
 
 /// Depth with the continental shelf at normalised distance `t` from the coast
-/// (M1 shelf: linear to the shelf edge, then the deep profile).
+/// (M1 shelf: linear to the shelf edge, then the deep profile; with a
+/// shoreface, a steep drop to the shoreface depth first).
 fn shelf_depth(t: f64, params: &PlanetParams) -> f64 {
     if params.shelf_fraction <= 0.0 {
         return params.ocean_depth_m * deep(t);
     }
     if t < params.shelf_fraction {
-        params.shelf_depth_m * t / params.shelf_fraction
+        let s = t / params.shelf_fraction;
+        let (a, d0) = (
+            params.shoreface_fraction,
+            params.shoreface_depth_m.min(params.shelf_depth_m),
+        );
+        if a > 0.0 && d0 > 0.0 {
+            // Shoreface: a steep, easing drop to d0 (slope 2·d0/a at the
+            // coast), then the shelf continues linearly to its edge.
+            if s < a {
+                let x = 1.0 - s / a;
+                d0 * (1.0 - x * x)
+            } else {
+                d0 + (params.shelf_depth_m - d0) * (s - a) / (1.0 - a)
+            }
+        } else {
+            params.shelf_depth_m * s
+        }
     } else {
         let u = (t - params.shelf_fraction) / (1.0 - params.shelf_fraction);
         params.shelf_depth_m + (params.ocean_depth_m - params.shelf_depth_m).max(0.0) * deep(u)
@@ -278,6 +295,25 @@ pub fn shelf_remap(depth_m: f64, params: &PlanetParams) -> f64 {
     }
     let t = 1.0 - (1.0 - depth_m / od).cbrt();
     shelf_depth(t, params)
+}
+
+/// Steepest slope of the re-zero remap (dz'/dz): the coastal rise steepens
+/// land at the coast by `1 + r0/λ`, so a sea-level difference `e` moves
+/// coastal heights by up to this times `e`.
+pub fn rezero_max_slope(params: &PlanetParams) -> f64 {
+    if params.coast_rise_m <= 0.0 || params.coast_rise_scale_m <= 0.0 {
+        return 1.0;
+    }
+    1.0 + params.coast_rise_m / params.coast_rise_scale_m
+}
+
+/// Coastal rise added to land height `z` > 0 (m): `r0·(1 − e^(−z/λ))`,
+/// monotone and 0 at the coast, so ocean coverage and coastlines stay.
+pub fn coast_rise(z: f64, params: &PlanetParams) -> f64 {
+    if params.coast_rise_m <= 0.0 || params.coast_rise_scale_m <= 0.0 {
+        return 0.0;
+    }
+    params.coast_rise_m * (1.0 - (-z / params.coast_rise_scale_m).exp())
 }
 
 /// Largest absolute macro elevation of a bake with `stages` (M2 design §4,
@@ -301,7 +337,8 @@ pub fn height_bound_m(params: &PlanetParams, stages: &[TierAStage]) -> f64 {
     } else {
         0.0
     };
-    (params.land_height_m + rise + uplift).max(params.ocean_depth_m + sink)
+    // The coastal rise lifts land by at most coast_rise_m.
+    (params.land_height_m + rise + uplift + params.coast_rise_m).max(params.ocean_depth_m + sink)
 }
 
 /// Bin of elevation `h` (m) in the second histogram over `±bound`.
@@ -654,11 +691,13 @@ pub fn landform_rule_fields(
 }
 
 /// Re-zero eroded elevation `h` at the second sea level `s2` (m), apply the
-/// shelf as a monotone depth remap and clamp to `±bound`.
+/// shelf as a monotone depth remap, lift land by the coastal rise and clamp to `±bound`.
 pub fn rezero(h: f64, s2: f64, bound: f64, shelf: bool, params: &PlanetParams) -> f64 {
     let z = h - s2;
     let z = if z < 0.0 && shelf {
         -shelf_remap(-z, params)
+    } else if z > 0.0 && shelf {
+        z + coast_rise(z, params)
     } else {
         z
     };
