@@ -74,6 +74,11 @@ pub const NEIGHBOUR_STEPS: [(i32, i32); 8] = [
 pub const INCISION_CLEARANCE_M: f64 = 0.01;
 /// Height above the spill point to which deposition fills a pit (m).
 pub const PIT_FILL_M: f64 = 0.1;
+/// Water-surface drops at or below this (m) do not route flow: ties on filled
+/// lake surfaces (the fill descends `PIT_FILL_M` per texel) would otherwise
+/// flip with f32 rounding and reroute whole catchments differently per
+/// backend.
+pub const ROUTE_TIE_M: f64 = 1.0e-3;
 
 /// Texel reached from `(face, i, j)` by the step `(di, dj)` (each −1, 0 or 1)
 /// on `n`-cell faces. Crossing one face edge goes through [`FACE_EDGES`]; the
@@ -425,8 +430,9 @@ fn iterate(
             if m == k || distance <= 0.0 {
                 continue;
             }
-            let s = (w[k] - w[m]) / distance;
-            if s > 0.0 {
+            let drop = w[k] - w[m];
+            if drop > ROUTE_TIE_M {
+                let s = drop / distance;
                 let sp = s.powf(c.p);
                 total += sp;
                 weighted += sp * s;
@@ -446,8 +452,9 @@ fn iterate(
             if m == k || distance <= 0.0 || w[m] < 0.0 || route[m].0 <= 0.0 {
                 continue;
             }
-            let s = (w[m] - w[k]) / distance;
-            if s > 0.0 {
+            let drop = w[m] - w[k];
+            if drop > ROUTE_TIE_M {
+                let s = drop / distance;
                 let share = s.powf(c.p) / route[m].0;
                 q += state.q[m] * share;
                 qs += state.qs_out[m] * share;

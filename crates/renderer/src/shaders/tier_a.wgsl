@@ -68,6 +68,8 @@ const STAGE_RAIN_SHADOW: u32 = 128u;
 const STAGE_EROSION: u32 = 256u;
 const UNFILLED_M: f32 = 1.0e7;
 const PIT_FILL_M: f32 = 0.1;
+// `erosion::ROUTE_TIE_M`: smaller water-surface drops route no flow.
+const ROUTE_TIE_M: f32 = 1.0e-3;
 const INCISION_CLEARANCE_M: f32 = 0.01;
 const BOUNDARY_UNITS_PER_M: f32 = 16.0;
 
@@ -615,15 +617,35 @@ fn base_temperature(x: f32) -> f32 {
 const HALF_PI: f32 = 1.5707963267948966;
 const PI: f32 = 3.141592653589793;
 
+// asin to f32 precision on every backend (Cephes `asinf`, ~2.5e-7 relative):
+// FXC (Dx12) expands the `asin` intrinsic to a polynomial with ~1e-4 error,
+// which put wind and moisture 3e-4 off the CPU oracle.
+fn precise_asin(v: f32) -> f32 {
+    let a = min(abs(v), 1.0);
+    var x = a;
+    var z = a * a;
+    let far = a > 0.5;
+    if far {
+        z = 0.5 * (1.0 - a);
+        x = sqrt(z);
+    }
+    var p = ((((4.2163199048e-2 * z + 2.4181311049e-2) * z + 4.5470025998e-2) * z
+        + 7.4953002686e-2) * z + 1.6666752422e-1) * z * x + x;
+    if far {
+        p = HALF_PI - 2.0 * p;
+    }
+    return select(p, -p, v < 0.0);
+}
+
 // Rain scale by the circulation cells (`tier_a::rain_modulation`): wetter where
 // the cells converge (cos(2 · cells · |lat|) > 0), drier where they diverge.
 fn rain_modulation(x: f32) -> f32 {
-    let latitude = abs(asin(clamp(x, -1.0, 1.0)));
+    let latitude = abs(precise_asin(x));
     return 1.0 + params.moisture.w * cos(2.0 * params.wind.x * latitude);
 }
 
 fn wind_at(x: f32) -> vec2<f32> {
-    let latitude = asin(clamp(x, -1.0, 1.0));
+    let latitude = precise_asin(x);
     let a = abs(latitude) / HALF_PI;
     let s = sin(params.wind.x * PI * a);
     return vec2<f32>(-s, -sign(latitude) * params.wind.y * s);
@@ -730,7 +752,8 @@ fn rain_rate(x: f32, uphill: f32) -> f32 {
 
 // One semi-Lagrangian advection step. o0 carried (source), o1 carried (out),
 // o2/o3 wind east/north, o4 elevation, o5 temperature, o6 precipitation
-// (accumulated), o7/o8 slope east/north.
+// (in), o7/o8 slope east/north, o9 precipitation (out; ping-pong, no
+// in-place update).
 @compute @workgroup_size(256)
 fn moisture_step(@builtin(global_invocation_id) id: vec3<u32>) {
     let t = texel(id);
@@ -748,10 +771,15 @@ fn moisture_step(@builtin(global_invocation_id) id: vec3<u32>) {
     let spread = params.moisture.y;
     if spread > 0.0 {
         let side = 0.5 * step;
-        let lateral = cube_sample(src, normalize(source + frame[0] * side), false)
-            + cube_sample(src, normalize(source - frame[0] * side), false)
-            + cube_sample(src, normalize(source + frame[1] * side), false)
-            + cube_sample(src, normalize(source - frame[1] * side), false);
+        // One cube_sample call in a loop (same summation order as the four
+        // inlined calls): AMD's Dx12 driver gave run-to-run different results
+        // for the large, fully inlined form.
+        var lateral = 0.0;
+        for (var s = 0u; s < 4u; s = s + 1u) {
+            let axis = select(frame[0], frame[1], s >= 2u);
+            let offset = select(axis, -axis, (s & 1u) == 1u) * side;
+            lateral += cube_sample(src, normalize(source + offset), false);
+        }
         upwind = (1.0 - spread) * upwind + spread * 0.25 * lateral;
     }
     var evaporate = 0.0;
@@ -761,7 +789,7 @@ fn moisture_step(@builtin(global_invocation_id) id: vec3<u32>) {
     let uphill = w.x * read_f(o(7u), t.k) + w.y * read_f(o(8u), t.k);
     let rain = upwind * rain_rate(dot(d, params.pole.xyz), uphill);
     write_f(o(1u), t.k, upwind + evaporate - rain);
-    write_f(o(6u), t.k, read_f(o(6u), t.k) + rain);
+    write_f(o(9u), t.k, read_f(o(6u), t.k) + rain);
 }
 
 // o0 precipitation, o1 moisture (out).
@@ -978,8 +1006,9 @@ fn erode_route(@builtin(global_invocation_id) id: vec3<u32>) {
         if nb.distance <= 0.0 {
             continue;
         }
-        let s = (w - read_f(o(0u), nb.k)) / nb.distance;
-        if s > 0.0 {
+        let drop = w - read_f(o(0u), nb.k);
+        if drop > ROUTE_TIE_M {
+            let s = drop / nb.distance;
             let sp = pow(s, params.erosion2.w);
             total += sp;
             weighted += sp * s;
@@ -1013,8 +1042,9 @@ fn erode_accumulate(@builtin(global_invocation_id) id: vec3<u32>) {
         if wm < 0.0 || total <= 0.0 {
             continue;
         }
-        let s = (wm - w) / nb.distance;
-        if s > 0.0 {
+        let drop = wm - w;
+        if drop > ROUTE_TIE_M {
+            let s = drop / nb.distance;
             let share = pow(s, params.erosion2.w) / total;
             q += read_f(o(2u), nb.k) * share;
             qs += read_f(o(3u), nb.k) * share;
@@ -1214,65 +1244,78 @@ fn lw_bump(x: f32, a: f32, b: f32) -> f32 {
     return 0.0;
 }
 
-// One rule at word `code` of the set (validated on the CPU).
+// Rule stack (`expr::MAX_RULE_STACK` = 16) in four vec4 registers with
+// select-based access: FXC (Dx12) miscompiled the runtime-indexed local
+// array of the interpreter loop (whole weight lanes came out zero).
+var<private> lw_stack: array<vec4<f32>, 4>;
+
+fn lw_get(i: u32) -> f32 {
+    let lo = select(lw_stack[0], lw_stack[1], i >= 4u);
+    let hi = select(lw_stack[2], lw_stack[3], i >= 12u);
+    let v = select(lo, hi, i >= 8u);
+    let j = i & 3u;
+    return select(select(v.x, v.y, j == 1u), select(v.z, v.w, j == 3u), j >= 2u);
+}
+
+fn lw_set(i: u32, value: f32) {
+    let lane = vec4<bool>((i & 3u) == 0u, (i & 3u) == 1u, (i & 3u) == 2u, (i & 3u) == 3u);
+    let row = i >> 2u;
+    lw_stack[0] = select(lw_stack[0], vec4<f32>(value), lane & vec4<bool>(row == 0u));
+    lw_stack[1] = select(lw_stack[1], vec4<f32>(value), lane & vec4<bool>(row == 1u));
+    lw_stack[2] = select(lw_stack[2], vec4<f32>(value), lane & vec4<bool>(row == 2u));
+    lw_stack[3] = select(lw_stack[3], vec4<f32>(value), lane & vec4<bool>(row == 3u));
+}
+
+// One rule at word `code` of the set (validated on the CPU, `expr::evaluate`).
+// The loop body is straight-line: every opcode's result is computed and the
+// right one selected, with one stack write and no `continue`/`switch`. FXC
+// (Dx12) mistranslated the branching form (the stack top stopped advancing).
+// Reads below the stack bottom wrap to high indices and are never selected.
 fn lw_rule(code: u32) -> f32 {
-    var stack: array<f32, 16>;
     var top = 0u;
     var at = code;
     for (var i = 0u; i < 64u; i = i + 1u) {
         let word = landform_rules[at];
-        at = at + 1u;
         let opcode = word & 255u;
         if opcode == 0u {
-            return stack[0];
+            break;
         }
-        if opcode == 1u {
-            stack[top] = bitcast<f32>(landform_rules[at]);
-            at = at + 1u;
-            top = top + 1u;
-            continue;
+        let constant = opcode == 1u;
+        let field = opcode == 2u;
+        let push = constant || field;
+        let unary = opcode == 7u || opcode == 10u;
+        let ternary = opcode >= 12u;
+        let x1 = lw_get(top - 1u);
+        let x2 = lw_get(top - 2u);
+        let x3 = lw_get(top - 3u);
+        // Pushes: a constant (next word) or a field.
+        let f = min(word >> 8u, 11u);
+        var value = bitcast<f32>(landform_rules[at + 1u]);
+        for (var k = 0u; k < 12u; k = k + 1u) {
+            value = select(value, lw_fields[k], field && k == f);
         }
-        if opcode == 2u {
-            stack[top] = lw_fields[min(word >> 8u, 11u)];
-            top = top + 1u;
-            continue;
-        }
-        if opcode == 7u || opcode == 10u {
-            let a = stack[top - 1u];
-            stack[top - 1u] = select(abs(a), -a, opcode == 7u);
-            continue;
-        }
-        if opcode >= 12u {
-            let a = stack[top - 3u];
-            let b = stack[top - 2u];
-            let c = stack[top - 1u];
-            var r = 0.0;
-            switch opcode {
-                case 12u: { r = min(max(a, b), c); }
-                case 13u: { r = a + (b - a) * c; }
-                case 14u: { r = lw_smoothstep(a, b, c); }
-                default: { r = lw_bump(a, b, c); }
-            }
-            top = top - 2u;
-            stack[top - 1u] = r;
-            continue;
-        }
-        let a = stack[top - 2u];
-        let b = stack[top - 1u];
-        var r = 0.0;
-        switch opcode {
-            case 3u: { r = a + b; }
-            case 4u: { r = a - b; }
-            case 5u: { r = a * b; }
-            case 6u: { r = select(0.0, a / b, b != 0.0); }
-            case 8u: { r = min(a, b); }
-            case 9u: { r = max(a, b); }
-            default: { r = select(0.0, pow(a, b), a > 0.0); }
-        }
-        top = top - 1u;
-        stack[top - 1u] = r;
+        // Unary: negate (7), abs (10).
+        let un = select(abs(x1), -x1, opcode == 7u);
+        // Ternary on (x3, x2, x1): clamp, mix, smoothstep, bump.
+        var tern = lw_bump(x3, x2, x1);
+        tern = select(tern, lw_smoothstep(x3, x2, x1), opcode == 14u);
+        tern = select(tern, x3 + (x2 - x3) * x1, opcode == 13u);
+        tern = select(tern, min(max(x3, x2), x1), opcode == 12u);
+        // Binary on (x2, x1).
+        var bin = select(0.0, pow(x2, x1), x2 > 0.0);
+        bin = select(bin, max(x2, x1), opcode == 9u);
+        bin = select(bin, min(x2, x1), opcode == 8u);
+        bin = select(bin, select(0.0, x2 / x1, x1 != 0.0), opcode == 6u);
+        bin = select(bin, x2 * x1, opcode == 5u);
+        bin = select(bin, x2 - x1, opcode == 4u);
+        bin = select(bin, x2 + x1, opcode == 3u);
+        let r = select(select(select(bin, tern, ternary), un, unary), value, push);
+        let slot = select(select(select(top - 2u, top - 3u, ternary), top - 1u, unary), top, push);
+        lw_set(slot, r);
+        top = select(select(select(top - 1u, top - 2u, ternary), top, unary), top + 1u, push);
+        at = at + select(1u, 2u, constant);
     }
-    return 0.0;
+    return lw_get(0u);
 }
 
 @compute @workgroup_size(256)
@@ -1304,9 +1347,9 @@ fn landform_weights(@builtin(global_invocation_id) id: vec3<u32>) {
     // Set header: version, count, flags (bit 0 normalise), fallback, offsets.
     let count = min(landform_rules[1], 4u);
     let fallback = landform_rules[3];
-    // A local array, not a vec4: FXC (Dx12) cannot write vector components
-    // through a runtime index (X3500).
-    var lanes = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
+    // Lanes written by select, not a runtime index: FXC (Dx12) rejects
+    // runtime-indexed vector component writes (X3500).
+    var w = vec4<f32>(0.0);
     var sum = 0.0;
     for (var i = 0u; i < count; i = i + 1u) {
         var r = lw_rule(landform_rules[4u + i]);
@@ -1314,12 +1357,11 @@ fn landform_weights(@builtin(global_invocation_id) id: vec3<u32>) {
             r = 0.0;
         }
         r = min(r, 1.0);
-        lanes[i] = r;
+        w = select(w, vec4<f32>(r), vec4<u32>(0u, 1u, 2u, 3u) == vec4<u32>(i));
         sum += r;
     }
     let lift = max(0.0625 - sum, 0.0);
-    lanes[min(fallback, 3u)] += lift;
-    var w = vec4<f32>(lanes[0], lanes[1], lanes[2], lanes[3]);
+    w += select(vec4<f32>(0.0), vec4<f32>(lift), vec4<u32>(0u, 1u, 2u, 3u) == vec4<u32>(min(fallback, 3u)));
     if (landform_rules[2] & 1u) != 0u {
         w = w / (sum + lift);
     }

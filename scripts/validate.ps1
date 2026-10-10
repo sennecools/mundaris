@@ -10,11 +10,11 @@ remain separate. Historical acceptance/evidence scripts are preserved unchanged.
 param(
     [string] $OutputDirectory,
     [switch] $IncludeGpu,
-    [ValidateSet('format','workspace-check','clippy-all-features','clippy-default','tests-debug','tests-release','rustdoc','long-orbits','native_close_surface','native_full_frame','developer_interface','developer_bridge','developer_scenarios')]
+    [ValidateSet('format','workspace-check','clippy-all-features','clippy-default','tests-debug','tests-release','rustdoc','long-orbits','native_close_surface','native_full_frame','developer_interface','developer_bridge','developer_scenarios','gpu-terrain-dx12')]
     [string[]] $Only = @()
 )
 $ErrorActionPreference = 'Stop'
-if (!$IncludeGpu -and @($Only | Where-Object { $_ -in @('native_close_surface','native_full_frame','developer_interface','developer_scenarios') }).Count -gt 0) {
+if (!$IncludeGpu -and @($Only | Where-Object { $_ -in @('native_close_surface','native_full_frame','developer_interface','developer_scenarios','gpu-terrain-dx12') }).Count -gt 0) {
     throw 'Selected GPU checks require -IncludeGpu; refusing an empty/unexecuted selection.'
 }
 $repo = Split-Path -Parent $PSScriptRoot
@@ -66,6 +66,17 @@ try {
     if ($IncludeGpu) {
         foreach ($test in @('native_close_surface','native_full_frame','developer_interface','developer_scenarios')) {
             Run-Check $test @('test','--locked','--release','-p','astrum_app','--all-features','--test',$test,'--','--ignored','--nocapture')
+        }
+        # Terrain GPU authority on Dx12 as well as the default backend. Needs
+        # Microsoft's DXC (ASTRUM_DXC_DIR or target/third-party/dxc-*; see
+        # GpuContext). gpu_terrain_oracle and gpu_terrain_colour join once
+        # their Dx12 differences (landform warp, ground layers) are fixed.
+        if ($IsWindows -or $env:OS -eq 'Windows_NT') {
+            $oldBackend = $env:WGPU_BACKEND
+            try {
+                $env:WGPU_BACKEND = 'dx12'
+                Run-Check 'gpu-terrain-dx12' @('test','--locked','-p','astrum_app','--test','gpu_tier_a','--test','gpu_terrain_seams','--test','gpu_terrain_overlays')
+            } finally { $env:WGPU_BACKEND = $oldBackend }
         }
     }
 } finally {

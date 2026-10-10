@@ -11,7 +11,14 @@ use std::sync::Arc;
 /// Windows). With neither, the test fails unless `ASTRUM_SKIP_GPU_TESTS=1`
 /// explicitly allows skipping, so a missing GPU is never a silent pass.
 pub fn gpu() -> Option<GpuContext> {
-    if let Ok(context) = GpuContext::new().or_else(|_| GpuContext::new_software()) {
+    // ASTRUM_SOFTWARE_GPU=1 forces the software adapter (with
+    // WGPU_BACKEND=dx12 on Windows: WARP), to tell driver behaviour from ours.
+    let context = if std::env::var("ASTRUM_SOFTWARE_GPU").as_deref() == Ok("1") {
+        GpuContext::new_software()
+    } else {
+        GpuContext::new().or_else(|_| GpuContext::new_software())
+    };
+    if let Ok(context) = context {
         let info = context.adapter.get_info();
         println!("adapter: {} ({:?})", info.name, info.backend);
         return Some(context);

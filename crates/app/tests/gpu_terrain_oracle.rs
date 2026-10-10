@@ -141,6 +141,20 @@ fn gpu_tiles_match_the_cpu_oracle_within_documented_tolerances() {
             nodes.sort_by_key(|n| (n.level(), n.face() as u8, n.coordinates()));
             nodes.dedup();
         }
+        // ASTRUM_ORACLE_BODY=<name> and ASTRUM_ORACLE_NODE="face,level,x,y"
+        // (face 0..5 in CubeFace::ALL order) narrow a diagnostic run, e.g. one
+        // tile on a slow software adapter.
+        if std::env::var("ASTRUM_ORACLE_BODY").is_ok_and(|b| b != body.name()) {
+            checked_bodies += 1;
+            continue;
+        }
+        if let Ok(spec) = std::env::var("ASTRUM_ORACLE_NODE") {
+            let v: Vec<u32> = spec.split(',').map(|x| x.trim().parse().unwrap()).collect();
+            nodes = vec![
+                CubePatchAddress::try_new(CubeFace::ALL[v[0] as usize], v[1] as u8, v[2], v[3])
+                    .unwrap(),
+            ];
+        }
         let tiles = common::produce(&context, config, &recipe, radius, &nodes);
         let (mut worst_height, mut worst_normal_1x, mut worst_normal_2x) = (0.0f64, 0.0f64, 0.0f64);
         // (ratio to tolerance, node, |dh|, slope at that texel)
