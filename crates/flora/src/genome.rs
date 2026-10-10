@@ -37,6 +37,10 @@ pub struct SpeciesFile {
     /// (`scatter::crown_areas`), set by `measure_crowns`. Not stored.
     #[serde(skip)]
     pub crown: Option<[f64; 2]>,
+    /// Mean top-view albedo of that LOD0 (`scatter::crown_top_color`): the
+    /// far tint colour. Not stored.
+    #[serde(skip)]
+    pub crown_color: Option<[f64; 3]>,
     /// Foliage build, from the planet file (`palette::apply`). Not stored.
     #[serde(skip)]
     pub style: FoliageStyle,

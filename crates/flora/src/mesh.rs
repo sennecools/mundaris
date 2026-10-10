@@ -905,7 +905,7 @@ fn puffs(m: &mut Mesh, sk: &Skeleton, sp: &SpeciesFile, seed: u64, count: usize,
             }
             let pos = centre + local;
             let crown_n = (pos - crown).normalize_or(DVec3::Z);
-            let nrm = (0.45 * *u + 0.55 * crown_n + 0.15 * DVec3::Z).normalize();
+            let nrm = (0.5 * *u + 0.5 * crown_n).normalize();
             let col = gradient(pos, nrm, crown_n);
             // Faces turned into the crown are darker (cheap AO).
             let ao = (0.6 + 0.4 * (0.5 + 0.5 * u.dot(out_dir))) as f32;
@@ -936,7 +936,7 @@ fn puffs(m: &mut Mesh, sk: &Skeleton, sp: &SpeciesFile, seed: u64, count: usize,
             let nrm_card = d.cross(fwd).cross(fwd).normalize_or(d) * -1.0;
             let side = nrm_card.cross(fwd);
             let crown_n = (anchor - crown).normalize_or(DVec3::Z);
-            let shade_n = (0.45 * d + 0.55 * crown_n + 0.15 * DVec3::Z).normalize();
+            let shade_n = (0.5 * d + 0.5 * crown_n).normalize();
             let col = gradient(anchor + d * leaf * 0.5, shade_n, crown_n);
             let b = m.vertices.len() as u32;
             for v in &shape.positions {

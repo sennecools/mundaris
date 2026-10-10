@@ -118,17 +118,24 @@ pub fn load_species_for_body(
     Ok(species)
 }
 
-/// Sets each species' crown areas from its grown LOD0 (variant 0, scale 1):
-/// the far canopy tint's coverage (scatter::crown_m2). Grows in parallel.
+/// Sets each species' crown areas and top-view colour from its grown LOD0
+/// (variant 0, scale 1): the far canopy tint's coverage
+/// (scatter::crown_m2) and colour (scatter::canopy_color). Grows in parallel.
 pub fn measure_crowns(species: &mut [SpeciesFile], kit: &Kit) {
-    let crowns: Vec<[f64; 2]> = std::thread::scope(|scope| {
+    let crowns: Vec<([f64; 2], [f64; 3])> = std::thread::scope(|scope| {
         let handles: Vec<_> = species
             .iter()
-            .map(|sp| scope.spawn(move || scatter::crown_areas(&grow_meshes(sp, kit, variant_seed(sp, 0)).1[0])))
+            .map(|sp| {
+                scope.spawn(move || {
+                    let lod0 = &grow_meshes(sp, kit, variant_seed(sp, 0)).1[0];
+                    (scatter::crown_areas(lod0), scatter::crown_top_color(lod0))
+                })
+            })
             .collect();
         handles.into_iter().map(|h| h.join().expect("crown growth thread")).collect()
     });
-    for (sp, c) in species.iter_mut().zip(crowns) {
-        sp.crown = Some(c);
+    for (sp, (areas, colour)) in species.iter_mut().zip(crowns) {
+        sp.crown = Some(areas);
+        sp.crown_color = Some(colour);
     }
 }
