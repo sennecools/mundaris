@@ -306,13 +306,16 @@ pub struct AtlasWorldSurface {
     pub climate_moisture: f32,
     /// Coast coverage width k (multiples of the unresolved relief RMS).
     pub coast_k: f32,
+    /// Ground palette words (`astrum_world::terrain::material_rules::
+    /// GroundPalette::words`): material colours, strata contrast, soil style.
+    pub ground: [f32; 24],
     /// Packed landform set (`astrum_world::terrain::landform::gpu`), appended
     /// after the LUT; empty for macro-only bodies.
     pub landforms: Vec<u32>,
 }
 
 /// Words before the LUT texels in the packed surface buffer.
-const WORLD_SURFACE_HEADER_WORDS: usize = 24;
+const WORLD_SURFACE_HEADER_WORDS: usize = 48;
 
 impl AtlasWorldSurface {
     /// Packed storage words (`world_surface` in the producer shader).
@@ -348,6 +351,7 @@ impl AtlasWorldSurface {
             f(self.water_deep[2]),
             0,
         ];
+        words.extend(self.ground.map(f));
         debug_assert_eq!(words.len(), WORLD_SURFACE_HEADER_WORDS);
         words.extend(
             self.lut_srgb
@@ -543,6 +547,9 @@ pub struct AtlasWater {
     pub deep: [f32; 3],
     /// Depth at which the colour is `1 - 1/e` of the way to `deep`.
     pub depth_scale_m: f32,
+    /// PROTOTYPE (M4 Surface): contrast of the draw-time ground detail on
+    /// the land of this world body (1 = physical, lower = stylised ground).
+    pub ground_detail: f32,
 }
 
 /// One drawn node. Transforms are camera-relative and already narrowed.
@@ -3413,7 +3420,7 @@ fn pack_instance(out: &mut Vec<u8>, instance: &AtlasInstance) {
         [
             if instance.water.is_some() { 1.0 } else { 0.0 },
             water.depth_scale_m,
-            0.0,
+            water.ground_detail,
             0.0,
         ],
         [water.shallow[0], water.shallow[1], water.shallow[2], 0.0],

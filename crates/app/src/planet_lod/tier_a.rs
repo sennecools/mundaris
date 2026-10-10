@@ -171,6 +171,9 @@ pub fn surface(field: &WorldField) -> anyhow::Result<AtlasWorldSurface> {
             .map_or(0.0, |c| c.temperature_c as f32),
         climate_moisture: look.climate.as_ref().map_or(0.0, |c| c.moisture as f32),
         coast_k: field.inputs().params.coast_coverage_k as f32,
+        ground: astrum_world::terrain::material_rules::GroundPalette::PHYSICAL
+            .blend(&look.ground, field.inputs().params.ground_style as f32)
+            .words(),
         landforms,
     })
 }

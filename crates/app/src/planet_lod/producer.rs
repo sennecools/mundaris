@@ -244,6 +244,12 @@ pub fn water_look(recipe: &ProducerRecipe) -> Option<astrum_renderer::AtlasWater
         shallow: look.water_shallow.map(|c| c as f32),
         deep: look.water_deep.map(|c| c as f32),
         depth_scale_m: look.water_depth_scale_m as f32,
+        ground_detail: astrum_world::terrain::material_rules::GroundPalette::PHYSICAL
+            .blend(
+                &look.ground,
+                world.field.inputs().params.ground_style as f32,
+            )
+            .detail,
     })
 }
 

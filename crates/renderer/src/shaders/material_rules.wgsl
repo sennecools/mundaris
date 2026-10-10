@@ -1,7 +1,7 @@
 // Surface material rules (pipeline §10.1, §10.4; milestone M4).
-// PROTOTYPE: standalone mirror of `astrum_world::terrain::material_rules`
-// (crates/world/src/terrain/material_rules.rs). Not included by any pipeline
-// yet. f32 only; keep constants and formulas in step with the Rust file.
+// PROTOTYPE: mirror of `astrum_world::terrain::material_rules`
+// (crates/world/src/terrain/material_rules.rs), included by the atlas
+// producer. f32 only; keep constants and formulas in step with the Rust file.
 // Slopes are angles from horizontal in radians.
 
 const MR_DEG: f32 = 0.017453292;
@@ -100,4 +100,100 @@ fn strata_colour_factor(tone: f32, visibility: f32) -> f32 {
 // Mean-matching (§10.2): detail albedo re-centred on the target colour.
 fn tint_detail(detail: vec3<f32>, detail_mean: vec3<f32>, target_colour: vec3<f32>) -> vec3<f32> {
     return detail / max(detail_mean, vec3<f32>(1.0e-4)) * target_colour;
+}
+
+// Ground palette (material_rules::GroundPalette): linear material colours,
+// strata contrast and the soil style pass in OKLCh.
+struct GroundPalette {
+    rock: vec3<f32>,
+    scree: vec3<f32>,
+    sand: vec3<f32>,
+    wet_sediment: vec3<f32>,
+    strata: f32,
+    soil_amount: f32,
+    chroma_gain: f32,
+    chroma_max: f32,
+    soften: f32,
+    lightness_mid: f32,
+    hue_pull: f32,
+    anchors: u32,
+    hue_anchors_deg: vec3<f32>,
+}
+
+const MR_PI: f32 = 3.14159265;
+
+fn mr_cbrt(x: f32) -> f32 {
+    return pow(max(x, 0.0), 1.0 / 3.0);
+}
+
+fn linear_to_oklab(c: vec3<f32>) -> vec3<f32> {
+    let l = mr_cbrt(0.41222146 * c.x + 0.53633255 * c.y + 0.05144599 * c.z);
+    let m = mr_cbrt(0.2119035 * c.x + 0.6806995 * c.y + 0.10739696 * c.z);
+    let s = mr_cbrt(0.08830246 * c.x + 0.28171885 * c.y + 0.6299787 * c.z);
+    return vec3<f32>(
+        0.21045426 * l + 0.7936178 * m - 0.004072047 * s,
+        1.9779985 * l - 2.4285922 * m + 0.4505937 * s,
+        0.025904037 * l + 0.78277177 * m - 0.80867577 * s,
+    );
+}
+
+fn oklab_to_linear(c: vec3<f32>) -> vec3<f32> {
+    let l0 = c.x + 0.39633778 * c.y + 0.21580376 * c.z;
+    let m0 = c.x - 0.105561346 * c.y - 0.06385417 * c.z;
+    let s0 = c.x - 0.08948418 * c.y - 1.2914855 * c.z;
+    let l = l0 * l0 * l0;
+    let m = m0 * m0 * m0;
+    let s = s0 * s0 * s0;
+    return vec3<f32>(
+        4.0767417 * l - 3.3077116 * m + 0.23096994 * s,
+        -1.268438 * l + 2.6097574 * m - 0.34131938 * s,
+        -0.0041960863 * l - 0.7034186 * m + 1.7076147 * s,
+    );
+}
+
+fn mr_in_gamut(c: vec3<f32>) -> bool {
+    return all(c >= vec3<f32>(0.0)) && all(c <= vec3<f32>(1.0));
+}
+
+// Signed angle difference in -π..π.
+fn mr_wrap(d: f32) -> f32 {
+    let x = d + 3.0 * MR_PI;
+    return x - 2.0 * MR_PI * floor(x / (2.0 * MR_PI)) - MR_PI;
+}
+
+// Soil style pass (material_rules::style_soil) on a linear colour.
+fn style_soil(colour: vec3<f32>, p: GroundPalette) -> vec3<f32> {
+    if p.soil_amount <= 0.0 {
+        return colour;
+    }
+    let lab = linear_to_oklab(colour);
+    var hue = atan2(lab.z, lab.y);
+    let chroma = min(length(lab.yz) * p.chroma_gain, p.chroma_max);
+    var pull = 0.0;
+    var nearest = 4.0;
+    for (var k = 0u; k < min(p.anchors, 3u); k = k + 1u) {
+        let d = mr_wrap(p.hue_anchors_deg[k] * MR_DEG - hue);
+        if abs(d) < nearest {
+            nearest = abs(d);
+            pull = d;
+        }
+    }
+    hue += p.hue_pull * pull;
+    let lightness = lab.x + (p.lightness_mid - lab.x) * p.soften;
+    let dir = vec2<f32>(cos(hue), sin(hue)) * chroma;
+    var styled = oklab_to_linear(vec3<f32>(lightness, dir));
+    if !mr_in_gamut(styled) {
+        var lo = 0.0;
+        var hi = 1.0;
+        for (var i = 0; i < 12; i = i + 1) {
+            let mid = 0.5 * (lo + hi);
+            if mr_in_gamut(oklab_to_linear(vec3<f32>(lightness, dir * mid))) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        styled = clamp(oklab_to_linear(vec3<f32>(lightness, dir * lo)), vec3<f32>(0.0), vec3<f32>(1.0));
+    }
+    return colour + (styled - colour) * p.soil_amount;
 }

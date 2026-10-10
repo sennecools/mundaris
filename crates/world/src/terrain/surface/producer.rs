@@ -412,6 +412,10 @@ impl ProducerRecipe {
             flow as f32,
             tint.map(|c| c as f32),
             warp as f32,
+            &crate::terrain::material_rules::GroundPalette::PHYSICAL.blend(
+                &look.ground,
+                recipe.field.inputs().params.ground_style as f32,
+            ),
         );
         Ok(Some(std::array::from_fn(|k| {
             let g = f64::from(ground[k]);

@@ -162,6 +162,29 @@
         deep_linear: (0.004, 0.014, 0.035),
         depth_scale_m: 120.0,
     ),
+    // Ground materials (M4; art direction 2026-10-10: stylised ground that
+    // sits with the flora). style 0 = the physical palette, 1 = this one
+    // (planet editor: Ground). Rocks cool blue-violet grey (echoing the
+    // stylised bark), pale warm sand, soft saturated soils pulled toward
+    // Rust's flora families (amber-olive 85°, green 135° in OKLCh), softer
+    // strata and less draw-time texture noise.
+    ground: (
+        style: 1.0,
+        stylised: (
+            rock_linear: (0.214, 0.187, 0.274),
+            scree_linear: (0.343, 0.285, 0.343),
+            sand_linear: (0.730, 0.539, 0.296),
+            wet_sediment_linear: (0.059, 0.084, 0.073),
+            strata: 0.6,
+            detail: 0.35,
+            soil_chroma_gain: 1.5,
+            soil_chroma_max: 0.13,
+            soil_soften: 0.25,
+            soil_lightness: 0.52,
+            soil_hue_pull: 0.3,
+            soil_hue_anchors_deg: [85.0, 135.0],
+        ),
+    ),
     // Measured for the canonical seed; gpu_terrain_colour.rs checks it (0.005).
     average_colour: (0.127, 0.130, 0.117),
 )

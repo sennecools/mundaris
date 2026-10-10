@@ -393,6 +393,110 @@ fn colour_valid(c: (f32, f32, f32)) -> bool {
     [c.0, c.1, c.2].iter().all(|v| (0.0..=1.0).contains(v))
 }
 
+/// Ground materials (M4 Surface; art direction 2026-10-10): `style` blends
+/// the physical palette (0) toward the stylised one (1), soft and saturated
+/// colours that sit with the planet's flora. Planet editor: Ground.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct GroundLook {
+    pub style: f64,
+    pub stylised: StylisedGround,
+}
+
+/// The stylised end of the ground palette (`material_rules::GroundPalette`):
+/// linear material colours, strata contrast and the soil style pass.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StylisedGround {
+    pub rock_linear: (f32, f32, f32),
+    pub scree_linear: (f32, f32, f32),
+    pub sand_linear: (f32, f32, f32),
+    pub wet_sediment_linear: (f32, f32, f32),
+    pub strata: f32,
+    /// Draw-time ground detail contrast (1 = physical).
+    pub detail: f32,
+    pub soil_chroma_gain: f32,
+    pub soil_chroma_max: f32,
+    pub soil_soften: f32,
+    pub soil_lightness: f32,
+    pub soil_hue_pull: f32,
+    /// At most three hue anchors (OKLCh degrees).
+    pub soil_hue_anchors_deg: Vec<f32>,
+}
+
+impl Default for StylisedGround {
+    /// The physical palette (style then changes nothing).
+    fn default() -> Self {
+        let p = crate::terrain::material_rules::GroundPalette::PHYSICAL;
+        let t = |c: [f32; 3]| (c[0], c[1], c[2]);
+        Self {
+            rock_linear: t(p.rock),
+            scree_linear: t(p.scree),
+            sand_linear: t(p.sand),
+            wet_sediment_linear: t(p.wet_sediment),
+            strata: 1.0,
+            detail: 1.0,
+            soil_chroma_gain: 1.0,
+            soil_chroma_max: 0.4,
+            soil_soften: 0.0,
+            soil_lightness: 0.5,
+            soil_hue_pull: 0.0,
+            soil_hue_anchors_deg: Vec::new(),
+        }
+    }
+}
+
+impl GroundLook {
+    fn valid(&self) -> bool {
+        let s = &self.stylised;
+        (0.0..=1.0).contains(&self.style)
+            && colour_valid(s.rock_linear)
+            && colour_valid(s.scree_linear)
+            && colour_valid(s.sand_linear)
+            && colour_valid(s.wet_sediment_linear)
+            && (0.0..=2.0).contains(&s.strata)
+            && (0.0..=1.0).contains(&s.detail)
+            && (0.0..=4.0).contains(&s.soil_chroma_gain)
+            && (0.0..=0.4).contains(&s.soil_chroma_max)
+            && (0.0..=1.0).contains(&s.soil_soften)
+            && (0.0..=1.0).contains(&s.soil_lightness)
+            && (0.0..=1.0).contains(&s.soil_hue_pull)
+            && s.soil_hue_anchors_deg.len() <= 3
+            && s.soil_hue_anchors_deg
+                .iter()
+                .all(|h| (0.0..=360.0).contains(h))
+    }
+
+    /// The stylised palette (style 1).
+    pub fn stylised_palette(&self) -> crate::terrain::material_rules::GroundPalette {
+        use crate::terrain::material_rules::{GroundPalette, SoilStyle};
+        let s = &self.stylised;
+        let c = |v: (f32, f32, f32)| [v.0, v.1, v.2];
+        let mut anchors = [0.0; 3];
+        for (a, h) in anchors.iter_mut().zip(&s.soil_hue_anchors_deg) {
+            *a = *h;
+        }
+        GroundPalette {
+            rock: c(s.rock_linear),
+            scree: c(s.scree_linear),
+            sand: c(s.sand_linear),
+            wet_sediment: c(s.wet_sediment_linear),
+            strata: s.strata,
+            detail: s.detail,
+            soil: SoilStyle {
+                amount: 1.0,
+                chroma_gain: s.soil_chroma_gain,
+                chroma_max: s.soil_chroma_max,
+                soften: s.soil_soften,
+                lightness_mid: s.soil_lightness,
+                hue_pull: s.soil_hue_pull,
+                anchors: s.soil_hue_anchors_deg.len() as u32,
+                hue_anchors_deg: anchors,
+            },
+        }
+    }
+}
+
 /// Authored archetype (`content/archetypes/*.ron`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -420,6 +524,9 @@ pub struct PlanetArchetype {
     pub snow: SnowRule,
     pub climate_detail: ClimateDetail,
     pub water: WaterLook,
+    /// Ground material palette, physical to stylised (M4 Surface).
+    #[serde(default)]
+    pub ground: GroundLook,
     /// Linear colour of the whole body seen as a few pixels (§6.1).
     pub average_colour: (f32, f32, f32),
 }
@@ -491,6 +598,7 @@ impl PlanetArchetype {
             && self.water.depth_scale_m.is_finite()
             && self.water.depth_scale_m > 0.0
             && colour_valid(self.average_colour)
+            && self.ground.valid()
             && self.shape_valid();
         if ok {
             Ok(())
@@ -617,6 +725,7 @@ impl PlanetArchetype {
             boundary_clamp_m: 1000.0 * tc.boundary_clamp_km,
             junction_blend_m: 1000.0 * tc.junction_blend_km,
             coast_coverage_k: self.water.coast_coverage_k,
+            ground_style: self.ground.style,
             hardness_crystalline: hd.crystalline,
             hardness_volcanic: hd.volcanic,
             hardness_sedimentary: hd.sedimentary,
@@ -776,6 +885,8 @@ pub struct PlanetParams {
     pub boundary_clamp_m: f64,
     pub junction_blend_m: f64,
     pub coast_coverage_k: f64,
+    /// Ground palette, 0 physical .. 1 stylised (`GroundLook`).
+    pub ground_style: f64,
     // Hardness (M2): see `HardnessRanges`.
     pub hardness_crystalline: f64,
     pub hardness_volcanic: f64,
@@ -876,6 +987,7 @@ pub const PARAM_FIELDS: &[ParamField] = fields! {
     "Tectonics": orogen_roughness: 0.0, 1.0;
     "Tectonics": junction_blend_m: 50.0, 5.0e3, "m";
     "Coast": coast_coverage_k: 0.0, 4.0;
+    "Ground": ground_style: 0.0, 1.0;
     "Rock hardness": hardness_noise: 0.0, 0.5;
     "Rain shadow": wind_deflection: 0.0, 1.0;
     "Rain shadow": orographic_rain: 0.0, 1.0;
@@ -1002,6 +1114,7 @@ impl PlanetParams {
                     self.boundary_clamp_m.to_bits(),
                     self.junction_blend_m.to_bits(),
                     self.coast_coverage_k.to_bits(),
+                    self.ground_style.to_bits(),
                     self.hardness_crystalline.to_bits(),
                     self.hardness_volcanic.to_bits(),
                     self.hardness_sedimentary.to_bits(),

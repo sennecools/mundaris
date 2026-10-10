@@ -627,7 +627,7 @@ fn detail_fbm(local: vec3<f32>) -> vec4<f32> {
 // Climate lookups (here and in page_climate) stay on the absolute f32
 // direction: unlike elevation, colour and overlays are insensitive to the
 // ~1e-7 R (sub-centimetre) sample offset.
-const SURFACE_LUT: u32 = 24u;
+const SURFACE_LUT: u32 = 48u;
 
 fn surface_f32(i: u32) -> f32 {
     return bitcast<f32>(world_surface[i]);
@@ -698,13 +698,30 @@ fn climate_detail(local: vec3<f32>) -> vec2<f32> {
     return sum * vec2<f32>(surface_f32(1u), surface_f32(2u));
 }
 
-// PROTOTYPE (M4 Surface): linear colours of rock and loose materials and the
-// strata thickness, as `material_rules::surface_colour`.
-const ROCK_LINEAR: vec3<f32> = vec3<f32>(0.17, 0.15, 0.13);
-const SCREE_LINEAR: vec3<f32> = vec3<f32>(0.24, 0.22, 0.2);
-const SAND_LINEAR: vec3<f32> = vec3<f32>(0.42, 0.35, 0.24);
-const WET_SEDIMENT_LINEAR: vec3<f32> = vec3<f32>(0.09, 0.085, 0.065);
+// Ground palette (M4 Surface): surface words 24..48 as
+// `material_rules::GroundPalette::words` (physical blended toward the
+// archetype's stylised palette by the planet's ground style).
+const SURFACE_GROUND: u32 = 24u;
 const STRATA_PERIOD_M: f32 = 40.0;
+
+fn ground_palette() -> GroundPalette {
+    var p: GroundPalette;
+    let g = SURFACE_GROUND;
+    p.rock = surface_vec3(g);
+    p.scree = surface_vec3(g + 3u);
+    p.sand = surface_vec3(g + 6u);
+    p.wet_sediment = surface_vec3(g + 9u);
+    p.strata = surface_f32(g + 12u);
+    p.soil_amount = surface_f32(g + 13u);
+    p.chroma_gain = surface_f32(g + 14u);
+    p.chroma_max = surface_f32(g + 15u);
+    p.soften = surface_f32(g + 16u);
+    p.lightness_mid = surface_f32(g + 17u);
+    p.hue_pull = surface_f32(g + 18u);
+    p.anchors = u32(surface_f32(g + 19u));
+    p.hue_anchors_deg = surface_vec3(g + 20u);
+    return p;
+}
 
 // Ground colour under the snow rule (mirrors material_rules::surface_colour).
 fn surface_colour(height: f32, slope: f32, moisture: f32, aux: vec3<f32>, soil: vec3<f32>, warp: f32) -> vec3<f32> {
@@ -718,9 +735,11 @@ fn surface_colour(height: f32, slope: f32, moisture: f32, aux: vec3<f32>, soil: 
     input.sediment = aux.y;
     input.flow = aux.z;
     let w = material_weights(input);
-    let rock = strata_colour_factor(strata_tone(height, warp, STRATA_PERIOD_M), strata_visibility(slope, aux.x));
-    return w.bedrock * ROCK_LINEAR * rock + w.scree * SCREE_LINEAR + (w.soil + w.snow) * soil
-        + w.sand * SAND_LINEAR + w.wet_sediment * WET_SEDIMENT_LINEAR;
+    let p = ground_palette();
+    let rock = strata_colour_factor(strata_tone(height, warp, STRATA_PERIOD_M), strata_visibility(slope, aux.x) * p.strata);
+    let styled = style_soil(soil, p);
+    return w.bedrock * p.rock * rock + w.scree * p.scree + (w.soil + w.snow) * styled
+        + w.sand * p.sand + w.wet_sediment * p.wet_sediment;
 }
 
 // Hardness, sediment and flow (aux0 bytes 1..3) of the node's mip at `d`,

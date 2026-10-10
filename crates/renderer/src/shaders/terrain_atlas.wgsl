@@ -16,7 +16,7 @@ struct Instance {
     parent: vec4<f32>,      // layer, rect origin xy, rect scale
     morph: vec4<f32>,       // morph start, morph end (view distance m), arrival fade, skirt depth m
     material: vec4<f32>,    // linear albedo rgb, w = BRDF (0 Lambert, 1 lunar-Lambert)
-    surface: vec4<f32>,     // x = flat ocean at height 0 (M1), y = water depth scale m
+    surface: vec4<f32>,     // x = flat ocean at height 0 (M1), y = water depth scale m, z = ground detail contrast
     water_shallow: vec4<f32>, // linear rgb of shallow water
     water_deep: vec4<f32>,    // linear rgb of deep water
 }
@@ -273,7 +273,8 @@ fn fs_main(input: VertexOut) -> SceneOut {
         canopy_lift = canopy.a;
         let detail = ground_detail(inst, input.grid_st, cell_footprint);
         let tint = mix(vec3<f32>(0.95, 1.04, 0.9), vec3<f32>(1.05, 0.97, 1.06), detail.y);
-        land_albedo *= detail.x * tint;
+        // Ground detail contrast: 1 physical, lower for stylised ground.
+        land_albedo *= mix(vec3<f32>(1.0), detail.x * tint, inst.surface.z);
     }
     let n0_view = inst.b2v_x.xyz * inst.n0.x + inst.b2v_y.xyz * inst.n0.y + inst.b2v_z.xyz * inst.n0.z;
     let up = normalize(input.view_pos - (inst.anchor.xyz - n0_view * inst.anchor.w));

@@ -6,8 +6,8 @@
 //! continuous weight and the six weights always sum to one. The WGSL mirror is
 //! `crates/renderer/src/shaders/material_rules.wgsl`; keep them in step.
 //!
-//! Not wired into the renderer yet. Constants marked `PROTOTYPE:` are
-//! hardcoded and move to archetype data when the look is accepted.
+//! The ground colours come from the archetype's `GroundPalette` (physical
+//! or stylised, M4); constants marked `PROTOTYPE:` are still hardcoded.
 
 use std::f32::consts::PI;
 
@@ -225,20 +225,199 @@ pub fn strata_colour_factor(strata: &Strata, visibility: f32) -> f32 {
     1.0 + 0.35 * strata.tone * visibility
 }
 
-/// PROTOTYPE (M4 Surface): linear mean colours of the rock and loose
-/// materials; soil takes the biome tint. Mirrored in
-/// `terrain_atlas_produce.wgsl` (`surface_materials`).
-pub const ROCK_LINEAR: [f32; 3] = [0.17, 0.15, 0.13];
-pub const SCREE_LINEAR: [f32; 3] = [0.24, 0.22, 0.2];
-pub const SAND_LINEAR: [f32; 3] = [0.42, 0.35, 0.24];
-pub const WET_SEDIMENT_LINEAR: [f32; 3] = [0.09, 0.085, 0.065];
 /// PROTOTYPE: mean strata layer thickness (m).
 pub const STRATA_PERIOD_M: f32 = 40.0;
 
+/// Ground palette of the material set (M4 Surface): linear mean colours of
+/// rock and the loose materials, the strata contrast on rock faces and the
+/// style pass on the biome soil tint. `PHYSICAL` is the measured-looking
+/// set; archetypes blend toward a stylised one (art direction 2026-10-10).
+/// Packed by `words` for `terrain_atlas_produce.wgsl` (`world_surface`
+/// header words 24..48).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GroundPalette {
+    pub rock: [f32; 3],
+    pub scree: [f32; 3],
+    pub sand: [f32; 3],
+    pub wet_sediment: [f32; 3],
+    /// Strata contrast on rock faces (1 = the physical bands).
+    pub strata: f32,
+    /// Contrast of the draw-time ground detail (1 = physical; the
+    /// stylised look is smoother, without photoreal texture noise).
+    pub detail: f32,
+    pub soil: SoilStyle,
+}
+
+/// Style pass on the biome soil tint in OKLCh, blended in by `amount`:
+/// chroma scaled and capped, lightness pulled toward `lightness_mid` by
+/// `soften` (softer contrast), hue pulled by `hue_pull` toward the nearest
+/// of the first `anchors` hue anchors, then fitted into sRGB by lowering
+/// chroma (keeps the hue instead of clipping a channel).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SoilStyle {
+    pub amount: f32,
+    pub chroma_gain: f32,
+    pub chroma_max: f32,
+    pub soften: f32,
+    pub lightness_mid: f32,
+    pub hue_pull: f32,
+    pub anchors: u32,
+    pub hue_anchors_deg: [f32; 3],
+}
+
+impl GroundPalette {
+    /// The M4 prototype look before stylisation.
+    pub const PHYSICAL: Self = Self {
+        rock: [0.17, 0.15, 0.13],
+        scree: [0.24, 0.22, 0.2],
+        sand: [0.42, 0.35, 0.24],
+        wet_sediment: [0.09, 0.085, 0.065],
+        strata: 1.0,
+        detail: 1.0,
+        soil: SoilStyle {
+            amount: 0.0,
+            chroma_gain: 1.0,
+            chroma_max: 1.0,
+            soften: 0.0,
+            lightness_mid: 0.5,
+            hue_pull: 0.0,
+            anchors: 0,
+            hue_anchors_deg: [0.0; 3],
+        },
+    };
+
+    /// `self` blended toward `stylised` by `style` (0..1): colours in
+    /// linear RGB, the soil pass by its amount.
+    pub fn blend(&self, stylised: &Self, style: f32) -> Self {
+        let s = style.clamp(0.0, 1.0);
+        let mix3 = |a: [f32; 3], b: [f32; 3]| std::array::from_fn(|k| a[k] + (b[k] - a[k]) * s);
+        Self {
+            rock: mix3(self.rock, stylised.rock),
+            scree: mix3(self.scree, stylised.scree),
+            sand: mix3(self.sand, stylised.sand),
+            wet_sediment: mix3(self.wet_sediment, stylised.wet_sediment),
+            strata: self.strata + (stylised.strata - self.strata) * s,
+            detail: self.detail + (stylised.detail - self.detail) * s,
+            soil: SoilStyle {
+                amount: stylised.soil.amount * s,
+                ..stylised.soil
+            },
+        }
+    }
+
+    /// GPU words (f32 bits), `world_surface` header words 24..48.
+    pub fn words(&self) -> [f32; 24] {
+        let s = &self.soil;
+        let [r, c, n, w] = [self.rock, self.scree, self.sand, self.wet_sediment];
+        [
+            r[0],
+            r[1],
+            r[2],
+            c[0],
+            c[1],
+            c[2],
+            n[0],
+            n[1],
+            n[2],
+            w[0],
+            w[1],
+            w[2],
+            self.strata,
+            s.amount,
+            s.chroma_gain,
+            s.chroma_max,
+            s.soften,
+            s.lightness_mid,
+            s.hue_pull,
+            s.anchors as f32,
+            s.hue_anchors_deg[0],
+            s.hue_anchors_deg[1],
+            s.hue_anchors_deg[2],
+            self.detail,
+        ]
+    }
+}
+
+/// Cube root as the GPU computes it (`pow(max(x, 0), 1/3)`).
+fn cbrt(x: f32) -> f32 {
+    x.max(0.0).powf(1.0 / 3.0)
+}
+
+/// Linear sRGB to OKLab (Ottosson).
+pub fn linear_to_oklab(c: [f32; 3]) -> [f32; 3] {
+    let l = cbrt(0.412_221_46 * c[0] + 0.536_332_55 * c[1] + 0.051_445_99 * c[2]);
+    let m = cbrt(0.211_903_5 * c[0] + 0.680_699_5 * c[1] + 0.107_396_96 * c[2]);
+    let s = cbrt(0.088_302_46 * c[0] + 0.281_718_85 * c[1] + 0.629_978_7 * c[2]);
+    [
+        0.210_454_26 * l + 0.793_617_8 * m - 0.004_072_047 * s,
+        1.977_998_5 * l - 2.428_592_2 * m + 0.450_593_7 * s,
+        0.025_904_037 * l + 0.782_771_77 * m - 0.808_675_77 * s,
+    ]
+}
+
+/// OKLab to linear sRGB (Ottosson).
+pub fn oklab_to_linear(c: [f32; 3]) -> [f32; 3] {
+    let l = c[0] + 0.396_337_78 * c[1] + 0.215_803_76 * c[2];
+    let m = c[0] - 0.105_561_346 * c[1] - 0.063_854_17 * c[2];
+    let s = c[0] - 0.089_484_18 * c[1] - 1.291_485_5 * c[2];
+    let (l, m, s) = (l * l * l, m * m * m, s * s * s);
+    [
+        4.076_741_7 * l - 3.307_711_6 * m + 0.230_969_94 * s,
+        -1.268_438 * l + 2.609_757_4 * m - 0.341_319_38 * s,
+        -0.004_196_086_3 * l - 0.703_418_6 * m + 1.707_614_7 * s,
+    ]
+}
+
+fn in_gamut(c: [f32; 3]) -> bool {
+    c.iter().all(|v| (0.0..=1.0).contains(v))
+}
+
+/// The soil style pass (`SoilStyle`) on a linear colour.
+pub fn style_soil(colour: [f32; 3], s: &SoilStyle) -> [f32; 3] {
+    if s.amount <= 0.0 {
+        return colour;
+    }
+    let [l, a, b] = linear_to_oklab(colour);
+    let mut hue = b.atan2(a);
+    let chroma = (a.hypot(b) * s.chroma_gain).min(s.chroma_max);
+    // Signed angle difference in -π..π (floor form, as the GPU).
+    let wrap = |d: f32| {
+        let x = d + 3.0 * PI;
+        x - 2.0 * PI * (x / (2.0 * PI)).floor() - PI
+    };
+    let mut pull = 0.0f32;
+    let mut nearest = 4.0f32;
+    for k in 0..(s.anchors.min(3) as usize) {
+        let d = wrap(s.hue_anchors_deg[k] * DEG - hue);
+        if d.abs() < nearest {
+            nearest = d.abs();
+            pull = d;
+        }
+    }
+    hue += s.hue_pull * pull;
+    let lightness = l + (s.lightness_mid - l) * s.soften;
+    let at = |k: f32| oklab_to_linear([lightness, k * chroma * hue.cos(), k * chroma * hue.sin()]);
+    // Largest chroma fraction that stays in sRGB (bisection, fixed steps).
+    let mut styled = at(1.0);
+    if !in_gamut(styled) {
+        let (mut lo, mut hi) = (0.0f32, 1.0f32);
+        for _ in 0..12 {
+            let mid = 0.5 * (lo + hi);
+            if in_gamut(at(mid)) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        styled = at(lo).map(|v| v.clamp(0.0, 1.0));
+    }
+    std::array::from_fn(|k| colour[k] + (styled[k] - colour[k]) * s.amount)
+}
+
 /// Ground colour under the snow rule: material weights (snow disabled; the
 /// world look's snow rule is applied on top) blending rock with strata,
-/// scree, the biome `soil` tint, sand and wet sediment. `warp` is a
-/// low-frequency noise in about -1..1 for the strata.
+/// scree, the styled biome `soil` tint, sand and wet sediment from the
+/// `palette`. `warp` is a low-frequency noise in about -1..1 for the strata.
 #[allow(clippy::too_many_arguments)]
 pub fn surface_colour(
     height_m: f32,
@@ -249,6 +428,7 @@ pub fn surface_colour(
     flow: f32,
     soil: [f32; 3],
     warp: f32,
+    palette: &GroundPalette,
 ) -> [f32; 3] {
     let w = material_weights(&MaterialInput {
         height_m,
@@ -261,13 +441,14 @@ pub fn surface_colour(
         flow,
     });
     let strata = strata_band(height_m, warp, STRATA_PERIOD_M);
-    let rock = strata_colour_factor(&strata, strata_visibility(slope, hardness));
+    let rock = strata_colour_factor(&strata, strata_visibility(slope, hardness) * palette.strata);
+    let soil = style_soil(soil, &palette.soil);
     std::array::from_fn(|k| {
-        w.bedrock * ROCK_LINEAR[k] * rock
-            + w.scree * SCREE_LINEAR[k]
+        w.bedrock * palette.rock[k] * rock
+            + w.scree * palette.scree[k]
             + (w.soil + w.snow) * soil[k]
-            + w.sand * SAND_LINEAR[k]
-            + w.wet_sediment * WET_SEDIMENT_LINEAR[k]
+            + w.sand * palette.sand[k]
+            + w.wet_sediment * palette.wet_sediment[k]
     })
 }
 
@@ -431,5 +612,74 @@ mod tests {
         assert_eq!(mean_colour(&snow, &p), p.mean[4]);
         let t = tint_detail([0.3, 0.3, 0.3], [0.3, 0.3, 0.3], [0.2, 0.1, 0.05]);
         assert!((t[0] - 0.2).abs() < 1.0e-6 && (t[2] - 0.05).abs() < 1.0e-6);
+    }
+
+    fn stylised() -> GroundPalette {
+        GroundPalette {
+            soil: SoilStyle {
+                amount: 1.0,
+                chroma_gain: 1.5,
+                chroma_max: 0.13,
+                soften: 0.25,
+                lightness_mid: 0.52,
+                hue_pull: 0.3,
+                anchors: 2,
+                hue_anchors_deg: [85.0, 135.0, 0.0],
+            },
+            ..GroundPalette::PHYSICAL
+        }
+    }
+
+    #[test]
+    fn oklab_round_trips_and_style_zero_is_identity() {
+        for c in [[0.2, 0.32, 0.15], [0.8, 0.66, 0.45], [0.02, 0.5, 0.9]] {
+            let back = oklab_to_linear(linear_to_oklab(c));
+            assert!(
+                (0..3).all(|k| (back[k] - c[k]).abs() < 1.0e-4),
+                "{c:?} {back:?}"
+            );
+        }
+        let soil = [0.05, 0.09, 0.03];
+        assert_eq!(style_soil(soil, &GroundPalette::PHYSICAL.soil), soil);
+        let off = GroundPalette::PHYSICAL.blend(&stylised(), 0.0);
+        assert_eq!(off.soil.amount, 0.0);
+        assert_eq!(off.rock, GroundPalette::PHYSICAL.rock);
+    }
+
+    #[test]
+    fn soil_style_saturates_softens_and_pulls_hue_in_gamut() {
+        let style = stylised().soil;
+        // Forest green, dry grass, desert, near-grey and a saturated blue.
+        for c in [
+            [0.03, 0.08, 0.02],
+            [0.21, 0.23, 0.07],
+            [0.6, 0.4, 0.17],
+            [0.1, 0.1, 0.1],
+            [0.0, 0.1, 0.9],
+        ] {
+            let s = style_soil(c, &style);
+            assert!(s.iter().all(|v| (0.0..=1.0).contains(v)), "{c:?} -> {s:?}");
+            let (a, b) = (linear_to_oklab(c), linear_to_oklab(s));
+            // Softer: lightness moves toward the mid value, never past it.
+            let (da, db) = ((a[0] - 0.52).abs(), (b[0] - 0.52).abs());
+            assert!(db <= da + 1.0e-4, "{c:?}: {a:?} -> {b:?}");
+            // Never greyer than gain allows, capped at chroma_max.
+            let (ca, cb) = (a[1].hypot(a[2]), b[1].hypot(b[2]));
+            assert!(cb <= style.chroma_max + 1.0e-3, "{c:?}: chroma {cb}");
+            if ca * style.chroma_gain < style.chroma_max
+                && in_gamut(oklab_to_linear([b[0], a[1] * 1.5, a[2] * 1.5]))
+            {
+                assert!(cb >= ca * 1.4, "{c:?}: chroma {ca} -> {cb}");
+            }
+        }
+        // A green at 145° moves toward the 135° anchor by 30 %.
+        let green = oklab_to_linear([
+            0.5,
+            0.08 * (145.0f32 * DEG).cos(),
+            0.08 * (145.0f32 * DEG).sin(),
+        ]);
+        let s = linear_to_oklab(style_soil(green, &style));
+        let hue = s[2].atan2(s[1]) / DEG;
+        assert!((hue - 142.0).abs() < 0.5, "hue {hue}");
     }
 }

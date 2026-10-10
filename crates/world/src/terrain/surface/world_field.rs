@@ -33,6 +33,9 @@ pub struct WorldLook {
     /// Tier B climate detail (temperature and moisture offsets); `None`
     /// until bound to a body seed by `WorldDefinition::new`.
     pub climate: Option<ClimateNoise>,
+    /// Stylised end of the ground palette (`GroundLook`); the planet
+    /// parameter `ground_style` blends toward it from the physical one.
+    pub ground: crate::terrain::material_rules::GroundPalette,
 }
 
 /// Compiled climate detail of one body: unit-amplitude band-limited fBm,
@@ -74,6 +77,7 @@ impl WorldLook {
             water_deep: colour(archetype.water.deep_linear),
             water_depth_scale_m: archetype.water.depth_scale_m,
             climate: None,
+            ground: archetype.ground.stylised_palette(),
         })
     }
 
@@ -89,6 +93,7 @@ impl WorldLook {
         .chain(self.snow_albedo)
         .chain(self.water_shallow)
         .chain(self.water_deep)
+        .chain(self.ground.words().map(f64::from))
         .chain(
             self.climate
                 .iter()
