@@ -1891,6 +1891,7 @@ impl GravityOrbitsDemo {
         self.atlas
             .annotate_terrain(&mut snapshot.terrain, &self.ids, &self.system);
         let shadows = renderer.shadow_report();
+        let aa = renderer.anti_aliasing_report();
         snapshot.render_settings = Some(serde_json::json!({
             "settings": crate::render_settings::listing(&crate::render_settings::RenderState {
                 settings: self.controls.render_settings,
@@ -1906,6 +1907,13 @@ impl GravityOrbitsDemo {
                 "casters": shadows.casters,
                 "splits_m": shadows.splits_m,
                 "texel_m": shadows.texel_m,
+            },
+            "anti_aliasing": {
+                "requested_samples": aa.requested_samples,
+                "samples": aa.samples,
+                "supported_mask": aa.supported_mask,
+                "fxaa": aa.fxaa,
+                "last_compile_ms": aa.last_compile_ms,
             },
         }));
         // Opt-in native evidence scratch export of this exact prepared state.

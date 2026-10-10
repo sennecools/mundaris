@@ -50,6 +50,44 @@ impl ExposureMode {
     }
 }
 
+/// Anti-aliasing method (amendment 2026-10-10 anti-aliasing). MSAA counts the
+/// adapter lacks fall back to the largest supported count below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AntiAliasing {
+    #[default]
+    Off,
+    /// Post-process edge blur on the tonemapped image (FXAA 3.11 quality).
+    Fxaa,
+    Msaa2,
+    Msaa4,
+    Msaa8,
+}
+
+impl AntiAliasing {
+    pub const ALL: [Self; 5] = [Self::Off, Self::Fxaa, Self::Msaa2, Self::Msaa4, Self::Msaa8];
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Fxaa => "fxaa",
+            Self::Msaa2 => "msaa2",
+            Self::Msaa4 => "msaa4",
+            Self::Msaa8 => "msaa8",
+        }
+    }
+    /// Main-pass samples per pixel this method asks for.
+    pub fn samples(self) -> u32 {
+        match self {
+            Self::Off | Self::Fxaa => 1,
+            Self::Msaa2 => 2,
+            Self::Msaa4 => 4,
+            Self::Msaa8 => 8,
+        }
+    }
+    pub fn fxaa(self) -> bool {
+        self == Self::Fxaa
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ExposureSettings {
     pub mode: ExposureMode,
@@ -139,6 +177,7 @@ pub struct RenderSettings {
     pub ao: AoSettings,
     pub lighting: LightingSettings,
     pub overlays: OverlaySettings,
+    pub anti_aliasing: AntiAliasing,
 }
 
 impl Default for RenderSettings {
@@ -190,6 +229,7 @@ impl Default for RenderSettings {
                 line_width_scale: 1.0,
                 opacity: 1.0,
             },
+            anti_aliasing: AntiAliasing::Off,
         }
     }
 }

@@ -160,7 +160,7 @@ impl TerrainCaptureRenderer {
                 mapped_at_creation: false,
             })
         });
-        let renderer = CelestialRenderer::new(&device, &queue, format, width, height);
+        let renderer = CelestialRenderer::new(&device, &queue, format, width, height, 1);
         Ok(Self {
             _instance: instance,
             adapter_name,

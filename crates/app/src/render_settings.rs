@@ -8,7 +8,7 @@
 //! content.
 use anyhow::{Result, bail, ensure};
 use astrum_renderer::{
-    ExposureMode, RenderSettings, SHADOW_RESOLUTIONS, TerrainViewMode, Tonemapper,
+    AntiAliasing, ExposureMode, RenderSettings, SHADOW_RESOLUTIONS, TerrainViewMode, Tonemapper,
 };
 use serde_json::{Value, json};
 
@@ -104,6 +104,8 @@ const EXPOSURE_MODES: &[&str] = &["auto", "manual"];
 const CASCADE_COUNTS: &[&str] = &["1", "2", "3", "4"];
 const RESOLUTIONS: &[&str] = &["1024", "2048", "4096"];
 const SUN_MODES: &[&str] = &["star", "studio"];
+/// `AntiAliasing::ALL` order.
+const AA_MODES: &[&str] = &["off", "fxaa", "msaa2", "msaa4", "msaa8"];
 
 pub const SPECS: &[SettingSpec] = &[
     spec(
@@ -111,6 +113,12 @@ pub const SPECS: &[SettingSpec] = &[
         "View",
         "View mode",
         SettingKind::Choice(VIEW_MODES),
+    ),
+    spec(
+        "render.aa.mode",
+        "Anti-aliasing",
+        "Method",
+        SettingKind::Choice(AA_MODES),
     ),
     spec(
         "render.tonemap.operator",
@@ -317,6 +325,7 @@ pub fn get(state: &RenderState, index: usize) -> SettingValue {
     let f = |v: f32| Float(f64::from(v));
     match SPECS[index].id {
         "render.view_mode" => Choice(choice_index(&TerrainViewMode::ALL, state.view_mode)),
+        "render.aa.mode" => Choice(choice_index(&AntiAliasing::ALL, s.anti_aliasing)),
         "render.tonemap.operator" => Choice(choice_index(&Tonemapper::ALL, s.tonemap)),
         "render.dither" => Bool(s.dither),
         "render.exposure.mode" => Choice(choice_index(&ExposureMode::ALL, s.exposure.mode)),
@@ -389,6 +398,7 @@ pub fn set(state: &mut RenderState, index: usize, value: SettingValue) -> Result
     };
     match spec.id {
         "render.view_mode" => next.view_mode = TerrainViewMode::ALL[c(value)],
+        "render.aa.mode" => s.anti_aliasing = AntiAliasing::ALL[c(value)],
         "render.tonemap.operator" => s.tonemap = Tonemapper::ALL[c(value)],
         "render.dither" => s.dither = b(value),
         "render.exposure.mode" => s.exposure.mode = ExposureMode::ALL[c(value)],
@@ -459,7 +469,8 @@ pub fn value_from_json(index: usize, value: &Value) -> Result<SettingValue> {
     })
 }
 
-fn value_json(index: usize, value: SettingValue) -> Value {
+/// JSON form of a setting value (option names for choices).
+pub fn value_json(index: usize, value: SettingValue) -> Value {
     match (SPECS[index].kind, value) {
         (_, SettingValue::Bool(b)) => json!(b),
         (_, SettingValue::Float(f)) => json!(f),

@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+mod aa;
 mod celestial;
 mod celestial_lines;
 mod celestial_view;
@@ -28,6 +29,7 @@ pub mod tier_a;
 #[cfg(feature = "terrain-capture")]
 pub mod terrain_capture;
 mod view;
+pub use aa::SAMPLE_COUNTS;
 pub use celestial::*;
 pub use celestial_lines::{
     CelestialLineStyle, CelestialPolyline, LineStyleScale, PolylinePreparationReport,
@@ -44,8 +46,8 @@ pub use lighting::{
     disk_visible_fraction, fit_cascades, shadow_range, slice_sphere,
 };
 pub use render_settings::{
-    AoSettings, BloomSettings, ExposureMode, ExposureSettings, LightingSettings, MAX_CASCADES,
-    OverlaySettings, RenderSettings, SHADOW_RESOLUTIONS, ShadowSettings, Tonemapper,
+    AntiAliasing, AoSettings, BloomSettings, ExposureMode, ExposureSettings, LightingSettings,
+    MAX_CASCADES, OverlaySettings, RenderSettings, SHADOW_RESOLUTIONS, ShadowSettings, Tonemapper,
 };
 pub use terrain_atlas::{
     ATLAS_BOUNDS_GRID, ATLAS_LADDER_LEVELS, ATLAS_LADDERS, AtlasBounds, AtlasChart,
@@ -122,6 +124,8 @@ pub struct GpuContext {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     timestamp_availability: TimestampAvailability,
+    /// Main-pass MSAA sample counts this adapter supports (bit mask of 1, 2, 4, 8).
+    msaa_support: u32,
 }
 
 impl GpuContext {
@@ -151,7 +155,10 @@ impl GpuContext {
             })
             .await?;
         let adapter_info = adapter.get_info();
-        let requested_features = gpu_profile::available_features(&adapter);
+        // MSAA 2x and 8x need adapter-specific format features (4x is core).
+        let requested_features = gpu_profile::available_features(&adapter)
+            | (adapter.features() & wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES);
+        let msaa_support = aa::supported_sample_counts(&adapter, requested_features);
         let timestamp_availability = gpu_profile::availability(requested_features);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -193,7 +200,13 @@ impl GpuContext {
             device,
             queue,
             timestamp_availability,
+            msaa_support,
         })
+    }
+
+    /// Main-pass MSAA sample counts this adapter supports (bit mask of 1, 2, 4, 8).
+    pub fn msaa_support(&self) -> u32 {
+        self.msaa_support
     }
 }
 
@@ -255,6 +268,7 @@ pub struct Renderer {
     submission_id: u64,
     native_render_timings: NativeRenderTimings,
     settings: RenderSettings,
+    msaa_support: u32,
     #[cfg(feature = "developer-tools")]
     native_capture: native_capture::NativeCapture,
     #[cfg(feature = "developer-tools")]
@@ -277,6 +291,7 @@ impl Renderer {
             submission_id: 0,
             native_render_timings: NativeRenderTimings::default(),
             settings: RenderSettings::default(),
+            msaa_support: context.msaa_support,
             #[cfg(feature = "developer-tools")]
             native_capture: native_capture::NativeCapture::new(
                 adapter_info.name,
@@ -302,6 +317,19 @@ impl Renderer {
 
     pub fn render_settings(&self) -> RenderSettings {
         self.settings
+    }
+
+    /// Anti-aliasing in effect: requested and used MSAA samples, FXAA, and the
+    /// pipeline compile time of the last sample-count switch.
+    pub fn anti_aliasing_report(&self) -> AaReport {
+        self.celestial.as_ref().map_or(
+            AaReport {
+                supported_mask: self.msaa_support,
+                samples: 1,
+                ..AaReport::default()
+            },
+            |c| c.aa_report(),
+        )
     }
 
     /// Cascades and caster counts of the latest celestial frame.
@@ -640,6 +668,7 @@ impl Renderer {
                     SCENE_RENDER_FORMAT,
                     width,
                     height,
+                    self.msaa_support,
                 );
                 renderer.set_settings(&self.device, settings);
                 renderer

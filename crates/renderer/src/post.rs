@@ -32,6 +32,16 @@ fn target(
     size: [u32; 2],
     format: wgpu::TextureFormat,
 ) -> Target {
+    ms_target(device, label, size, format, 1)
+}
+
+fn ms_target(
+    device: &wgpu::Device,
+    label: &str,
+    size: [u32; 2],
+    format: wgpu::TextureFormat,
+    samples: u32,
+) -> Target {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d {
@@ -40,10 +50,13 @@ fn target(
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
-        sample_count: 1,
+        sample_count: samples,
         dimension: wgpu::TextureDimension::D2,
         format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
     let view = texture.create_view(&Default::default());
@@ -53,8 +66,27 @@ fn target(
     }
 }
 
+/// Multisampled main-pass targets and the bind group that resolves them.
+struct MsTargets {
+    direct: Target,
+    normal: Target,
+    ambient: Target,
+    depth: Target,
+    resolve_group: wgpu::BindGroup,
+}
+
+/// Tonemapped image before FXAA: written through an sRGB view, read as unorm.
+struct LdrTarget {
+    _texture: wgpu::Texture,
+    render_view: wgpu::TextureView,
+    fxaa_group: wgpu::BindGroup,
+}
+
 struct Targets {
     size: [u32; 2],
+    samples: u32,
+    ms: Option<MsTargets>,
+    ldr: Option<LdrTarget>,
     ao_size: [u32; 2],
     bloom_levels: u32,
     direct: Target,
@@ -92,6 +124,12 @@ pub(crate) struct PostProcess {
     down: wgpu::RenderPipeline,
     up: wgpu::RenderPipeline,
     tonemap: wgpu::RenderPipeline,
+    resolve_layout: wgpu::BindGroupLayout,
+    resolve: wgpu::RenderPipeline,
+    fxaa_layout: wgpu::BindGroupLayout,
+    fxaa: wgpu::RenderPipeline,
+    /// Scene view format; the FXAA input texture shares it.
+    output: wgpu::TextureFormat,
     targets: Option<Targets>,
     half_res_ao: bool,
     frame: u64,
@@ -444,6 +482,109 @@ impl PostProcess {
                 include_str!("shaders/tonemap.wgsl")
             ),
         );
+        let ms_texture = |binding: u32, sample_type: wgpu::TextureSampleType| {
+            entry(
+                binding,
+                fragment,
+                wgpu::BindingType::Texture {
+                    sample_type,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: true,
+                },
+            )
+        };
+        let unfiltered = wgpu::TextureSampleType::Float { filterable: false };
+        let resolve_layout = layout(
+            device,
+            "MSAA resolve inputs",
+            &[
+                ms_texture(0, unfiltered),
+                ms_texture(1, unfiltered),
+                ms_texture(2, unfiltered),
+                ms_texture(3, wgpu::TextureSampleType::Depth),
+            ],
+        );
+        let resolve_shader = module(
+            device,
+            "MSAA resolve",
+            concat!(
+                include_str!("shaders/post_common.wgsl"),
+                include_str!("shaders/aa_resolve.wgsl")
+            ),
+        );
+        let resolve = {
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("MSAA resolve"),
+                bind_group_layouts: &[Some(&resolve_layout)],
+                immediate_size: 0,
+            });
+            let targets: Vec<_> = SCENE_TARGETS
+                .iter()
+                .map(|&format| {
+                    Some(wgpu::ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })
+                })
+                .collect();
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("MSAA resolve"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &resolve_shader,
+                    entry_point: Some("vs_fullscreen"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &resolve_shader,
+                    entry_point: Some("fs_resolve"),
+                    compilation_options: Default::default(),
+                    targets: &targets,
+                }),
+                primitive: Default::default(),
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Always),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let fxaa_layout = layout(
+            device,
+            "FXAA inputs",
+            &[
+                texture_entry(0, fragment, true),
+                entry(
+                    1,
+                    fragment,
+                    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                ),
+            ],
+        );
+        let fxaa_shader = module(
+            device,
+            "FXAA",
+            concat!(
+                include_str!("shaders/post_common.wgsl"),
+                include_str!("shaders/aa_fxaa.wgsl")
+            ),
+        );
+        let fxaa = fullscreen(
+            device,
+            "FXAA",
+            &fxaa_layout,
+            &fxaa_shader,
+            "fs_fxaa",
+            output,
+            None,
+        );
         let compute_pipeline = |entry_point: &str| {
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(entry_point),
@@ -525,6 +666,11 @@ impl PostProcess {
             exposure_layout,
             tonemap_layout,
             bloom_layout,
+            resolve_layout,
+            resolve,
+            fxaa_layout,
+            fxaa,
+            output,
             targets: None,
             half_res_ao: true,
             frame: 0,
@@ -536,14 +682,23 @@ impl PostProcess {
         &self.exposure
     }
 
-    /// (Re)creates transient targets when the viewport or AO resolution changes.
-    pub(crate) fn ensure(&mut self, device: &wgpu::Device, size: [u32; 2], half_res_ao: bool) {
+    /// (Re)creates transient targets when the viewport, AO resolution, MSAA
+    /// sample count or FXAA use changes.
+    pub(crate) fn ensure(
+        &mut self,
+        device: &wgpu::Device,
+        size: [u32; 2],
+        half_res_ao: bool,
+        samples: u32,
+        fxaa: bool,
+    ) {
         let size = [size[0].max(1), size[1].max(1)];
-        if self
-            .targets
-            .as_ref()
-            .is_some_and(|t| t.size == size && self.half_res_ao == half_res_ao)
-        {
+        if self.targets.as_ref().is_some_and(|t| {
+            t.size == size
+                && self.half_res_ao == half_res_ao
+                && t.samples == samples
+                && t.ldr.is_some() == fxaa
+        }) {
             return;
         }
         self.half_res_ao = half_res_ao;
@@ -611,7 +766,72 @@ impl PostProcess {
             })
             .collect();
         let up_groups = bloom_views.iter().map(bloom_group).collect();
+        let ms = (samples > 1).then(|| {
+            let direct = ms_target(device, "MSAA direct radiance", size, HDR_FORMAT, samples);
+            let normal = ms_target(device, "MSAA view normals", size, NORMAL_FORMAT, samples);
+            let ambient = ms_target(device, "MSAA ambient radiance", size, HDR_FORMAT, samples);
+            let depth = ms_target(device, "MSAA reverse-Z", size, DEPTH_FORMAT, samples);
+            let resolve_group = group(
+                "MSAA resolve inputs",
+                &self.resolve_layout,
+                &[
+                    view(0, &direct.view),
+                    view(1, &normal.view),
+                    view(2, &ambient.view),
+                    view(3, &depth.view),
+                ],
+            );
+            MsTargets {
+                direct,
+                normal,
+                ambient,
+                depth,
+                resolve_group,
+            }
+        });
+        let ldr = fxaa.then(|| {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Tonemapped image before FXAA"),
+                size: wgpu::Extent3d {
+                    width: size[0],
+                    height: size[1],
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.output.remove_srgb_suffix(),
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[self.output],
+            });
+            let render_view = texture.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("Tonemapped image (sRGB render view)"),
+                format: Some(self.output),
+                ..Default::default()
+            });
+            let read_view = texture.create_view(&Default::default());
+            let fxaa_group = group(
+                "FXAA inputs",
+                &self.fxaa_layout,
+                &[
+                    view(0, &read_view),
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            );
+            LdrTarget {
+                _texture: texture,
+                render_view,
+                fxaa_group,
+            }
+        });
         let targets = Targets {
+            samples,
+            ms,
+            ldr,
             gtao_group: group(
                 "GTAO inputs",
                 &self.gtao_layout,
@@ -674,12 +894,17 @@ impl PostProcess {
     }
 
     /// Main-pass attachments: direct, normal, ambient colour views and depth.
+    /// The multisampled targets when MSAA is on; [`Self::encode`] resolves them.
     pub(crate) fn scene_views(&self) -> Option<([&wgpu::TextureView; 3], &wgpu::TextureView)> {
-        self.targets.as_ref().map(|t| {
-            (
+        self.targets.as_ref().map(|t| match &t.ms {
+            Some(ms) => (
+                [&ms.direct.view, &ms.normal.view, &ms.ambient.view],
+                &ms.depth.view,
+            ),
+            None => (
                 [&t.direct.view, &t.normal.view, &t.ambient.view],
                 &t.depth.view,
-            )
+            ),
         })
     }
 
@@ -765,6 +990,42 @@ impl PostProcess {
                 .collect::<Vec<_>>(),
         );
         let mut mask = 0u32;
+        if let Some(ms) = &t.ms {
+            // One pass resolves the colour MRT (weighted) and the depth.
+            let attachment = |view| {
+                Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })
+            };
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("MSAA resolve"),
+                color_attachments: &[
+                    attachment(&t.direct.view),
+                    attachment(&t.normal.view),
+                    attachment(&t.ambient.view),
+                ],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &t.depth.view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.resolve);
+            pass.set_bind_group(0, &ms.resolve_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
         let pass = fullscreen_pass;
         let clear = wgpu::LoadOp::Clear(wgpu::Color::BLACK);
         if ao_enabled && !frame.passthrough {
@@ -840,15 +1101,29 @@ impl PostProcess {
             }
             mask |= 1 << pair::BLOOM;
         }
+        // With FXAA the tonemap writes an intermediate that FXAA filters into
+        // `output`; both count as the tonemap scope.
+        let tonemap_view = t.ldr.as_ref().map_or(output, |ldr| &ldr.render_view);
         pass(
             encoder,
             "Tonemap",
-            output,
+            tonemap_view,
             clear,
-            timestamps.map(|q| q.pass_writes(pair::TONEMAP)),
+            timestamps.and_then(|q| q.pass_writes_partial(pair::TONEMAP, true, t.ldr.is_none())),
             &self.tonemap,
             &t.tonemap_group,
         );
+        if let Some(ldr) = &t.ldr {
+            pass(
+                encoder,
+                "FXAA",
+                output,
+                clear,
+                timestamps.and_then(|q| q.pass_writes_partial(pair::TONEMAP, false, true)),
+                &self.fxaa,
+                &ldr.fxaa_group,
+            );
+        }
         mask | 1 << pair::TONEMAP
     }
 }
@@ -895,6 +1170,20 @@ mod tests {
                     include_str!("shaders/post_common.wgsl"),
                     include_str!("shaders/ao_filter.wgsl"),
                     include_str!("shaders/tonemap.wgsl")
+                ),
+            ),
+            (
+                "msaa resolve",
+                concat!(
+                    include_str!("shaders/post_common.wgsl"),
+                    include_str!("shaders/aa_resolve.wgsl")
+                ),
+            ),
+            (
+                "fxaa",
+                concat!(
+                    include_str!("shaders/post_common.wgsl"),
+                    include_str!("shaders/aa_fxaa.wgsl")
                 ),
             ),
         ] {

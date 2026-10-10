@@ -653,7 +653,7 @@ pub struct ShadowReport {
 
 pub(crate) struct CelestialRenderer {
     sky: crate::sky::SkyRenderer,
-    sphere_pipeline: wgpu::RenderPipeline,
+    sphere_pipeline: crate::aa::MsaaPipeline,
     polyline_pipeline: wgpu::RenderPipeline,
     projection: wgpu::Buffer,
     projection_layout: wgpu::BindGroupLayout,
@@ -676,6 +676,23 @@ pub(crate) struct CelestialRenderer {
     settings: crate::RenderSettings,
     size: [u32; 2],
     shadow_report: ShadowReport,
+    /// Sample counts the adapter supports (bit mask, crate::aa).
+    msaa_support: u32,
+    /// Main-pass samples in use.
+    samples: u32,
+    aa_report: AaReport,
+}
+
+/// Anti-aliasing state for diagnostics: what the setting asks for, what the
+/// adapter allows, and the one-time pipeline compile cost of the last switch.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AaReport {
+    pub requested_samples: u32,
+    pub samples: u32,
+    pub supported_mask: u32,
+    pub fxaa: bool,
+    /// Wall time spent compiling pipeline variants at the last sample-count switch.
+    pub last_compile_ms: f64,
 }
 impl CelestialRenderer {
     pub(crate) fn last_sky_resource_report(&self) -> crate::sky::SkyResourceReport {
@@ -725,6 +742,7 @@ impl CelestialRenderer {
         output_format: wgpu::TextureFormat,
         width: u32,
         height: u32,
+        msaa_support: u32,
     ) -> Self {
         let settings = crate::RenderSettings::default();
         let projection = buffer(
@@ -808,16 +826,49 @@ impl CelestialRenderer {
             settings,
             size: [width.max(1), height.max(1)],
             shadow_report: ShadowReport::default(),
+            msaa_support,
+            samples: 1,
+            aa_report: AaReport::default(),
         };
+        renderer.apply_samples(device);
+        renderer.ensure_post(device);
         renderer
-            .post
-            .ensure(device, renderer.size, renderer.settings.ao.half_res);
-        renderer
+    }
+    /// Selects the main-pass sample count from the anti-aliasing setting and
+    /// the adapter, compiling pipeline variants on first use.
+    fn apply_samples(&mut self, device: &wgpu::Device) {
+        let requested = self.settings.anti_aliasing.samples();
+        let samples = crate::aa::clamp_samples(requested, self.msaa_support);
+        if samples != self.samples {
+            let started = std::time::Instant::now();
+            self.sky.set_samples(device, samples);
+            self.sphere_pipeline.set_samples(device, samples);
+            if let Some(atlas) = &mut self.terrain_atlas {
+                atlas.set_samples(device, samples);
+            }
+            self.samples = samples;
+            self.aa_report.last_compile_ms = started.elapsed().as_secs_f64() * 1000.0;
+        }
+        self.aa_report.requested_samples = requested;
+        self.aa_report.samples = samples;
+        self.aa_report.supported_mask = self.msaa_support;
+        self.aa_report.fxaa = self.settings.anti_aliasing.fxaa();
+    }
+    fn ensure_post(&mut self, device: &wgpu::Device) {
+        self.post.ensure(
+            device,
+            self.size,
+            self.settings.ao.half_res,
+            self.samples,
+            self.settings.anti_aliasing.fxaa(),
+        );
+    }
+    pub(crate) fn aa_report(&self) -> AaReport {
+        self.aa_report
     }
     pub(crate) fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         self.size = [width.max(1), height.max(1)];
-        self.post
-            .ensure(device, self.size, self.settings.ao.half_res);
+        self.ensure_post(device);
     }
     /// Applies validated settings; reallocates only what changed.
     pub(crate) fn set_settings(&mut self, device: &wgpu::Device, settings: crate::RenderSettings) {
@@ -832,7 +883,8 @@ impl CelestialRenderer {
             );
         }
         self.settings = settings;
-        self.post.ensure(device, self.size, settings.ao.half_res);
+        self.apply_samples(device);
+        self.ensure_post(device);
     }
     pub(crate) fn draw(
         &mut self,
@@ -847,7 +899,7 @@ impl CelestialRenderer {
         frame.validate()?;
         let storage = &frame.staging;
         let settings = self.settings;
-        self.post.ensure(device, self.size, settings.ao.half_res);
+        self.ensure_post(device);
         self.sky.upload(device, queue, storage.sky.as_ref());
         if let Some(atlas_frame) = &storage.terrain_atlas
             && let Some(config) = atlas_frame.config
@@ -868,6 +920,9 @@ impl CelestialRenderer {
                     )
                     .map_err(RenderPreparationError::TerrainAtlas)?,
                 );
+                if let Some(atlas) = &mut self.terrain_atlas {
+                    atlas.set_samples(device, self.samples);
+                }
             }
             if let Some(atlas) = &mut self.terrain_atlas {
                 atlas
@@ -1099,7 +1154,7 @@ impl CelestialRenderer {
     // Each section owns its complete draw state. In particular, a new pass has
     // no bindings.
     fn bind_sphere_state(&self, pass: &mut wgpu::RenderPass<'_>, draw: u32, start: u32) {
-        pass.set_pipeline(&self.sphere_pipeline);
+        pass.set_pipeline(self.sphere_pipeline.get());
         pass.set_bind_group(0, &self.projection_group, &[]);
         pass.set_bind_group(1, &self.uniform_group, &[draw * 256]);
         pass.set_bind_group(2, &self.lighting_group, &[]);
@@ -1260,7 +1315,7 @@ fn scene_pipeline(
     device: &wgpu::Device,
     layouts: &[&wgpu::BindGroupLayout],
     source: &str,
-) -> wgpu::RenderPipeline {
+) -> crate::aa::MsaaPipeline {
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("Celestial sphere pipeline layout"),
         bind_group_layouts: &layouts.iter().copied().map(Some).collect::<Vec<_>>(),
@@ -1270,49 +1325,52 @@ fn scene_pipeline(
         label: Some("Observer-relative lit spheres"),
         source: wgpu::ShaderSource::Wgsl(source.into()),
     });
-    let targets: Vec<_> = crate::post::SCENE_TARGETS
-        .iter()
-        .map(|&format| {
-            Some(wgpu::ColorTargetState {
-                format,
-                blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
+    // One variant per MSAA sample count (crate::aa).
+    crate::aa::MsaaPipeline::new(device, move |device, samples| {
+        let targets: Vec<_> = crate::post::SCENE_TARGETS
+            .iter()
+            .map(|&format| {
+                Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })
             })
+            .collect();
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Celestial spheres reverse-Z pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: 32,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0=>Float32x4,1=>Float32x4],
+                })],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &targets,
+            }),
+            primitive: wgpu::PrimitiveState {
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: crate::post::DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: crate::aa::multisample(samples),
+            multiview_mask: None,
+            cache: None,
         })
-        .collect();
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("Celestial spheres reverse-Z pipeline"),
-        layout: Some(&layout),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: Some("vs_main"),
-            compilation_options: Default::default(),
-            buffers: &[Some(wgpu::VertexBufferLayout {
-                array_stride: 32,
-                step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &wgpu::vertex_attr_array![0=>Float32x4,1=>Float32x4],
-            })],
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: Some("fs_main"),
-            compilation_options: Default::default(),
-            targets: &targets,
-        }),
-        primitive: wgpu::PrimitiveState {
-            cull_mode: Some(wgpu::Face::Back),
-            ..Default::default()
-        },
-        depth_stencil: Some(wgpu::DepthStencilState {
-            format: crate::post::DEPTH_FORMAT,
-            depth_write_enabled: Some(true),
-            depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-            stencil: Default::default(),
-            bias: Default::default(),
-        }),
-        multisample: Default::default(),
-        multiview_mask: None,
-        cache: None,
     })
 }
 /// Anti-aliased guide quads over the tonemapped image, depth-tested against

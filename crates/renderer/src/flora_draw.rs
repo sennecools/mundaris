@@ -211,7 +211,7 @@ pub(crate) struct FloraDraw {
     /// Overflow counter read-back (async map, never stalls the frame).
     readback: wgpu::Buffer,
     readback_state: Arc<AtomicU8>,
-    pipeline: wgpu::RenderPipeline,
+    pipeline: crate::aa::MsaaPipeline,
     shadow_pipeline: wgpu::RenderPipeline,
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
@@ -274,36 +274,51 @@ impl FloraDraw {
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &ATTRIBUTES,
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Flora grown plants (prototype)"),
-            layout: Some(draw_layout),
-            vertex: wgpu::VertexState {
-                module: draw_shader,
-                entry_point: Some("vs_flora"),
-                compilation_options: Default::default(),
-                buffers: std::slice::from_ref(&layout),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: draw_shader,
-                entry_point: Some("fs_flora"),
-                compilation_options: Default::default(),
-                targets: color_targets,
-            }),
-            primitive: wgpu::PrimitiveState {
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        // One variant per MSAA sample count (crate::aa).
+        let pipeline = {
+            let draw_shader = draw_shader.clone();
+            let draw_layout = draw_layout.clone();
+            let color_targets = color_targets.to_vec();
+            crate::aa::MsaaPipeline::new(device, move |device, samples| {
+                let layout = Some(wgpu::VertexBufferLayout {
+                    array_stride: VERTEX_BYTES,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &ATTRIBUTES,
+                });
+                let (draw_shader, draw_layout, color_targets) =
+                    (&draw_shader, &draw_layout, &color_targets[..]);
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("Flora grown plants (prototype)"),
+                    layout: Some(draw_layout),
+                    vertex: wgpu::VertexState {
+                        module: draw_shader,
+                        entry_point: Some("vs_flora"),
+                        compilation_options: Default::default(),
+                        buffers: std::slice::from_ref(&layout),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: draw_shader,
+                        entry_point: Some("fs_flora"),
+                        compilation_options: Default::default(),
+                        targets: color_targets,
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        cull_mode: None,
+                        ..Default::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: wgpu::TextureFormat::Depth32Float,
+                        depth_write_enabled: Some(true),
+                        depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                        stencil: Default::default(),
+                        bias: Default::default(),
+                    }),
+                    multisample: crate::aa::multisample(samples),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            })
+        };
         let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Flora grown plants sun shadow casters (prototype)"),
             layout: Some(shadow_layout),
@@ -412,9 +427,14 @@ impl FloraDraw {
         }
     }
 
+    /// Selects the MSAA sample count of the main-pass pipeline (crate::aa).
+    pub(crate) fn set_samples(&mut self, device: &wgpu::Device, samples: u32) {
+        self.pipeline.set_samples(device, samples);
+    }
+
     /// Main pass; groups 0–3 are the scatter draw's (plants at group 3).
     pub(crate) fn draw(&self, pass: &mut wgpu::RenderPass<'_>, plant_args: &wgpu::Buffer) {
-        pass.set_pipeline(&self.pipeline);
+        pass.set_pipeline(self.pipeline.get());
         self.draws(pass, plant_args);
     }
 

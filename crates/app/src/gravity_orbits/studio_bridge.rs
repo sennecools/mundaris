@@ -498,6 +498,26 @@ impl GravityOrbitsDemo {
                             )
                         }),
                 );
+                if let Some(aa) = snapshot
+                    .render_settings
+                    .as_ref()
+                    .map(|r| &r["anti_aliasing"])
+                    && let Some(samples) = aa["samples"].as_u64()
+                {
+                    let requested = aa["requested_samples"].as_u64().unwrap_or(samples);
+                    let mut text = match (samples, aa["fxaa"].as_bool().unwrap_or(false)) {
+                        (1, true) => "FXAA".to_string(),
+                        (1, false) => "off".to_string(),
+                        (n, _) => format!("MSAA {n}×"),
+                    };
+                    if requested > samples {
+                        text.push_str(&format!(" ({requested}× unsupported)"));
+                    }
+                    if let Some(ms) = aa["last_compile_ms"].as_f64().filter(|ms| *ms > 0.0) {
+                        text.push_str(&format!(" · switch {ms:.0} ms"));
+                    }
+                    stats.push(StatItem::new("Anti-aliasing", text));
+                }
                 if let Some(shadows) = snapshot.render_settings.as_ref().map(|r| &r["shadows"])
                     && let Some(count) = shadows["cascades"].as_u64().filter(|c| *c > 0)
                 {
