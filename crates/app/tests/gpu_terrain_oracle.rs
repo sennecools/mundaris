@@ -20,15 +20,9 @@
 mod common;
 
 use astrum_app::{planet_lod::select, shared_system::SharedTestSystem};
-use astrum_math::{
-    Direction3,
-    surface::{CubeFace, CubePatchAddress, SurfaceLocation},
-};
+use astrum_math::surface::{CubeFace, CubePatchAddress};
 use astrum_renderer::TerrainAtlasConfig;
-use astrum_world::terrain::{
-    SurfaceGenerator, noise,
-    producer::{ProducerRecipe, tile_texel_m},
-};
+use astrum_world::terrain::{SurfaceGenerator, noise, producer::tile_texel_m};
 use glam::DVec3;
 
 const HEIGHT_TOLERANCE_M: f64 = 1.0e-3;
@@ -38,36 +32,6 @@ const NORMAL_TOLERANCE_DEG: f64 = 0.75;
 /// f32 accumulation over landform recipes (kilometre amplitudes summed over
 /// many octaves): allowance per metre of the body's landform bound.
 const HEIGHT_TOLERANCE_LANDFORM: f64 = 4.0e-6;
-
-/// Direction of the highest terrain at a 20 km footprint (Fibonacci search):
-/// landform bodies also check a node path down to a mountain range.
-fn highest_direction(recipe: &ProducerRecipe) -> DVec3 {
-    let samples = 2000;
-    let golden = std::f64::consts::PI * (3.0 - 5.0f64.sqrt());
-    (0..samples)
-        .map(|k| {
-            let y = 1.0 - 2.0 * (k as f64 + 0.5) / samples as f64;
-            let r = (1.0 - y * y).sqrt();
-            let a = golden * k as f64;
-            DVec3::new(r * a.cos(), y, r * a.sin())
-        })
-        .max_by(|a, b| {
-            let h = |d: &DVec3| {
-                recipe
-                    .evaluate(*d, 20_000.0)
-                    .map_or(f64::MIN, |s| s.height_m)
-            };
-            h(a).total_cmp(&h(b))
-        })
-        .unwrap()
-}
-
-fn node_on_path(direction: DVec3, level: u8) -> CubePatchAddress {
-    let (face, uv) = SurfaceLocation::new(Direction3::try_new(direction).unwrap()).face_uv();
-    let count = 1u32 << level;
-    let index = |c: f64| (((c + 1.0) * 0.5 * f64::from(count)) as u32).min(count - 1);
-    CubePatchAddress::try_new(face, level, index(uv[0]), index(uv[1])).unwrap()
-}
 
 /// About 64 nodes: roots, cube-face corners, the canonical camera path at every
 /// fourth data level down to the finest, and seeded random nodes.
@@ -89,10 +53,10 @@ fn node_set(camera: DVec3, finest_data_level: u8) -> Vec<CubePatchAddress> {
     }
     let mut level = 0;
     while level <= finest_data_level {
-        nodes.push(node_on_path(camera, level));
+        nodes.push(common::node_on_path(camera, level));
         level += 2;
     }
-    nodes.push(node_on_path(camera, finest_data_level));
+    nodes.push(common::node_on_path(camera, finest_data_level));
     let mut rng = common::Rng(0x5eed_0123_4567_89ab);
     while nodes.len() < 64 {
         let level = rng.below(u32::from(finest_data_level) + 1) as u8;
@@ -156,11 +120,11 @@ fn gpu_tiles_match_the_cpu_oracle_within_documented_tolerances() {
         let mut nodes = node_set(camera, finest_data_level);
         let landform_bound = definition.world().map_or(0.0, |w| w.landform_bound_m());
         if landform_bound > 0.0 {
-            let peak = highest_direction(&recipe);
+            let peak = common::highest_direction(&recipe);
             for level in (0..=finest_data_level).step_by(2) {
-                nodes.push(node_on_path(peak, level));
+                nodes.push(common::node_on_path(peak, level));
             }
-            nodes.push(node_on_path(peak, finest_data_level));
+            nodes.push(common::node_on_path(peak, finest_data_level));
             nodes.sort_by_key(|n| (n.level(), n.face() as u8, n.coordinates()));
             nodes.dedup();
         }

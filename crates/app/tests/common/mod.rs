@@ -144,3 +144,35 @@ impl Rng {
         (self.next() % u64::from(n)) as u32
     }
 }
+
+/// Direction of the highest terrain at a 20 km footprint (Fibonacci search):
+/// tests of landform bodies also cover a mountain range.
+pub fn highest_direction(recipe: &ProducerRecipe) -> glam::DVec3 {
+    let samples = 2000;
+    let golden = std::f64::consts::PI * (3.0 - 5.0f64.sqrt());
+    (0..samples)
+        .map(|k| {
+            let y = 1.0 - 2.0 * (k as f64 + 0.5) / samples as f64;
+            let r = (1.0 - y * y).sqrt();
+            let a = golden * k as f64;
+            glam::DVec3::new(r * a.cos(), y, r * a.sin())
+        })
+        .max_by(|a, b| {
+            let h = |d: &glam::DVec3| {
+                recipe
+                    .evaluate(*d, 20_000.0)
+                    .map_or(f64::MIN, |s| s.height_m)
+            };
+            h(a).total_cmp(&h(b))
+        })
+        .unwrap()
+}
+
+/// The node of `level` containing unit `direction`.
+pub fn node_on_path(direction: glam::DVec3, level: u8) -> CubePatchAddress {
+    use astrum_math::{Direction3, surface::SurfaceLocation};
+    let (face, uv) = SurfaceLocation::new(Direction3::try_new(direction).unwrap()).face_uv();
+    let count = 1u32 << level;
+    let index = |c: f64| (((c + 1.0) * 0.5 * f64::from(count)) as u32).min(count - 1);
+    CubePatchAddress::try_new(face, level, index(uv[0]), index(uv[1])).unwrap()
+}

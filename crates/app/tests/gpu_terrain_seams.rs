@@ -58,11 +58,6 @@ fn neighbouring_gpu_tiles_agree_along_shared_edges() {
         };
         pairs.push((CubePatchAddress::try_new(face, level, x, y).unwrap(), edge));
     }
-    let mut nodes = Vec::new();
-    for &(node, edge) in &pairs {
-        nodes.push(node);
-        nodes.push(node.neighbor(edge).address);
-    }
     let mut checked_bodies = 0;
     for (_, body) in loaded.system.bodies().filter(|(_, b)| b.has_surface()) {
         let definition = body.surface_definition().unwrap();
@@ -72,9 +67,27 @@ fn neighbouring_gpu_tiles_agree_along_shared_edges() {
             .producer_recipe()
             .unwrap();
         common::provide_gpu_world(&context, &recipe);
+        // Landform bodies also check same-level neighbours along a path down
+        // to their highest terrain (mountain relief, rock layers).
+        let landform_bound = definition.world().map_or(0.0, |w| w.landform_bound_m());
+        let mut pairs = pairs.clone();
+        if landform_bound > 0.0 {
+            let peak = common::highest_direction(&recipe);
+            for level in (8..=finest).step_by(2).chain([finest]) {
+                let node = common::node_on_path(peak, level);
+                pairs.push((node, PatchEdge::UMax));
+                pairs.push((node, PatchEdge::VMax));
+            }
+        }
+        let mut nodes = Vec::new();
+        for &(node, edge) in &pairs {
+            nodes.push(node);
+            nodes.push(node.neighbor(edge).address);
+        }
         let tiles = common::produce(&context, config, &recipe, radius, &nodes);
         let side = config.height_side() as usize;
         let (mut worst, mut worst_ratio, mut cross_face) = (0.0f64, 0.0f64, 0);
+        let mut worst_normal = 0.0f64;
         for (index, &(node, edge)) in pairs.iter().enumerate() {
             let neighbour = node.neighbor(edge);
             if neighbour.address.face() != node.face() {
@@ -94,7 +107,7 @@ fn neighbouring_gpu_tiles_agree_along_shared_edges() {
                 let ha = f64::from(a.heights[aj * side + ai]);
                 let hb = f64::from(b.heights[bj * side + bi]);
                 let gap = (ha - hb).abs();
-                let allowed = seam_tolerance_m(texel, ha);
+                let allowed = seam_tolerance_m(texel, ha) + 2.0 * 4.0e-6 * landform_bound;
                 assert!(
                     gap <= allowed,
                     "{} {node:?} {edge:?} k={k}: {ha} vs {hb} ({gap} m > {allowed} m)",
@@ -103,10 +116,35 @@ fn neighbouring_gpu_tiles_agree_along_shared_edges() {
                 worst = worst.max(gap);
                 worst_ratio = worst_ratio.max(gap / allowed);
             }
+            // Normals along the edge at the 2× normal resolution: both tiles are
+            // within the oracle's 0.75° of the same function.
+            let ncells = config.cells * config.normal_scale;
+            let nside = config.normal_side() as usize;
+            for k in 0..=ncells {
+                let (ai, aj) = edge_texel(edge, k, ncells);
+                let kb = if neighbour.reversed { ncells - k } else { k };
+                let (bi, bj) = edge_texel(neighbour.edge, kb, ncells);
+                let na = a.normals[aj * nside + ai];
+                let nb = b.normals[bj * nside + bi];
+                let dot = (0..3)
+                    .map(|c| f64::from(na[c]) * f64::from(nb[c]))
+                    .sum::<f64>();
+                let len = |n: [f32; 3]| (0..3).map(|c| f64::from(n[c]).powi(2)).sum::<f64>().sqrt();
+                let degrees = (dot / (len(na) * len(nb)))
+                    .clamp(-1.0, 1.0)
+                    .acos()
+                    .to_degrees();
+                worst_normal = worst_normal.max(degrees);
+                assert!(
+                    degrees <= 1.5,
+                    "{} {node:?} {edge:?} normal k={k}: {degrees} deg",
+                    body.name()
+                );
+            }
         }
         println!(
             "{}: {} edge pairs ({cross_face} across cube faces), max seam gap {worst:.6} m \
-             ({worst_ratio:.2} of tolerance)",
+             ({worst_ratio:.2} of tolerance), max normal {worst_normal:.3} deg",
             body.name(),
             pairs.len()
         );
