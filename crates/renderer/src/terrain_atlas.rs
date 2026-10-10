@@ -1910,7 +1910,7 @@ impl TerrainAtlasRenderer {
         } else {
             0
         };
-        let args = [72u32, 0, 0, 0, staged, 0, 0, 0];
+        let args = [96u32, 0, 0, 0, staged, 0, 0, 0];
         let bytes: Vec<u8> = args.iter().flat_map(|w| w.to_le_bytes()).collect();
         queue.write_buffer(&self.plant_args, 0, &bytes);
         if staged == 0 {

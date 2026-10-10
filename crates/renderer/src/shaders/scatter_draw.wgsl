@@ -29,7 +29,7 @@
 
 const SCATTER_SIDE: u32 = 32u;
 const SCATTER_SLOTS: u32 = 1024u;
-const SCATTER_VERTS: u32 = 72u;
+const SCATTER_VERTS: u32 = 96u;
 const SCATTER_CELL_BITS: u32 = 16u;
 // Full density within this view distance (m); keep(d) = (FULL / d)².
 const SCATTER_FULL_M: f32 = 350.0;
@@ -151,75 +151,107 @@ fn sc_keep(d: f32) -> f32 {
         * (1.0 - smoothstep(0.7 * SCATTER_MAX_DISTANCE_M, SCATTER_MAX_DISTANCE_M, d));
 }
 
-// Shapes: kind 0 conifer, 1 broadleaf, 2 shrub, 3 boulder. Part A
-// (triangles 0..7) is an 8-sided cone or upper pyramid, part B (8..15) a
-// second cone (conifer) or the lower pyramid, part C (16..23) a 4-sided
-// trunk. Returns the local corner (metres before scaling, z up).
-struct Part {
-    ring_z: f32,
-    ring_r: f32,
-    apex_z: f32,
+// Shapes (32 triangles, 96 vertices): kind 0 conifer, 1 broadleaf, 2 shrub,
+// 3 boulder. Triangles 0..23 form three "lobes" of 8 triangles; 24..31 the
+// trunk (4 quads; degenerate for shrubs and boulders).
+// - Conifer lobes are stacked open cones (8 sides), widest at the bottom.
+// - Other lobes are 4-sided bipyramids (4 up, 4 down) around a lobe centre,
+//   offset and sized per plant from `seed`, with per-vertex jitter; several
+//   overlapping lobes read as a rounded, irregular crown, shrub or rock pile.
+// Positions are metres before scaling, z up; trunks start below ground.
+struct Lobe {
+    centre: vec3<f32>,
+    radius: f32,
+    up: f32,
+    down: f32,
 }
 
-fn sc_part(kind: u32, part: u32) -> Part {
-    var p: Part;
+fn sc_rand(seed: u32, a: u32, b: u32) -> f32 {
+    return sc_unit(sc_pcg3d(vec3<u32>(seed, a, b)).x);
+}
+
+fn sc_lobe(kind: u32, lobe: u32, seed: u32) -> Lobe {
+    var l: Lobe;
+    let angle = (f32(lobe) * 2.1 + sc_rand(seed, lobe, 1u) * 1.2) ;
+    let r1 = sc_rand(seed, lobe, 2u);
     if kind == 0u {
-        if part == 0u {
-            p = Part(2.0, 3.1, 9.0);
-        } else {
-            p = Part(6.0, 2.2, 13.0);
-        }
+        // Conifer tiers: ring height, ring radius, apex above the ring.
+        let tier = f32(lobe);
+        l.centre = vec3<f32>(0.0, 0.0, 2.0 + 3.4 * tier);
+        l.radius = (3.3 - 0.85 * tier) * (0.9 + 0.2 * r1);
+        l.up = 5.2 - 0.6 * tier;
+        l.down = 0.0;
     } else if kind == 1u {
-        if part == 0u {
-            p = Part(7.4, 4.1, 11.6);
+        // Broadleaf: one main crown and two side lobes.
+        if lobe == 0u {
+            l.centre = vec3<f32>(0.0, 0.0, 8.0);
+            l.radius = 4.0;
+            l.up = 3.4;
+            l.down = 2.6;
         } else {
-            p = Part(7.4, 4.1, 3.4);
+            let off = 2.0 + 0.8 * r1;
+            l.centre = vec3<f32>(cos(angle) * off, sin(angle) * off, 7.0 + 2.0 * sc_rand(seed, lobe, 3u));
+            l.radius = 2.8 + 0.6 * r1;
+            l.up = 2.4;
+            l.down = 1.8;
         }
     } else if kind == 2u {
-        if part == 0u {
-            p = Part(0.8, 1.6, 2.1);
-        } else {
-            p = Part(0.8, 1.6, -0.6);
-        }
+        // Shrub: a clump of three low lobes.
+        let off = select(0.9 + 0.5 * r1, 0.0, lobe == 0u);
+        l.centre = vec3<f32>(cos(angle) * off, sin(angle) * off, 0.9 + 0.3 * r1);
+        l.radius = select(1.0 + 0.3 * r1, 1.5, lobe == 0u);
+        l.up = select(0.8 + 0.3 * r1, 1.1, lobe == 0u);
+        l.down = 1.0;
     } else {
-        if part == 0u {
-            p = Part(0.4, 1.2, 1.0);
-        } else {
-            p = Part(0.4, 1.2, -0.3);
-        }
+        // Boulder: one main block and two smaller stones beside it.
+        let off = select(1.3 + 0.6 * r1, 0.0, lobe == 0u);
+        l.centre = vec3<f32>(cos(angle) * off, sin(angle) * off, select(0.15, 0.35, lobe == 0u));
+        l.radius = select(0.45 + 0.35 * r1, 1.25, lobe == 0u);
+        l.up = select(0.35 + 0.3 * r1, 0.85, lobe == 0u);
+        l.down = l.up * 0.6;
     }
-    return p;
+    return l;
 }
 
+// Local corner `corner` of triangle `tri` of a plant of `kind`.
 fn sc_corner(kind: u32, tri: u32, corner: u32, seed: u32) -> vec3<f32> {
-    if tri < 16u {
-        let part = sc_part(kind, tri / 8u);
+    if tri < 24u {
+        let lobe = tri / 8u;
         let i = tri % 8u;
+        let l = sc_lobe(kind, lobe, seed);
+        if kind == 0u {
+            // Open cone: apex, then two ring vertices (8 sides).
+            if corner == 0u {
+                return l.centre + vec3<f32>(0.0, 0.0, l.up);
+            }
+            let j = (i + corner - 1u) % 8u;
+            let a = f32(j) * (6.2831853 / 8.0) + f32(lobe) * 0.39;
+            let r = l.radius * (0.88 + 0.24 * sc_rand(seed, lobe * 8u + j, 5u));
+            return l.centre + vec3<f32>(cos(a) * r, sin(a) * r, 0.0);
+        }
+        // Bipyramid: triangles 0..3 to the top apex, 4..7 to the bottom one.
+        let upper = i < 4u;
+        let k = i % 4u;
         if corner == 0u {
-            return vec3<f32>(0.0, 0.0, part.apex_z);
+            return l.centre + vec3<f32>(0.0, 0.0, select(-l.down, l.up, upper));
         }
-        let j = (i + corner - 1u) % 8u;
-        let a = f32(j) * (6.2831853 / 8.0);
-        var r = part.ring_r;
-        if kind == 3u {
-            // Irregular rocks: per-vertex radius from the seed.
-            r *= 0.65 + 0.7 * sc_unit(sc_pcg3d(vec3<u32>(seed, j, 7u)).x);
-        } else if kind == 1u {
-            r *= 0.85 + 0.3 * sc_unit(sc_pcg3d(vec3<u32>(seed, j, 9u)).x);
-        }
-        return vec3<f32>(cos(a) * r, sin(a) * r, part.ring_z);
+        let j = (k + corner - 1u) % 4u;
+        let a = (f32(j) + 0.5) * (6.2831853 / 4.0) + sc_rand(seed, lobe, 4u) * 1.57;
+        let r = l.radius * (0.8 + 0.4 * sc_rand(seed, lobe * 4u + j, 6u));
+        let dz = (sc_rand(seed, lobe * 4u + j, 7u) - 0.5) * 0.4 * l.radius;
+        return l.centre + vec3<f32>(cos(a) * r, sin(a) * r, dz);
     }
     // Trunk: 4 quads, two triangles each.
     var trunk_r = 0.32;
-    var trunk_top = 2.4;
+    var trunk_top = 3.0;
     if kind == 1u {
         trunk_r = 0.38;
-        trunk_top = 4.0;
+        trunk_top = 6.0;
     } else if kind >= 2u {
         trunk_r = 0.0;
         trunk_top = 0.0;
     }
-    let t = tri - 16u;
+    let t = tri - 24u;
     let q = t / 2u;
     let a0 = f32(q) * (6.2831853 / 4.0);
     let a1 = f32(q + 1u) * (6.2831853 / 4.0);
@@ -233,6 +265,13 @@ fn sc_corner(kind: u32, tri: u32, corner: u32, seed: u32) -> vec3<f32> {
     return select(select(p01, p11, corner == 1u), p10, corner == 0u);
 }
 
+// Point the face normal points away from (lobe centre or trunk axis).
+fn sc_face_origin(kind: u32, tri: u32, seed: u32, centre: vec3<f32>) -> vec3<f32> {
+    if tri < 24u {
+        return sc_lobe(kind, tri / 8u, seed).centre;
+    }
+    return vec3<f32>(0.0, 0.0, centre.z);
+}
 // Chart coordinates of node position `st` in base cells.
 fn sc_cells(inst: Instance, st: vec2<f32>) -> vec2<f32> {
     let width = inst.face_u.w;
@@ -268,6 +307,30 @@ fn forest_cover(inst: Instance, st: vec2<f32>, normal_body: vec3<f32>, climate: 
     let cover = clamp(site.tree * site.stature + 0.4 * site.shrub, 0.0, 1.0);
     let far = 1.0 - sc_keep(d);
     return vec4<f32>(colour, cover * mix(0.7, 0.9, far));
+}
+
+// PROTOTYPE (M4/M5): mean-preserving ground detail near the camera: four
+// octaves of world-anchored value noise (about 0.5, 2, 8 and 32 m), each
+// fading out once its wavelength spans fewer than about four pixels, so the
+// far colour is unchanged. Returns a brightness factor around 1 and a 0..1
+// patch value for a slight green/dry hue shift.
+fn ground_detail(inst: Instance, st: vec2<f32>, footprint_px: f32) -> vec2<f32> {
+    let c = sc_cells(inst, st);
+    let face = sc_face(inst.n0.xyz);
+    var sum = 0.0;
+    var hue = 0.0;
+    let scales = array<f32, 4>(16.0, 4.0, 1.0, 0.25);
+    let amps = array<f32, 4>(0.16, 0.14, 0.12, 0.10);
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let wl = 1.0 / scales[i];
+        let keep = 1.0 - smoothstep(0.25 * wl, 0.5 * wl, footprint_px);
+        let v = sc_value(face, c.x * scales[i], c.y * scales[i], 50u + i);
+        sum += amps[i] * (v - 0.5) * 2.0 * keep;
+        if i >= 2u {
+            hue += (v - 0.5) * keep;
+        }
+    }
+    return vec2<f32>(1.0 + sum, 0.5 + hue);
 }
 
 // One placed plant for the draw, in view space: stem foot and scale, yawed

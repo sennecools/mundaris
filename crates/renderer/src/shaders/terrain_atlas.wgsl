@@ -235,6 +235,9 @@ fn fs_main(input: VertexOut) -> SceneOut {
         let climate = mix(mix(parent_c, own_c, input.blend.x), parent_c, input.blend.y);
         let canopy = forest_cover(inst, input.grid_st, normalize(sampled.xyz), climate.xy, input.ground, length(input.view_pos), cell_footprint);
         land_albedo = mix(land_albedo, canopy.rgb, canopy.a);
+        let detail = ground_detail(inst, input.grid_st, cell_footprint);
+        let tint = mix(vec3<f32>(0.95, 1.04, 0.9), vec3<f32>(1.05, 0.97, 1.06), detail.y);
+        land_albedo *= detail.x * tint;
     }
     let n0_view = inst.b2v_x.xyz * inst.n0.x + inst.b2v_y.xyz * inst.n0.y + inst.b2v_z.xyz * inst.n0.z;
     let up = normalize(input.view_pos - (inst.anchor.xyz - n0_view * inst.anchor.w));

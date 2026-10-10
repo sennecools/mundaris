@@ -1,5 +1,5 @@
 // PROTOTYPE (M5 Life): draw stage of the plants placed by cs_scatter
-// (scatter_cull.wgsl): one instance per placed plant, 72 procedural
+// (scatter_cull.wgsl): one instance per placed plant, 96 procedural
 // vertices, flat shaded and lit like terrain.
 
 @group(3) @binding(0) var<storage, read> plants: array<Plant>;
@@ -30,13 +30,10 @@ fn vs_scatter(@builtin(vertex_index) vertex: u32, @builtin(instance_index) index
     let c2 = sc_corner(kind, tri, 2u, seed) * shape;
     let local = sc_corner(kind, tri, corner, seed) * shape * scale;
     var local_n = normalize(cross(c1 - c0, c2 - c0));
-    // Face outward from the part's axis point.
-    var axis_z = 0.0;
-    if tri < 16u {
-        axis_z = sc_part(kind, tri / 8u).ring_z;
-    }
-    let centre = (c0 + c1 + c2) / 3.0 - vec3<f32>(0.0, 0.0, axis_z);
-    if dot(local_n, centre) < 0.0 {
+    // Face outward from the lobe centre (or the trunk axis).
+    let centroid = (c0 + c1 + c2) / 3.0;
+    let origin = sc_face_origin(kind, tri, seed, centroid) * shape;
+    if dot(local_n, centroid - origin) < 0.0 {
         local_n = -local_n;
     }
     let view_position = p.base.xyz + e1 * local.x + e2 * local.y + up * local.z;
@@ -50,7 +47,7 @@ fn vs_scatter(@builtin(vertex_index) vertex: u32, @builtin(instance_index) index
     let shift = vec3<f32>(1.0 + 0.25 * (hue - 0.5), 1.0, 1.0 - 0.3 * (hue - 0.5));
     if kind == 3u {
         out.albedo = vec3<f32>(0.2, 0.19, 0.17) * tint;
-    } else if tri >= 16u {
+    } else if tri >= 24u {
         out.albedo = vec3<f32>(0.075, 0.05, 0.03);
     } else if kind == 0u {
         out.albedo = vec3<f32>(0.022, 0.05, 0.028) * tint * shift;
