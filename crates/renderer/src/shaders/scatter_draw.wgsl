@@ -38,14 +38,6 @@ const SCATTER_MAX_DISTANCE_M: f32 = 16000.0;
 const SCATTER_DEG: f32 = 0.017453292;
 const SCATTER_MAX_LEVEL: u32 = 12u;
 
-struct ScatterOut {
-    @builtin(position) clip_position: vec4<f32>,
-    @location(0) view_pos: vec3<f32>,
-    @location(1) @interpolate(flat) normal: vec3<f32>,
-    @location(2) @interpolate(flat) up: vec3<f32>,
-    @location(3) @interpolate(flat) albedo: vec3<f32>,
-}
-
 fn sc_pcg3d(v_in: vec3<u32>) -> vec3<u32> {
     var v = v_in * 1664525u + 1013904223u;
     v.x += v.y * v.z;
@@ -265,33 +257,41 @@ fn forest_cover(inst: Instance, st: vec2<f32>, normal_body: vec3<f32>, climate: 
     return vec4<f32>(colour, cover * mix(0.7, 0.9, far));
 }
 
-fn sc_hidden() -> ScatterOut {
-    var out: ScatterOut;
-    out.clip_position = vec4<f32>(2.0, 2.0, 2.0, 1.0);
-    out.view_pos = vec3<f32>(0.0);
-    out.normal = vec3<f32>(0.0, 0.0, 1.0);
-    out.up = vec3<f32>(0.0, 0.0, 1.0);
-    out.albedo = vec3<f32>(0.0);
-    return out;
+// One placed plant for the draw, in view space: stem foot and scale, yawed
+// horizontal axis and crown spread, up, then kind and three hash seeds
+// (shape, brightness, hue).
+struct Plant {
+    base: vec4<f32>,
+    e1: vec4<f32>,
+    up: vec4<f32>,
+    info: vec4<u32>,
 }
 
-@vertex
-fn vs_scatter(@builtin(vertex_index) vertex: u32, @builtin(instance_index) index: u32) -> ScatterOut {
+struct Placed {
+    ok: bool,
+    plant: Plant,
+}
+
+// Place candidate `index` (drawn node index × SCATTER_SLOTS + slot): the
+// hierarchy, rank, keep, water, forest field and species choice described
+// at the top of this file.
+fn sc_place(index: u32) -> Placed {
+    var out: Placed;
+    out.ok = false;
     let inst = instances[index / SCATTER_SLOTS];
     let slot = index % SCATTER_SLOTS;
     let mode = u32(inst.b2v_x.w + 0.5);
     // World maps only (flat ocean flag), lit views only.
     if inst.surface.x < 0.5 || !(mode == 0u || mode == 9u || mode == 11u) {
-        return sc_hidden();
+        return out;
     }
     let radius = inst.anchor.w;
     let width = inst.face_u.w;
     let q0 = inst.n0.w;
     // Whole node beyond the plant distance: nothing to draw.
     if length(inst.anchor.xyz) - 0.75 * width / q0 * radius > SCATTER_MAX_DISTANCE_M {
-        return sc_hidden();
+        return out;
     }
-    // Chart (face-plane) coordinates of the node's lower corner.
     let u_min = dot(inst.n0.xyz, inst.face_u.xyz) * q0 - 0.5 * width;
     let v_min = dot(inst.n0.xyz, inst.face_v.xyz) * q0 - 0.5 * width;
     let cells_per_unit = f32(1u << (SCATTER_CELL_BITS - 1u));
@@ -308,9 +308,8 @@ fn vs_scatter(@builtin(vertex_index) vertex: u32, @builtin(instance_index) index
     let a = slot % SCATTER_SIDE;
     let b = slot / SCATTER_SIDE;
     if a >= side || b >= side {
-        return sc_hidden();
+        return out;
     }
-    // Coarse cell, then hashed quadrant choices down to a base cell.
     var ci = (i0 >> k) + a;
     var cj = (j0 >> k) + b;
     for (var level = k; level > 0u; level = level - 1u) {
@@ -318,7 +317,6 @@ fn vs_scatter(@builtin(vertex_index) vertex: u32, @builtin(instance_index) index
         ci = ci * 2u + (q & 1u);
         cj = cj * 2u + (q >> 1u);
     }
-    // λ: further ancestors that also pick this cell.
     var lambda = k;
     loop {
         let next = lambda + 1u;
@@ -339,22 +337,19 @@ fn vs_scatter(@builtin(vertex_index) vertex: u32, @builtin(instance_index) index
     let v = (f32(cj) + 0.15 + 0.7 * sc_unit(h.y)) / cells_per_unit - 1.0;
     let st = vec2<f32>((u - u_min) / width, (v - v_min) / width);
     if any(st < vec2<f32>(0.0)) || any(st > vec2<f32>(1.0)) {
-        return sc_hidden();
+        return out;
     }
     let ground = blended_height(inst, st, 0.0);
     let base_view = to_view(inst, body_position(inst, st, ground));
     let keep = sc_keep(length(base_view));
-    // Grow in over the last 35 % of keep before the rank.
     let grow = clamp((keep - rank) / (0.35 * keep + 1.0e-12), 0.0, 1.0);
     if grow <= 0.0 {
-        return sc_hidden();
+        return out;
     }
-    // Site from the node's own page.
     let own_uv = normal_uv(own_st(inst, st));
     let page_n = textureSampleLevel(normal_atlas, normal_sampler, own_uv, i32(inst.own.x), 0.0);
     if page_n.w > -0.2 {
-        // Water (or its shore band).
-        return sc_hidden();
+        return out;
     }
     let climate = textureSampleLevel(climate_atlas, normal_sampler, own_uv, i32(inst.own.x), 0.0);
     let diff = chart_diff(inst, st);
@@ -375,23 +370,9 @@ fn vs_scatter(@builtin(vertex_index) vertex: u32, @builtin(instance_index) index
         kind = 3u;
         scale = mix(0.5, 2.2, sc_unit(h2.y) * sc_unit(h2.x));
     } else {
-        return sc_hidden();
+        return out;
     }
     scale *= smoothstep(0.0, 1.0, grow);
-    let yaw = sc_unit(h2.z) * 6.2831853;
-    // Local frame: up, and a yawed horizontal pair from the face U axis; a
-    // slight lean for rocks only.
-    let e1r = normalize(inst.face_u.xyz - up_body * dot(inst.face_u.xyz, up_body));
-    let e2r = cross(up_body, e1r);
-    let e1 = e1r * cos(yaw) + e2r * sin(yaw);
-    let e2 = cross(up_body, e1);
-    let tri = vertex / 3u;
-    let corner = vertex % 3u;
-    let seed = h.x ^ h.y;
-    let shape = vec3<f32>(select(1.0, clamp(1.25 * inverseSqrt(max(keep, 1.0e-6)), 1.0, 30.0), kind <= 2u));
-    let c0 = sc_corner(kind, tri, 0u, seed) * vec3<f32>(shape.x, shape.y, 1.0);
-    let c1 = sc_corner(kind, tri, 1u, seed) * vec3<f32>(shape.x, shape.y, 1.0);
-    let c2 = sc_corner(kind, tri, 2u, seed) * vec3<f32>(shape.x, shape.y, 1.0);
     // Each kept tree or shrub stands for the 1 / keep candidates around it:
     // its crown spreads sideways (not up) so far forests close into a
     // canopy at true canopy height with a bumpy silhouette.
@@ -399,45 +380,15 @@ fn vs_scatter(@builtin(vertex_index) vertex: u32, @builtin(instance_index) index
     if kind <= 2u {
         spread = clamp(1.25 * inverseSqrt(max(keep, 1.0e-6)), 1.0, 30.0);
     }
-    let local = sc_corner(kind, tri, corner, seed) * vec3<f32>(scale * spread, scale * spread, scale);
-    var local_n = normalize(cross(c1 - c0, c2 - c0));
-    // Face outward from the part's axis point.
-    var axis_z = 0.0;
-    if tri < 16u {
-        axis_z = sc_part(kind, tri / 8u).ring_z;
-    }
-    let centre = (c0 + c1 + c2) / 3.0 - vec3<f32>(0.0, 0.0, axis_z);
-    if dot(local_n, centre) < 0.0 {
-        local_n = -local_n;
-    }
-    let to_body = mat3x3<f32>(e1, e2, up_body);
-    let base = body_position(inst, st, ground - 0.15 * scale);
-    let view_position = to_view(inst, base + to_body * local);
-    let n_body = to_body * local_n;
-    var out: ScatterOut;
-    out.clip_position = projection.matrix * vec4<f32>(view_position, 1.0);
-    out.view_pos = view_position;
-    out.normal = normalize(inst.b2v_x.xyz * n_body.x + inst.b2v_y.xyz * n_body.y + inst.b2v_z.xyz * n_body.z);
-    out.up = normalize(inst.b2v_x.xyz * up_body.x + inst.b2v_y.xyz * up_body.y + inst.b2v_z.xyz * up_body.z);
-    let tint = 0.8 + 0.4 * sc_unit(h2.x ^ h2.y);
-    // Per-plant hue: some greener, some olive or bluish.
-    let hue = sc_unit(h.y ^ h2.z);
-    let shift = vec3<f32>(1.0 + 0.25 * (hue - 0.5), 1.0, 1.0 - 0.3 * (hue - 0.5));
-    if kind == 3u {
-        out.albedo = vec3<f32>(0.2, 0.19, 0.17) * tint;
-    } else if tri >= 16u {
-        out.albedo = vec3<f32>(0.075, 0.05, 0.03);
-    } else if kind == 0u {
-        out.albedo = vec3<f32>(0.022, 0.05, 0.028) * tint * shift;
-    } else if kind == 1u {
-        out.albedo = vec3<f32>(0.045, 0.085, 0.025) * tint * shift;
-    } else {
-        out.albedo = vec3<f32>(0.055, 0.07, 0.03) * tint * shift;
-    }
+    let yaw = sc_unit(h2.z) * 6.2831853;
+    let e1r = normalize(inst.face_u.xyz - up_body * dot(inst.face_u.xyz, up_body));
+    let e2r = cross(up_body, e1r);
+    let e1 = e1r * cos(yaw) + e2r * sin(yaw);
+    let to_view_dir = mat3x3<f32>(inst.b2v_x.xyz, inst.b2v_y.xyz, inst.b2v_z.xyz);
+    out.plant.base = vec4<f32>(to_view(inst, body_position(inst, st, ground - 0.15 * scale)), scale);
+    out.plant.e1 = vec4<f32>(to_view_dir * e1, spread);
+    out.plant.up = vec4<f32>(to_view_dir * up_body, 0.0);
+    out.plant.info = vec4<u32>(kind, h.x ^ h.y, h2.x ^ h2.y, h.y ^ h2.z);
+    out.ok = true;
     return out;
-}
-
-@fragment
-fn fs_scatter(input: ScatterOut) -> SceneOut {
-    return shade(input.view_pos, input.normal, input.up, input.albedo, 0.0, true);
 }

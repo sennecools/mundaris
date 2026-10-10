@@ -17,8 +17,20 @@ use std::sync::{
 const DRAW_SHADER: &str = concat!(
     include_str!("shaders/lighting.wgsl"),
     include_str!("shaders/terrain_atlas.wgsl"),
-    include_str!("shaders/scatter_draw.wgsl")
+    include_str!("shaders/scatter_draw.wgsl"),
+    include_str!("shaders/scatter_vs.wgsl")
 );
+/// PROTOTYPE (M5 Life): plant culling compute shader (same helpers as the draw).
+const CULL_SHADER: &str = concat!(
+    include_str!("shaders/lighting.wgsl"),
+    include_str!("shaders/terrain_atlas.wgsl"),
+    include_str!("shaders/scatter_draw.wgsl"),
+    include_str!("shaders/scatter_cull.wgsl")
+);
+/// Placed plants the culling pass can hold (64 bytes each).
+const PLANT_CAPACITY: u64 = 262_144;
+/// Candidate slots per drawn node (`SCATTER_SLOTS` in scatter_draw.wgsl).
+const PLANT_SLOTS: u32 = 1024;
 /// Producer shader: shared split-lattice noise and cube-map sampling followed by
 /// the atlas producer.
 const PRODUCE_SHADER: &str = concat!(
@@ -653,6 +665,12 @@ pub(crate) struct TerrainAtlasRenderer {
     /// PROTOTYPE (M5 Life): procedural trees and boulders on drawn nodes.
     scatter_pipeline: wgpu::RenderPipeline,
     scatter_shadow_pipeline: wgpu::RenderPipeline,
+    scatter_cull: wgpu::ComputePipeline,
+    plants_ro_group: wgpu::BindGroup,
+    plants_rw_group: wgpu::BindGroup,
+    empty_group: wgpu::BindGroup,
+    plant_args: wgpu::Buffer,
+    _plants: wgpu::Buffer,
     draw_group: wgpu::BindGroup,
     instances: wgpu::Buffer,
     instance_capacity: u64,
@@ -950,13 +968,16 @@ impl TerrainAtlasRenderer {
             label: Some("Terrain atlas draw"),
             source: wgpu::ShaderSource::Wgsl(DRAW_SHADER.into()),
         });
-        let vertex_fragment = wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT;
+        // Compute too: the plant culling pass reads the draw resources.
+        let vertex_fragment = wgpu::ShaderStages::VERTEX
+            | wgpu::ShaderStages::FRAGMENT
+            | wgpu::ShaderStages::COMPUTE;
         let draw_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Terrain atlas draw resources"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: false },
                         view_dimension: wgpu::TextureViewDimension::D2Array,
@@ -1100,9 +1121,119 @@ impl TerrainAtlasRenderer {
             multiview_mask: None,
             cache: None,
         });
+        // PROTOTYPE (M5 Life): placed plants (culled per frame by cs_scatter)
+        // and their indirect draw arguments.
+        let plant_storage = |binding, read_only, visibility| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let plants_ro_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Terrain plants (draw)"),
+            entries: &[plant_storage(0, true, wgpu::ShaderStages::VERTEX)],
+        });
+        let plants_rw_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Terrain plants (cull)"),
+            entries: &[
+                plant_storage(0, false, wgpu::ShaderStages::COMPUTE),
+                plant_storage(1, false, wgpu::ShaderStages::COMPUTE),
+            ],
+        });
+        let empty_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Terrain empty"),
+            entries: &[],
+        });
+        let plants = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Terrain plants"),
+            size: PLANT_CAPACITY * 64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let plant_args = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Terrain plant draw arguments"),
+            size: 32,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let plants_ro_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Terrain plants (draw)"),
+            layout: &plants_ro_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: plants.as_entire_binding(),
+            }],
+        });
+        let plants_rw_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Terrain plants (cull)"),
+            layout: &plants_rw_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: plants.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: plant_args.as_entire_binding(),
+                },
+            ],
+        });
+        let empty_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Terrain empty"),
+            layout: &empty_layout,
+            entries: &[],
+        });
+        let scatter_draw_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Terrain plants draw layout"),
+            bind_group_layouts: &[
+                Some(projection_layout),
+                Some(&draw_layout),
+                Some(lighting_layout),
+                Some(&plants_ro_layout),
+            ],
+            immediate_size: 0,
+        });
+        let scatter_shadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Terrain plants shadow layout"),
+            bind_group_layouts: &[
+                Some(light_layout),
+                Some(&draw_layout),
+                Some(&empty_layout),
+                Some(&plants_ro_layout),
+            ],
+            immediate_size: 0,
+        });
+        let cull_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Terrain plants cull layout"),
+            bind_group_layouts: &[
+                Some(&empty_layout),
+                Some(&draw_layout),
+                Some(&empty_layout),
+                Some(&plants_rw_layout),
+            ],
+            immediate_size: 0,
+        });
+        let cull_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Terrain plants cull"),
+            source: wgpu::ShaderSource::Wgsl(CULL_SHADER.into()),
+        });
+        let scatter_cull = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Terrain plants cull"),
+            layout: Some(&cull_layout),
+            module: &cull_shader,
+            entry_point: Some("cs_scatter"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
         let scatter_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Terrain scatter (prototype trees and boulders)"),
-            layout: Some(&draw_pipeline_layout),
+            layout: Some(&scatter_draw_layout),
             vertex: wgpu::VertexState {
                 module: &draw_shader,
                 entry_point: Some("vs_scatter"),
@@ -1174,7 +1305,7 @@ impl TerrainAtlasRenderer {
         });
         let scatter_shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Terrain scatter sun shadow casters (prototype)"),
-            layout: Some(&shadow_pipeline_layout),
+            layout: Some(&scatter_shadow_layout),
             vertex: wgpu::VertexState {
                 module: &draw_shader,
                 entry_point: Some("vs_scatter"),
@@ -1250,6 +1381,12 @@ impl TerrainAtlasRenderer {
             pipeline,
             scatter_pipeline,
             scatter_shadow_pipeline,
+            scatter_cull,
+            plants_ro_group,
+            plants_rw_group,
+            empty_group,
+            plant_args,
+            _plants: plants,
             draw_group,
             instances,
             instance_capacity,
@@ -1537,6 +1674,7 @@ impl TerrainAtlasRenderer {
 
         if frame.jobs.is_empty() && frame.collision_jobs.is_empty() {
             self.stage_instances(device, queue, frame);
+            self.cull_plants(queue, encoder);
             return Ok(());
         }
         let validate = |job: &AtlasProduceJob| -> Result<(), String> {
@@ -1712,7 +1850,31 @@ impl TerrainAtlasRenderer {
             }
         }
         self.stage_instances(device, queue, frame);
+        self.cull_plants(queue, encoder);
         Ok(())
+    }
+
+    /// PROTOTYPE (M5 Life): place this frame's plants on the staged nodes
+    /// (cs_scatter) into the plant buffer and its indirect draw arguments.
+    fn cull_plants(&self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder) {
+        let staged = if scatter_enabled() { self.staged_instances } else { 0 };
+        let args = [72u32, 0, 0, 0, staged, 0, 0, 0];
+        let bytes: Vec<u8> = args.iter().flat_map(|w| w.to_le_bytes()).collect();
+        queue.write_buffer(&self.plant_args, 0, &bytes);
+        if staged == 0 {
+            return;
+        }
+        let groups = (staged * PLANT_SLOTS).div_ceil(64);
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("Terrain plants cull"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.scatter_cull);
+        pass.set_bind_group(0, &self.empty_group, &[]);
+        pass.set_bind_group(1, &self.draw_group, &[]);
+        pass.set_bind_group(2, &self.empty_group, &[]);
+        pass.set_bind_group(3, &self.plants_rw_group, &[]);
+        pass.dispatch_workgroups(groups.min(65_535), groups.div_ceil(65_535), 1);
     }
 
     fn stage_instances(
@@ -1797,8 +1959,11 @@ impl TerrainAtlasRenderer {
         pass.draw_indexed(0..self.index_count, 0, 0..self.staged_instances);
         // PROTOTYPE (M5 Life): 1024 scatter slots of 72 procedural vertices per
         // drawn node (scatter_draw.wgsl); bind groups are shared.
-        pass.set_pipeline(&self.scatter_pipeline);
-        pass.draw(0..72, 0..self.staged_instances * 1024);
+        if scatter_enabled() {
+            pass.set_pipeline(&self.scatter_pipeline);
+            pass.set_bind_group(3, &self.plants_ro_group, &[]);
+            pass.draw_indirect(&self.plant_args, 0);
+        }
     }
 
     /// Uploads per-cascade caster lists back to back.
@@ -1863,9 +2028,11 @@ impl TerrainAtlasRenderer {
         pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..self.index_count, 0, start..end);
         // PROTOTYPE (M5 Life): plants cast shadows in the two nearest cascades.
-        if cascade < 2 {
+        if cascade < 2 && scatter_enabled() {
             pass.set_pipeline(&self.scatter_shadow_pipeline);
-            pass.draw(0..72, start * 1024..end * 1024);
+            pass.set_bind_group(2, &self.empty_group, &[]);
+            pass.set_bind_group(3, &self.plants_ro_group, &[]);
+            pass.draw_indirect(&self.plant_args, 0);
         }
     }
 }
@@ -2682,6 +2849,13 @@ fn upload_source(
     })
 }
 
+/// PROTOTYPE (M5 Life): `ASTRUM_NO_SCATTER=1` turns the plant draw off (for
+/// A/B frame-cost measurements).
+fn scatter_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("ASTRUM_NO_SCATTER").is_none())
+}
+
 /// Producer source bind group: profile images, profile/field constants
 /// (`constants[0..2]`), Tier A world fields, surface colours (`constants[2]`)
 /// and the packed rivers.
@@ -3031,7 +3205,7 @@ mod tests {
 
     #[test]
     fn atlas_shaders_parse_and_validate() {
-        for (name, source) in [("produce", PRODUCE_SHADER), ("draw", DRAW_SHADER)] {
+        for (name, source) in [("produce", PRODUCE_SHADER), ("draw", DRAW_SHADER), ("cull", CULL_SHADER)] {
             let module = naga::front::wgsl::parse_str(source)
                 .unwrap_or_else(|error| panic!("{name}: {}", error.emit_to_string(source)));
             naga::valid::Validator::new(
