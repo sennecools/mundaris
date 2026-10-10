@@ -605,6 +605,13 @@ fn world_albedo(d: vec3<f32>, height: f32, normal: vec3<f32>) -> vec3<f32> {
     return mix(biome_colour(t, m), surface_vec3(12u), snow);
 }
 
+// Water mask in the normal page's w: 1 where a world map's ground is below
+// sea level. Filtered at page resolution, it gives the draw a smooth coastline
+// instead of one decided per vertex.
+fn page_water(value: vec4<f32>) -> f32 {
+    return select(0.0, 1.0, tile.info.y == 2u && value.w < 0.0);
+}
+
 // Page albedo texel for an evaluated sample `value` (normal, height) at `st`.
 fn page_albedo(st: vec2<f32>, value: vec4<f32>) -> vec4<f32> {
     if tile.info.y != 2u {
@@ -678,7 +685,7 @@ fn produce_heights(@builtin(global_invocation_id) id: vec3<u32>) {
     textureStore(height_out, vec2<i32>(id.xy), layer, vec4<f32>(value.w, 0.0, 0.0, 0.0));
     if dispatch.side == dispatch.cells + 3u {
         // Normal map at geometry resolution shares this evaluation.
-        textureStore(normal_out, vec2<i32>(id.xy), layer, vec4<f32>(value.xyz, 0.0));
+        textureStore(normal_out, vec2<i32>(id.xy), layer, vec4<f32>(value.xyz, page_water(value)));
         textureStore(albedo_out, vec2<i32>(id.xy), layer, page_albedo(st, value));
         textureStore(climate_out, vec2<i32>(id.xy), layer, page_climate(st));
     }
@@ -707,7 +714,7 @@ fn produce_normals(@builtin(global_invocation_id) id: vec3<u32>) {
     tile = tiles[dispatch.base + id.z];
     let st = (vec2<f32>(id.xy) - vec2<f32>(1.0)) / f32(dispatch.cells);
     let value = evaluate(st);
-    textureStore(normal_out, vec2<i32>(id.xy), i32(tile.info.x), vec4<f32>(value.xyz, 0.0));
+    textureStore(normal_out, vec2<i32>(id.xy), i32(tile.info.x), vec4<f32>(value.xyz, page_water(value)));
     textureStore(albedo_out, vec2<i32>(id.xy), i32(tile.info.x), page_albedo(st, value));
     textureStore(climate_out, vec2<i32>(id.xy), i32(tile.info.x), page_climate(st));
 }

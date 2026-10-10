@@ -10,7 +10,7 @@ impl FrameHost<'_> {
     pub fn take_terrain_atlas_bounds(&mut self) -> Vec<astrum_renderer::AtlasBounds> {
         self.renderer.take_terrain_atlas_bounds()
     }
-    pub fn take_terrain_ready_sources(&mut self) -> Vec<u64> {
+    pub fn take_terrain_ready_sources(&mut self) -> Vec<(u64, Option<String>)> {
         self.renderer.take_terrain_ready_sources()
     }
     pub fn take_terrain_collision_pages(&mut self) -> Vec<astrum_renderer::AtlasCollisionPage> {

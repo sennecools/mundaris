@@ -358,7 +358,7 @@ impl Renderer {
 
     /// Atlas sources (keys) whose Tier A world-map bake completed in the last
     /// recorded frame.
-    pub fn take_terrain_ready_sources(&mut self) -> Vec<u64> {
+    pub fn take_terrain_ready_sources(&mut self) -> Vec<(u64, Option<String>)> {
         self.celestial
             .as_mut()
             .map_or_else(Vec::new, |c| c.take_ready_sources())

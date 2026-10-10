@@ -689,7 +689,7 @@ impl CelestialRenderer {
             atlas.on_submitted();
         }
     }
-    pub(crate) fn take_ready_sources(&mut self) -> Vec<u64> {
+    pub(crate) fn take_ready_sources(&mut self) -> Vec<(u64, Option<String>)> {
         self.terrain_atlas
             .as_mut()
             .map_or_else(Vec::new, |atlas| atlas.take_ready_sources())

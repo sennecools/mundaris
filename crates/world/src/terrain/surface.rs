@@ -814,7 +814,10 @@ impl SurfaceGenerator {
             SurfaceAlgorithm::WorldV1 => {
                 let world = definition.world.as_ref().ok_or(TerrainError::InvalidConfig)?;
                 let g = world_field::WorldField::new(world, radius_m)?;
-                (GeologicalField::World(g), world.height_bound_m().next_up())
+                // Bicubic (Catmull-Rom) sampling overshoots its samples: the
+                // absolute weights sum to at most 1.25 per axis (t = 1/2), so
+                // 1.25² bounds the 2-D tensor.
+                (GeologicalField::World(g), (world.height_bound_m() * 1.5625).next_up())
             }
             SurfaceAlgorithm::MoonProfileV1 => {
                 let profile = definition

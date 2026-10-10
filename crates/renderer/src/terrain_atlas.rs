@@ -462,6 +462,9 @@ pub struct TerrainAtlasFrame {
     pub collision_jobs: Vec<AtlasProduceJob>,
     /// Cells per collision page edge, `1..=MAX_COLLISION_CELLS`.
     pub collision_cells: u32,
+    /// Sources the app no longer uses (a rebind or release): freed now,
+    /// including any unfinished Tier A bake.
+    pub retired_sources: Vec<u64>,
 }
 
 /// One read-back collision page: `(cells + 1)^2` samples on the job's chart at
@@ -537,7 +540,11 @@ pub(crate) struct TerrainAtlasRenderer {
     config: TerrainAtlasConfig,
     tier_a: crate::tier_a::TierAPipelines,
     /// World sources whose Tier A bake finished in a recorded frame.
-    ready_sources: Vec<u64>,
+    /// Finished world bakes `(key, None)` and sources that failed to upload
+    /// `(key, Some(error))`, reported once.
+    ready_sources: Vec<(u64, Option<String>)>,
+    /// Sources that failed to upload; not retried until retired.
+    failed_sources: std::collections::HashSet<u64>,
     _height: wgpu::Texture,
     _normal: wgpu::Texture,
     _albedo: wgpu::Texture,
@@ -1077,6 +1084,7 @@ impl TerrainAtlasRenderer {
             config,
             tier_a: crate::tier_a::TierAPipelines::new(device),
             ready_sources: Vec::new(),
+            failed_sources: Default::default(),
             _height: height,
             _normal: normal,
             _albedo: albedo,
@@ -1138,8 +1146,9 @@ impl TerrainAtlasRenderer {
     }
 
     /// World sources whose Tier A fields are complete as of the last recorded
-    /// frame; tiles for them may be requested from the next frame on.
-    pub(crate) fn take_ready_sources(&mut self) -> Vec<u64> {
+    /// frame (tiles for them may be requested from the next frame on), and
+    /// sources that failed to upload, with the error.
+    pub(crate) fn take_ready_sources(&mut self) -> Vec<(u64, Option<String>)> {
         std::mem::take(&mut self.ready_sources)
     }
 
@@ -1265,18 +1274,32 @@ impl TerrainAtlasRenderer {
                 frame.jobs.len()
             ));
         }
+        for key in &frame.retired_sources {
+            self.sources.remove(key);
+            self.failed_sources.remove(key);
+        }
         for (key, source) in &frame.sources {
             if let Some(existing) = self.sources.get_mut(key) {
                 existing.last_used = self.frame;
-            } else {
-                let gpu = upload_source(device, queue, &self.source_layout, &self.tier_a, source)?;
-                self.sources.insert(
-                    *key,
-                    SourceGpu {
-                        last_used: self.frame,
-                        ..gpu
-                    },
-                );
+            } else if !self.failed_sources.contains(key) {
+                // A source the device cannot hold (for example a Tier A bake
+                // beyond the storage limits) is skipped and reported, so other
+                // bodies keep drawing.
+                match upload_source(device, queue, &self.source_layout, &self.tier_a, source) {
+                    Ok(gpu) => {
+                        self.sources.insert(
+                            *key,
+                            SourceGpu {
+                                last_used: self.frame,
+                                ..gpu
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        self.failed_sources.insert(*key);
+                        self.ready_sources.push((*key, Some(error)));
+                    }
+                }
             }
         }
         let frame_number = self.frame;
@@ -1299,7 +1322,7 @@ impl TerrainAtlasRenderer {
                 };
                 bake.encode(encoder, &self.tier_a, budget);
                 if bake.done() {
-                    self.ready_sources.push(*key);
+                    self.ready_sources.push((*key, None));
                 }
             }
         }
@@ -1653,6 +1676,9 @@ impl TerrainAtlasRenderer {
 pub struct ProducedTileReadback {
     pub heights: Vec<f32>,
     pub normals: Vec<[f32; 3]>,
+    /// Flat-water mask stored in the normal page's w (1 where a world map's
+    /// ground is below sea level).
+    pub water: Vec<f32>,
     /// Page albedo per normal texel: linear rgb (decoded from sRGB) and the
     /// ownership alpha.
     pub albedo: Vec<[f32; 4]>,
@@ -1820,11 +1846,13 @@ pub fn produce_for_validation(
             .get_mapped_range()
             .map_err(|error| error.to_string())?;
         let mut normal_values = Vec::with_capacity(side * side);
+        let mut water_values = Vec::with_capacity(side * side);
         for y in 0..side {
             for x in 0..side {
                 let at = y * *normal_row as usize + x * 4;
                 let snorm = |b: u8| (f32::from(b as i8) / 127.0).max(-1.0);
                 normal_values.push([snorm(view[at]), snorm(view[at + 1]), snorm(view[at + 2])]);
+                water_values.push(snorm(view[at + 3]));
             }
         }
         drop(view);
@@ -1871,6 +1899,7 @@ pub fn produce_for_validation(
         output.push(ProducedTileReadback {
             heights: height_values,
             normals: normal_values,
+            water: water_values,
             albedo: albedo_values,
             climate: climate_values,
             bounds: None,

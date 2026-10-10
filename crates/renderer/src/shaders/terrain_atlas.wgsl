@@ -196,22 +196,25 @@ fn wind_colour(east: f32, north: f32) -> vec3<f32> {
 @fragment
 fn fs_main(input: VertexOut) -> SceneOut {
     let inst = instances[input.instance];
-    let own_n = textureSampleLevel(normal_atlas, normal_sampler, input.own_uv, input.layers.x, 0.0).xyz;
-    let parent_n = textureSampleLevel(normal_atlas, normal_sampler, input.parent_uv, input.layers.y, 0.0).xyz;
+    let own_n = textureSampleLevel(normal_atlas, normal_sampler, input.own_uv, input.layers.x, 0.0);
+    let parent_n = textureSampleLevel(normal_atlas, normal_sampler, input.parent_uv, input.layers.y, 0.0);
     let arrived = mix(parent_n, own_n, input.blend.x);
-    var normal = normalize(mix(arrived, parent_n, input.blend.y));
+    let sampled = mix(arrived, parent_n, input.blend.y);
+    var normal = normalize(sampled.xyz);
     let own_a = textureSampleLevel(albedo_atlas, normal_sampler, input.own_uv, input.layers.x, 0.0);
     let parent_a = textureSampleLevel(albedo_atlas, normal_sampler, input.parent_uv, input.layers.y, 0.0);
     let page = mix(mix(parent_a, own_a, input.blend.x), parent_a, input.blend.y);
     let albedo = mix(inst.material.rgb, atlas_srgb_to_linear(page.rgb), page.a);
     let n0_view = inst.b2v_x.xyz * inst.n0.x + inst.b2v_y.xyz * inst.n0.y + inst.b2v_z.xyz * inst.n0.z;
     let up = normalize(input.view_pos - (inst.anchor.xyz - n0_view * inst.anchor.w));
-    let water = inst.surface.x > 0.5 && input.ground < 0.0;
+    // Flat water: the page's filtered water mask (normal w) blends to the
+    // sphere normal, so coastlines follow the 2× page, not the vertex grid.
+    let water_mask = select(0.0, smoothstep(0.35, 0.65, sampled.w), inst.surface.x > 0.5);
+    let water = water_mask > 0.5;
     var n_view = normalize(inst.b2v_x.xyz * normal.x + inst.b2v_y.xyz * normal.y + inst.b2v_z.xyz * normal.z);
-    if water {
-        // Flat water surface: the sphere normal.
-        n_view = up;
-        normal = vec3<f32>(dot(inst.b2v_x.xyz, up), dot(inst.b2v_y.xyz, up), dot(inst.b2v_z.xyz, up));
+    if water_mask > 0.0 {
+        n_view = normalize(mix(n_view, up, water_mask));
+        normal = vec3<f32>(dot(inst.b2v_x.xyz, n_view), dot(inst.b2v_y.xyz, n_view), dot(inst.b2v_z.xyz, n_view));
     }
     let mode = u32(inst.b2v_x.w + 0.5);
     var debug_color = vec3<f32>(-1.0);

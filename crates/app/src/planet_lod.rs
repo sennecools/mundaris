@@ -188,6 +188,8 @@ struct BodyLod {
     world_ready: bool,
     /// Seconds from binding to the finished Tier A bake (world maps).
     world_ready_s: Option<f64>,
+    /// Upload or bake failure of a world-map source.
+    world_error: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy, Serialize)]
@@ -247,6 +249,9 @@ pub struct FrameSample {
 }
 
 pub struct PlanetLod {
+    /// Source keys of released bodies, sent once so the renderer frees their
+    /// GPU sources (and stops their bakes) at once.
+    retired_sources: Vec<u64>,
     pub enabled: bool,
     pub hold: bool,
     policy: Option<LodPolicy>,
@@ -274,12 +279,15 @@ pub struct PlanetLod {
 
 const SAMPLE_HISTORY: usize = 256;
 const VISIT_LIMIT: usize = 60_000;
-const INACTIVE_RELEASE_FRAMES: u64 = 600;
+/// Below the renderer's 600-frame source eviction, so an idle body is
+/// released (and its source retired) before the renderer would drop it.
+const INACTIVE_RELEASE_FRAMES: u64 = 500;
 
 impl PlanetLod {
     pub fn new(policy: Option<LodPolicy>) -> Self {
         Self {
             enabled: policy.is_some(),
+            retired_sources: Vec::new(),
             hold: false,
             policy,
             bodies: HashMap::new(),
@@ -385,13 +393,27 @@ impl PlanetLod {
         self.bodies.get(&body)?.world_ready_s
     }
 
-    pub fn receive_ready_sources(&mut self, ready: Vec<u64>) {
-        for lod in self.bodies.values_mut() {
-            if ready.contains(&lod.source_key) && !lod.world_ready {
-                lod.world_ready = true;
-                lod.world_ready_s = Some(lod.bound_at.elapsed().as_secs_f64());
+    /// Finished Tier A bakes, and sources the renderer could not upload (the
+    /// body then stays a plain sphere and reports the error).
+    pub fn receive_ready_sources(&mut self, events: Vec<(u64, Option<String>)>) {
+        for (key, error) in events {
+            let Some(lod) = self.bodies.values_mut().find(|lod| lod.source_key == key) else {
+                continue;
+            };
+            match error {
+                None if !lod.world_ready => {
+                    lod.world_ready = true;
+                    lod.world_ready_s = Some(lod.bound_at.elapsed().as_secs_f64());
+                }
+                None => {}
+                Some(error) => lod.world_error = Some(error),
             }
         }
+    }
+
+    /// Why a world-map body's source could not be used, if it failed.
+    pub fn world_bake_error(&self, body: BodyId) -> Option<&str> {
+        self.bodies.get(&body)?.world_error.as_deref()
     }
 
     pub fn receive_bounds(&mut self, bounds: Vec<AtlasBounds>) {
@@ -505,6 +527,7 @@ impl PlanetLod {
                 stats: BodyStats::default(),
                 world_ready,
                 world_ready_s: None,
+                world_error: None,
                 collision: self.collision_policy.map(|policy| {
                     collision::BodyCollision::new(collision::BodyColliders::new(
                         policy.physics_level(input.radius_m),
@@ -519,6 +542,7 @@ impl PlanetLod {
 
     fn release(&mut self, body: BodyId) {
         if let Some(lod) = self.bodies.remove(&body) {
+            self.retired_sources.push(lod.source_key);
             for node in lod.nodes.values() {
                 self.free_layers.push(node.layer);
             }
@@ -934,6 +958,7 @@ impl PlanetLod {
             self.collision_tokens.retain(|token, _| *token >= floor);
         }
         self.jobs_total += frame.jobs.len() as u64;
+        frame.retired_sources = std::mem::take(&mut self.retired_sources);
         self.selection_ms = started.elapsed().as_secs_f64() * 1000.0;
         Ok(frame)
     }
@@ -1424,6 +1449,7 @@ mod tests {
             collision: None,
             world_ready: true,
             world_ready_s: None,
+            world_error: None,
         }
     }
 

@@ -106,8 +106,8 @@ fn gpu_albedo_pages_match_the_cpu_oracle_and_water_follows_sea_level() {
         for (node, tile) in nodes.iter().zip(&tiles) {
             if !owns_colour {
                 assert!(
-                    tile.albedo.iter().all(|a| a[3] == 0.0),
-                    "{}: page claims colour",
+                    tile.albedo.iter().all(|a| a[3] == 0.0) && tile.water.iter().all(|w| *w == 0.0),
+                    "{}: page claims colour or water",
                     body.name
                 );
                 continue;
@@ -148,6 +148,13 @@ fn gpu_albedo_pages_match_the_cpu_oracle_and_water_follows_sea_level() {
                         sample.height_m
                     );
                     worst = worst.max(error);
+                    // The normal page's water mask (smooth coastlines in the draw).
+                    let mask = if sample.height_m < 0.0 { 1.0 } else { 0.0 };
+                    assert_eq!(
+                        tile.water[j * nside + i], mask,
+                        "{} {node:?} ({i},{j}) h {:.3}: water mask",
+                        body.name, sample.height_m
+                    );
                     if sample.height_m < 0.0 {
                         water += 1;
                     } else {

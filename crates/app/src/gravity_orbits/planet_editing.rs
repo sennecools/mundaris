@@ -146,7 +146,9 @@ impl GravityOrbitsDemo {
                     .face_cells(body.properties().reference_radius_m())
             ),
         )];
-        if let Some(seconds) = self.atlas.world_bake_seconds(self.ids[index]) {
+        if let Some(error) = self.atlas.world_bake_error(self.ids[index]) {
+            stats.push(StatItem::new("Bake", format!("failed: {error}")).tone(Tone::Error));
+        } else if let Some(seconds) = self.atlas.world_bake_seconds(self.ids[index]) {
             stats.push(StatItem::new("Bake", format!("{:.0} ms", seconds * 1000.0)));
         } else {
             stats.push(StatItem::new("Bake", "running").tone(Tone::Warn));
