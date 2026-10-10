@@ -139,3 +139,14 @@ fn params_check_ranges_and_kinds() {
         }
     }
 }
+
+/// Studio grows and rasterises off the UI thread (LANES.md interface log).
+#[test]
+fn growth_types_are_send_and_sync() {
+    fn check<T: Send + Sync>() {}
+    check::<SpeciesFile>();
+    check::<Kit>();
+    check::<astrum_flora::GrownPlant>();
+    check::<astrum_flora::raster::Canvas>();
+    check::<astrum_flora::raster::Camera>();
+}
