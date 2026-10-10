@@ -182,22 +182,26 @@ fn main() {
         "slope-area exponent {:.2} (R² {:.2}, {} texels; target -0.9..-0.2)",
         fit.exponent, fit.r2, fit.texels
     );
-    // Hack's law: longest upstream length against drainage area per vertex.
-    let mut longest = vec![0.0f64; graph.vertices.len()];
-    for i in graph.topological_order() {
-        let (i, v) = (i as usize, &graph.vertices[i as usize]);
-        if v.downstream != NO_RECEIVER {
-            let d = v.downstream as usize;
-            let length = (v.pos - graph.vertices[d].pos).length() * radius_m * 1e-3;
-            longest[d] = longest[d].max(longest[i] + length);
+    // Hack's law on the texel flow graph: longest flow path from the divide
+    // against the plain (not rain-weighted) drainage area, over channel texels
+    // (area >= 100 km²).
+    let level = erosion::Level::new(n, radius_m);
+    let mut area: Vec<f64> = level.areas.clone();
+    let mut longest = vec![0.0f64; 6 * n * n];
+    for &k in &fill.order {
+        let k = k as usize;
+        let r = fill.receiver[k];
+        if r == NO_RECEIVER {
+            continue;
         }
+        let r = r as usize;
+        area[r] += area[k];
+        let step = (level.directions[k] - level.directions[r]).length() * radius_m * 1e-3;
+        longest[r] = longest[r].max(longest[k] + step);
     }
-    let points: Vec<(f64, f64)> = graph
-        .vertices
-        .iter()
-        .zip(&longest)
-        .filter(|(v, l)| **l > 0.0 && v.discharge_km2 > 0.0)
-        .map(|(v, l)| (v.discharge_km2.ln(), l.ln()))
+    let points: Vec<(f64, f64)> = (0..6 * n * n)
+        .filter(|&k| !fill.ocean[k] && area[k] >= 100.0 && longest[k] > 0.0)
+        .map(|k| (area[k].ln(), longest[k].ln()))
         .collect();
     let hack = least_squares(&points);
     println!(

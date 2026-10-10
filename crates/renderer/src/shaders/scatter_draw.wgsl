@@ -67,6 +67,21 @@ fn sc_density(k: u32, t: f32, m: f32, slope: f32, h: f32) -> f32 {
     return 0.35 * sc_range(0.0, 60.0 * SCATTER_DEG, 10.0 * SCATTER_DEG, slope) * (0.25 + 0.75 * rock);
 }
 
+// Smooth value noise in 0..1 over base-cell coordinates (x, y) of a face.
+fn sc_value(face: u32, x: f32, y: f32, salt: u32) -> f32 {
+    let i = floor(x);
+    let j = floor(y);
+    let f = vec2<f32>(x - i, y - j);
+    let w = f * f * (vec2<f32>(3.0) - 2.0 * f);
+    let c = vec2<u32>(u32(i), u32(j));
+    let k = face * 64u + salt;
+    let a = sc_unit(sc_pcg3d(vec3<u32>(c.x, c.y, k)).x);
+    let b = sc_unit(sc_pcg3d(vec3<u32>(c.x + 1u, c.y, k)).x);
+    let d = sc_unit(sc_pcg3d(vec3<u32>(c.x, c.y + 1u, k)).x);
+    let e = sc_unit(sc_pcg3d(vec3<u32>(c.x + 1u, c.y + 1u, k)).x);
+    return mix(mix(a, b, w.x), mix(d, e, w.x), w.y);
+}
+
 // Face id of a chart normal: dominant axis and sign (consistent per face).
 fn sc_face(n: vec3<f32>) -> u32 {
     let a = abs(n);
@@ -203,8 +218,13 @@ fn vs_scatter(@builtin(vertex_index) vertex: u32, @builtin(instance_index) index
     let up_body = normalize(inst.n0.xyz + diff);
     let normal_body = normalize(page_n.xyz);
     let slope = acos(clamp(dot(normal_body, up_body), -1.0, 1.0));
-    let d0 = sc_density(0u, climate.x, climate.y, slope, ground);
-    let d1 = sc_density(1u, climate.x, climate.y, slope, ground);
+    // Clearings and forest edges: two octaves of value noise (~500 m and
+    // ~120 m) gate trees and shrubs.
+    let cover = 0.65 * sc_value(face, f32(ci) / 48.0, f32(cj) / 48.0, 40u)
+        + 0.35 * sc_value(face, f32(ci) / 12.0, f32(cj) / 12.0, 41u);
+    let wooded = smoothstep(0.38, 0.6, cover);
+    let d0 = sc_density(0u, climate.x, climate.y, slope, ground) * wooded;
+    let d1 = sc_density(1u, climate.x, climate.y, slope, ground) * mix(0.3, 1.0, wooded);
     let d2 = sc_density(2u, climate.x, climate.y, slope, ground);
     let total = d0 + d1 + d2;
     if sc_unit(h.z) >= min(total, 1.0) {

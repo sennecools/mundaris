@@ -47,7 +47,7 @@ fn material_weights(i: MaterialInput) -> MaterialWeights {
     let wet_raw = mr_smoothstep(0.35, 0.7, i.flow) * flat_ground * mr_smoothstep(0.1, 0.4, i.moisture);
 
     let gentle = 1.0 - mr_smoothstep(6.0 * MR_DEG, 14.0 * MR_DEG, slope);
-    let beach = 1.0 - mr_smoothstep(3.0, 6.0, i.height_m);
+    let beach = 1.0 - mr_smoothstep(1.5, 3.0, i.height_m);
     let arid = (1.0 - mr_smoothstep(0.15, 0.4, i.moisture)) * mr_smoothstep(0.3, 0.6, i.sediment);
     let sand_raw = max(beach, arid) * gentle;
 

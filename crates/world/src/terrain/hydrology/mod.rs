@@ -81,6 +81,9 @@ pub struct HydrologyParams {
     pub simplify_texels: f64,
     /// Catmull–Rom points inserted per simplified segment.
     pub curve_points: usize,
+    /// Meander passes and their sideways amplitude (fraction of a segment).
+    pub meander_levels: usize,
+    pub meander_amplitude: f64,
 }
 
 impl HydrologyParams {
@@ -109,6 +112,8 @@ impl HydrologyParams {
             floodplain_slope: 0.004,
             simplify_texels: 0.5,
             curve_points: 3,
+            meander_levels: 2,
+            meander_amplitude: 0.3,
         }
     }
 }

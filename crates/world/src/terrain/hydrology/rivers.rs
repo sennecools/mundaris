@@ -204,7 +204,89 @@ pub fn extract(fill: &Fill, discharge: &[f64], level: &Level, p: &HydrologyParam
         }
     }
     let simple = simplify(full, 2.0 / fill.n as f64 * p.simplify_texels);
-    smooth(simple, p.curve_points)
+    // Radius from any texel's first real neighbour distance.
+    let radius_m = (0..8)
+        .find(|&s| level.distances[0][s] > 0.0)
+        .map_or(1.0, |s| {
+            let m = level.neighbours[0][s] as usize;
+            level.distances[0][s] / (level.directions[0] - level.directions[m]).length()
+        });
+    let meandered = meander(
+        simple,
+        p.meander_levels,
+        p.meander_amplitude,
+        p.floodplain_slope,
+        radius_m,
+    );
+    smooth(meandered, p.curve_points)
+}
+
+/// PROTOTYPE meanders (§7.4, without the LOD band limit): `levels` passes
+/// of midpoint displacement, each inserting a vertex in every segment pushed
+/// sideways by up to `amplitude` of the segment length (hashed from the
+/// end positions), scaled down on steep reaches (full on beds flatter than
+/// `flat_slope`, a fifth on steep ones). Fields and beds interpolate, so
+/// beds stay descending.
+pub fn meander(
+    graph: RiverGraph,
+    levels: usize,
+    amplitude: f64,
+    flat_slope: f64,
+    radius_m: f64,
+) -> RiverGraph {
+    let mut graph = graph;
+    for pass in 0..levels {
+        let v = graph.vertices;
+        let mut out = v.clone();
+        for (i, a) in v.iter().enumerate() {
+            if a.downstream == NO_RECEIVER {
+                continue;
+            }
+            let b = &v[a.downstream as usize];
+            let chord = b.pos - a.pos;
+            let length_m = chord.length() * radius_m;
+            if length_m < 1.0 {
+                continue;
+            }
+            let slope = ((a.bed_m - b.bed_m) / length_m).max(0.0);
+            let flat = (1.0 - slope / (4.0 * flat_slope)).clamp(0.2, 1.0);
+            let mid = (a.pos + b.pos).normalize();
+            let side = mid.cross(chord).normalize_or_zero();
+            let pos = (mid
+                + side * (chord.length() * amplitude * flat * signed_hash(a.pos, b.pos, pass)))
+            .normalize();
+            let half = |x: f64, y: f64| 0.5 * (x + y);
+            let index = out.len() as u32;
+            out.push(RiverVertex {
+                pos,
+                discharge_km2: half(a.discharge_km2, b.discharge_km2),
+                q_m3s: half(a.q_m3s, b.q_m3s),
+                width_m: half(a.width_m, b.width_m),
+                depth_m: half(a.depth_m, b.depth_m),
+                incision_m: half(a.incision_m, b.incision_m),
+                bed_m: half(a.bed_m, b.bed_m),
+                downstream: a.downstream,
+                mouth: Mouth::None,
+                texel: INSERTED,
+            });
+            out[i].downstream = index;
+        }
+        graph = RiverGraph { vertices: out };
+    }
+    graph
+}
+
+/// Deterministic value in [-1, 1] from two positions and a pass number.
+fn signed_hash(a: DVec3, b: DVec3, pass: usize) -> f64 {
+    let mut h = 0x9e37_79b9_7f4a_7c15u64 ^ pass as u64;
+    for c in [a.x, a.y, a.z, b.x, b.y, b.z] {
+        h ^= c.to_bits();
+        h = h.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        h ^= h >> 31;
+    }
+    (h >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0
 }
 
 /// Insert `points` Catmull–Rom points per segment through the main stem

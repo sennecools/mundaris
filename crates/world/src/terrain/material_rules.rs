@@ -98,7 +98,7 @@ const SOIL_SLOPE_LOSS: (f32, f32) = (15.0 * DEG, 45.0 * DEG);
 const SNOW_T_C: f32 = 0.0;
 const SNOW_BLEND_C: f32 = 3.0;
 const SNOW_SLOPE: (f32, f32) = (35.0 * DEG, 55.0 * DEG);
-const BEACH_H_M: f32 = 6.0;
+const BEACH_H_M: f32 = 3.0;
 const SCREE_UPHILL: (f32, f32) = (30.0 * DEG, 45.0 * DEG);
 const SCREE_HERE: (f32, f32) = (18.0 * DEG, 32.0 * DEG);
 
