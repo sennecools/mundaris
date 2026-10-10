@@ -33,7 +33,7 @@ const SCATTER_SLOTS: u32 = 1024u;
 const SCATTER_VERTS: u32 = 96u;
 const SCATTER_CELL_BITS: u32 = 16u;
 // Full density within this view distance (m); keep(d) = (FULL / d)².
-const SCATTER_FULL_M: f32 = 350.0;
+const SCATTER_FULL_M: f32 = 800.0;
 // No plants beyond this view distance (m), faded over the last 30 %.
 const SCATTER_MAX_DISTANCE_M: f32 = 16000.0;
 const SCATTER_DEG: f32 = 0.017453292;

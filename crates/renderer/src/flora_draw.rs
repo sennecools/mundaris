@@ -222,7 +222,7 @@ pub(crate) fn species_shader(shader: &str) -> String {
     // Debug (measurement): ASTRUM_FLORA_FULL_M overrides the full-density
     // view distance of the plant thinning (SCATTER_FULL_M, metres).
     if let Some(m) = std::env::var("ASTRUM_FLORA_FULL_M").ok().and_then(|v| v.parse::<f32>().ok()) {
-        out = out.replace("const SCATTER_FULL_M: f32 = 350.0;", &format!("const SCATTER_FULL_M: f32 = {m:.1};"));
+        out = out.replace("const SCATTER_FULL_M: f32 = 800.0;", &format!("const SCATTER_FULL_M: f32 = {m:.1};"));
         tracing::info!("flora: SCATTER_FULL_M overridden to {m} m");
     }
     // Debug (measurement): ASTRUM_FLORA_PER_SAMPLE = 0 (all per pixel),
