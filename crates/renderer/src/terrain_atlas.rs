@@ -29,7 +29,7 @@ const PRODUCE_SHADER: &str = concat!(
 /// Largest number of producer jobs accepted in one frame.
 pub const MAX_ATLAS_JOBS_PER_FRAME: usize = 256;
 const TILE_BYTES: u64 = 464;
-const INSTANCE_BYTES: u64 = 192;
+const INSTANCE_BYTES: u64 = 224;
 const DISPATCH_STRIDE: u64 = 256;
 /// Largest number of collision pages produced in one frame.
 pub const MAX_COLLISION_JOBS_PER_FRAME: usize = 32;
@@ -420,6 +420,15 @@ pub struct AtlasSampleSource {
     pub scale: f32,
 }
 
+/// Flat-water look of a world-map body (linear colours; M1, until M3).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AtlasWater {
+    pub shallow: [f32; 3],
+    pub deep: [f32; 3],
+    /// Depth at which the colour is `1 - 1/e` of the way to `deep`.
+    pub depth_scale_m: f32,
+}
+
 /// One drawn node. Transforms are camera-relative and already narrowed.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct AtlasInstance {
@@ -437,8 +446,9 @@ pub struct AtlasInstance {
     pub skirt_m: f32,
     pub material: crate::SurfaceMaterial,
     /// Flat water at the reference radius over ground below it (world maps
-    /// with oceans, M1): drawn at height 0 with the sphere normal.
-    pub ocean: bool,
+    /// with oceans, M1): drawn at height 0 with the sphere normal and a
+    /// depth-tinted colour, through the coast contour in the normal page.
+    pub water: Option<AtlasWater>,
     pub mode: u32,
     /// Edges (`PatchEdge::bit`: s=0, s=1, t=0, t=1) bordering a coarser node;
     /// their vertices are drawn fully morphed (pipeline §9.8).
@@ -2502,9 +2512,10 @@ fn pack_octaves(octaves: &[AtlasOctave]) -> Vec<u8> {
 }
 
 fn pack_instance(out: &mut Vec<u8>, instance: &AtlasInstance) {
+    let water = instance.water.unwrap_or_default();
     let c = instance.chart;
     let b = instance.body_to_view;
-    let rows: [[f32; 4]; 12] = [
+    let rows: [[f32; 4]; 14] = [
         [
             instance.anchor_view_m[0],
             instance.anchor_view_m[1],
@@ -2546,7 +2557,14 @@ fn pack_instance(out: &mut Vec<u8>, instance: &AtlasInstance) {
             instance.material.albedo[2],
             instance.material.brdf.shader_index(),
         ],
-        [if instance.ocean { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+        [
+            if instance.water.is_some() { 1.0 } else { 0.0 },
+            water.depth_scale_m,
+            0.0,
+            0.0,
+        ],
+        [water.shallow[0], water.shallow[1], water.shallow[2], 0.0],
+        [water.deep[0], water.deep[1], water.deep[2], 0.0],
     ];
     for row in &rows {
         out.extend(f32_bytes(row));

@@ -223,13 +223,22 @@ fn fields_kind(recipe: &FieldsRecipe, n0: DVec3, texel_m: f64) -> Result<AtlasTi
     })
 }
 
-/// World maps with a sea level draw flat water over ground below it.
-pub fn has_ocean(recipe: &ProducerRecipe) -> bool {
-    matches!(recipe, ProducerRecipe::World(world) if world
-        .field
-        .inputs()
-        .stages
-        .contains(&astrum_world::terrain::archetype::TierAStage::SeaLevel))
+/// Flat-water look of a world map with a sea level (drawn over ground below
+/// it); `None` for bodies without an ocean.
+pub fn water_look(recipe: &ProducerRecipe) -> Option<astrum_renderer::AtlasWater> {
+    let ProducerRecipe::World(world) = recipe else {
+        return None;
+    };
+    let sea = astrum_world::terrain::archetype::TierAStage::SeaLevel;
+    if !world.field.inputs().stages.contains(&sea) {
+        return None;
+    }
+    let look = world.field.look();
+    Some(astrum_renderer::AtlasWater {
+        shallow: look.water_shallow.map(|c| c as f32),
+        deep: look.water_deep.map(|c| c as f32),
+        depth_scale_m: look.water_depth_scale_m as f32,
+    })
 }
 
 /// Producer parameters of one node at its nominal texel footprint.

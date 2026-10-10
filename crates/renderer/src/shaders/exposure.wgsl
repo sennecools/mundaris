@@ -81,12 +81,13 @@ fn adapt_main(@builtin(local_invocation_index) li: u32) {
         if exposure.luminance < 0.0 {
             ev = goal;
         } else {
+            // Exponential approach: each frame closes 1 - e^(-rate·dt) of the
+            // gap (rate per second, separate towards bright and dark), so a
+            // night-to-day jump settles in about a second and small changes
+            // stay smooth.
             let dt = post.exposure.w;
-            ev = previous_ev + clamp(
-                goal - previous_ev,
-                -post.exposure_range.w * dt,
-                post.exposure_range.z * dt,
-            );
+            let rate = select(post.exposure_range.w, post.exposure_range.z, goal > previous_ev);
+            ev = previous_ev + (goal - previous_ev) * (1.0 - exp(-rate * dt));
         }
     }
     exposure.previous = exposure.value;

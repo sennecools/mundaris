@@ -773,7 +773,7 @@ impl PlanetLod {
                         radius,
                         now,
                         material: input.material,
-                        ocean: producer::has_ocean(&lod.recipe),
+                        water: producer::water_look(&lod.recipe),
                         mode,
                         morph: true,
                     },
@@ -876,7 +876,7 @@ impl PlanetLod {
                             radius,
                             now,
                             material: input.material,
-                            ocean: producer::has_ocean(&lod.recipe),
+                            water: producer::water_look(&lod.recipe),
                             mode,
                             morph: false,
                         };
@@ -1114,7 +1114,7 @@ struct NodeContext<'a> {
     now: Instant,
     material: SurfaceMaterial,
     /// Flat water over ground below the reference radius.
-    ocean: bool,
+    water: Option<astrum_renderer::AtlasWater>,
     mode: u32,
     /// CDLOD morphing; uniform-detail shadow casters do not morph.
     morph: bool,
@@ -1198,7 +1198,7 @@ fn build_instance(
             arrival: arrival as f32,
             skirt_m: (c.policy.skirt_cells * cell) as f32,
             material: c.material,
-            ocean: c.ocean,
+            water: c.water,
             mode: c.mode,
             // Shadow casters do not morph, so they need no edge snap.
             coarser_edges: if c.morph { selected.coarser_edges } else { 0 },
@@ -1692,7 +1692,7 @@ mod tests {
             radius,
             now: Instant::now(),
             material: Default::default(),
-            ocean: false,
+            water: None,
             mode: 0,
             morph: true,
         };

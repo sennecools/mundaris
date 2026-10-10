@@ -47,7 +47,7 @@ pub use render_settings::{
 pub use terrain_atlas::{
     ATLAS_BOUNDS_GRID, AtlasBounds, AtlasChart, AtlasCollisionPage, AtlasFieldsConstants,
     AtlasImageLevel, AtlasInstance, AtlasOctave, AtlasProduceJob, AtlasProfileLayer,
-    AtlasSampleSource, AtlasShadowFrame, AtlasSource, AtlasTileKind, AtlasWorldSource, AtlasWorldSurface, MAX_ATLAS_JOBS_PER_FRAME,
+    AtlasSampleSource, AtlasShadowFrame, AtlasSource, AtlasTileKind, AtlasWater, AtlasWorldSource, AtlasWorldSurface, MAX_ATLAS_JOBS_PER_FRAME,
     MAX_ATLAS_OCTAVES, MAX_COLLISION_CELLS, MAX_COLLISION_JOBS_PER_FRAME, ProducedTileReadback,
     TerrainAtlasConfig, TerrainAtlasFrame, TerrainAtlasReport, TerrainViewMode,
     collision_for_validation, lattice_hash_for_validation, produce_for_validation,

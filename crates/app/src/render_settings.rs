@@ -149,13 +149,13 @@ pub const SPECS: &[SettingSpec] = &[
         "render.exposure.speed_up",
         "Exposure",
         "Adapt to bright",
-        float(0.1, 10.0, "EV/s"),
+        float(0.1, 10.0, "1/s"),
     ),
     spec(
         "render.exposure.speed_down",
         "Exposure",
         "Adapt to dark",
-        float(0.1, 10.0, "EV/s"),
+        float(0.1, 10.0, "1/s"),
     ),
     spec(
         "render.lighting.sun_mode",

@@ -328,14 +328,33 @@ impl ProducerRecipe {
             return Ok(None);
         };
         let sample = self.evaluate(direction, texel_m)?;
-        let look = recipe.field.look();
         if sample.height_m < 0.0 {
-            return Ok(Some(look.water(sample.height_m)));
+            return Ok(Some(recipe.field.look().water(sample.height_m)));
         }
+        self.page_albedo(direction, texel_m)
+    }
+
+    /// CPU reference for the albedo page itself: the land colour everywhere,
+    /// under the sea too (the draw lays flat water over it through the coast
+    /// contour stored in the normal page).
+    pub fn page_albedo(
+        &self,
+        direction: DVec3,
+        texel_m: f64,
+    ) -> Result<Option<[f64; 3]>, TerrainError> {
+        let Self::World(recipe) = self else {
+            return Ok(None);
+        };
+        let sample = self.evaluate(direction, texel_m)?;
         let maps = recipe.field.maps()?;
         let n = direction.normalize();
         let (temperature, moisture) = maps.climate(maps.mip_for(texel_m, recipe.radius_m), n);
-        Ok(Some(look.land(temperature, moisture, n, sample.normal)))
+        Ok(Some(recipe.field.look().land(
+            temperature,
+            moisture,
+            n,
+            sample.normal,
+        )))
     }
 }
 

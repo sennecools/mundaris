@@ -4,6 +4,9 @@
 //! Runs by default on a hardware or software adapter.
 //!
 //! Tolerances:
+//! - Albedo pages hold the land colour everywhere (water is laid over it in
+//!   the draw through the coast contour, -height / 32 m clamped, in the
+//!   normal page's w; checked to within half an snorm8 step).
 //! - Albedo: pages store sRGB in 8 bits. Half a step in linear colour is
 //!   about 0.0045 · c^0.58 (0.0045 at albedo 1, 0.0012 at 0.1), plus f32
 //!   climate sampling; allowed 0.001 + 0.005 · c^0.6 per channel. Texels whose height is within 5 cm of sea level are skipped:
@@ -27,6 +30,8 @@ use glam::DVec3;
 const ALBEDO_TOLERANCE: f64 = 0.001;
 const ALBEDO_TOLERANCE_SCALE: f64 = 0.005;
 const SEA_LEVEL_MARGIN_M: f64 = 0.05;
+/// `WATER_CONTOUR_M` in terrain_atlas_produce.wgsl.
+const WATER_CONTOUR_M: f64 = 32.0;
 const STABILITY_TOLERANCE: f64 = 0.01;
 const AVERAGE_TOLERANCE: f64 = 0.005;
 
@@ -126,7 +131,7 @@ fn gpu_albedo_pages_match_the_cpu_oracle_and_water_follows_sea_level() {
                         skipped += 1;
                         continue;
                     }
-                    let reference = body.recipe.albedo(d, texel).unwrap().unwrap();
+                    let reference = body.recipe.page_albedo(d, texel).unwrap().unwrap();
                     let a = tile.albedo[j * nside + i];
                     assert_eq!(
                         a[3], 1.0,
@@ -148,13 +153,19 @@ fn gpu_albedo_pages_match_the_cpu_oracle_and_water_follows_sea_level() {
                         sample.height_m
                     );
                     worst = worst.max(error);
-                    // The normal page's water mask (smooth coastlines in the draw).
-                    let mask = if sample.height_m < 0.0 { 1.0 } else { 0.0 };
-                    assert_eq!(
-                        tile.water[j * nside + i], mask,
-                        "{} {node:?} ({i},{j}) h {:.3}: water mask",
-                        body.name, sample.height_m
+                    // The coast contour in the normal page's w: -height / 32 m,
+                    // clamped, stored as snorm8 (half a step is 1/254).
+                    let contour = (-sample.height_m / WATER_CONTOUR_M).clamp(-1.0, 1.0);
+                    let stored = f64::from(tile.water[j * nside + i]);
+                    assert!(
+                        (stored - contour).abs() <= 1.0 / 254.0 + 1e-6,
+                        "{} {node:?} ({i},{j}) h {:.3}: contour {stored} vs {contour}",
+                        body.name,
+                        sample.height_m
                     );
+                    if contour.abs() > 1.0 / 127.0 {
+                        assert_eq!(stored > 0.0, sample.height_m < 0.0, "contour sign");
+                    }
                     if sample.height_m < 0.0 {
                         water += 1;
                     } else {

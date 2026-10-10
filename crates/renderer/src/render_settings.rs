@@ -59,7 +59,8 @@ pub struct ExposureSettings {
     pub compensation: f32,
     pub min_ev100: f32,
     pub max_ev100: f32,
-    /// Adaptation speeds in EV per second.
+    /// Adaptation rates per second: each frame closes 1 - e^(-rate·dt) of the
+    /// gap to the metered target (towards bright, towards dark).
     pub speed_up: f32,
     pub speed_down: f32,
 }
@@ -153,7 +154,7 @@ impl Default for RenderSettings {
                 min_ev100: -1.0,
                 max_ev100: 18.0,
                 speed_up: 3.0,
-                speed_down: 1.5,
+                speed_down: 2.0,
             },
             bloom: BloomSettings {
                 enabled: true,

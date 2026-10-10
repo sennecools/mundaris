@@ -590,11 +590,10 @@ fn biome_colour(t: f32, m: f32) -> vec3<f32> {
     return mix(top, bottom, fy);
 }
 
-fn world_albedo(d: vec3<f32>, height: f32, normal: vec3<f32>) -> vec3<f32> {
-    if height < 0.0 {
-        let deep = 1.0 - exp(height / surface_f32(19u));
-        return mix(surface_vec3(16u), surface_vec3(20u), deep);
-    }
+// Land colour everywhere, under the sea too: the draw lays the flat water
+// over it through the coast contour in the normal page's w, so the page
+// never blends water and land colours across a texel.
+fn world_albedo(d: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
     cube_level_n = tile.noise.w;
     let stride = 6u * cube_level_n * cube_level_n;
     let t = cube_sample(tile.noise.z + stride, d, false);
@@ -605,11 +604,13 @@ fn world_albedo(d: vec3<f32>, height: f32, normal: vec3<f32>) -> vec3<f32> {
     return mix(biome_colour(t, m), surface_vec3(12u), snow);
 }
 
-// Water mask in the normal page's w: 1 where a world map's ground is below
-// sea level. Filtered at page resolution, it gives the draw a smooth coastline
-// instead of one decided per vertex.
+// Coast contour in the normal page's w for world maps: -height / 32 m,
+// clamped to [-1, 1] (positive under the sea). Its bilinearly filtered zero
+// crossing is a smooth coastline at sub-texel precision.
+const WATER_CONTOUR_M: f32 = 32.0;
+
 fn page_water(value: vec4<f32>) -> f32 {
-    return select(0.0, 1.0, tile.info.y == 2u && value.w < 0.0);
+    return select(0.0, clamp(-value.w / WATER_CONTOUR_M, -1.0, 1.0), tile.info.y == 2u);
 }
 
 // Page albedo texel for an evaluated sample `value` (normal, height) at `st`.
@@ -618,7 +619,7 @@ fn page_albedo(st: vec2<f32>, value: vec4<f32>) -> vec4<f32> {
         return vec4<f32>(0.0);
     }
     let d = normalize(chart_point(st).n);
-    return vec4<f32>(linear_to_srgb(world_albedo(d, value.w, value.xyz)), 1.0);
+    return vec4<f32>(linear_to_srgb(world_albedo(d, value.xyz)), 1.0);
 }
 
 // Page climate texel at `st`: temperature and moisture from the node's mip (as
