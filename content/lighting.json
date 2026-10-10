@@ -50,16 +50,22 @@
       ],
       "brdf": "lambert",
       "atmosphere": {
-        "top_height_m": 60000,
+        "top_height_m": 45000,
         "rayleigh_per_m": [
           5.2e-6,
           12.2e-6,
           29.8e-6
         ],
-        "rayleigh_scale_height_m": 8000,
+        "rayleigh_scale_height_m": 6000,
         "mie_per_m": 2.1e-5,
         "mie_scale_height_m": 1200,
-        "mie_g": 0.76
+        "mie_g": 0.76,
+        "clouds": {
+          "altitude_m": 2500,
+          "coverage": 0.45,
+          "scale_m": 12000,
+          "opacity": 0.9
+        }
       },
       "look": {
         "sky_tint": [

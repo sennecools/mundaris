@@ -105,6 +105,17 @@ struct AtmosphereContent {
     mie_per_m: f32,
     mie_scale_height_m: f64,
     mie_g: f32,
+    #[serde(default)]
+    clouds: Option<CloudsContent>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CloudsContent {
+    altitude_m: f64,
+    coverage: f32,
+    scale_m: f64,
+    opacity: f32,
 }
 
 /// Validated scene light; colours are normalised chromaticities.
@@ -191,6 +202,12 @@ impl SceneLighting {
                     mie_per_m: a.mie_per_m,
                     mie_scale_height_m: a.mie_scale_height_m,
                     mie_g: a.mie_g,
+                    clouds: a.clouds.as_ref().map(|c| astrum_renderer::Clouds {
+                        altitude_m: c.altitude_m,
+                        coverage: c.coverage,
+                        scale_m: c.scale_m,
+                        opacity: c.opacity,
+                    }),
                 };
                 ensure!(atmosphere.validate(), "{body}: invalid atmosphere");
                 atmospheres.insert(body.clone(), atmosphere);

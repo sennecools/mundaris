@@ -32,7 +32,7 @@ pub mod tier_a;
 pub mod terrain_capture;
 mod view;
 pub use aa::SAMPLE_COUNTS;
-pub use atmosphere::{Atmosphere, FrameAtmosphere};
+pub use atmosphere::{Atmosphere, Clouds, FrameAtmosphere};
 pub use grade::{Grade, StylisedLook};
 pub use celestial::*;
 pub use celestial_lines::{

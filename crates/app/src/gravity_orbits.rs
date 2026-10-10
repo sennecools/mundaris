@@ -1704,9 +1704,15 @@ impl GravityOrbitsDemo {
                 .atmosphere(&self.presentation[index].semantic_id)
         {
             let (center, radius) = centres[index];
+            // Body axes in view space: the cloud layer is fixed to the body.
+            let body_fixed = view.prepare_source(pair.projection().frames_for(self.ids[index])?.body_fixed)?;
+            let axis = |a: DVec3| -> Result<DVec3> {
+                Ok(body_fixed.view_direction(Direction3::try_new(a)?)?.unit())
+            };
             frame.set_atmosphere(astrum_renderer::FrameAtmosphere {
                 center_view_m: center,
                 radius_m: radius,
+                body_axes_view: [axis(DVec3::X)?, axis(DVec3::Y)?, axis(DVec3::Z)?],
                 atmosphere,
                 look: self.lighting.look(&self.presentation[index].semantic_id),
             })?;

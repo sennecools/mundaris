@@ -173,7 +173,7 @@ pub(crate) struct PostFrame {
     /// TAA parameters of this frame (shader `Taa` struct), when TAA is on.
     pub taa: Option<[[f32; 4]; 6]>,
     /// Atmosphere parameters (shader `Atmosphere` struct), when one is drawn.
-    pub atmosphere: Option<[[f32; 4]; 8]>,
+    pub atmosphere: Option<[[f32; 4]; crate::atmosphere::ATMOSPHERE_ROWS]>,
     /// Stylised look of the surrounding body (grade, bloom).
     pub look: crate::StylisedLook,
 }

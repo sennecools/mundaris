@@ -18,7 +18,11 @@ struct Atmosphere {
     camera: vec4<f32>,      // Mie g, -, tan(half fov y), aspect
     params: vec4<f32>,      // near m, enabled, haze multiplier, sky multiplier
     tint: vec4<f32>,        // inscatter tint (rgb), saturation
-    extra: vec4<f32>,       // -
+    clouds: vec4<f32>,      // cloud altitude m, coverage, feature scale m, opacity
+    axis_x: vec4<f32>,      // body x axis in view, w = stylised weight (0 physical .. 1)
+    axis_y: vec4<f32>,      // body y axis in view
+    axis_z: vec4<f32>,      // body z axis in view
+    sun_disc: vec4<f32>,    // cos(disc radius), physical angular radius, glow, clouds on
 }
 
 @group(0) @binding(0) var<uniform> atmo: Atmosphere;
@@ -53,6 +57,44 @@ fn air_mass(cos_zenith: f32) -> f32 {
     let c = max(cos_zenith, -0.05);
     let zenith_deg = degrees(acos(clamp(c, -1.0, 1.0)));
     return 1.0 / max(c + 0.50572 * pow(max(96.07995 - zenith_deg, 0.1), -1.6364), 0.025);
+}
+
+// Value noise and fBm for the cloud layer (body-fixed sphere coordinates).
+fn hash3(p: vec3<f32>) -> f32 {
+    let q = fract(p * vec3<f32>(0.1031, 0.1030, 0.0973));
+    let r = q + dot(q, q.yxz + 33.33);
+    return fract((r.x + r.y) * r.z);
+}
+
+fn value_noise(p: vec3<f32>) -> f32 {
+    let i = floor(p);
+    let f = p - i;
+    let u = f * f * (3.0 - 2.0 * f);
+    let n000 = hash3(i);
+    let n100 = hash3(i + vec3<f32>(1.0, 0.0, 0.0));
+    let n010 = hash3(i + vec3<f32>(0.0, 1.0, 0.0));
+    let n110 = hash3(i + vec3<f32>(1.0, 1.0, 0.0));
+    let n001 = hash3(i + vec3<f32>(0.0, 0.0, 1.0));
+    let n101 = hash3(i + vec3<f32>(1.0, 0.0, 1.0));
+    let n011 = hash3(i + vec3<f32>(0.0, 1.0, 1.0));
+    let n111 = hash3(i + vec3<f32>(1.0, 1.0, 1.0));
+    return mix(
+        mix(mix(n000, n100, u.x), mix(n010, n110, u.x), u.y),
+        mix(mix(n001, n101, u.x), mix(n011, n111, u.x), u.y),
+        u.z,
+    );
+}
+
+fn cloud_fbm(p: vec3<f32>) -> f32 {
+    var sum = 0.0;
+    var amplitude = 0.5;
+    var q = p;
+    for (var i = 0; i < 5; i += 1) {
+        sum += amplitude * value_noise(q);
+        q = q * 2.03 + vec3<f32>(17.1, 3.7, 9.2);
+        amplitude *= 0.5;
+    }
+    return sum / 0.96875;
 }
 
 fn phase_rayleigh(c: f32) -> f32 {
@@ -153,5 +195,58 @@ fn fs_atmosphere(input: FullscreenOut) -> @location(0) vec4<f32> {
     let grey = luminance(inscatter);
     inscatter = mix(vec3<f32>(grey), inscatter, atmo.tint.w) * atmo.tint.rgb * atmo.params.w;
     let pre = exposure.value;
-    return vec4<f32>(scene.rgb * transmittance + max(inscatter, vec3<f32>(0.0)) * pre, scene.a);
+    var color = scene.rgb * transmittance + max(inscatter, vec3<f32>(0.0)) * pre;
+    let sky_pixel = d <= 0.0 && ground < 0.0;
+
+    // Sun disc (and the stylised glow) through the atmosphere. The disc keeps
+    // the sun's energy: a larger stylised disc is proportionally dimmer.
+    if sky_pixel {
+        let cos_r = atmo.sun_disc.x;
+        let theta = atmo.sun_disc.y;
+        let theta_disc = acos(clamp(cos_r, -1.0, 1.0));
+        let luminance_disc = atmo.sun.w / (PI * theta_disc * theta_disc);
+        let edge = smoothstep(cos_r - 0.25 * (1.0 - cos_r), cos_r, nu);
+        var sun_light = vec3<f32>(luminance_disc * edge);
+        let glow = atmo.sun_disc.z * atmo.sun.w * 0.02 * pow(max(nu, 0.0), 300.0);
+        sun_light += vec3<f32>(glow) * vec3<f32>(1.0, 0.9, 0.75);
+        color += sun_light * transmittance * pre;
+    }
+
+    // Cloud layer: a thin body-fixed sphere of fBm coverage, lit by the sun
+    // through the air above it and by the sky, seen through the air below.
+    if atmo.sun_disc.w > 0.5 {
+        let rc = radius + atmo.clouds.x;
+        var tc = -1.0;
+        if r0 < rc {
+            tc = ray_sphere_exit(r0, mu, rc);
+        } else {
+            let dc = (rc - r0) * (rc + r0) + r0 * r0 * mu * mu;
+            if dc >= 0.0 && mu < 0.0 {
+                tc = -r0 * mu - sqrt(dc);
+            }
+        }
+        if tc > 0.0 && tc < t_max && (ground < 0.0 || tc < ground) {
+            let q = dir * tc + up * r0;
+            let body = vec3<f32>(dot(atmo.axis_x.xyz, q), dot(atmo.axis_y.xyz, q), dot(atmo.axis_z.xyz, q));
+            let p = normalize(body) * (radius / atmo.clouds.z);
+            let coverage = atmo.clouds.y;
+            let alpha = smoothstep(1.0 - coverage, 1.0 - coverage + 0.2, cloud_fbm(p)) * atmo.clouds.w;
+            if alpha > 0.0 {
+                let normal = normalize(q);
+                let cos_sun_c = dot(normal, sun);
+                let h_c = atmo.clouds.x;
+                let column = air_mass(cos_sun_c)
+                    * (beta_r * h_r * exp(-h_c / h_r) + vec3<f32>(beta_m * 1.1 * h_m * exp(-h_c / h_m)));
+                let sunlit = exp(-column) * smoothstep(-0.08, 0.05, cos_sun_c);
+                // White Lambertian-ish puffs: sun on top plus a sky share.
+                let cloud = atmo.sun.w / PI * (0.8 * sunlit * max(cos_sun_c + 0.3, 0.0) + vec3<f32>(0.12) * smoothstep(-0.1, 0.1, cos_sun_c));
+                // Air between camera and cloud: its share of this ray's segment.
+                let share = clamp((tc - t0) / max(t1 - t0, 1.0), 0.0, 1.0);
+                let seen = cloud * pow(transmittance, vec3<f32>(share)) + max(inscatter, vec3<f32>(0.0)) * share;
+                color = mix(color, seen * pre, alpha);
+            }
+        }
+    }
+    // Keep the f16 target finite (the sun disc can exceed it).
+    return vec4<f32>(min(color, vec3<f32>(60000.0)), scene.a);
 }
