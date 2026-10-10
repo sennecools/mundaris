@@ -16,6 +16,7 @@ pub mod biome_lut;
 pub mod hydrology;
 pub mod landform;
 pub mod material_rules;
+pub mod scatter;
 pub mod surface_query;
 pub mod tier_a;
 pub mod world_map;
