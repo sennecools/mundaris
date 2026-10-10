@@ -229,13 +229,13 @@ const STYLISED_LODS: [LodPlan; LOD_COUNT] = [
         first_level: 3,
         budget: 0.5,
         branch_share: 0.35,
-        organs: OrganLod::Puffs { count: 22, detail: 1 },
+        organs: OrganLod::Puffs { count: 34, detail: 1 },
     },
     LodPlan {
         first_level: 4,
         budget: 0.15,
         branch_share: 0.3,
-        organs: OrganLod::Puffs { count: 11, detail: 0 },
+        organs: OrganLod::Puffs { count: 14, detail: 0 },
     },
     LodPlan {
         first_level: 4,
@@ -328,7 +328,7 @@ fn branches(sk: &Skeleton, sp: &SpeciesFile, spec: &LodSpec) -> Mesh {
         .unwrap_or(g.tip_radius_m)
         .max(1e-6);
     // Stylised trunks are chunkier (art direction 2026-10-10).
-    let girth = if sp.style == crate::genome::FoliageStyle::Stylised { 1.4 } else { 1.0 };
+    let girth = if sp.style == crate::genome::FoliageStyle::Stylised { 1.8 } else { 1.0 };
     for (ai, chain) in axes(sk).iter().enumerate() {
         let first = &sk.nodes[chain[1] as usize];
         if first.order > spec.max_order {
@@ -877,12 +877,12 @@ fn puffs(m: &mut Mesh, sk: &Skeleton, sp: &SpeciesFile, seed: u64, count: usize,
         let n = members.len() as f64;
         let spread = (members.iter().map(|&i| pts[i].distance_squared(centre)).sum::<f64>() / n).sqrt();
         let size = members.iter().map(|&i| organs[i].size).sum::<f64>() / n;
-        let r = 1.25 * spread + 0.9 * size;
+        let r = 1.05 * spread + 0.8 * size;
         let radii = DVec3::new(r, r, 0.85 * r);
         let base = m.vertices.len() as u32;
         let out_dir = (centre - crown).normalize_or(DVec3::Z);
         for (vi, u) in unit.iter().enumerate() {
-            let lump = 1.0 + 0.24 * (rng.unit(c as u64 * 64 + vi as u64, 12) - 0.5);
+            let lump = 1.0 + 0.34 * (rng.unit(c as u64 * 64 + vi as u64, 12) - 0.5);
             let mut local = *u * radii * lump;
             if pointed {
                 // Conifer tiers: each puff narrows into a short cone.
