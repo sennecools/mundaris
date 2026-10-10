@@ -175,6 +175,16 @@ impl DetailNoise {
         self.octaves.iter().map(|o| o.amplitude_m).sum::<f64>() * GRADIENT_NOISE_BOUND
     }
 
+    /// Bound of what texels of `texel_m` leave out: `Σ amplitude·(1 − w)`
+    /// over the octaves' band-limit weights `w`, times the noise bound.
+    pub fn unresolved_bound_m(&self, texel_m: f64) -> f64 {
+        self.octaves
+            .iter()
+            .map(|o| o.amplitude_m * (1.0 - octave_weight(o.frequency_per_m, texel_m)))
+            .sum::<f64>()
+            * GRADIENT_NOISE_BOUND
+    }
+
     /// Band-limited fBm at body-space point `p_m` (metres from the body
     /// centre, on the reference sphere). `texel_m = None` evaluates every
     /// octave (the complete function). Returns the height and its gradient
@@ -341,6 +351,30 @@ pub(crate) mod tests {
                     * gpu_style_noise3(anchors, o.octave, o.seed, glam::Vec3::from_array(local))
             })
             .sum()
+    }
+
+    #[test]
+    fn unresolved_bound_covers_what_a_texel_leaves_out() {
+        let noise = DetailNoise::new(&moon_like(), 7).unwrap();
+        assert_eq!(noise.unresolved_bound_m(1.0e-3), 0.0);
+        let mut previous = 0.0;
+        for texel in [0.1, 0.5, 2.0, 8.0, 64.0] {
+            let bound = noise.unresolved_bound_m(texel);
+            assert!(bound >= previous, "grows with the texel");
+            previous = bound;
+            for k in 0..200 {
+                let a = f64::from(k) * 0.37;
+                let p = DVec3::new(a.cos(), a.sin(), (0.1 * a).cos()).normalize() * 1.7e6;
+                let full = noise.evaluate(p, None).0;
+                let coarse = noise.evaluate(p, Some(texel)).0;
+                assert!(
+                    (full - coarse).abs() <= bound,
+                    "{texel}: {} > {bound}",
+                    (full - coarse).abs()
+                );
+            }
+        }
+        assert!(noise.unresolved_bound_m(1.0e4) <= noise.bound_m() * (1.0 + 1e-12));
     }
 
     #[test]

@@ -176,6 +176,9 @@ struct BodyLod {
     source: Arc<AtlasSource>,
     source_key: u64,
     height_bound_m: f64,
+    /// Relief each produced level leaves out (landform and detail octaves
+    /// above its band limit), by level; computed at bind.
+    unresolved_m: Vec<f64>,
     nodes: HashMap<CubePatchAddress, Resident>,
     bounds: HashMap<CubePatchAddress, BoundsGrid>,
     bounds_order: VecDeque<CubePatchAddress>,
@@ -494,7 +497,15 @@ impl PlanetLod {
                         .cells
                         .map(|[low, high]| [f64::from(low), f64::from(high)]);
                     if let Some(collision) = &mut lod.collision {
-                        collision.far_field(address, grid);
+                        // The far collider must contain the complete surface:
+                        // pad by the relief this tile's band limit leaves out.
+                        let pad = lod
+                            .unresolved_m
+                            .get(usize::from(address.level()))
+                            .copied()
+                            .unwrap_or(0.0);
+                        collision
+                            .far_field(address, grid.map(|[low, high]| [low - pad, high + pad]));
                     }
                     if lod.bounds.insert(address, grid).is_none() {
                         lod.bounds_order.push_back(address);
@@ -572,6 +583,9 @@ impl PlanetLod {
         let slot = self.next_slot;
         self.next_slot += 1;
         let world_ready = !matches!(recipe, ProducerRecipe::World(_));
+        let unresolved_m = self.policy.as_ref().map_or_else(Vec::new, |policy| {
+            unresolved_by_level(&recipe, input.radius_m, policy)
+        });
         self.bodies.insert(
             input.body,
             BodyLod {
@@ -583,6 +597,7 @@ impl PlanetLod {
                 source: Arc::new(source),
                 source_key: slot,
                 height_bound_m,
+                unresolved_m,
                 nodes: HashMap::new(),
                 bounds: HashMap::new(),
                 bounds_order: VecDeque::new(),
@@ -849,6 +864,9 @@ impl PlanetLod {
         let radius = input.radius_m;
         let data_offset = policy.data_level_offset();
         let ranges = lod_ranges(&policy, radius, focal);
+        // Pads estimates from measured ancestors (`BodyLod::unresolved_m`).
+        let unresolved = lod.unresolved_m.clone();
+        let unresolved_at = |level: u8| unresolved.get(usize::from(level)).copied().unwrap_or(0.0);
         let selection = {
             let _span = crate::engine_profile::span("Atlas selection");
             let measured = &lod.bounds;
@@ -872,6 +890,7 @@ impl PlanetLod {
                         bound,
                         policy.base_resident_level,
                         data_offset + MEASURED_LOOKAHEAD,
+                        &unresolved_at,
                     )
                 },
             )
@@ -1077,6 +1096,7 @@ impl PlanetLod {
                                 bound,
                                 policy.base_resident_level,
                                 data_offset + MEASURED_LOOKAHEAD,
+                                &unresolved_at,
                             )
                         },
                     );
@@ -1459,6 +1479,20 @@ fn finest_resident(
     None
 }
 
+/// Relief a tile of each level leaves out: the recipe's unresolved bound at
+/// the producer's band-limit texel (`tile_texel_m` with the tile cells).
+fn unresolved_by_level(recipe: &ProducerRecipe, radius_m: f64, policy: &LodPolicy) -> Vec<f64> {
+    (0..=policy.max_level)
+        .map(|level| {
+            recipe.unresolved_bound_m(astrum_world::terrain::producer::tile_texel_m(
+                radius_m,
+                level,
+                policy.tile_cells,
+            ))
+        })
+        .collect()
+}
+
 /// Produced bounds of the node or an expanded estimate from its nearest
 /// measured ancestor; the recipe's absolute bound before anything is known.
 fn node_bounds(
@@ -1467,6 +1501,7 @@ fn node_bounds(
     absolute_bound_m: f64,
     base_level: u8,
     lookahead: u8,
+    unresolved: &dyn Fn(u8) -> f64,
 ) -> ([f64; 2], bool) {
     let mut cursor = Some(address);
     while let Some(node) = cursor {
@@ -1488,8 +1523,10 @@ fn node_bounds(
             if depth == 0 {
                 return (range, true);
             }
-            // Finer bands can add relief the ancestor filtered away.
-            let margin = 0.15 * f64::from(depth) * (range[1] - range[0]) + 0.5;
+            // Finer bands can add relief the ancestor filtered away: at least
+            // the recipe's unresolved bound at the ancestor's level.
+            let margin = (0.15 * f64::from(depth) * (range[1] - range[0]) + 0.5)
+                .max(unresolved(node.level()));
             return (
                 [
                     (range[0] - margin).max(-absolute_bound_m),
@@ -1665,6 +1702,7 @@ mod tests {
             revision: 0,
             source_key: 1,
             height_bound_m: 100.0,
+            unresolved_m: Vec::new(),
             nodes,
             bounds: HashMap::new(),
             bounds_order: VecDeque::new(),
@@ -1696,17 +1734,17 @@ mod tests {
         grid[2] = [-10.0, 30.0]; // row 0, column 2: covers the grandchild quadrant
         let mut measured = HashMap::new();
         measured.insert(child, grid);
-        let (estimate, refinable) = node_bounds(&measured, grandchild, 500.0, 1, 2);
+        let (estimate, refinable) = node_bounds(&measured, grandchild, 500.0, 1, 2, &|_| 0.0);
         assert!(refinable);
         assert!(estimate[0] < -10.0 && estimate[1] > 30.0, "{estimate:?}");
         assert_eq!(
-            node_bounds(&measured, child, 500.0, 1, 2),
+            node_bounds(&measured, child, 500.0, 1, 2, &|_| 0.0),
             ([-10.0, 30.0], true)
         );
         let deep = grandchild.children().unwrap()[0].children().unwrap()[0];
-        assert!(!node_bounds(&measured, deep, 500.0, 1, 2).1);
+        assert!(!node_bounds(&measured, deep, 500.0, 1, 2, &|_| 0.0).1);
         assert_eq!(
-            node_bounds(&HashMap::new(), grandchild, 500.0, 1, 2),
+            node_bounds(&HashMap::new(), grandchild, 500.0, 1, 2, &|_| 0.0),
             ([-500.0, 500.0], false)
         );
     }

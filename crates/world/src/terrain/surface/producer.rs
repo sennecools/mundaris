@@ -272,6 +272,24 @@ impl ProducerRecipe {
         }
     }
 
+    /// Bound of the relief a surface band-limited at `texel_m` leaves out
+    /// (detail noise and landform octaves above the band limit): measured
+    /// bounds of a tile at that texel, padded by this, contain the complete
+    /// surface. Profile and field recipes return only the detail-noise part.
+    pub fn unresolved_bound_m(&self, texel_m: f64) -> f64 {
+        let noise = self
+            .detail_noise()
+            .map_or(0.0, |noise| noise.unresolved_bound_m(texel_m));
+        let landforms = match self {
+            Self::World(world) => world
+                .field
+                .landforms()
+                .map_or(0.0, |l| l.set.unresolved_bound_m(&l.params, texel_m)),
+            _ => 0.0,
+        };
+        noise + landforms
+    }
+
     /// CPU reference for the derived band-limited surface at `texel_m`.
     pub fn evaluate(
         &self,
@@ -367,13 +385,12 @@ impl ProducerRecipe {
             let s = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
             s * s * (3.0 - 2.0 * s)
         };
-        let snow = (1.0
-            - step(
+        let snow =
+            (1.0 - step(
                 look.snow_temperature_c - look.snow_blend_c,
                 look.snow_temperature_c + look.snow_blend_c,
                 t,
-            ))
-            * (1.0 - step(look.snow_slope_rad.0, look.snow_slope_rad.1, slope));
+            )) * (1.0 - step(look.snow_slope_rad.0, look.snow_slope_rad.1, slope));
         let (hardness, sediment, flow) = maps.shape.as_ref().map_or((0.0, 0.0, 0.0), |s| {
             (
                 s.hardness_mips[level].bilinear(n),
