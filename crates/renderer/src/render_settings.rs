@@ -61,10 +61,19 @@ pub enum AntiAliasing {
     Msaa2,
     Msaa4,
     Msaa8,
+    /// Temporal: jittered frames reprojected and clipped (camera motion only).
+    Taa,
 }
 
 impl AntiAliasing {
-    pub const ALL: [Self; 5] = [Self::Off, Self::Fxaa, Self::Msaa2, Self::Msaa4, Self::Msaa8];
+    pub const ALL: [Self; 6] = [
+        Self::Off,
+        Self::Fxaa,
+        Self::Msaa2,
+        Self::Msaa4,
+        Self::Msaa8,
+        Self::Taa,
+    ];
     pub fn name(self) -> &'static str {
         match self {
             Self::Off => "off",
@@ -72,12 +81,13 @@ impl AntiAliasing {
             Self::Msaa2 => "msaa2",
             Self::Msaa4 => "msaa4",
             Self::Msaa8 => "msaa8",
+            Self::Taa => "taa",
         }
     }
     /// Main-pass samples per pixel this method asks for.
     pub fn samples(self) -> u32 {
         match self {
-            Self::Off | Self::Fxaa => 1,
+            Self::Off | Self::Fxaa | Self::Taa => 1,
             Self::Msaa2 => 2,
             Self::Msaa4 => 4,
             Self::Msaa8 => 8,
@@ -85,6 +95,9 @@ impl AntiAliasing {
     }
     pub fn fxaa(self) -> bool {
         self == Self::Fxaa
+    }
+    pub fn taa(self) -> bool {
+        self == Self::Taa
     }
 }
 

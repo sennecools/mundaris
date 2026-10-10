@@ -14,6 +14,8 @@ pub(crate) const NORMAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg16F
 pub(crate) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const AO_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Float;
 const POST_BYTES: u64 = 7 * 16;
+/// Shader `Taa` uniform (aa_taa.wgsl).
+const TAA_BYTES: u64 = 6 * 16;
 const MAX_BLOOM_LEVELS: u32 = 6;
 /// Initial exposure: EV100 14 (bright daylight), flagged for an immediate snap.
 const INITIAL_EV100: f32 = 14.0;
@@ -75,6 +77,12 @@ struct MsTargets {
     resolve_group: wgpu::BindGroup,
 }
 
+/// TAA history ping-pong: frame k writes `history[k % 2]` reading the other.
+struct TaaTargets {
+    history: [Target; 2],
+    groups: [wgpu::BindGroup; 2],
+}
+
 /// Tonemapped image before FXAA: written through an sRGB view, read as unorm.
 struct LdrTarget {
     _texture: wgpu::Texture,
@@ -87,6 +95,7 @@ struct Targets {
     samples: u32,
     ms: Option<MsTargets>,
     ldr: Option<LdrTarget>,
+    taa: Option<TaaTargets>,
     ao_size: [u32; 2],
     bloom_levels: u32,
     direct: Target,
@@ -126,6 +135,13 @@ pub(crate) struct PostProcess {
     tonemap: wgpu::RenderPipeline,
     resolve_layout: wgpu::BindGroupLayout,
     resolve: wgpu::RenderPipeline,
+    taa_layout: wgpu::BindGroupLayout,
+    taa_pipeline: wgpu::RenderPipeline,
+    taa_buffer: wgpu::Buffer,
+    /// History written last frame (index into `TaaTargets::history`).
+    taa_parity: usize,
+    /// The history holds a previous frame (false after (re)allocation).
+    taa_valid: bool,
     fxaa_layout: wgpu::BindGroupLayout,
     fxaa: wgpu::RenderPipeline,
     /// Scene view format; the FXAA input texture shares it.
@@ -144,6 +160,8 @@ pub(crate) struct PostFrame {
     pub view_mode: u32,
     /// Debug views bypass exposure, metering and tonemapping.
     pub passthrough: bool,
+    /// TAA parameters of this frame (shader `Taa` struct), when TAA is on.
+    pub taa: Option<[[f32; 4]; 6]>,
 }
 
 fn entry(
@@ -556,6 +574,52 @@ impl PostProcess {
                 cache: None,
             })
         };
+        let taa_layout = layout(
+            device,
+            "TAA inputs",
+            &[
+                entry(
+                    0,
+                    fragment,
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(TAA_BYTES),
+                    },
+                ),
+                texture_entry(1, fragment, false),
+                depth_entry(2),
+                texture_entry(3, fragment, true),
+                entry(
+                    4,
+                    fragment,
+                    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                ),
+            ],
+        );
+        let taa_shader = module(
+            device,
+            "TAA",
+            concat!(
+                include_str!("shaders/post_common.wgsl"),
+                include_str!("shaders/aa_taa.wgsl")
+            ),
+        );
+        let taa_pipeline = fullscreen(
+            device,
+            "TAA",
+            &taa_layout,
+            &taa_shader,
+            "fs_taa",
+            HDR_FORMAT,
+            None,
+        );
+        let taa_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("TAA parameters"),
+            size: TAA_BYTES,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let fxaa_layout = layout(
             device,
             "FXAA inputs",
@@ -668,6 +732,11 @@ impl PostProcess {
             bloom_layout,
             resolve_layout,
             resolve,
+            taa_layout,
+            taa_pipeline,
+            taa_buffer,
+            taa_parity: 0,
+            taa_valid: false,
             fxaa_layout,
             fxaa,
             output,
@@ -691,6 +760,7 @@ impl PostProcess {
         half_res_ao: bool,
         samples: u32,
         fxaa: bool,
+        taa: bool,
     ) {
         let size = [size[0].max(1), size[1].max(1)];
         if self.targets.as_ref().is_some_and(|t| {
@@ -698,6 +768,7 @@ impl PostProcess {
                 && self.half_res_ao == half_res_ao
                 && t.samples == samples
                 && t.ldr.is_some() == fxaa
+                && t.taa.is_some() == taa
         }) {
             return;
         }
@@ -828,10 +899,36 @@ impl PostProcess {
                 fxaa_group,
             }
         });
+        let taa = taa.then(|| {
+            let history = [
+                target(device, "TAA history A", size, HDR_FORMAT),
+                target(device, "TAA history B", size, HDR_FORMAT),
+            ];
+            let groups = [0, 1].map(|index: usize| {
+                group(
+                    "TAA inputs",
+                    &self.taa_layout,
+                    &[
+                        buffer(0, &self.taa_buffer),
+                        view(1, &direct.view),
+                        view(2, &depth.view),
+                        view(3, &history[1 - index].view),
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        },
+                    ],
+                )
+            });
+            TaaTargets { history, groups }
+        });
+        // New history textures hold nothing yet.
+        self.taa_valid = false;
         let targets = Targets {
             samples,
             ms,
             ldr,
+            taa,
             gtao_group: group(
                 "GTAO inputs",
                 &self.gtao_layout,
@@ -1050,6 +1147,46 @@ impl PostProcess {
             &t.composite_group,
         );
         mask |= 1 << pair::AO_COMPOSITE;
+        if let (Some(taa), Some(mut values)) = (&t.taa, frame.taa) {
+            // Lit HDR (direct + ambient × AO) is final here: TAA writes the
+            // other history and copies it back over `direct`, so exposure,
+            // bloom and tonemap read the converged image.
+            if !self.taa_valid {
+                values[5][2] = 1.0;
+            }
+            queue.write_buffer(
+                &self.taa_buffer,
+                0,
+                &values
+                    .iter()
+                    .flatten()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            );
+            let index = 1 - self.taa_parity;
+            pass(
+                encoder,
+                "TAA",
+                &taa.history[index].view,
+                clear,
+                None,
+                &self.taa_pipeline,
+                &taa.groups[index],
+            );
+            encoder.copy_texture_to_texture(
+                taa.history[index]._texture.as_image_copy(),
+                t.direct._texture.as_image_copy(),
+                wgpu::Extent3d {
+                    width: t.size[0],
+                    height: t.size[1],
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.taa_parity = index;
+            self.taa_valid = true;
+        } else {
+            self.taa_valid = false;
+        }
         {
             let mut compute = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Exposure histogram and adaptation"),
@@ -1184,6 +1321,13 @@ mod tests {
                 concat!(
                     include_str!("shaders/post_common.wgsl"),
                     include_str!("shaders/aa_fxaa.wgsl")
+                ),
+            ),
+            (
+                "taa",
+                concat!(
+                    include_str!("shaders/post_common.wgsl"),
+                    include_str!("shaders/aa_taa.wgsl")
                 ),
             ),
         ] {

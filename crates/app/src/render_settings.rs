@@ -105,7 +105,7 @@ const CASCADE_COUNTS: &[&str] = &["1", "2", "3", "4"];
 const RESOLUTIONS: &[&str] = &["1024", "2048", "4096"];
 const SUN_MODES: &[&str] = &["star", "studio"];
 /// `AntiAliasing::ALL` order.
-const AA_MODES: &[&str] = &["off", "fxaa", "msaa2", "msaa4", "msaa8"];
+const AA_MODES: &[&str] = &["off", "fxaa", "msaa2", "msaa4", "msaa8", "taa"];
 
 pub const SPECS: &[SettingSpec] = &[
     spec(

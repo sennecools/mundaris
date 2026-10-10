@@ -681,7 +681,41 @@ pub(crate) struct CelestialRenderer {
     /// Main-pass samples in use.
     samples: u32,
     aa_report: AaReport,
+    /// TAA jitter sequence index and the previous frame's camera.
+    taa_frame: u64,
+    taa_previous: Option<TaaPose>,
 }
+
+/// Camera of one frame, for TAA reprojection.
+#[derive(Debug, Clone, Copy)]
+struct TaaPose {
+    frame: FrameId,
+    position: DVec3,
+    /// Camera-to-frame rotation.
+    orientation: glam::DQuat,
+    tan_half: f64,
+    aspect: f64,
+    size: [u32; 2],
+}
+
+/// Radical inverse of `index` in `base` (Halton sequence), in [0, 1).
+fn halton(mut index: u64, base: u64) -> f64 {
+    let mut result = 0.0;
+    let mut fraction = 1.0 / base as f64;
+    while index > 0 {
+        result += (index % base) as f64 * fraction;
+        index /= base;
+        fraction /= base as f64;
+    }
+    result
+}
+
+/// TAA sub-pixel jitter cycle length (Halton 2,3).
+const TAA_JITTER_PHASES: u64 = 8;
+/// Weight of the current frame in the TAA blend.
+const TAA_CURRENT_WEIGHT: f32 = 0.1;
+/// Camera moves larger than this per frame drop the history (teleports).
+const TAA_MAX_STEP_M: f64 = 10_000.0;
 
 /// Anti-aliasing state for diagnostics: what the setting asks for, what the
 /// adapter allows, and the one-time pipeline compile cost of the last switch.
@@ -829,6 +863,8 @@ impl CelestialRenderer {
             msaa_support,
             samples: 1,
             aa_report: AaReport::default(),
+            taa_frame: 0,
+            taa_previous: None,
         };
         renderer.apply_samples(device);
         renderer.ensure_post(device);
@@ -861,7 +897,78 @@ impl CelestialRenderer {
             self.settings.ao.half_res,
             self.samples,
             self.settings.anti_aliasing.fxaa(),
+            self.settings.anti_aliasing.taa(),
         );
+    }
+    /// TAA parameters of this frame (shader `Taa` struct, aa_taa.wgsl): the
+    /// Halton jitter, current and previous projection shape, and the rigid
+    /// transform from this frame's view space to the previous one. History is
+    /// dropped when the camera's frame, the viewport or a huge step changes.
+    fn taa_frame_params(
+        &mut self,
+        frame: &CelestialFrame<'_, '_, '_>,
+        enabled: bool,
+    ) -> Option<[[f32; 4]; 6]> {
+        if !enabled {
+            self.taa_previous = None;
+            return None;
+        }
+        let projection = frame.projection;
+        let [width, height] = projection.viewport();
+        let observer = frame.view.observer();
+        let pose = TaaPose {
+            frame: observer.position().frame(),
+            position: observer.position().local().metres(),
+            orientation: observer.orientation().quaternion(),
+            tan_half: f64::from(height) * 0.5 / projection.focal_pixels(),
+            aspect: f64::from(width) / f64::from(height.max(1)),
+            size: [width, height],
+        };
+        self.taa_frame = self.taa_frame.wrapping_add(1);
+        let phase = self.taa_frame % TAA_JITTER_PHASES + 1;
+        let jitter = [
+            (halton(phase, 2) - 0.5) * 2.0 / f64::from(width.max(1)),
+            (halton(phase, 3) - 0.5) * 2.0 / f64::from(height.max(1)),
+        ];
+        let previous = self.taa_previous.replace(pose).filter(|previous| {
+            previous.frame == pose.frame
+                && previous.size == pose.size
+                && previous.position.distance(pose.position) < TAA_MAX_STEP_M
+        });
+        let (reset, rotation, translation, previous) = match previous {
+            Some(previous) => {
+                let to_previous = previous.orientation.inverse();
+                (
+                    0.0,
+                    glam::DMat3::from_quat(to_previous * pose.orientation),
+                    to_previous * (pose.position - previous.position),
+                    previous,
+                )
+            }
+            None => (1.0, glam::DMat3::IDENTITY, DVec3::ZERO, pose),
+        };
+        // Rows of [R | t]; glam matrices are column-major.
+        let row = |r: usize| {
+            [
+                rotation.col(0)[r] as f32,
+                rotation.col(1)[r] as f32,
+                rotation.col(2)[r] as f32,
+                translation[r] as f32,
+            ]
+        };
+        Some([
+            [jitter[0] as f32, jitter[1] as f32, 0.0, 0.0],
+            [
+                pose.tan_half as f32,
+                pose.aspect as f32,
+                previous.tan_half as f32,
+                previous.aspect as f32,
+            ],
+            row(0),
+            row(1),
+            row(2),
+            [projection.near_m() as f32, TAA_CURRENT_WEIGHT, reset, 0.0],
+        ])
     }
     pub(crate) fn aa_report(&self) -> AaReport {
         self.aa_report
@@ -959,7 +1066,13 @@ impl CelestialRenderer {
                 DRAW_UNIFORM_BYTES,
             );
         }
-        queue.write_buffer(&self.projection, 0, &frame.projection.gpu_bytes());
+        let taa =
+            self.taa_frame_params(frame, settings.anti_aliasing.taa() && !storage.passthrough);
+        let mut projection = frame.projection.gpu_bytes();
+        if let Some(values) = &taa {
+            jitter_projection(&mut projection, values[0][0], values[0][1]);
+        }
+        queue.write_buffer(&self.projection, 0, &projection);
         for (buffer, bytes) in [
             (&self.vertices, &storage.vertices),
             (&self.polylines, &storage.polylines),
@@ -1108,6 +1221,7 @@ impl CelestialRenderer {
                 focal_px: frame.projection.focal_pixels(),
                 view_mode: storage.view_mode,
                 passthrough: storage.passthrough,
+                taa,
             },
             timestamps,
         );
@@ -1423,4 +1537,20 @@ fn overlay_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat) -> wgpu:
         multiview_mask: None,
         cache: None,
     })
+}
+
+/// Adds a clip-space offset of `jitter` NDC units (x right, y up) to a
+/// column-major projection: clip.xy += jitter * clip.w.
+fn jitter_projection(bytes: &mut [u8; 64], jx: f32, jy: f32) {
+    let mut m = [0f32; 16];
+    for (value, chunk) in m.iter_mut().zip(bytes.as_chunks::<4>().0) {
+        *value = f32::from_le_bytes(*chunk);
+    }
+    for column in m.as_chunks_mut::<4>().0 {
+        column[0] += jx * column[3];
+        column[1] += jy * column[3];
+    }
+    for (value, chunk) in m.iter().zip(bytes.as_chunks_mut::<4>().0) {
+        chunk.copy_from_slice(&value.to_le_bytes());
+    }
 }
