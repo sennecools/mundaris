@@ -113,6 +113,12 @@ impl Engine {
                 self.demo.studio_action(StudioAction::SetSetting(index, value));
             }
         }
+        if let Some(sensitivity) = saved.get(LOOK_KEY).and_then(serde_json::Value::as_f64)
+            && sensitivity > 0.0
+        {
+            self.demo
+                .studio_action(StudioAction::SetLookSensitivity(sensitivity.log10() as f32));
+        }
     }
 
     /// Saves the graphics options (anti-aliasing) for the next run.
@@ -128,6 +134,11 @@ impl Engine {
                 Some((spec.id.to_string(), registry::value_json(index, value)))
             })
             .collect();
+        let mut map = map;
+        map.insert(
+            LOOK_KEY.to_string(),
+            serde_json::json!(10f64.powf(f64::from(self.demo.studio_view().look_exponent))),
+        );
         if let Ok(text) = serde_json::to_string_pretty(&map) {
             let _ = std::fs::write(GRAPHICS_PATH, text);
         }
@@ -322,6 +333,8 @@ const LAYOUT_PATH: &str = "target/studio-layout.json";
 /// between runs; session state, not content.
 const GRAPHICS_PATH: &str = "target/studio-graphics.json";
 const GRAPHICS_PREFIX: &str = "render.aa.";
+/// Drag look sensitivity, saved with the graphics options.
+const LOOK_KEY: &str = "camera.look_sensitivity";
 
 impl StudioLayout {
     fn load() -> Self {

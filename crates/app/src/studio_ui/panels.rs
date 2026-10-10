@@ -398,6 +398,26 @@ fn body_tab(ui: &mut Ui, view: &StudioView, panel: &StudioView, actions: &mut Ve
                 }
             });
         });
+        prop_row(ui, "Look speed", |ui| {
+            let mut exponent = view.look_exponent;
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_sized(
+                    [48.0, ROW_HEIGHT],
+                    egui::Label::new(
+                        RichText::new(format!("{:.2}×", 10f32.powf(exponent)))
+                            .font(mono())
+                            .color(TEXT_PRIMARY),
+                    ),
+                );
+                fill_row(ui);
+                let response = ui
+                    .add(egui::Slider::new(&mut exponent, -1.0..=1.0).show_value(false))
+                    .on_hover_text("Drag look response; 1.00× = the scene follows the pointer");
+                if response.changed() {
+                    actions.push(StudioAction::SetLookSensitivity(exponent));
+                }
+            });
+        });
         ui.label(
             RichText::new("Go to altitude")
                 .font(small())

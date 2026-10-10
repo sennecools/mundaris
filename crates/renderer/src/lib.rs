@@ -269,6 +269,8 @@ pub struct Renderer {
     native_render_timings: NativeRenderTimings,
     settings: RenderSettings,
     msaa_support: u32,
+    /// "adapter · backend", for the viewport stats.
+    adapter_label: String,
     #[cfg(feature = "developer-tools")]
     native_capture: native_capture::NativeCapture,
     #[cfg(feature = "developer-tools")]
@@ -292,6 +294,10 @@ impl Renderer {
             native_render_timings: NativeRenderTimings::default(),
             settings: RenderSettings::default(),
             msaa_support: context.msaa_support,
+            adapter_label: {
+                let info = context.adapter.get_info();
+                format!("{} · {:?}", info.name, info.backend)
+            },
             #[cfg(feature = "developer-tools")]
             native_capture: native_capture::NativeCapture::new(
                 adapter_info.name,
@@ -317,6 +323,11 @@ impl Renderer {
 
     pub fn render_settings(&self) -> RenderSettings {
         self.settings
+    }
+
+    /// GPU adapter and graphics API in use, e.g. "AMD Radeon RX 9070 XT · Vulkan".
+    pub fn adapter_label(&self) -> &str {
+        &self.adapter_label
     }
 
     /// Anti-aliasing in effect: requested and used MSAA samples, FXAA, and the

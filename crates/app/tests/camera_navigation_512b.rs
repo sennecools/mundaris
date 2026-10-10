@@ -169,8 +169,10 @@ fn response_matrix_actual_angles_and_wheel_displacements() {
                 );
                 if fov == 60.0 && height == 1080 && dpi == 1.0 && [2.0, 10.0].contains(&clearance_m)
                 {
+                    // Look follows the pointer at every altitude (user direction
+                    // 2026-10-10): 200 px of a 1080 px, 60° view is about 12°.
                     assert!(
-                        local_angle > 0.0 && local_angle < 1.0,
+                        (10.0..15.0).contains(&local_angle),
                         "local swipe {local_angle}° at {clearance_m}m"
                     );
                     assert!(
@@ -577,7 +579,8 @@ fn overview_response_matrix_and_repeated_surface_turns_remain_usable() {
         summed_angle >= std::f64::consts::PI
             && summed_angle < std::f64::consts::PI + gesture_deg.to_radians() + 1e-6
     );
-    assert!(endpoint_angle.to_degrees() > 179.0);
+    // The last gesture may overshoot 180° by up to one gesture.
+    assert!(endpoint_angle.to_degrees() > 180.0 - gesture_deg - 1e-6);
     println!(
         "repeated_turn,clearance_m=2,logical_pixels_per_gesture=200,gestures={gestures},total_swipe_pixels={},summed_turn_deg={},endpoint_turn_deg={}; mechanical reachability only, not human usability approval",
         gestures * 200,

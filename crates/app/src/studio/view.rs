@@ -96,6 +96,8 @@ pub struct StudioView {
     pub camera_stats: Vec<StatItem>,
     pub terrain_stats: Vec<StatItem>,
     pub speed_exponent: f32,
+    /// log10 of the drag look sensitivity (0 = the scene follows the pointer).
+    pub look_exponent: f32,
     pub surface_available: bool,
     pub status: Vec<StatItem>,
     pub automation_owner: String,
@@ -198,6 +200,8 @@ pub enum StudioAction {
     SelectBody(usize),
     FocusBody(usize),
     SetSpeedExponent(f32),
+    /// log10 of the drag look sensitivity, -1..1.
+    SetLookSensitivity(f32),
     Approach(usize),
     SurfaceNavigation,
     FrameSelected,

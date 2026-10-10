@@ -132,6 +132,14 @@ impl GravityOrbitsDemo {
                     self.controls.manual_speed = 10f64.powf(f64::from(exponent.clamp(-2.0, 2.0)));
                 }
             }
+            StudioAction::SetLookSensitivity(exponent) => {
+                if exponent.is_finite() {
+                    let sensitivity = 10f64.powf(f64::from(exponent.clamp(-1.0, 1.0)));
+                    if let Err(error) = self.camera.set_look_sensitivity(sensitivity) {
+                        self.log(Tone::Warn, format!("Look speed rejected: {error:#}"));
+                    }
+                }
+            }
             StudioAction::Approach(index) => {
                 if let Some(&clearance) = ALTITUDE_PRESETS_M.get(index) {
                     if self.camera.mode() == CameraMode::SystemOrbit
@@ -383,6 +391,13 @@ impl GravityOrbitsDemo {
                 "Nodes",
                 terrain.visible_leaf_count.to_string(),
             ));
+            if let Some(adapter) = snapshot
+                .render_settings
+                .as_ref()
+                .and_then(|r| r["adapter"].as_str())
+            {
+                hud.push(StatItem::new("API", adapter));
+            }
         }
 
         let interval_p50 = self.controls.profiler.interval_percentile(0.5);
@@ -450,6 +465,7 @@ impl GravityOrbitsDemo {
             camera_stats,
             terrain_stats,
             speed_exponent: self.controls.manual_speed.log10() as f32,
+            look_exponent: self.camera.look_sensitivity().log10() as f32,
             surface_available,
             status,
             automation_owner,

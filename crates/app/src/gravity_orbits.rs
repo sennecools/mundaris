@@ -1892,6 +1892,7 @@ impl GravityOrbitsDemo {
             .annotate_terrain(&mut snapshot.terrain, &self.ids, &self.system);
         let shadows = renderer.shadow_report();
         let aa = renderer.anti_aliasing_report();
+        let adapter = renderer.adapter_label();
         snapshot.render_settings = Some(serde_json::json!({
             "settings": crate::render_settings::listing(&crate::render_settings::RenderState {
                 settings: self.controls.render_settings,
@@ -1908,6 +1909,7 @@ impl GravityOrbitsDemo {
                 "splits_m": shadows.splits_m,
                 "texel_m": shadows.texel_m,
             },
+            "adapter": adapter,
             "anti_aliasing": {
                 "requested_samples": aa.requested_samples,
                 "samples": aa.samples,
