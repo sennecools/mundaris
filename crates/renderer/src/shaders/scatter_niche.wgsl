@@ -247,15 +247,19 @@ fn sc_forest(face: u32, ci: f32, cj: f32, footprint: f32, s: FlSite, view: vec3<
     }
     var c = vec3<f32>(0.0);
     var wsum = 0.0;
+    var warea = 0.0;
     for (var k = 0u; k < FL_SPECIES; k = k + 1u) {
         if ((FL_CANOPY_MASK >> k) & 1u) != 0u {
             let w = fl_weight(k, s);
-            c += w * fl_niche(k).color;
+            // Weighted by crown area too: a far forest shows what covers it.
+            let area = max(fl_niche(k).crown.x, 1.0e-3);
+            c += w * area * fl_niche(k).color;
             wsum += w;
+            warea += w * area;
         }
     }
     // Too little canopy to weigh: the default tint (f32 cannot divide tiny sums).
-    site.color = select(vec3<f32>(0.04, 0.07, 0.025), c / max(wsum, 1.0e-6), wsum > 1.0e-6);
+    site.color = select(vec3<f32>(0.04, 0.07, 0.025), c / max(warea, 1.0e-6), wsum > 1.0e-6);
     return site;
 }
 

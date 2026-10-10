@@ -395,12 +395,21 @@ impl Palette {
         if alien > 0.0 {
             let fam = self.hue_families(p);
             let dist = |a: f64, b: f64| ((a - b + 540.0).rem_euclid(360.0) - 180.0).abs();
-            let target = if n.layer == Layer::Canopy {
-                *fam.iter().min_by(|a, b| dist(**a, 45.0).total_cmp(&dist(**b, 45.0))).unwrap()
-            } else {
-                fam[(st.unit(5, 0) * 3.0) as usize % 3]
+            // Spread the woody species across the warm family so a forest is
+            // not one colour (NMS 2016: red, orange and amber crowns): broad
+            // canopy toward amber, needle canopy toward crimson (and
+            // darker), shrubs toward coral/magenta.
+            let warm = *fam.iter().min_by(|a, b| dist(**a, 45.0).total_cmp(&dist(**b, 45.0))).unwrap();
+            let needle = sp.genome.organ == crate::genome::OrganKind::Needle;
+            let offset = match (n.layer, needle) {
+                (Layer::Canopy, false) => 25.0,
+                (Layer::Canopy, true) => -15.0,
+                (Layer::Shrub, _) => -45.0,
             };
-            let target = (target + 12.0 * st.signed(6, 0)).rem_euclid(360.0);
+            if needle {
+                leaf[0] -= 0.04 * alien;
+            }
+            let target = (warm + offset + 8.0 * st.signed(6, 0)).rem_euclid(360.0);
             let dh = (target - leaf[2] + 540.0).rem_euclid(360.0) - 180.0;
             leaf[2] = (leaf[2] + alien * dh).rem_euclid(360.0);
             leaf[1] = leaf[1].max(alien * 0.8 * chroma_cap(p.realism()));

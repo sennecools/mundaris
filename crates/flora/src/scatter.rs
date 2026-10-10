@@ -183,6 +183,7 @@ impl Placement<'_> {
         // Canopy colour: species colours weighted like the species choice.
         let mut c = [0.0; 3];
         let mut wsum = 0.0;
+        let mut warea = 0.0;
         for k in 0..self.count() {
             let sp = &self.species[k];
             if sp.niche.layer != Layer::Canopy {
@@ -191,12 +192,15 @@ impl Placement<'_> {
             let su = self.suit(k, s);
             let w = su * su * sp.niche.prior;
             let col = canopy_color(sp);
+            // Weighted by crown area too: a far forest shows what covers it.
+            let area = crown_m2(sp)[0].max(1e-3);
             for a in 0..3 {
-                c[a] += w * col[a];
+                c[a] += w * area * col[a];
             }
             wsum += w;
+            warea += w * area;
         }
-        site.color = if wsum > 1e-6 { c.map(|v| v / wsum) } else { DEFAULT_CANOPY };
+        site.color = if wsum > 1e-6 { c.map(|v| v / warea) } else { DEFAULT_CANOPY };
         site
     }
 

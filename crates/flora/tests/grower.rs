@@ -54,7 +54,7 @@ fn same_seed_same_bytes() {
 /// `powf`/`sin`/`cos`, which are not guaranteed bit-identical across
 /// platforms (genesis §9.3 determinism scope is still open). Update the
 /// constant deliberately when the grower changes.
-const GOLDEN_BUSHEL_12345: u64 = 0x2536_3347_dcf6_5a05;
+const GOLDEN_BUSHEL_12345: u64 = 0x67c2_3fce_1565_6532;
 
 #[test]
 fn golden_seed() {

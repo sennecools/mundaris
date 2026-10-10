@@ -33,7 +33,7 @@ const SCATTER_SLOTS: u32 = 1024u;
 const SCATTER_VERTS: u32 = 96u;
 const SCATTER_CELL_BITS: u32 = 16u;
 // Full density within this view distance (m); keep(d) = (FULL / d)².
-const SCATTER_FULL_M: f32 = 350.0;
+const SCATTER_FULL_M: f32 = 800.0;
 // No plants beyond this view distance (m), faded over the last 30 %.
 const SCATTER_MAX_DISTANCE_M: f32 = 16000.0;
 const SCATTER_DEG: f32 = 0.017453292;
@@ -256,8 +256,21 @@ fn forest_cover(inst: Instance, st: vec2<f32>, normal_body: vec3<f32>, climate: 
     let groups = mix(sc_value(face, c.x / 3.0, c.y / 3.0, 44u), 0.5, smoothstep(0.75, 1.5, footprint));
     let clumps = mix(sc_value(face, c.x / 9.0, c.y / 9.0, 45u), 0.5, smoothstep(2.25, 4.5, footprint));
     colour *= 1.0 + 0.7 * (groups - 0.5) * (1.0 - 0.5 * detail) + 0.7 * (clumps - 0.5);
-    return vec4<f32>(colour, clamp(site.cover, 0.0, 0.98));
+    // Once single crowns are sub-pixel (far views, orbit) the tint stands
+    // for the canopy's average under light: crowns plus the shade between
+    // and inside them, so darker and less saturated than the crown-top
+    // albedo, and the gaps let some ground through.
+    let far = 1.0 - detail;
+    let luma = dot(colour, vec3<f32>(0.2126, 0.7152, 0.0722));
+    colour = mix(colour, mix(vec3<f32>(luma), colour, FL_FAR_CHROMA) * FL_FAR_SHADE, far);
+    return vec4<f32>(colour, clamp(site.cover * mix(1.0, FL_FAR_COVER, far), 0.0, 0.98));
 }
+
+// Far canopy average (forest_cover): chroma kept, brightness kept, share of
+// the ground the crowns hide once single crowns are sub-pixel.
+const FL_FAR_CHROMA: f32 = 0.6;
+const FL_FAR_SHADE: f32 = 0.7;
+const FL_FAR_COVER: f32 = 0.85;
 
 // PROTOTYPE (M4/M5): mean-preserving ground detail near the camera: four
 // octaves of world-anchored value noise (about 0.5, 2, 8 and 32 m), each

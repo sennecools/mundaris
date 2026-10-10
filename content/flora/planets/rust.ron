@@ -22,9 +22,8 @@ PlanetLife(
     geology_age: 0.7,
     // Species: 10 generated from the planet (body plans, niches, colours),
     // the authored files in content/flora/species serving as tree/shrub
-    // templates. 0 = only the authored species. PROTOTYPE: 0 until the
-    // forest LOD chain is fixed (user 2026-10-10); 10 is the intended value.
-    generated_species: 0,
+    // templates. 0 = only the authored species.
+    generated_species: 10,
     // Hard bedrock (most of Rust, Tier A hardness ~0.85) breaks into granite
     // blocks; soft basins carry bedded sandstone.
     rocks: [
