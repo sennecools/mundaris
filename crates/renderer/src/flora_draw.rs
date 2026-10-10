@@ -19,21 +19,27 @@
 
 use std::sync::{Arc, OnceLock};
 
-use astrum_flora::scatter::{MAX_SPECIES, species_wgsl, splice_species};
+use astrum_flora::hash::{derive, name_key};
+use astrum_flora::palette::{Palette, PlanetRock, from_lch, load_planet};
+use astrum_flora::rock::{RockFile, Weathering, grow_rock};
+use astrum_flora::scatter::{MAX_ROCKS, MAX_SPECIES, species_wgsl, splice_species};
 use astrum_flora::{Kit, LOD_COUNT, Mesh, SpeciesFile, grow_meshes, load_species_for_body, variant_seed};
 use wgpu::util::DeviceExt;
 
-/// Grown variants per species (`FLORA_VARIANTS` in scatter_cull.wgsl).
+/// Grown variants per entry (`FLORA_VARIANTS` in scatter_cull.wgsl). Rocks:
+/// variant 0 dry, variant 1 wet (weathered, mossy).
 pub const VARIANTS: usize = 2;
-pub const BUCKETS: usize = MAX_SPECIES * VARIANTS * LOD_COUNT;
+/// Bucket entries: up to MAX_SPECIES plants, then MAX_ROCKS rock archetypes.
+pub const ENTRIES: usize = MAX_SPECIES + MAX_ROCKS;
+pub const BUCKETS: usize = ENTRIES * VARIANTS * LOD_COUNT;
 /// First word of the flora draw arguments (`FLORA_ARGS_WORD`).
 pub const ARGS_WORD: usize = 16;
-/// Word holding the species mask (`FLORA_MASK_WORD`).
+/// Word holding the entry mask (`FLORA_MASK_WORD`).
 pub const MASK_WORD: usize = 5;
 /// Size of the shared plant argument buffer once flora is included.
 pub const ARGS_BYTES: u64 = 1024;
 const FAR_CAPACITY: u32 = 98_304;
-const CAPACITY: [u32; LOD_COUNT] = [1024, 4096, 8192];
+const CAPACITY: [u32; LOD_COUNT] = [1024, 3072, 6144];
 /// GPU vertex: the 36-byte flora vertex plus the bucket's first instance slot.
 const VERTEX_BYTES: u64 = 40;
 
@@ -43,9 +49,11 @@ fn bucket_base(bucket: usize) -> u32 {
     FAR_CAPACITY + (bucket / LOD_COUNT) as u32 * CAPACITY.iter().sum::<u32>() + before
 }
 
-/// Species and CPU meshes of every bucket, grown once per process.
+/// Species, rocks and CPU meshes of every bucket, grown once per process.
 struct Grown {
     species: Vec<SpeciesFile>,
+    rocks: Vec<PlanetRock>,
+    mask: u32,
     vertices: Vec<u8>,
     indices: Vec<u32>,
     /// Per bucket: (index count, first index, base vertex).
@@ -53,55 +61,108 @@ struct Grown {
 }
 
 fn grow_all() -> Grown {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content/flora/species");
-    // PROTOTYPE: Rust is the only body with life; its planet file sets the palette.
-    let planets = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content/flora/planets");
-    let mut species: Vec<SpeciesFile> = match load_species_for_body(&dir, &planets, "rust") {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("flora: {e}; using the built-in niche table and procedural plants");
-            Vec::new()
-        }
-    };
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content/flora");
+    // PROTOTYPE: Rust is the only body with life; its planet file sets the
+    // palette and the rocks.
+    let mut species: Vec<SpeciesFile> =
+        match load_species_for_body(&root.join("species"), &root.join("planets"), "rust") {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("flora: {e}; using the built-in niche table and procedural plants");
+                Vec::new()
+            }
+        };
     if species.len() > MAX_SPECIES {
         tracing::warn!("flora: {} species, only the first {MAX_SPECIES} are used", species.len());
         species.truncate(MAX_SPECIES);
     }
+    let planet = load_planet(&root.join("planets"), "rust").ok();
+    let mut rocks: Vec<(PlanetRock, RockFile)> = Vec::new();
+    if let Some(p) = &planet {
+        for r in p.rocks.iter().take(MAX_ROCKS) {
+            match std::fs::read_to_string(root.join("rocks").join(format!("{}.ron", r.name)))
+                .map_err(|e| e.to_string())
+                .and_then(|t| RockFile::from_ron(&t))
+            {
+                Ok(file) => rocks.push((r.clone(), file)),
+                Err(e) => {
+                    tracing::warn!("flora: rock `{}`: {e}; rocks stay procedural", r.name);
+                    rocks.clear();
+                    break;
+                }
+            }
+        }
+    }
+    let weathering = |wet: bool| {
+        let (age, moss) = planet.as_ref().map_or((0.5, [0.05, 0.08, 0.03]), |p| {
+            let pal = Palette::for_planet(p);
+            let m = from_lch([pal.foliage[0] - 0.08, pal.foliage[1] * 0.8, pal.foliage[2]]);
+            (p.geology_age, m.map(|v| v as f32))
+        });
+        if wet {
+            Weathering { wetness: 0.85, age, moss, moss_cover: 0.7 }
+        } else {
+            Weathering { wetness: 0.15, age, moss, moss_cover: 0.05 }
+        }
+    };
     let kit = Kit::builtin();
     let started = std::time::Instant::now();
-    // Grow every (species, variant) on its own thread; results in bucket order.
-    let plants: Vec<[Mesh; LOD_COUNT]> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..species.len() * VARIANTS)
-            .map(|sv| {
-                let sp = &species[sv / VARIANTS];
+    // Grow every (entry, variant) on its own thread.
+    let jobs: Vec<(usize, usize)> = (0..species.len())
+        .chain((0..rocks.len()).map(|r| MAX_SPECIES + r))
+        .flat_map(|e| (0..VARIANTS).map(move |v| (e, v)))
+        .collect();
+    let meshes: Vec<[Mesh; LOD_COUNT]> = std::thread::scope(|scope| {
+        let handles: Vec<_> = jobs
+            .iter()
+            .map(|&(e, v)| {
                 let kit = &kit;
-                scope.spawn(move || grow_meshes(sp, kit, variant_seed(sp, (sv % VARIANTS) as u32)).1)
+                let species = &species;
+                let rocks = &rocks;
+                let w = weathering(v == 1);
+                scope.spawn(move || {
+                    if e < MAX_SPECIES {
+                        let sp = &species[e];
+                        grow_meshes(sp, kit, variant_seed(sp, v as u32)).1
+                    } else {
+                        let rock = &rocks[e - MAX_SPECIES].1;
+                        grow_rock(rock, derive(name_key(&rock.name), v as u64), &w)
+                    }
+                })
             })
             .collect();
         handles.into_iter().map(|h| h.join().expect("flora growth thread")).collect()
     });
-    let mut g = Grown { species, vertices: Vec::new(), indices: Vec::new(), ranges: Vec::with_capacity(BUCKETS) };
+    let mut g = Grown {
+        species,
+        rocks: rocks.iter().map(|r| r.0.clone()).collect(),
+        mask: 0,
+        vertices: Vec::new(),
+        indices: Vec::new(),
+        ranges: vec![(0, 0, 0); BUCKETS],
+    };
     let mut tris = 0usize;
-    for (sv, plant) in plants.iter().enumerate() {
-        for (lod, mesh) in plant.iter().enumerate() {
-            let bucket = sv * LOD_COUNT + lod;
+    for (&(e, v), lods) in jobs.iter().zip(&meshes) {
+        g.mask |= 1 << e;
+        for (lod, mesh) in lods.iter().enumerate() {
+            let bucket = (e * VARIANTS + v) * LOD_COUNT + lod;
             let base_vertex = (g.vertices.len() as u64 / VERTEX_BYTES) as i32;
             let first_index = g.indices.len() as u32;
             let slot = bucket_base(bucket);
-            for v in &mesh.vertices {
-                v.to_bytes(&mut g.vertices);
+            for vtx in &mesh.vertices {
+                vtx.to_bytes(&mut g.vertices);
                 g.vertices.extend_from_slice(&slot.to_le_bytes());
             }
             g.indices.extend_from_slice(&mesh.indices);
-            g.ranges.push((mesh.indices.len() as u32, first_index, base_vertex));
+            g.ranges[bucket] = (mesh.indices.len() as u32, first_index, base_vertex);
             tris += mesh.triangles();
         }
     }
-    g.ranges.resize(BUCKETS, (0, 0, 0));
     tracing::info!(
-        "flora: grew {:?} ({} meshes, {} triangles, {} KiB) in {:.0} ms",
+        "flora: grew {:?} + rocks {:?} ({} meshes, {} triangles, {} KiB) in {:.0} ms",
         g.species.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
-        plants.len() * LOD_COUNT,
+        g.rocks.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+        meshes.len() * LOD_COUNT,
         tris,
         (g.vertices.len() + g.indices.len() * 4) / 1024,
         started.elapsed().as_secs_f64() * 1e3
@@ -109,15 +170,15 @@ fn grow_all() -> Grown {
     g
 }
 
-/// `shader` with the niche table generated from the loaded species spliced
-/// over the built-in one (pure string transform; unchanged when no species
-/// loaded).
+/// `shader` with the niche/rock table generated from the loaded content
+/// spliced over the built-in one (pure string transform; unchanged when no
+/// species loaded).
 pub(crate) fn species_shader(shader: &str) -> String {
     let g = grown();
     if g.species.is_empty() {
         return shader.to_string();
     }
-    splice_species(shader, &species_wgsl(&g.species))
+    splice_species(shader, &species_wgsl(&g.species, &g.rocks))
 }
 
 fn grown() -> Arc<Grown> {
@@ -159,7 +220,7 @@ impl FloraDraw {
         color_targets: &[Option<wgpu::ColorTargetState>],
     ) -> Self {
         let g = grown();
-        let mask = (1u32 << g.species.len()) - 1;
+        let mask = g.mask;
         let mut args = vec![0u32; BUCKETS * 5];
         for (b, &(count, first, base)) in g.ranges.iter().enumerate() {
             args[b * 5] = count;
@@ -305,7 +366,7 @@ mod tests {
         let last = bucket_base(BUCKETS - 1) + CAPACITY[LOD_COUNT - 1];
         assert!(last as u64 <= 262_144, "plants buffer holds 262144");
         assert!(((ARGS_WORD + BUCKETS * 5) * 4) as u64 <= ARGS_BYTES);
-        // WGSL mirror: flora_base(b) = FAR + (b / 3) * 13312 + {0, 1024, 5120}.
-        assert_eq!(bucket_base(4), FAR_CAPACITY + 13_312 + 1024);
+        // WGSL mirror: flora_base(b) = FAR + (b / 3) * 10240 + {0, 1024, 4096}.
+        assert_eq!(bucket_base(4), FAR_CAPACITY + 10_240 + 1024);
     }
 }

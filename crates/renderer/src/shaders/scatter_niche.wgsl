@@ -219,3 +219,31 @@ fn sc_forest(face: u32, ci: f32, cj: f32, footprint: f32, s: FlSite) -> ForestSi
     site.color = select(vec3<f32>(0.04, 0.07, 0.025), c / max(wsum, 1.0e-6), wsum > 1.0e-6);
     return site;
 }
+
+// Rock archetype for bedrock `hardness` (Tier A, 0..1) drawn by `roll` with
+// weights from the planet's hardness envelopes; -1 when none fits
+// (astrum_flora::scatter::pick_rock).
+fn fl_pick_rock(hardness: f32, roll: f32) -> i32 {
+    var total = 0.0;
+    for (var r = 0u; r < FL_ROCKS; r = r + 1u) {
+        let e = fl_rock(r);
+        total += sc_range(e.x, e.y, e.z, hardness);
+    }
+    if total <= 0.0 {
+        return -1;
+    }
+    var acc = 0.0;
+    var last = -1;
+    for (var r = 0u; r < FL_ROCKS; r = r + 1u) {
+        let e = fl_rock(r);
+        let w = sc_range(e.x, e.y, e.z, hardness);
+        acc += w;
+        if roll * total < acc {
+            return i32(r);
+        }
+        if w > 0.0 {
+            last = i32(r);
+        }
+    }
+    return last;
+}

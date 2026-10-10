@@ -27,4 +27,17 @@ fn fl_niche(k: u32) -> FlNiche {
         default: { return FlNiche(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 0.0, 1.0), vec2<f32>(0.0, 0.0), 1.0, 0.0, vec2<f32>(1.0, 1.0), 1u, vec3<f32>(0.04, 0.07, 0.025)); }
     }
 }
+const FL_ROCKS: u32 = 2u;
+// Bucket entry of rock 0 (after the MAX_SPECIES plant entries).
+const FL_ROCK_ENTRY: u32 = 6u;
+// Bedrock hardness envelope (min, max, falloff) of rock archetype `r`.
+fn fl_rock(r: u32) -> vec3<f32> {
+    switch r {
+        // granite
+        case 0u: { return vec3<f32>(0.550000, 1.000000, 0.100000); }
+        // sandstone
+        case 1u: { return vec3<f32>(0.000000, 0.500000, 0.100000); }
+        default: { return vec3<f32>(0.0, 0.0, 1.0); }
+    }
+}
 // END FLORA SPECIES

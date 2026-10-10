@@ -48,7 +48,8 @@ fn vs_flora(v: FloraIn, @builtin(instance_index) index: u32) -> FloraOut {
     let tint = 0.85 + 0.3 * sc_unit(p.info.z);
     let hue = sc_unit(p.info.w);
     var shift = vec3<f32>(1.0 + 0.2 * (hue - 0.5), 1.0, 1.0 - 0.25 * (hue - 0.5));
-    if v.wind.w == 0u {
+    // Hue jitter on organs only (bark, fruit and rock keep their colour).
+    if v.wind.w != 1u {
         shift = vec3<f32>(1.0);
     }
     out.albedo = c * tint * shift;

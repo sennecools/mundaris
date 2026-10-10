@@ -4,8 +4,9 @@
 // first vertex, first instance, then the staged node count).
 //
 // PROTOTYPE (flora lane): trees and shrubs of a kind with a grown species
-// (mask in plant_args[5], bit = species) go to flora buckets instead: one
-// region of `plants_out` and one indexed indirect draw per (kind, variant,
+// (mask in plant_args[5], bit = entry: species, then rocks from FL_ROCK_ENTRY)
+// go to flora buckets instead: one
+// region of `plants_out` and one indexed indirect draw per (entry, variant,
 // LOD). Keep FLORA_* in step with crates/renderer/src/flora_draw.rs.
 
 @group(3) @binding(0) var<storage, read_write> plants_out: array<Plant>;
@@ -22,8 +23,8 @@ const FLORA_MASK_WORD: u32 = 5u;
 const FLORA_ARGS_WORD: u32 = 16u;
 // Instances per bucket by LOD and their sum per (kind, variant).
 const FLORA_CAP0: u32 = 1024u;
-const FLORA_CAP1: u32 = 4096u;
-const FLORA_CAP2: u32 = 8192u;
+const FLORA_CAP1: u32 = 3072u;
+const FLORA_CAP2: u32 = 6144u;
 // LOD switch distances (m) for a 1-scale tree; shrubs switch at half. Each
 // plant dithers its own switch over ±15 % so LOD changes never line up.
 const FLORA_LOD0_M: f32 = 90.0;
@@ -48,7 +49,8 @@ fn flora_route(plant: Plant) -> bool {
         return false;
     }
     let kind = species - 1u;
-    let reach = select(1.0, 0.5, (plant.info.x & 0xffu) == 2u) * (0.85 + 0.3 * sc_unit(plant.info.z ^ 0x9e3779b9u));
+    // Shrubs and rocks are small: they switch LODs at half the distance.
+    let reach = select(1.0, 0.5, (plant.info.x & 0xffu) >= 2u) * (0.85 + 0.3 * sc_unit(plant.info.z ^ 0x9e3779b9u));
     let d = length(plant.base.xyz) / reach;
     if d >= FLORA_FAR_M {
         return false;

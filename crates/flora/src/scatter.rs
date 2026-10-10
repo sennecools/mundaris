@@ -16,6 +16,8 @@ use crate::niche::{Layer, Site, smoothstep};
 
 /// Most species the GPU table and bucket layout hold.
 pub const MAX_SPECIES: usize = 6;
+/// Most rock archetypes (entries after the species in the GPU tables).
+pub const MAX_ROCKS: usize = 2;
 
 /// PCG3D integer hash (Jarzynski & Olano 2020), as `sc_pcg3d`.
 pub fn pcg3d(input: [u32; 3]) -> [u32; 3] {
@@ -225,7 +227,7 @@ fn f(x: f64) -> String {
 }
 
 /// The generated niche table (`scatter_species.wgsl`), markers included.
-pub fn species_wgsl(species: &[SpeciesFile]) -> String {
+pub fn species_wgsl(species: &[SpeciesFile], rocks: &[crate::palette::PlanetRock]) -> String {
     let n = species.len().min(MAX_SPECIES);
     let mut canopy = 0u32;
     let mut shrub = 0u32;
@@ -279,6 +281,21 @@ pub fn species_wgsl(species: &[SpeciesFile]) -> String {
     out.push_str(
         "        default: { return FlNiche(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 0.0, 1.0), vec2<f32>(0.0, 0.0), 1.0, 0.0, vec2<f32>(1.0, 1.0), 1u, vec3<f32>(0.04, 0.07, 0.025)); }\n    }\n}\n",
     );
+    let nr = rocks.len().min(MAX_ROCKS);
+    out.push_str(&format!("const FL_ROCKS: u32 = {nr}u;\n"));
+    out.push_str(&format!("// Bucket entry of rock 0 (after the MAX_SPECIES plant entries).\nconst FL_ROCK_ENTRY: u32 = {MAX_SPECIES}u;\n"));
+    out.push_str("// Bedrock hardness envelope (min, max, falloff) of rock archetype `r`.\n");
+    out.push_str("fn fl_rock(r: u32) -> vec3<f32> {\n    switch r {\n");
+    for (k, r) in rocks.iter().take(nr).enumerate() {
+        out.push_str(&format!(
+            "        // {}\n        case {k}u: {{ return vec3<f32>({}, {}, {}); }}\n",
+            r.name,
+            f(r.hardness.min),
+            f(r.hardness.max),
+            f(r.hardness.falloff.max(1e-6))
+        ));
+    }
+    out.push_str("        default: { return vec3<f32>(0.0, 0.0, 1.0); }\n    }\n}\n");
     out.push_str(WGSL_END);
     out.push('\n');
     out
@@ -295,6 +312,29 @@ pub fn splice_species(shader: &str, table: &str) -> String {
         }
         _ => shader.to_string(),
     }
+}
+
+/// Rock archetype for bedrock `hardness`, drawn by `roll` with weights from
+/// the hardness envelopes (mirror of `fl_pick_rock`).
+pub fn pick_rock(rocks: &[crate::palette::PlanetRock], hardness: f64, roll: f64) -> Option<usize> {
+    let n = rocks.len().min(MAX_ROCKS);
+    let total: f64 = rocks[..n].iter().map(|r| r.hardness.eval(hardness)).sum();
+    if total <= 0.0 {
+        return None;
+    }
+    let mut acc = 0.0;
+    let mut last = None;
+    for (k, r) in rocks[..n].iter().enumerate() {
+        let w = r.hardness.eval(hardness);
+        acc += w;
+        if roll * total < acc {
+            return Some(k);
+        }
+        if w > 0.0 {
+            last = Some(k);
+        }
+    }
+    last
 }
 
 #[cfg(test)]

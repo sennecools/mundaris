@@ -334,14 +334,17 @@ fn sc_place(index: u32) -> Placed {
     let up_body = normalize(inst.n0.xyz + diff);
     let normal_body = normalize(page_n.xyz);
     let slope = acos(clamp(dot(normal_body, up_body), -1.0, 1.0));
-    let sediment = textureSampleLevel(shape_atlas, normal_sampler, own_uv, i32(inst.own.x), 0.0).z;
-    let fsite = FlSite(climate.x, climate.y, ground, slope, sediment);
+    // Shape page: hardness (.y) picks the rock archetype, sediment (.z) is soil.
+    let shape = textureSampleLevel(shape_atlas, normal_sampler, own_uv, i32(inst.own.x), 0.0);
+    let fsite = FlSite(climate.x, climate.y, ground, slope, shape.z);
     let site = sc_forest(face, f32(ci), f32(cj), 0.0, fsite);
     let roll = sc_unit(h.z);
     // kind: low byte = procedural far shape (0 conifer, 1 broadleaf, 2 shrub,
     // 3 boulder), bits 8.. = species index + 1 (0 = none).
     var kind = 3u;
     var scale = 1.0;
+    // Low bit picks the grown variant (scatter_cull.wgsl).
+    var variant_bits = h.x ^ h.y;
     if roll < site.tree + site.shrub {
         let canopy = roll < site.tree;
         let pick = fl_pick(select(FL_SHRUB_MASK, FL_CANOPY_MASK, canopy), fsite, sc_unit(h2.x));
@@ -358,6 +361,14 @@ fn sc_place(index: u32) -> Placed {
     } else if roll < site.tree + site.shrub + site.boulder {
         kind = 3u;
         scale = mix(0.5, 2.2, sc_unit(h2.y) * sc_unit(h2.x));
+        // Grown rock of the bedrock's archetype; the wet variant (weathered,
+        // mossy) where the climate is moist.
+        let r = fl_pick_rock(shape.y, sc_unit(h2.x ^ 0x51ed27u));
+        if r >= 0 {
+            kind = 3u | ((FL_ROCK_ENTRY + u32(r) + 1u) << 8u);
+            scale = mix(0.35, 1.3, sc_unit(h2.y) * sc_unit(h2.x));
+            variant_bits = (variant_bits & ~1u) | select(0u, 1u, climate.y > 0.5);
+        }
     } else {
         return out;
     }
@@ -377,7 +388,7 @@ fn sc_place(index: u32) -> Placed {
     out.plant.base = vec4<f32>(to_view(inst, body_position(inst, st, ground - 0.15 * scale)), scale);
     out.plant.e1 = vec4<f32>(to_view_dir * e1, spread);
     out.plant.up = vec4<f32>(to_view_dir * up_body, 0.0);
-    out.plant.info = vec4<u32>(kind, h.x ^ h.y, h2.x ^ h2.y, h.y ^ h2.z);
+    out.plant.info = vec4<u32>(kind, variant_bits, h2.x ^ h2.y, h.y ^ h2.z);
     out.ok = true;
     return out;
 }

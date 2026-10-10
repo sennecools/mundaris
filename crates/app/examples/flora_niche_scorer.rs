@@ -41,6 +41,8 @@ fn cells(d: DVec3) -> (u32, f64, f64) {
 
 struct Sample {
     site: Site,
+    /// Tier A rock hardness 0..1.
+    hardness: f64,
     face: u32,
     ci: f64,
     cj: f64,
@@ -100,6 +102,7 @@ fn main() {
         let (face, ci, cj) = cells(d);
         samples.push(Sample {
             site: Site { temperature_c: t, moisture: m, height_m: h, slope, sediment: shape.sediment_mips[0].bilinear(d) },
+            hardness: shape.hardness_mips[0].bilinear(d),
             face,
             ci,
             cj,
@@ -224,6 +227,26 @@ fn main() {
             println!("no sample for band {name}");
         }
     }
+    // Rock poses: steep ground on hard and on soft bedrock.
+    for (name, test) in [
+        ("granite-rocks", (|s: &Sample| s.hardness > 0.7 && s.site.slope > 12f64.to_radians()) as fn(&Sample) -> bool),
+        ("sandstone-rocks", |s: &Sample| s.hardness < 0.4 && s.site.slope > 1.5f64.to_radians()),
+    ] {
+        if let Some((i, s)) = samples.iter().enumerate().find(|(_, s)| s.site.height_m > 50.0 && test(s)) {
+            let z = 1.0 - 2.0 * (i as f64 + 0.5) / count as f64;
+            let rr = (1.0 - z * z).sqrt();
+            let a = golden * i as f64;
+            let d = DVec3::new(rr * a.cos(), rr * a.sin(), z);
+            let pos = d * (radius + s.site.height_m + 30.0);
+            let q = horizon_quat(d, 0.2).normalize();
+            let _ = writeln!(poses, "  {{\"name\": \"{name}\", \"position_body_m\": [{:.3}, {:.3}, {:.3}], \"orientation_xyzw\": [{:.15}, {:.15}, {:.15}, {:.15}], \"site\": \"hardness {:.2} slope {:.1} h {:.0} M {:.2}\"}},", pos.x, pos.y, pos.z, q.x, q.y, q.z, q.w, s.hardness, s.site.slope.to_degrees(), s.site.height_m, s.site.moisture);
+        } else {
+            println!("no sample for {name}");
+        }
+    }
+    let hard: Vec<f64> = samples.iter().filter(|s| s.site.height_m > 0.0).map(|s| s.hardness).collect();
+    let soft = hard.iter().filter(|h| **h < 0.5).count() as f64 / hard.len().max(1) as f64;
+    println!("land with hardness < 0.5 (sandstone): {:.1} %", 100.0 * soft);
     poses.push_str("]
 ");
     std::fs::write(out.join("poses.json"), &poses).unwrap();

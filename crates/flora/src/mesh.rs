@@ -23,6 +23,7 @@ pub mod class {
     pub const BARK: u8 = 0;
     pub const ORGAN: u8 = 1;
     pub const FRUIT: u8 = 2;
+    pub const ROCK: u8 = 3;
 }
 
 /// 36-byte vertex. Positions in metres, plant frame (z up, origin at the

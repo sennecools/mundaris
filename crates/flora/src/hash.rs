@@ -19,6 +19,7 @@ pub mod domain {
     pub const TUFT: u64 = 0x464c_0006;
     pub const VARIANT: u64 = 0x464c_0007;
     pub const FRUIT: u64 = 0x464c_0008;
+    pub const ROCK: u64 = 0x464c_0009;
 }
 
 /// A keyed stream: `key` is the species/variant seed, `domain` the purpose.

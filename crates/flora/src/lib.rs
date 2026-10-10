@@ -18,6 +18,7 @@ pub mod palette;
 pub mod metrics;
 pub mod params;
 pub mod raster;
+pub mod rock;
 pub mod scatter;
 
 pub use genome::{Genome, SpeciesFile};

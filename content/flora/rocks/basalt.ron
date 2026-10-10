@@ -1,0 +1,13 @@
+// Basaltic-volcanic rock (genesis §6): columnar joints, dark.
+RockFile(
+    schema: 1,
+    name: "basalt",
+    geology: Basaltic,
+    size_m: 1.6,
+    aspect: (0.5, 0.5, 0.45),
+    joints: 5,
+    strata: 0.0,
+    rounding: 0.15,
+    roughness: 0.02,
+    bands: [(0.07, 0.07, 0.075), (0.09, 0.085, 0.085)],
+)

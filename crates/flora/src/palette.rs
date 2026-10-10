@@ -63,6 +63,21 @@ pub struct PlanetLife {
     pub strangeness: f64,
     /// 0 grounded .. 1 stylised (DECISIONS.md: plausible but stylised).
     pub realism: f64,
+    /// Surface age 0 fresh .. 1 old (rock weathering, genesis §6).
+    #[serde(default)]
+    pub geology_age: f64,
+    /// Rock archetypes of the planet (`content/flora/rocks/<name>.ron`) and
+    /// the bedrock hardness they occur on.
+    #[serde(default)]
+    pub rocks: Vec<PlanetRock>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanetRock {
+    pub name: String,
+    /// Tier A rock hardness 0..1 where this rock forms.
+    pub hardness: crate::niche::Envelope,
 }
 
 impl PlanetLife {
@@ -392,6 +407,8 @@ mod tests {
             seed: 0,
             strangeness: 0.0,
             realism: 0.0,
+            geology_age: 0.5,
+            rocks: Vec::new(),
         }
     }
 

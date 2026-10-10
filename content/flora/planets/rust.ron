@@ -15,4 +15,12 @@ PlanetLife(
     // is plausible but stylised.
     strangeness: 0.4,
     realism: 0.5,
+    // Old continental surfaces: weathered, rounded rocks where it is wet.
+    geology_age: 0.7,
+    // Hard bedrock (most of Rust, Tier A hardness ~0.85) breaks into granite
+    // blocks; soft basins carry bedded sandstone.
+    rocks: [
+        (name: "granite", hardness: (min: 0.55, max: 1.0, falloff: 0.1)),
+        (name: "sandstone", hardness: (min: 0.0, max: 0.5, falloff: 0.1)),
+    ],
 )

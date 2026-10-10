@@ -16,11 +16,16 @@ fn species() -> Vec<SpeciesFile> {
     load_species_for_body(&dir, &dir.join("../planets"), "rust").unwrap()
 }
 
+fn planet() -> astrum_flora::palette::PlanetLife {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content/flora/planets");
+    astrum_flora::palette::load_planet(&dir, "rust").unwrap()
+}
+
 #[test]
 fn flora_species_table_matches_the_content() {
     assert_eq!(
         TABLE.replace("\r\n", "\n"),
-        species_wgsl(&species()),
+        species_wgsl(&species(), &planet().rocks),
         "content/flora/species changed: run `cargo run -p astrum_flora --example species_wgsl`"
     );
 }
@@ -50,7 +55,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     results[i * 4u + 3u] = vec4<f32>(f.color, f.cover);
     let far = sc_forest(2u, p.extra.y, p.extra.z, 30.0 + 300.0 * p.extra.w, s);
     results[arrayLength(&probes) * 4u + i * 2u] = vec4<f32>(far.tree, far.shrub, far.core, far.cover);
-    results[arrayLength(&probes) * 4u + i * 2u + 1u] = vec4<f32>(far.stature, far.boulder, 0.0, 0.0);
+    results[arrayLength(&probes) * 4u + i * 2u + 1u] = vec4<f32>(far.stature, far.boulder, f32(fl_pick_rock(p.site.x / 40.0 + 0.5, p.extra.w)), 0.0);
 }
 "#;
 
@@ -92,6 +97,7 @@ fn gpu_forest_field_matches_the_cpu_reference() {
     let (device, queue) = (&ctx.device, &ctx.queue);
     let species = species();
     let placement = Placement { species: &species };
+    let rocks = planet().rocks;
     let src = format!("{TABLE}\n{NICHE}\n{KERNEL}");
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("flora niche probe"),
@@ -177,6 +183,10 @@ fn gpu_forest_field_matches_the_cpu_reference() {
         let far = placement.forest(2, p[5] as f64, p[6] as f64, 30.0 + 300.0 * p[7] as f64, &s);
         let o = input.len() * 16 + i * 8;
         let gf = &data[o..o + 8];
+        let rock = astrum_flora::scatter::pick_rock(&rocks, (p[0] / 40.0 + 0.5) as f64, p[7] as f64).map_or(-1.0, |r| r as f64);
+        if rock != gf[6] as f64 {
+            pick_mismatch += 1;
+        }
         for (k, (c, gv)) in [(far.tree, gf[0]), (far.shrub, gf[1]), (far.core, gf[2]), (far.cover, gf[3]), (far.stature, gf[4]), (far.boulder, gf[5])].iter().enumerate() {
             let d = (c - *gv as f64).abs();
             worst = worst.max(d);

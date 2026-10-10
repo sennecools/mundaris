@@ -1,0 +1,14 @@
+// Regolith breccia for airless bodies (genesis §6): angular fractures,
+// micrometeorite rounding only with age.
+RockFile(
+    schema: 1,
+    name: "breccia",
+    geology: Regolith,
+    size_m: 1.4,
+    aspect: (0.5, 0.45, 0.38),
+    joints: 7,
+    strata: 0.0,
+    rounding: 0.3,
+    roughness: 0.04,
+    bands: [(0.16, 0.16, 0.16), (0.2, 0.2, 0.19)],
+)
