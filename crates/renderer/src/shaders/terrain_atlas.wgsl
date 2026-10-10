@@ -245,7 +245,15 @@ fn fs_main(input: VertexOut) -> SceneOut {
     let own_a = textureSampleLevel(albedo_atlas, normal_sampler, input.own_uv, input.layers.x, 0.0);
     let parent_a = textureSampleLevel(albedo_atlas, normal_sampler, input.parent_uv, input.layers.y, 0.0);
     let page = mix(mix(parent_a, own_a, input.blend.x), parent_a, input.blend.y);
-    var land_albedo = mix(inst.material.rgb, atlas_srgb_to_linear(page.rgb), page.a);
+    // Flat-water world bodies: the page always covers the land and its alpha
+    // is 1 − coast softness (coast coverage, terrain_atlas_produce.wgsl).
+    let flat_water = inst.surface.x > 0.5;
+    var land_albedo = select(
+        mix(inst.material.rgb, atlas_srgb_to_linear(page.rgb), page.a),
+        atlas_srgb_to_linear(page.rgb),
+        flat_water,
+    );
+    let coast_softness = select(0.0, 1.0 - page.a, flat_water);
     // Base cells per pixel, continuous across nodes (uniform control flow).
     let cell_footprint = max(length(fwidth(sc_cells(inst, input.grid_st))), 1.0e-3);
     // Flora: share of the fragment that stands for canopy (crown tops).
@@ -272,14 +280,21 @@ fn fs_main(input: VertexOut) -> SceneOut {
     // Flat water: the normal page's w is -height / 32 m (clamped); its
     // filtered zero crossing is the coastline at sub-texel precision. The
     // depth-tinted water colour and the sphere normal blend in through it.
-    let water_mask = select(0.0, smoothstep(-0.03, 0.03, sampled.w), inst.surface.x > 0.5);
-    let depth = max(-input.ground, 0.0);
+    // Coast coverage: where finer relief is still unresolved the coast is a
+    // soft band of expected coverage (the contour already widened by it):
+    // the mask widens with the softness, the land darkens to wet sand and the
+    // water stays shallow across the band.
+    let edge = mix(0.03, 0.9, coast_softness);
+    let water_mask = select(0.0, smoothstep(-edge, edge, sampled.w), flat_water);
+    let band = coast_softness * (1.0 - abs(2.0 * water_mask - 1.0));
+    let depth = max(-input.ground, 0.0) * (1.0 - coast_softness);
     let water_colour = mix(
         inst.water_shallow.rgb,
         inst.water_deep.rgb,
         1.0 - exp(-depth / max(inst.surface.y, 1.0)),
     );
-    let albedo = mix(land_albedo, water_colour, water_mask);
+    let wet_land = land_albedo * mix(1.0, 0.72, band);
+    let albedo = mix(wet_land, water_colour, water_mask);
     let water = water_mask > 0.5;
     var n_view = normalize(inst.b2v_x.xyz * normal.x + inst.b2v_y.xyz * normal.y + inst.b2v_z.xyz * normal.z);
     if water_mask > 0.0 {

@@ -166,6 +166,7 @@ pub fn surface(field: &WorldField) -> anyhow::Result<AtlasWorldSurface> {
             .as_ref()
             .map_or(0.0, |c| c.temperature_c as f32),
         climate_moisture: look.climate.as_ref().map_or(0.0, |c| c.moisture as f32),
+        coast_k: field.inputs().params.coast_coverage_k as f32,
         landforms,
     })
 }

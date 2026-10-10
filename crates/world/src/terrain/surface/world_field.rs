@@ -561,6 +561,19 @@ impl WorldField {
             .map(|fields| compose(&landforms.set, &landforms.params, fields, d, texel_m)))
     }
 
+    /// The four landform weights at unit direction `d` (B-spline of the
+    /// baked weight run); `None` without landforms or the M2 (Shape) maps.
+    pub fn landform_weights(&self, d: DVec3) -> Result<Option<[f64; 4]>, TerrainError> {
+        if self.landforms.is_none() {
+            return Ok(None);
+        }
+        let maps = self.maps()?;
+        let fields = self
+            .landform_fields
+            .get_or_init(|| MapsFields::new(maps, self.inputs.radius_m));
+        Ok(fields.as_ref().map(|fields| fields.weights(d)))
+    }
+
     pub fn look(&self) -> &WorldLook {
         &self.look
     }

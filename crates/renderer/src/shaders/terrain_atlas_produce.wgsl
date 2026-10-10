@@ -9,12 +9,12 @@ struct Tile {
     face_u: vec4<f32>,      // w = chart width on the cube face
     face_v: vec4<f32>,      // w = cells
     info: vec4<u32>,        // atlas layer, kind (0 profile, 1 fields, 2 world), macro count, profile detail count
-    scale: vec4<f32>,       // radius, band-limit texel (m), unused, unused
+    scale: vec4<f32>,       // radius, band-limit texel (m), world: detail unresolved bound (m), unused
     layer_origin: array<vec4<f32>, 5>, // profile: chart origin x/y/z modulo width, w = K
     layer_info: array<vec4<f32>, 5>,   // profile: mip, width at mip, amplitude, cubic flag
     band_cell: array<vec4<i32>, 6>,    // fields: base cell per band * 2 + layout; world: [0] = texel origin xy, face
     band_frac: array<vec4<f32>, 6>,    // fields: base cell fraction, w = edge; world: [0].xy = texel fraction, [1] = d texel / d st columns
-    band_weight: vec4<f32>,            // fields: band footprint weights
+    band_weight: vec4<f32>,            // fields: band footprint weights; world: landform lanes' unresolved bounds (m)
     noise: vec4<u32>,                  // x unused; world: y = Tier A face cells, z = elevation mip offset, w = mip cells
     // Fixed-point anchors of the chart centre per dyadic ladder (M2 design §3):
     // ladder m's xyz are packed elements 3m..3m+2 of each array.
@@ -769,11 +769,29 @@ fn page_water(st: vec2<f32>, value: vec4<f32>) -> f32 {
     let c = clamp(dot(value.xyz, up), 1.0e-3, 1.0);
     let slope = max(sqrt(1.0 - c * c) / c, 1.0e-3);
     let texel = tile.scale.x * tile.face_u.w / f32(dispatch_cells);
-    let sea = clamp(-value.w / (slope * texel * WATER_CONTOUR_TEXELS), -1.0, 1.0);
+    // Coast coverage (lane proposal coast-coverage-PROPOSAL.md): the contour
+    // widens by k·σ, the RMS of the relief this level leaves out, so where
+    // finer octaves would put islets in or out the coast is a soft band of
+    // expected coverage instead of a hard edge that later shatters. σ → 0
+    // close up: the contour is the geometric one, as before.
+    let geometric = slope * texel * WATER_CONTOUR_TEXELS;
+    // Only coarse pages (orbit views, where whole islets pop) blur: on flat
+    // beaches even centimetres of unresolved relief would fuzz a close coast.
+    let coarse = smoothstep(COAST_FINE_TEXEL_M, COAST_COARSE_TEXEL_M, texel);
+    // River valleys carved down towards sea level stay sharp: the coverage
+    // is for open coasts, not for flooding inland valleys.
+    let carved = max(sample_precarve_height - value.w, 0.0);
+    let blur = surface_f32(3u) * sample_coast_sigma * coarse * (1.0 - smoothstep(0.5, 3.0, carved));
+    let width = sqrt(geometric * geometric + blur * blur);
+    sample_coast_softness = blur / width;
+    let sea = clamp(-value.w / width, -1.0, 1.0);
     if sample_water_depth > -1.0e29 {
         // Lakes and rivers: the same contour against the carved ground.
         let ground_slope = max(sample_ground_slope, 1.0e-3);
         let inland = clamp(sample_water_depth / (ground_slope * texel * WATER_CONTOUR_TEXELS), -1.0, 1.0);
+        if inland > sea {
+            sample_coast_softness = 0.0;
+        }
         return max(sea, inland);
     }
     return sea;
@@ -786,7 +804,11 @@ fn page_albedo(st: vec2<f32>, value: vec4<f32>) -> vec4<f32> {
     }
     let p = chart_point(st);
     let local = p.diff * tile.scale.x;
-    return vec4<f32>(linear_to_srgb(world_albedo(normalize(p.n), value.xyz, local, value.w)), 1.0);
+    // Alpha: 1 − coast softness (page_water ran first for this sample).
+    return vec4<f32>(
+        linear_to_srgb(world_albedo(normalize(p.n), value.xyz, local, value.w)),
+        1.0 - sample_coast_softness,
+    );
 }
 
 // Page climate texel at `st`: temperature and moisture from the node's mip (as
@@ -812,6 +834,7 @@ fn page_climate(st: vec2<f32>) -> vec4<f32> {
 fn evaluate(st: vec2<f32>) -> vec4<f32> {
     let p = chart_point(st);
     var sample_value: HeightSample;
+    sample_coast_sigma = 0.0;
     if tile.info.y == 0u {
         sample_value = evaluate_profile(p);
     } else if tile.info.y == 1u {
@@ -822,6 +845,11 @@ fn evaluate(st: vec2<f32>) -> vec4<f32> {
         let relief = landform_relief(p.diff * tile.scale.x, normalize(p.n));
         sample_value.height += relief.x;
         sample_value.gradient += relief.yzw * tile.scale.x;
+        // Relief left out at this level: the local landform weights over the
+        // lanes' unresolved bounds, plus the detail noise's (scale.z).
+        // Capped: only small relief on flat shelves makes islets pop; hills'
+        // large unresolved relief must not flood lowlands or tint the sea.
+        sample_coast_sigma = min(COAST_RMS * (lf_unresolved + tile.scale.z), COAST_SIGMA_MAX_M);
     }
     if ((tile.detail.y >> 8u) & 255u) > 0u {
         // Ladder anchors: the CPU anchors the exact f64 chart centre n0 * R, so
@@ -837,6 +865,7 @@ fn evaluate(st: vec2<f32>) -> vec4<f32> {
     sample_riparian = 0.0;
     if tile.info.y == 2u {
         let texel = tile.scale.x * tile.face_u.w / f32(dispatch_cells);
+        sample_precarve_height = sample_value.height;
         let carve = river_carve(n, sample_value.height, sample_value.gradient, 0.75 * texel);
         sample_value.height = carve.height;
         sample_value.gradient = carve.gradient;
@@ -868,6 +897,22 @@ fn riparian_moisture(m: f32) -> f32 {
     return mix(m, max(m, 0.72), sample_riparian);
 }
 var<private> sample_ground_slope: f32;
+// Coast coverage: RMS of the relief this tile leaves out at the last sample
+// (m), and the share of the coast contour width it sets (0..1, page_water;
+// carried to the draw in the albedo page's alpha).
+var<private> sample_coast_sigma: f32;
+var<private> sample_coast_softness: f32;
+// Height before the river carve at the last sample (coast coverage skips
+// carved valleys, which reach sea level inland).
+var<private> sample_precarve_height: f32;
+// Unresolved bound to RMS height of the band-limited octaves left out.
+const COAST_RMS: f32 = 0.25;
+// Largest unresolved RMS (m) the coast coverage uses.
+const COAST_SIGMA_MAX_M: f32 = 15.0;
+// Page texel sizes (m) over which coast coverage fades in: none at or below
+// the fine size (close views stay as before), full from the coarse size.
+const COAST_FINE_TEXEL_M: f32 = 40.0;
+const COAST_COARSE_TEXEL_M: f32 = 160.0;
 
 fn ordered(value: f32) -> u32 {
     let bits = bitcast<u32>(value);

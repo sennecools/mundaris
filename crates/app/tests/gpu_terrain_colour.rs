@@ -134,10 +134,13 @@ fn gpu_albedo_pages_match_the_cpu_oracle_and_water_follows_sea_level() {
                     }
                     let reference = body.recipe.page_albedo(d, texel).unwrap().unwrap();
                     let a = tile.albedo[j * nside + i];
-                    assert_eq!(
-                        a[3], 1.0,
-                        "{} {node:?}: page does not own colour",
-                        body.name
+                    // World pages always own their colour; alpha carries
+                    // 1 − coast softness (coast coverage) for the draw.
+                    assert!(
+                        (0.0..=1.0).contains(&a[3]),
+                        "{} {node:?}: alpha {} is no coast softness",
+                        body.name,
+                        a[3]
                     );
                     let gpu = [a[0], a[1], a[2]].map(f64::from);
                     let error = (0..3)

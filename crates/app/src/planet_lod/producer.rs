@@ -272,6 +272,26 @@ pub fn tile_kind(
                 whole.abs().max_element() < f64::from(i32::MAX / 2),
                 "world-map texel origin exceeds the GPU producer's integer range"
             );
+            // Coast coverage: relief this tile leaves out, per landform lane
+            // (0..3) and of the detail noise (4).
+            let mut coast_unresolved_m = [0.0f32; 5];
+            if let Some(landforms) = world.field.landforms() {
+                for (lane, (landform, params)) in landforms
+                    .set
+                    .landforms()
+                    .iter()
+                    .zip(&landforms.params)
+                    .take(4)
+                    .enumerate()
+                {
+                    coast_unresolved_m[lane] =
+                        landform.program.unresolved_bound_m(params, texel_m) as f32;
+                }
+            }
+            coast_unresolved_m[4] = world
+                .detail_noise
+                .as_ref()
+                .map_or(0.0, |n| n.unresolved_bound_m(texel_m) as f32);
             Ok(AtlasTileKind::World {
                 mip_offset,
                 mip_cells,
@@ -280,6 +300,7 @@ pub fn tile_kind(
                 texel_origin: [whole.x as i32, whole.y as i32],
                 texel_fraction: (map.origin - whole).as_vec2().to_array(),
                 texel_jacobian: map.jacobian.map(|column| column.as_vec2().to_array()),
+                coast_unresolved_m,
             })
         }
     }

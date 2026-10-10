@@ -304,6 +304,8 @@ pub struct AtlasWorldSurface {
     /// job scale by these): temperature in °C, moisture.
     pub climate_temperature_c: f32,
     pub climate_moisture: f32,
+    /// Coast coverage width k (multiples of the unresolved relief RMS).
+    pub coast_k: f32,
     /// Packed landform set (`astrum_world::terrain::landform::gpu`), appended
     /// after the LUT; empty for macro-only bodies.
     pub landforms: Vec<u32>,
@@ -324,7 +326,7 @@ impl AtlasWorldSurface {
             n,
             f(self.climate_temperature_c),
             f(self.climate_moisture),
-            0,
+            f(self.coast_k),
             f(self.temperature_c[0]),
             f(self.temperature_c[1]),
             f(self.moisture[0]),
@@ -444,6 +446,9 @@ pub enum AtlasTileKind {
         texel_fraction: [f32; 2],
         /// Columns d texel / d s and d texel / d t.
         texel_jacobian: [[f32; 2]; 2],
+        /// Coast coverage: relief this tile leaves out (unresolved bounds, m)
+        /// per landform lane 0..3 and of the detail noise (lane 4).
+        coast_unresolved_m: [f32; 5],
     },
 }
 
@@ -3243,7 +3248,18 @@ fn pack_tile(out: &mut Vec<u8>, job: &AtlasProduceJob) {
     for value in [job.layer, kind, macro_count, detail_count] {
         out.extend_from_slice(&value.to_le_bytes());
     }
-    out.extend(f32_bytes(&[job.radius_m, job.octaves.texel_m, 0.0, 0.0]));
+    let coast_detail_m = match &job.kind {
+        AtlasTileKind::World {
+            coast_unresolved_m, ..
+        } => coast_unresolved_m[4],
+        _ => 0.0,
+    };
+    out.extend(f32_bytes(&[
+        job.radius_m,
+        job.octaves.texel_m,
+        coast_detail_m,
+        0.0,
+    ]));
     let mut origins = [[0.0f32; 4]; 5];
     let mut infos = [[0.0f32; 4]; 5];
     let mut cells = [[0i32; 4]; 6];
@@ -3285,8 +3301,17 @@ fn pack_tile(out: &mut Vec<u8>, job: &AtlasProduceJob) {
             texel_origin,
             texel_fraction,
             texel_jacobian,
+            coast_unresolved_m,
             ..
         } => {
+            // The Fields-only band weights carry the landform lanes' unresolved
+            // relief (coast coverage); scale.z the detail noise's.
+            weights = [
+                coast_unresolved_m[0],
+                coast_unresolved_m[1],
+                coast_unresolved_m[2],
+                coast_unresolved_m[3],
+            ];
             // The Fields-only band slots carry the split texel lookup.
             cells[0] = [texel_origin[0], texel_origin[1], *face as i32, 0];
             fractions[0] = [texel_fraction[0], texel_fraction[1], 0.0, 0.0];
@@ -3637,6 +3662,7 @@ mod tests {
                     texel_origin: [-3, 7],
                     texel_fraction: [0.25, 0.5],
                     texel_jacobian: [[2.0, 0.0], [0.0, 2.0]],
+                    coast_unresolved_m: [0.0; 5],
                 },
                 octaves,
             },

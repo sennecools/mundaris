@@ -322,6 +322,16 @@ pub struct WaterLook {
     pub shallow_linear: (f32, f32, f32),
     pub deep_linear: (f32, f32, f32),
     pub depth_scale_m: f64,
+    /// Coast coverage width k: coarse coasts widen by k RMS heights of the
+    /// relief they leave out (lane proposal coast-coverage-PROPOSAL.md).
+    /// 0 = off (today's look) until the user picks a value; the proposal
+    /// starts at 1.25 (planet editor: Coast).
+    #[serde(default = "default_coast_coverage_k")]
+    pub coast_coverage_k: f64,
+}
+
+fn default_coast_coverage_k() -> f64 {
+    0.0
 }
 
 /// Surface material definition (`content/materials/*/material.ron`, App. C.2).
@@ -588,6 +598,7 @@ impl PlanetArchetype {
             boundary_softness_m: 1000.0 * tc.softness_km,
             boundary_clamp_m: 1000.0 * tc.boundary_clamp_km,
             junction_blend_m: 1000.0 * tc.junction_blend_km,
+            coast_coverage_k: self.water.coast_coverage_k,
             hardness_crystalline: hd.crystalline,
             hardness_volcanic: hd.volcanic,
             hardness_sedimentary: hd.sedimentary,
@@ -738,6 +749,7 @@ pub struct PlanetParams {
     pub boundary_softness_m: f64,
     pub boundary_clamp_m: f64,
     pub junction_blend_m: f64,
+    pub coast_coverage_k: f64,
     // Hardness (M2): see `HardnessRanges`.
     pub hardness_crystalline: f64,
     pub hardness_volcanic: f64,
@@ -833,6 +845,7 @@ pub const PARAM_FIELDS: &[ParamField] = fields! {
     "Tectonics": orogen_width_m: 1.0e4, 1.0e6, "m";
     "Tectonics": orogen_roughness: 0.0, 1.0;
     "Tectonics": junction_blend_m: 50.0, 5.0e3, "m";
+    "Coast": coast_coverage_k: 0.0, 4.0;
     "Rock hardness": hardness_noise: 0.0, 0.5;
     "Rain shadow": wind_deflection: 0.0, 1.0;
     "Rain shadow": orographic_rain: 0.0, 1.0;
@@ -958,6 +971,7 @@ impl PlanetParams {
                     self.boundary_softness_m.to_bits(),
                     self.boundary_clamp_m.to_bits(),
                     self.junction_blend_m.to_bits(),
+                    self.coast_coverage_k.to_bits(),
                     self.hardness_crystalline.to_bits(),
                     self.hardness_volcanic.to_bits(),
                     self.hardness_sedimentary.to_bits(),

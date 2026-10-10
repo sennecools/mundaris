@@ -67,6 +67,8 @@ fn lf_field_run(field: u32) -> vec2<u32> {
 var<private> lf_cache: array<vec4<f32>, 9>;
 // True once `lf_fill_cache` ran for this sample.
 var<private> lf_cache_valid: bool;
+// Σ wᵢ · (lane i's unresolved relief) at the last landform_relief sample (m).
+var<private> lf_unresolved: f32;
 // Field ids of the four lanes of a 4-field sample (> 8: unused lane).
 var<private> lf4_ids: vec4<u32>;
 
@@ -655,6 +657,7 @@ fn lf_program(index: u32, local: vec3<f32>, d: vec3<f32>) -> vec4<f32> {
 // `local` (direction `d`); zero without a landform block.
 fn landform_relief(local: vec3<f32>, d: vec3<f32>) -> vec4<f32> {
     lf_base = SURFACE_LUT + world_surface[0] * world_surface[0];
+    lf_unresolved = 0.0;
     let count = lf_word(0u);
     if tile.info.y != 2u || tile.noise.y == 0u || count == 0u {
         return vec4<f32>(0.0);
@@ -669,6 +672,8 @@ fn landform_relief(local: vec3<f32>, d: vec3<f32>) -> vec4<f32> {
         if w.x <= 0.0 {
             continue;
         }
+        // Coast coverage: the lane's unresolved relief (tile.band_weight).
+        lf_unresolved += w.x * tile.band_weight[i];
         let h = lf_program(i, local, d);
         sum += vec4<f32>(w.x * h.x, h.yzw * w.x + w.yzw * h.x);
     }
