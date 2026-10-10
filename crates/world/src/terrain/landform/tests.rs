@@ -167,8 +167,8 @@ fn terra_landforms_load_validate_and_produce_normalised_weights() {
     };
     assert!(stack.anisotropy.is_some() && stack.warp.is_some());
     assert!(stack.damp.is_some() && stack.erosion.is_some());
-    assert_eq!(stack.base.wavelength_m(), 2048.0);
-    assert_eq!(stack.octaves, 7);
+    assert_eq!(stack.base.wavelength_m(), 4096.0);
+    assert_eq!(stack.octaves, 8);
     // Weights from the bytecode: normalised, plains where nothing else
     // applies, mountains on high uplift.
     let mut fields = [0.0; expr::field::COUNT];
@@ -494,8 +494,11 @@ fn damped_and_eroded_gradients_are_close_to_finite_differences() {
     let text = std::fs::read_to_string(content_dir().join("recipes/mountains.ron"))
         .unwrap()
         .replace("damp: 1.2", "damp: 0.0")
-        .replace("strength: 0.6", "strength: 0.0");
-    let program = compile(&text).unwrap();
+        .replace("strength: 0.8", "strength: 0.0");
+    let options = CompileOptions {
+        relief_band_edge_m: set.relief_band_edge_m(),
+    };
+    let program = Program::compile("test", &recipe(&text), &options).unwrap();
     for _ in 0..50 {
         let x = rng.near_boundary(fields.axis, 60_000.0);
         let g = program.evaluate(x, &p, None, &fields).gradient;
@@ -616,7 +619,7 @@ fn band_limit_drops_octaves_above_the_limit_and_nests() {
     let set = terra();
     for (l, p) in set.landforms().iter().zip(set.sample_params(3)) {
         let program = &l.program;
-        assert_eq!(program.unresolved_bound_m(&p, 0.5), 0.0);
+        assert_eq!(program.unresolved_bound_m(&p, 0.25), 0.0);
         let mut previous = 0.0;
         for texel in [1.0, 4.0, 16.0, 64.0, 256.0, 1024.0, 4096.0] {
             let bound = program.unresolved_bound_m(&p, texel);

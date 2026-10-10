@@ -23,7 +23,8 @@ const DRAW_SHADER: &str = concat!(
 const PRODUCE_SHADER: &str = concat!(
     include_str!("shaders/terrain_noise.wgsl"),
     include_str!("shaders/cube_map.wgsl"),
-    include_str!("shaders/terrain_atlas_produce.wgsl")
+    include_str!("shaders/terrain_atlas_produce.wgsl"),
+    include_str!("shaders/landform_eval.wgsl")
 );
 
 /// Largest number of producer jobs accepted in one frame.
@@ -257,6 +258,9 @@ pub struct AtlasWorldSurface {
     /// job scale by these): temperature in °C, moisture.
     pub climate_temperature_c: f32,
     pub climate_moisture: f32,
+    /// Packed landform set (`astrum_world::terrain::landform::gpu`), appended
+    /// after the LUT; empty for macro-only bodies.
+    pub landforms: Vec<u32>,
 }
 
 /// Words before the LUT texels in the packed surface buffer.
@@ -302,6 +306,12 @@ impl AtlasWorldSurface {
                 .iter()
                 .map(|c| u32::from(c[0]) | u32::from(c[1]) << 8 | u32::from(c[2]) << 16),
         );
+        // Landform block (landform_eval.wgsl); one zero word means none.
+        if self.landforms.is_empty() {
+            words.push(0);
+        } else {
+            words.extend_from_slice(&self.landforms);
+        }
         Ok(words.into_iter().flat_map(u32::to_le_bytes).collect())
     }
 }

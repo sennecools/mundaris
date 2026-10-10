@@ -296,7 +296,12 @@ impl ProducerRecipe {
             }
             Self::World(recipe) => {
                 let maps = recipe.field.maps()?;
-                maps.sample(maps.mip_for(texel_m, recipe.radius_m), n)
+                let (h, g) = maps.sample(maps.mip_for(texel_m, recipe.radius_m), n);
+                match recipe.field.landform_relief(n, texel_m)? {
+                    // Landform gradients are per metre; ours per unit direction.
+                    Some(relief) => (h + relief.value, g + relief.gradient * recipe.radius_m),
+                    None => (h, g),
+                }
             }
         };
         let (height_m, gradient) = match self.detail_noise() {

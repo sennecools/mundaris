@@ -63,7 +63,7 @@ pub fn atlas_source(recipe: &ProducerRecipe) -> Result<AtlasSource> {
         ProducerRecipe::Fields(fields) => AtlasSource::Fields(Box::new(fields_constants(fields))),
         ProducerRecipe::World(world) => AtlasSource::World(Box::new(AtlasWorldSource {
             bake: super::tier_a::bake_inputs(world.field.inputs()),
-            surface: super::tier_a::surface(world.field.look()),
+            surface: super::tier_a::surface(&world.field)?,
         })),
     })
 }

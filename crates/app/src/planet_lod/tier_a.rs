@@ -6,11 +6,12 @@ use astrum_renderer::{
 };
 use astrum_world::terrain::{
     archetype::TierAStage,
+    landform,
     tier_a::{
         OCEAN_BLUR_PASSES, TierAInputs, climate::smoothing_step_rad, erosion, height_bound_m,
         tectonics,
     },
-    world_field::WorldLook,
+    world_field::WorldField,
 };
 
 pub fn bake_inputs(inputs: &TierAInputs) -> TierABakeInputs {
@@ -134,10 +135,16 @@ pub fn bake_inputs(inputs: &TierAInputs) -> TierABakeInputs {
     }
 }
 
-/// Colour constants of a world-map body for the GPU producer, narrowed once.
-pub fn surface(look: &WorldLook) -> AtlasWorldSurface {
+/// Colour constants and the packed landform set of a world-map body for the
+/// GPU producer, narrowed once.
+pub fn surface(field: &WorldField) -> anyhow::Result<AtlasWorldSurface> {
+    let look = field.look();
+    let landforms = match field.landforms() {
+        Some(l) => landform::gpu::pack_set(&l.set, &l.params)?,
+        None => Vec::new(),
+    };
     let v3 = |c: [f64; 3]| c.map(|v| v as f32);
-    AtlasWorldSurface {
+    Ok(AtlasWorldSurface {
         lut_size: look.lut.size,
         lut_srgb: look.lut.srgb.to_vec(),
         temperature_c: [
@@ -157,5 +164,6 @@ pub fn surface(look: &WorldLook) -> AtlasWorldSurface {
             .as_ref()
             .map_or(0.0, |c| c.temperature_c as f32),
         climate_moisture: look.climate.as_ref().map_or(0.0, |c| c.moisture as f32),
-    }
+        landforms,
+    })
 }

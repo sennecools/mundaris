@@ -303,6 +303,10 @@ mod tests {
             "lut/terra_whittaker.ron",
             "lut/terra_whittaker.png",
             "materials/snow/material.ron",
+            "landforms/terra.ron",
+            "landforms/recipes/mountains.ron",
+            "landforms/recipes/hills.ron",
+            "landforms/recipes/plains.ron",
         ] {
             let to = root.join(file);
             std::fs::create_dir_all(to.parent().unwrap()).unwrap();

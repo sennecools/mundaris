@@ -72,7 +72,7 @@ struct FieldsConstants {
 @group(1) @binding(2) var<uniform> profile: ProfileConstants;
 @group(1) @binding(3) var<uniform> fields: FieldsConstants;
 // World sources: Tier A result fields (elevation mips; see tier_a.rs).
-@group(1) @binding(4) var<storage, read> world_fields: array<f32>;
+@group(1) @binding(4) var<storage, read> world_fields: array<u32>;
 // World sources: surface colour constants and biome LUT (AtlasWorldSurface).
 @group(1) @binding(5) var<storage, read> world_surface: array<u32>;
 
@@ -80,8 +80,19 @@ var<private> tile: Tile;
 // Face cells of the elevation mip sampled through cube_map.wgsl.
 var<private> cube_level_n: u32;
 
+// Decoding of `cube_field` reads: 0 f32 bits, 1 i32 in 1/16 m (boundary_coord)
+// to metres, 2 + k byte k of a packed unorm8 word (aux runs).
+var<private> cube_decode: u32;
+
 fn cube_field(index: u32) -> f32 {
-    return world_fields[index];
+    let word = world_fields[index];
+    if cube_decode == 0u {
+        return bitcast<f32>(word);
+    }
+    if cube_decode == 1u {
+        return f32(bitcast<i32>(word)) / 16.0;
+    }
+    return f32((word >> (8u * (cube_decode - 2u))) & 255u) / 255.0;
 }
 
 fn cube_n() -> u32 {
@@ -748,6 +759,10 @@ fn evaluate(st: vec2<f32>) -> vec4<f32> {
         sample_value = evaluate_fields(p);
     } else {
         sample_value = evaluate_world(p, st);
+        // Landform relief (landform_eval.wgsl); its gradient is per metre.
+        let relief = landform_relief(p.diff * tile.scale.x, normalize(p.n));
+        sample_value.height += relief.x;
+        sample_value.gradient += relief.yzw * tile.scale.x;
     }
     if ((tile.detail.y >> 8u) & 255u) > 0u {
         // Ladder anchors: the CPU anchors the exact f64 chart centre n0 * R, so

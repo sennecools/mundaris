@@ -12,9 +12,11 @@
 pub mod bounds;
 pub mod eval;
 pub mod expr;
+pub mod gpu;
 pub mod ir;
 pub mod schema;
 pub mod set;
+pub mod world_source;
 
 pub use bounds::Interval;
 pub use eval::{Dual, FieldSource, LandformParams, node_seed};

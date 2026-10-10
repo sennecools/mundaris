@@ -1,0 +1,593 @@
+// Landform relief on world maps (M2 Shape Step 6a; pipeline §8.1–§8.3,
+// §9.6). PROTOTYPE: interprets the packed landform set
+// (`astrum_world::terrain::landform::gpu`) appended to `world_surface` after
+// the biome LUT, per sample: weight bytecode over level-0 Tier A fields,
+// then each landform's recipe ops. Mirrors the CPU oracle
+// (`landform::world_source::compose`, `landform::eval`) in f32. Step 6b
+// replaces the recipe interpreter with generated WGSL and moves the weights
+// into the Tier A bake. Appended to terrain_atlas_produce.wgsl.
+
+var<private> lf_base: u32;
+// Value registers of one program: (value, gradient per metre in body axes).
+var<private> lf_reg: array<vec4<f32>, 16>;
+// Weight-rule inputs (`landform::expr::field`).
+var<private> lf_rule_fields: array<f32, 12>;
+// Per-octave (effective frequency, gradient contribution) of a stack.
+var<private> lf_contrib: array<vec4<f32>, 24>;
+
+fn lf_word(i: u32) -> u32 {
+    return world_surface[lf_base + i];
+}
+
+fn lf_f32(i: u32) -> f32 {
+    return bitcast<f32>(lf_word(i));
+}
+
+fn lf_i32(i: u32) -> i32 {
+    return bitcast<i32>(lf_word(i));
+}
+
+// `landform::eval::node_seed`.
+fn lf_node_seed(body_seed: u32, salt: u32, lane: u32) -> u32 {
+    return pcg3d(vec3<u32>(body_seed, salt, lane ^ 0x4c460000u)).x;
+}
+
+fn lf_tangential(g: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
+    return g - normal * dot(normal, g);
+}
+
+// ---------------------------------------------------------------- fields
+
+// Level-0 Tier A run and decoding (`cube_decode`) of a recipe field
+// (`RecipeField::id`): uplift, sediment, flow, hardness (aux0 bytes 0, 2, 3,
+// 1), moisture, temperature, volcanic (aux1 byte 2), elevation,
+// boundary_coord (i32, 1/16 m).
+fn lf_field_run(field: u32) -> vec2<u32> {
+    switch field {
+        case 0u: { return vec2<u32>(6u, 2u); }
+        case 1u: { return vec2<u32>(6u, 4u); }
+        case 2u: { return vec2<u32>(6u, 5u); }
+        case 3u: { return vec2<u32>(6u, 3u); }
+        case 4u: { return vec2<u32>(2u, 0u); }
+        case 5u: { return vec2<u32>(1u, 0u); }
+        case 6u: { return vec2<u32>(7u, 4u); }
+        case 7u: { return vec2<u32>(0u, 0u); }
+        default: { return vec2<u32>(5u, 1u); }
+    }
+}
+
+// Bicubic level-0 value of `field` at unit direction `d` and its gradient
+// per metre (central differences over a quarter texel; `MapsFields`).
+fn lf_field(field: u32, d: vec3<f32>) -> vec4<f32> {
+    let saved = cube_level_n;
+    cube_level_n = tile.noise.y;
+    let rd = lf_field_run(field);
+    cube_decode = rd.y;
+    let base = rd.x * 6u * cube_level_n * cube_level_n;
+    let delta = 0.5 / f32(cube_level_n);
+    let e1 = any_orthonormal(d);
+    let e2 = cross(d, e1);
+    let v = cube_sample(base, d, true);
+    let g1 = cube_sample(base, normalize(d + e1 * delta), true)
+        - cube_sample(base, normalize(d - e1 * delta), true);
+    let g2 = cube_sample(base, normalize(d + e2 * delta), true)
+        - cube_sample(base, normalize(d - e2 * delta), true);
+    cube_decode = 0u;
+    cube_level_n = saved;
+    return vec4<f32>(v, (e1 * g1 + e2 * g2) / (2.0 * delta * tile.scale.x));
+}
+
+// `RecipeField::range`.
+fn lf_field_range(field: u32) -> vec2<f32> {
+    switch field {
+        case 5u: { return vec2<f32>(-250.0, 500.0); }
+        case 7u: { return vec2<f32>(-30000.0, 30000.0); }
+        case 8u: { return vec2<f32>(-300000.0, 300000.0); }
+        default: { return vec2<f32>(0.0, 1.0); }
+    }
+}
+
+// `eval::clamped_field`: out of range gives the constant bound.
+fn lf_clamped_field(field: u32, d: vec3<f32>) -> vec4<f32> {
+    let range = lf_field_range(field);
+    let f = lf_field(field, d);
+    if f.x < range.x {
+        return vec4<f32>(range.x, vec3<f32>(0.0));
+    }
+    if f.x > range.y {
+        return vec4<f32>(range.y, vec3<f32>(0.0));
+    }
+    return f;
+}
+
+fn lf_value(field: u32, d: vec3<f32>) -> f32 {
+    let saved = cube_level_n;
+    cube_level_n = tile.noise.y;
+    let rd = lf_field_run(field);
+    cube_decode = rd.y;
+    let v = cube_sample(rd.x * 6u * cube_level_n * cube_level_n, d, true);
+    cube_decode = 0u;
+    cube_level_n = saved;
+    return v;
+}
+
+// ---------------------------------------------------------------- weights
+
+fn lf_smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
+    if e0 == e1 {
+        return select(1.0, 0.0, x < e0);
+    }
+    let t = clamp((x - e0) / (e1 - e0), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+fn lf_bump(x: f32, a: f32, b: f32) -> f32 {
+    if b <= a {
+        return 0.0;
+    }
+    let t = (2.0 * x - a - b) / (b - a);
+    if abs(t) < 1.0 {
+        let s = 1.0 - t * t;
+        return s * s;
+    }
+    return 0.0;
+}
+
+// Rule inputs at direction `d` (`MapsFields::rule_fields`).
+fn lf_fill_rule_fields(d: vec3<f32>) {
+    let elevation = lf_field(7u, d);
+    let t = lf_value(5u, d);
+    let m = clamp(lf_value(4u, d), 0.0, 1.0);
+    let x = clamp((t + 15.0) / 20.0, 0.0, 1.0);
+    lf_rule_fields[0] = clamp(lf_value(0u, d), 0.0, 1.0);
+    lf_rule_fields[1] = clamp(lf_value(1u, d), 0.0, 1.0);
+    lf_rule_fields[2] = m;
+    lf_rule_fields[3] = 1.0 - m;
+    lf_rule_fields[4] = t;
+    lf_rule_fields[5] = 1.0 - x * x * (3.0 - 2.0 * x);
+    lf_rule_fields[6] = clamp(lf_value(3u, d), 0.0, 1.0);
+    lf_rule_fields[7] = length(elevation.yzw);
+    lf_rule_fields[8] = elevation.x;
+    lf_rule_fields[9] = abs(lf_value(8u, d));
+    lf_rule_fields[10] = clamp(lf_value(6u, d), 0.0, 1.0);
+    lf_rule_fields[11] = select(0.0, 1.0, elevation.x < 0.0);
+}
+
+// One rule of the set bytecode at `code` (`expr::evaluate`; validated on
+// the CPU, so no checks here).
+fn lf_rule(code: u32) -> f32 {
+    var stack: array<f32, 16>;
+    var top = 0u;
+    var at = code;
+    for (var i = 0u; i < 64u; i = i + 1u) {
+        let word = lf_word(at);
+        at = at + 1u;
+        let opcode = word & 255u;
+        if opcode == 0u {
+            return stack[0];
+        }
+        if opcode == 1u {
+            stack[top] = lf_f32(at);
+            at = at + 1u;
+            top = top + 1u;
+            continue;
+        }
+        if opcode == 2u {
+            stack[top] = lf_rule_fields[min(word >> 8u, 11u)];
+            top = top + 1u;
+            continue;
+        }
+        if opcode == 7u || opcode == 10u {
+            let a = stack[top - 1u];
+            stack[top - 1u] = select(abs(a), -a, opcode == 7u);
+            continue;
+        }
+        if opcode >= 12u {
+            let a = stack[top - 3u];
+            let b = stack[top - 2u];
+            let c = stack[top - 1u];
+            var r = 0.0;
+            switch opcode {
+                case 12u: { r = min(max(a, b), c); }
+                case 13u: { r = a + (b - a) * c; }
+                case 14u: { r = lf_smoothstep(a, b, c); }
+                default: { r = lf_bump(a, b, c); }
+            }
+            top = top - 2u;
+            stack[top - 1u] = r;
+            continue;
+        }
+        let a = stack[top - 2u];
+        let b = stack[top - 1u];
+        var r = 0.0;
+        switch opcode {
+            case 3u: { r = a + b; }
+            case 4u: { r = a - b; }
+            case 5u: { r = a * b; }
+            case 6u: { r = select(0.0, a / b, b != 0.0); }
+            case 8u: { r = min(a, b); }
+            case 9u: { r = max(a, b); }
+            default: { r = select(0.0, pow(a, b), a > 0.0); }
+        }
+        top = top - 1u;
+        stack[top - 1u] = r;
+    }
+    return 0.0;
+}
+
+// Weight of landform `index` (`expr::evaluate_set`): rules clamped to
+// [0, 1], the fallback lifted to FALLBACK_FLOOR, optionally normalised.
+fn lf_weight(code: u32, index: u32) -> f32 {
+    let count = lf_word(code + 1u);
+    let fallback = lf_word(code + 3u);
+    var sum = 0.0;
+    var own = 0.0;
+    for (var i = 0u; i < count; i = i + 1u) {
+        var w = lf_rule(code + lf_word(code + 4u + i));
+        // Non-finite → 0 (NaN fails both comparisons).
+        if !(w >= 0.0) {
+            w = 0.0;
+        }
+        w = min(w, 1.0);
+        sum += w;
+        if i == index {
+            own = w;
+        }
+    }
+    let lift = max(0.0625 - sum, 0.0);
+    if index == fallback {
+        own += lift;
+    }
+    if (lf_word(code + 2u) & 1u) != 0u {
+        return own / (sum + lift);
+    }
+    return own;
+}
+
+// ---------------------------------------------------------------- stacks
+
+fn lf_shape(kind: u32, sharpness: f32, n: f32, g: vec3<f32>) -> vec4<f32> {
+    if kind == 0u {
+        return vec4<f32>(n, g);
+    }
+    if kind == 2u {
+        return vec4<f32>(abs(n), g * sign(n));
+    }
+    let r = 1.0 - abs(n);
+    if r <= 0.0 {
+        return vec4<f32>(0.0);
+    }
+    let v = pow(r, sharpness);
+    return vec4<f32>(v, g * (-sign(n) * sharpness * v / r));
+}
+
+// Unit-normalised gain-½ fBm (`eval::warp_fbm`) at chart-local `local`.
+fn lf_warp_fbm(local: vec3<f32>, ladder: u32, level: i32, octaves: u32, seed: u32) -> vec4<f32> {
+    let anchor = tile_anchor_cell(ladder);
+    let residual = tile_anchor_residual(ladder);
+    var total = 0.0;
+    for (var k = 0u; k < octaves; k = k + 1u) {
+        total += ldexp(1.0, -i32(k));
+    }
+    var sum = vec4<f32>(0.0);
+    for (var k = 0u; k < octaves; k = k + 1u) {
+        let lv = level - i32(k);
+        let w = octave_weight(ladder_frequency(ladder, lv), tile.scale.y);
+        if w <= 0.0 {
+            continue;
+        }
+        let a = ldexp(1.0, -i32(k)) / total * w;
+        sum += ladder_noise3(anchor, residual, ladder, lv, ladder_octave_seed(seed, ladder, lv), local) * a;
+    }
+    return sum;
+}
+
+// Gully kernel (`eval::gully`) of one octave at chart-local `q`, stripes
+// along unit `contour`: value and gradient per metre.
+fn lf_gully(q: vec3<f32>, ladder: u32, level: i32, seed: u32, contour: vec3<f32>) -> vec4<f32> {
+    let split = ladder_split(tile_anchor_cell(ladder), tile_anchor_residual(ladder), ladder, level, q);
+    let x_all = split.q + ladder_octave_offset(seed);
+    let fl = floor(x_all);
+    let cell = split.cell + vec3<i32>(fl);
+    let x = x_all - fl;
+    let r2 = 1.25 * 1.25;
+    var num = 0.0;
+    var den = 0.0;
+    var dnum = vec3<f32>(0.0);
+    var dden = vec3<f32>(0.0);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let o = vec3<i32>(dx, dy, dz);
+                let bits = lattice_bits(cell + o, seed);
+                let u = vec3<f32>(bits) * (1.0 / 4294967296.0);
+                let d = x - (vec3<f32>(o) + vec3<f32>(0.5) + (u - vec3<f32>(0.5)) * 0.4);
+                let d2 = dot(d, d);
+                if d2 >= r2 {
+                    continue;
+                }
+                let t = 1.0 - d2 / r2;
+                let kernel = t * t;
+                let dkernel = d * (-4.0 * t / r2);
+                let phase = 6.2831855 * dot(d, contour);
+                let s = sin(phase);
+                let c = cos(phase);
+                num += kernel * c;
+                den += kernel;
+                dnum += dkernel * c + contour * (-s * 6.2831855 * kernel);
+                dden += dkernel;
+            }
+        }
+    }
+    if den <= 0.0 {
+        return vec4<f32>(0.0);
+    }
+    return vec4<f32>(num / den, (dnum * den - dden * num) / (den * den) * split.freq);
+}
+
+// One stack op (`eval::evaluate_stack`) at chart-local `local`; constants at
+// word `at` (`gpu::pack_stack`).
+fn lf_stack(at: u32, local: vec3<f32>, amplitude: f32, body_seed: u32) -> vec4<f32> {
+    let w0 = lf_word(at);
+    let kind = w0 & 255u;
+    let flags = w0 >> 8u;
+    let ladder = lf_word(at + 1u);
+    let base_level = lf_i32(at + 2u);
+    let octaves = min(lf_word(at + 3u), 24u);
+    let gain = lf_f32(at + 4u);
+    let salt = lf_word(at + 5u);
+    let sharpness = lf_f32(at + 6u);
+    let mean3 = lf_f32(at + 7u);
+    let mean4 = lf_f32(at + 8u);
+    let radius = tile.scale.x;
+    // Warp: q = p + d(p); rows[c] = ∇d_c.
+    var q = local;
+    var rows = array<vec3<f32>, 3>(vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0));
+    if (flags & 2u) != 0u {
+        let strength = lf_f32(at + 13u);
+        for (var c = 0u; c < 3u; c = c + 1u) {
+            let seed = lf_node_seed(body_seed, lf_word(at + 17u), 1u + c);
+            let v = lf_warp_fbm(local, lf_word(at + 14u), lf_i32(at + 15u), lf_word(at + 16u), seed);
+            q[c] += strength * v.x;
+            rows[c] = v.yzw * strength;
+        }
+    }
+    let normal = normalize(tile.n0.xyz + q / radius);
+    let aniso = (flags & 1u) != 0u;
+    let stretch_log2 = lf_word(at + 9u);
+    let kappa = lf_f32(at + 10u);
+    let aniso_octaves = lf_word(at + 11u);
+    var delta = vec4<f32>(0.0);
+    if aniso {
+        let clamp_m = lf_f32(at + 12u);
+        delta = lf_clamped_field(8u, normal);
+        if abs(delta.x) > clamp_m {
+            delta = vec4<f32>(sign(delta.x) * clamp_m, vec3<f32>(0.0));
+        }
+    }
+    let relief_seed = lf_node_seed(body_seed, salt, 0u);
+    let anchor = tile_anchor_cell(ladder);
+    let residual = tile_anchor_residual(ladder);
+    let stretch = f32(1u << stretch_log2);
+    var total = 0.0;
+    for (var k = 0u; k < octaves; k = k + 1u) {
+        total += pow(gain, f32(k));
+    }
+    var value = 0.0;
+    var gradient = vec3<f32>(0.0);
+    for (var k = 0u; k < octaves; k = k + 1u) {
+        let level = base_level - i32(k);
+        let f = ladder_frequency(ladder, level);
+        let four = aniso && k < aniso_octaves;
+        let f_eff = select(f, f * sqrt(1.0 / (stretch * stretch) + kappa * kappa), four);
+        let w = octave_weight(f_eff, tile.scale.y);
+        if w <= 0.0 {
+            lf_contrib[k] = vec4<f32>(f_eff, vec3<f32>(0.0));
+            continue;
+        }
+        let seed = ladder_octave_seed(relief_seed, ladder, level);
+        var n = 0.0;
+        var g = vec3<f32>(0.0);
+        if four {
+            let fk = f * kappa;
+            let qw = fk * delta.x;
+            let qw_floor = floor(qw);
+            let n4 = ladder_noise4(anchor, residual, ladder, level + i32(stretch_log2), seed, q,
+                i32(qw_floor), qw - qw_floor);
+            n = n4.value;
+            g = n4.gradient + delta.yzw * (fk * n4.dw);
+        } else {
+            let n3 = ladder_noise3(anchor, residual, ladder, level, seed, q);
+            n = n3.x;
+            g = n3.yzw;
+        }
+        let shaped = lf_shape(kind, sharpness, n, g);
+        var damp = 1.0;
+        if (flags & 4u) != 0u {
+            var steer = vec3<f32>(0.0);
+            for (var j = 0u; j < k; j = j + 1u) {
+                if lf_contrib[j].x <= 0.5 * f_eff * (1.0 + 1.0e-6) {
+                    steer += lf_contrib[j].yzw;
+                }
+            }
+            let slope = amplitude * length(lf_tangential(steer, normal));
+            damp = 1.0 / (1.0 + lf_f32(at + 18u) * slope * slope);
+        }
+        let scale = pow(gain, f32(k)) / total * w * damp;
+        value += scale * (shaped.x - select(mean3, mean4, four));
+        let contribution = shaped.yzw * scale;
+        gradient += contribution;
+        lf_contrib[k] = vec4<f32>(f_eff, contribution);
+    }
+    if (flags & 8u) != 0u {
+        let strength = lf_f32(at + 19u);
+        let e_ladder = lf_word(at + 20u);
+        let e_level = lf_i32(at + 21u);
+        let e_octaves = lf_word(at + 22u);
+        let e_mean = lf_f32(at + 24u);
+        let gully_seed = lf_node_seed(body_seed, lf_word(at + 23u), 4u);
+        let hardness = lf_clamped_field(3u, normal);
+        let fade = vec4<f32>(1.0 - hardness.x, -hardness.yzw);
+        var gullies = vec3<f32>(0.0);
+        for (var k = 0u; k < e_octaves; k = k + 1u) {
+            let level = e_level - i32(k);
+            let f = ladder_frequency(e_ladder, level);
+            let w = octave_weight(f, tile.scale.y);
+            if w <= 0.0 {
+                break;
+            }
+            var steer = gullies;
+            for (var j = 0u; j < octaves; j = j + 1u) {
+                if lf_contrib[j].x <= 0.5 * f * (1.0 + 1.0e-6) {
+                    steer += lf_contrib[j].yzw;
+                }
+            }
+            let g_t = lf_tangential(steer, normal);
+            let slope = length(g_t);
+            if !(slope > 0.0) {
+                continue;
+            }
+            let contour = cross(normal, g_t / slope);
+            let s = lf_gully(q, e_ladder, level, ladder_octave_seed(gully_seed, e_ladder, level), contour);
+            var cap = 3.4e38;
+            if amplitude > 0.0 {
+                cap = 1.0 / amplitude;
+            }
+            let depth = strength / (f * 6.2831855) * min(slope, cap) * w;
+            let centred = s.x - e_mean;
+            value += depth * fade.x * centred;
+            let contribution = (s.yzw * fade.x + fade.yzw * centred) * depth;
+            gradient += contribution;
+            gullies += contribution;
+        }
+    }
+    // Pull back through the warp: ∇_p = ∇_q + Σ_c (∇_q)_c ∇d_c.
+    let pulled = gradient + rows[0] * gradient.x + rows[1] * gradient.y + rows[2] * gradient.z;
+    return vec4<f32>(value, pulled);
+}
+
+// ---------------------------------------------------------------- programs
+
+// Monotone cubic curve (`ir::CurveOp::evaluate`) with `n` points at `at`.
+fn lf_curve(at: u32, n: u32, x: f32) -> vec2<f32> {
+    let xs = at;
+    let ys = at + n;
+    let ts = at + 2u * n;
+    if x <= lf_f32(xs) {
+        return vec2<f32>(lf_f32(ys), 0.0);
+    }
+    if x >= lf_f32(xs + n - 1u) {
+        return vec2<f32>(lf_f32(ys + n - 1u), 0.0);
+    }
+    var i = 0u;
+    for (var j = 0u; j + 1u < n; j = j + 1u) {
+        if lf_f32(xs + j) <= x {
+            i = j;
+        }
+    }
+    let x0 = lf_f32(xs + i);
+    let h = lf_f32(xs + i + 1u) - x0;
+    let t = (x - x0) / h;
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let y0 = lf_f32(ys + i);
+    let y1 = lf_f32(ys + i + 1u);
+    let m0 = lf_f32(ts + i);
+    let m1 = lf_f32(ts + i + 1u);
+    let value = (2.0 * t3 - 3.0 * t2 + 1.0) * y0 + (t3 - 2.0 * t2 + t) * h * m0
+        + (-2.0 * t3 + 3.0 * t2) * y1 + (t3 - t2) * h * m1;
+    let dy = (y1 - y0) / h;
+    let a = -6.0 * dy + 3.0 * m0 + 3.0 * m1;
+    let b = 6.0 * dy - 4.0 * m0 - 2.0 * m1;
+    return vec2<f32>(value, a * t2 + b * t + m0);
+}
+
+// Landform program `index` in metres (`Program::evaluate`).
+fn lf_program(index: u32, local: vec3<f32>, d: vec3<f32>) -> vec4<f32> {
+    let entry = 4u + 4u * index;
+    let amplitude = lf_f32(entry);
+    let body_seed = lf_word(entry + 1u);
+    var at = lf_word(entry + 2u);
+    let count = min(lf_word(entry + 3u), 16u);
+    for (var k = 0u; k < count; k = k + 1u) {
+        let header = lf_word(at);
+        at = at + 1u;
+        let opcode = header & 255u;
+        let a = lf_reg[min((header >> 8u) & 255u, 15u)];
+        let b = lf_reg[min((header >> 16u) & 255u, 15u)];
+        let c = lf_reg[min(header >> 24u, 15u)];
+        var r = vec4<f32>(0.0);
+        switch opcode {
+            case 1u: {
+                r = lf_stack(at, local, amplitude, body_seed);
+                at = at + 25u;
+            }
+            case 2u: { r = lf_clamped_field((header >> 8u) & 255u, d); }
+            case 3u: {
+                r = vec4<f32>(lf_f32(at), vec3<f32>(0.0));
+                at = at + 1u;
+            }
+            case 4u: { r = a + b; }
+            case 5u: { r = vec4<f32>(a.x * b.x, a.yzw * b.x + b.yzw * a.x); }
+            case 6u: {
+                r = vec4<f32>(a.x + (b.x - a.x) * c.x,
+                    a.yzw + (b.yzw - a.yzw) * c.x + c.yzw * (b.x - a.x));
+            }
+            case 7u: { r = select(a, b, b.x < a.x); }
+            case 8u: { r = select(a, b, b.x > a.x); }
+            case 9u: {
+                let kk = lf_f32(at);
+                at = at + 1u;
+                let h = max(kk - abs(a.x - b.x), 0.0) / kk;
+                let lo = select(b, a, a.x <= b.x);
+                let hi = select(a, b, a.x <= b.x);
+                r = vec4<f32>(lo.x - h * h * kk * 0.25, lo.yzw * (1.0 - 0.5 * h) + hi.yzw * (0.5 * h));
+            }
+            case 10u: {
+                let lo = lf_f32(at);
+                let hi = lf_f32(at + 1u);
+                at = at + 2u;
+                r = a;
+                if a.x < lo {
+                    r = vec4<f32>(lo, vec3<f32>(0.0));
+                } else if a.x > hi {
+                    r = vec4<f32>(hi, vec3<f32>(0.0));
+                }
+            }
+            case 11u: {
+                let n = lf_word(at);
+                let y = lf_curve(at + 1u, n, a.x);
+                at = at + 1u + 3u * n;
+                r = vec4<f32>(y.x, a.yzw * y.y);
+            }
+            default: {
+                r = a * lf_f32(at);
+                at = at + 1u;
+            }
+        }
+        lf_reg[k] = r;
+    }
+    return lf_reg[count - 1u] * amplitude;
+}
+
+// Landform relief Σ wᵢ·landformᵢ (metres, gradient per metre) at chart-local
+// `local` (direction `d`); zero without a landform block.
+fn landform_relief(local: vec3<f32>, d: vec3<f32>) -> vec4<f32> {
+    lf_base = SURFACE_LUT + world_surface[0] * world_surface[0];
+    let count = lf_word(0u);
+    if tile.info.y != 2u || tile.noise.y == 0u || count == 0u {
+        return vec4<f32>(0.0);
+    }
+    let code = lf_word(1u);
+    lf_fill_rule_fields(d);
+    var sum = vec4<f32>(0.0);
+    for (var i = 0u; i < count; i = i + 1u) {
+        let w = lf_weight(code, i);
+        if w <= 0.0 {
+            continue;
+        }
+        let h = lf_program(i, local, d);
+        sum += vec4<f32>(w * h.x, h.yzw * w);
+    }
+    return sum;
+}

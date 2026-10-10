@@ -818,7 +818,9 @@ impl SurfaceGenerator {
                 // Bicubic (Catmull-Rom) sampling overshoots its samples: the
                 // absolute weights sum to at most 1.25 per axis (t = 1/2), so
                 // 1.25² bounds the 2-D tensor.
-                (GeologicalField::World(g), (world.height_bound_m() * 1.5625).next_up())
+                // Landform relief adds its interval bound (M2 Step 6a).
+                let bound = world.height_bound_m() * 1.5625 + world.landform_bound_m();
+                (GeologicalField::World(g), bound.next_up())
             }
             SurfaceAlgorithm::MoonProfileV1 => {
                 let profile = definition

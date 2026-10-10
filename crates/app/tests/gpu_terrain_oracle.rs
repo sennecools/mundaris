@@ -94,7 +94,15 @@ fn gpu_tiles_match_the_cpu_oracle_within_documented_tolerances() {
     };
     let loaded = SharedTestSystem::load_canonical(std::num::NonZeroU64::new(5).unwrap()).unwrap();
     let policy = loaded.lod;
-    let camera = DVec3::from_array(loaded.camera.position_body_m).normalize();
+    // ASTRUM_ORACLE_DIRECTION="x,y,z" checks the node set around another
+    // direction (e.g. a mountain range) instead of the canonical camera.
+    let camera = std::env::var("ASTRUM_ORACLE_DIRECTION").ok().map_or_else(
+        || DVec3::from_array(loaded.camera.position_body_m).normalize(),
+        |v| {
+            let c: Vec<f64> = v.split(',').map(|x| x.trim().parse().unwrap()).collect();
+            DVec3::new(c[0], c[1], c[2]).normalize()
+        },
+    );
     let finest_data_level = policy.max_level - policy.data_level_offset();
     let config = TerrainAtlasConfig {
         cells: policy.tile_cells,

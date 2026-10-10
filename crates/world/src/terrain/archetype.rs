@@ -377,6 +377,10 @@ pub struct PlanetArchetype {
     pub hardness: HardnessRanges,
     pub rain_shadow: RainShadowRanges,
     pub erosion: ErosionRanges,
+    /// Landform set (`landform::LandformSetFile`), relative to the content
+    /// root: relief recipes on top of the macro elevation (M2 Shape).
+    #[serde(default)]
+    pub landforms: Option<String>,
     /// Biome LUT metadata (`biome_lut::LutMetadata`), relative to the content
     /// root.
     pub biome_lut: String,

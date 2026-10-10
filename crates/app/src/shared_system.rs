@@ -328,6 +328,37 @@ fn world_look(
     Ok((look, vec![metadata_path, image_path, snow_path]))
 }
 
+/// Load and compile a landform set and its recipes (paths relative to the
+/// set file's directory, which must stay beneath the content root).
+fn landform_set(
+    root: &Path,
+    relative: &str,
+) -> Result<(astrum_world::terrain::landform::LandformSet, Vec<PathBuf>)> {
+    use astrum_world::terrain::landform::{LandformSet, LandformSetFile, RecipeFile};
+    let set_path = local_path(root, relative)?;
+    let (file, _): (LandformSetFile, _) = parse(&set_path)?;
+    let directory = Path::new(relative).parent().unwrap_or(Path::new(""));
+    let mut files = vec![set_path];
+    let set = LandformSet::compile(&file, |recipe| {
+        let joined = directory.join(recipe);
+        let loaded = joined
+            .to_str()
+            .context("landform recipe path is not UTF-8")
+            .and_then(|p| local_path(root, p))
+            .and_then(|path| {
+                let (recipe, _): (RecipeFile, _) = parse(&path)?;
+                files.push(path);
+                Ok(recipe)
+            });
+        loaded.map_err(|e| astrum_world::terrain::landform::LandformError::Load {
+            path: recipe.into(),
+            message: format!("{e:#}"),
+        })
+    })
+    .with_context(|| format!("invalid landform set {relative}"))?;
+    Ok((set, files))
+}
+
 fn local_path(root: &Path, relative: &str) -> Result<PathBuf> {
     let path = Path::new(relative);
     ensure!(
@@ -581,6 +612,14 @@ fn terrain_definition(
             parse(&archetype_path)?;
         let (look, mut dependencies) = world_look(root, &archetype)?;
         dependencies.extend([terrain_path.clone(), archetype_path]);
+        let landforms = match &archetype.landforms {
+            Some(path) => {
+                let (set, files) = landform_set(root, path)?;
+                dependencies.extend(files);
+                Some(set)
+            }
+            None => None,
+        };
         world_source = Some(WorldSource {
             root: root.canonicalize()?,
             terrain: name.to_string(),
@@ -597,6 +636,10 @@ fn terrain_definition(
             pole,
         )
         .context("invalid world map")?;
+        let world = match landforms {
+            Some(set) => world.with_landforms(set),
+            None => world,
+        };
         definition = definition.with_world(world)?;
     }
     if let Some(profile) = content.profile {

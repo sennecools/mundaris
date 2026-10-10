@@ -7,22 +7,31 @@ Recipe(
     schema: 1,
     output: "out",
     graph: [
-        // 2048 m (dyadic, needed for anisotropy) down to 32 m; the first three
-        // octaves run twice as long along the boundary. f·kappa·clamp ≤ 256:
-        // 2 · 64 km / 512 m = 250.
+        // 4096 m (dyadic, needed for anisotropy) down to 24 m. Tuned on
+        // 2026-10-10 against the USGS Sawatch scorecard
+        // (ai/research/terrain/2026-10-10-dem-scorecard.md): kappa 0.5 with no
+        // stretch matches its structure-tensor anisotropy (0.15 vs 0.17;
+        // kappa 2 gave 0.83), the 4096 m octave fills the 2.6–8 km band the
+        // bicubic Tier A map under-represents. f·kappa·clamp ≤ 256:
+        // 0.5 · 64 km / 1024 m = 31.
         ("ridge", RidgedFbm(
-            base_wavelength_m: 2048.0,
+            base_wavelength_m: 4096.0,
             min_wavelength_m: 24.0,
             gain: 0.5,
-            sharpness: 2.0,
+            sharpness: 1.5,
             salt: 1,
-            anisotropy: Some((stretch: 2, kappa: 2.0, octaves: 3, clamp_km: 64.0)),
+            anisotropy: Some((stretch: 1, kappa: 0.5, octaves: 3, clamp_km: 64.0)),
         )),
-        // Warp wavelengths ≥ 2 × the ridge base; f·strength ≤ 64 (1200 m / 32 m).
-        ("warp", Warp(input: "ridge", strength_m: 1200.0, base_wavelength_m: 16384.0, octaves: 3, salt: 2)),
+        // Warp wavelengths ≥ 2 × the ridge base; f·strength ≤ 64 (1500 m / 8192 m).
+        ("warp", Warp(input: "ridge", strength_m: 1500.0, base_wavelength_m: 32768.0, octaves: 3, salt: 2)),
         ("damp", SlopeDamped(input: "warp", damp: 1.2)),
-        ("erode", ErosionFilter(input: "damp", strength: 0.6, base_wavelength_m: 512.0, octaves: 4, salt: 3)),
+        ("erode", ErosionFilter(input: "damp", strength: 0.8, base_wavelength_m: 512.0, octaves: 4, salt: 3)),
+        // Rock relief 64 m – 1 m (prototype, 2026-10-10): the main stack ends
+        // at 24 m with a few metres of relief, so close up the slopes were
+        // smooth. Factor 0.015: about 1.5 m RMS after the uplift and valley weights.
+        ("rock", RidgedFbm(base_wavelength_m: 64.0, min_wavelength_m: 1.0, gain: 0.55, sharpness: 1.0, salt: 4)),
+        ("relief", Add(a: "erode", b: Scale(input: "rock", factor: 0.015))),
         ("valley", Curve(input: Field(Flow), points: [(0.0, 1.0), (0.6, 0.3), (1.0, 0.1)])),
-        ("out", Multiply(a: "erode", b: Multiply(a: Field(Uplift), b: "valley"))),
+        ("out", Multiply(a: "relief", b: Multiply(a: Field(Uplift), b: "valley"))),
     ],
 )

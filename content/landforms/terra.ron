@@ -7,8 +7,10 @@
 LandformSet(
     schema: 1,
     name: "terra",
-    // About two world-map texels; recipe stacks start at or below it.
-    relief_band_edge_m: 2600.0,
+    // About four world-map texels; recipe stacks start at or below it. The
+    // bicubic Tier A map carries little of the 2.6–5.2 km band, so recipes
+    // own it (scorecard tuning 2026-10-10).
+    relief_band_edge_m: 5200.0,
     normalize: true,
     fallback: "plains",
     landforms: [
@@ -16,7 +18,7 @@ LandformSet(
             name: "mountains",
             weight: "smoothstep(0.5, 0.8, uplift)",
             recipe: "recipes/mountains.ron",
-            amplitude_m: (500.0, 900.0),
+            amplitude_m: (1600.0, 2000.0),
         ),
         (
             name: "hills",

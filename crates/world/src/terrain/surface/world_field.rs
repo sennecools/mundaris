@@ -6,6 +6,8 @@
 //! requested (tests), or takes fields read back from the GPU. Building a
 //! generator or a producer recipe never bakes.
 use super::TerrainError;
+use crate::terrain::landform::world_source::{MapsFields, compose};
+use crate::terrain::landform::{Dual, LandformParams, LandformSet};
 use crate::terrain::{
     archetype::{MaterialAsset, PlanetArchetype, PlanetParams},
     biome_lut::BiomeLut,
@@ -145,6 +147,38 @@ pub struct WorldDefinition {
     /// Body-fixed rotation axis.
     pub pole: DVec3,
     pub look: Arc<WorldLook>,
+    /// Landform recipes on top of the macro elevation (M2 Shape), `None`
+    /// for macro-only bodies.
+    pub landforms: Option<Arc<WorldLandforms>>,
+}
+
+/// A body's compiled landform set with its sampled per-landform parameters.
+///
+/// PROTOTYPE (M2 Step 6a): the landform seed comes from the continent seed
+/// (the body seed is not kept); the GPU producer draws only the mountain
+/// landform (`landform_wgsl` codegen replaces it in Step 6b).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorldLandforms {
+    pub set: LandformSet,
+    pub params: Vec<LandformParams>,
+}
+
+impl WorldLandforms {
+    pub fn new(set: LandformSet, params: &PlanetParams) -> Self {
+        let params = set.sample_params(u64::from(params.continent_seed));
+        Self { set, params }
+    }
+
+    /// Largest |landform relief| in metres.
+    pub fn bound_m(&self) -> f64 {
+        self.set.bound_m(&self.params)
+    }
+
+    pub fn identity(&self) -> u64 {
+        self.params.iter().fold(self.set.identity(), |hash, p| {
+            hash.rotate_left(13) ^ p.amplitude_m.to_bits() ^ u64::from(p.seed)
+        })
+    }
 }
 
 impl WorldDefinition {
@@ -176,6 +210,7 @@ impl WorldDefinition {
             params,
             pole,
             look: Arc::new(look),
+            landforms: None,
         })
     }
 
@@ -209,6 +244,21 @@ impl WorldDefinition {
             ^ self.pole.y.to_bits().rotate_left(23)
             ^ self.pole.z.to_bits().rotate_left(43)
             ^ self.look.identity().rotate_left(53)
+            ^ self
+                .landforms
+                .as_ref()
+                .map_or(0, |l| l.identity().rotate_left(37))
+    }
+
+    /// Attach a landform set (parameters sampled for this body).
+    pub fn with_landforms(mut self, set: LandformSet) -> Self {
+        self.landforms = Some(Arc::new(WorldLandforms::new(set, &self.params)));
+        self
+    }
+
+    /// Largest |landform relief| in metres (0 without landforms).
+    pub fn landform_bound_m(&self) -> f64 {
+        self.landforms.as_ref().map_or(0.0, |l| l.bound_m())
     }
 }
 
@@ -441,6 +491,9 @@ pub struct WorldField {
     inputs: TierAInputs,
     look: Arc<WorldLook>,
     maps: Arc<OnceLock<Arc<WorldMaps>>>,
+    landforms: Option<Arc<WorldLandforms>>,
+    /// Level-0 fields of the landform recipes, built from the maps on first use.
+    landform_fields: Arc<OnceLock<Option<MapsFields>>>,
 }
 
 impl WorldField {
@@ -472,11 +525,34 @@ impl WorldField {
             inputs: definition.inputs(radius_m),
             look: definition.look.clone(),
             maps: Arc::new(OnceLock::new()),
+            landforms: definition.landforms.clone(),
+            landform_fields: Arc::new(OnceLock::new()),
         })
     }
 
     pub fn inputs(&self) -> &TierAInputs {
         &self.inputs
+    }
+
+    /// Landform set of the body, if any.
+    pub fn landforms(&self) -> Option<&Arc<WorldLandforms>> {
+        self.landforms.as_ref()
+    }
+
+    /// Landform relief `Σ wᵢ·landformᵢ` (metres; gradient per metre) at unit
+    /// direction `d` for texels of `texel_m`; `None` without landforms or
+    /// without the M2 (Shape) maps.
+    pub fn landform_relief(&self, d: DVec3, texel_m: f64) -> Result<Option<Dual>, TerrainError> {
+        let Some(landforms) = &self.landforms else {
+            return Ok(None);
+        };
+        let maps = self.maps()?;
+        let fields = self
+            .landform_fields
+            .get_or_init(|| MapsFields::new(maps, self.inputs.radius_m));
+        Ok(fields
+            .as_ref()
+            .map(|fields| compose(&landforms.set, &landforms.params, fields, d, texel_m)))
     }
 
     pub fn look(&self) -> &WorldLook {
