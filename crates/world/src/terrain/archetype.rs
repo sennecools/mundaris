@@ -7,6 +7,7 @@
 //! never reshuffles another stage. Editor overrides replace sampled values by
 //! name ([`PlanetParams::set`]).
 use super::TerrainError;
+use astrum_core::params::{ParamDesc, ParamKind, ParamValue, Params};
 use serde::{Deserialize, Serialize};
 
 /// Inclusive `(min, max)` authored range, sampled uniformly.
@@ -767,45 +768,44 @@ impl PlanetParams {
     }
 }
 
-/// One editor-adjustable parameter: name, authored bounds and accessors.
-pub struct ParamField {
-    pub name: &'static str,
-    /// Editor section (planet editor groups by it, in registry order).
-    pub group: &'static str,
-    pub min: f64,
-    pub max: f64,
-    get: fn(&PlanetParams) -> f64,
-    set: fn(&mut PlanetParams, f64),
-}
+/// One editor-adjustable planet parameter: the shared descriptor
+/// (`astrum_core::params`, docs/STUDIO_UI.md amendment 2026-10-10b). Every
+/// planet parameter is a `ParamKind::Float`; its bounds validate overrides.
+pub type ParamField = ParamDesc<PlanetParams>;
 
+/// `"Group": field: min, max[, "unit"];` The label derives from the field name.
 macro_rules! fields {
-    ($($group:literal: $name:ident: $min:expr, $max:expr;)*) => {
-        &[$(ParamField {
+    ($($group:literal: $name:ident: $min:expr, $max:expr $(, $unit:literal)?;)*) => {
+        &[$(ParamDesc {
+            key: stringify!($name),
+            label: "",
             group: $group,
-            name: stringify!($name),
-            min: $min,
-            max: $max,
-            get: |p| p.$name,
-            set: |p, v| p.$name = v,
+            unit: fields!(@unit $($unit)?),
+            help: "",
+            kind: ParamKind::Float { min: $min, max: $max, log: false },
+            get: |p| ParamValue::Float(p.$name),
+            set: |p, v| p.$name = v.as_f64(),
         }),*]
     };
+    (@unit) => { "" };
+    (@unit $unit:literal) => { $unit };
 }
 
 /// Continuous parameters exposed to overrides (planet editor, terrain files).
 pub const PARAM_FIELDS: &[ParamField] = fields! {
     "Continents": ocean_coverage: 0.0, 0.98;
-    "Continents": continent_wavelength_m: 1.0e3, 1.0e8;
-    "Continents": warp_wavelength_m: 1.0e3, 1.0e8;
+    "Continents": continent_wavelength_m: 1.0e3, 1.0e8, "m";
+    "Continents": warp_wavelength_m: 1.0e3, 1.0e8, "m";
     "Continents": warp_strength: 0.0, 2.0;
-    "Continents": land_height_m: 0.0, 2.0e4;
-    "Ocean": ocean_depth_m: 1.0, 2.0e4;
-    "Ocean": shelf_depth_m: 0.0, 2.0e3;
-    "Temperature": equator_c: -250.0, 500.0;
-    "Temperature": pole_c: -250.0, 500.0;
-    "Temperature": axial_tilt_deg: 0.0, 90.0;
+    "Continents": land_height_m: 0.0, 2.0e4, "m";
+    "Ocean": ocean_depth_m: 1.0, 2.0e4, "m";
+    "Ocean": shelf_depth_m: 0.0, 2.0e3, "m";
+    "Temperature": equator_c: -250.0, 500.0, "°C";
+    "Temperature": pole_c: -250.0, 500.0, "°C";
+    "Temperature": axial_tilt_deg: 0.0, 90.0, "°";
     "Temperature": lapse_c_per_km: 0.0, 50.0;
     "Temperature": ocean_moderation: 0.0, 1.0;
-    "Temperature": temperature_noise_c: 0.0, 50.0;
+    "Temperature": temperature_noise_c: 0.0, 50.0, "°C";
     "Moisture": evaporation: 0.0, 1.0;
     "Moisture": rain: 0.0, 1.0;
     "Moisture": precipitation_scale: 1.0e-3, 1.0e3;
@@ -815,19 +815,19 @@ pub const PARAM_FIELDS: &[ParamField] = fields! {
     "Tectonics": plate_warp_strength: 0.0, 1.0;
     "Tectonics": plate_speed: 0.01, 2.0;
     "Tectonics": crust_weight: 0.0, 0.9;
-    "Tectonics": collision_height_m: 0.0, 1.0e4;
-    "Tectonics": arc_height_m: 0.0, 1.0e4;
-    "Tectonics": trench_depth_m: 0.0, 1.2e4;
-    "Tectonics": ridge_height_m: 0.0, 5.0e3;
-    "Tectonics": orogen_width_m: 1.0e4, 1.0e6;
+    "Tectonics": collision_height_m: 0.0, 1.0e4, "m";
+    "Tectonics": arc_height_m: 0.0, 1.0e4, "m";
+    "Tectonics": trench_depth_m: 0.0, 1.2e4, "m";
+    "Tectonics": ridge_height_m: 0.0, 5.0e3, "m";
+    "Tectonics": orogen_width_m: 1.0e4, 1.0e6, "m";
     "Tectonics": orogen_roughness: 0.0, 1.0;
     "Rock hardness": hardness_noise: 0.0, 0.5;
     "Rain shadow": wind_deflection: 0.0, 1.0;
     "Rain shadow": orographic_rain: 0.0, 1.0;
     "Rain shadow": lee_drying: 0.0, 1.0;
     "Erosion": erosion_strength: 0.0, 100.0;
-    "Erosion": erosion_uplift_m: 0.0, 5.0e3;
-    "Erosion": talus_deg: 5.0, 80.0;
+    "Erosion": erosion_uplift_m: 0.0, 5.0e3, "m";
+    "Erosion": talus_deg: 5.0, 80.0, "°";
     "Erosion": deposition: 0.0, 1.0;
 };
 
@@ -836,7 +836,7 @@ impl PlanetArchetype {
     /// by half its span on each side, or the current `value` within ×0.5–2
     /// for fixed parameters; always inside the field's validation bounds.
     pub fn editor_range(&self, name: &str, value: f64) -> Option<(f64, f64)> {
-        let field = PARAM_FIELDS.iter().find(|f| f.name == name)?;
+        let (min, max) = float_bounds(PARAM_FIELDS.iter().find(|f| f.key == name)?);
         let c = &self.continents;
         let t = &self.temperature;
         let m = &self.moisture;
@@ -873,34 +873,38 @@ impl PlanetArchetype {
                 (r.0 - pad, r.1 + pad)
             }
             None if value != 0.0 => (0.5 * value.min(2.0 * value), 2.0 * value.max(0.5 * value)),
-            None => (field.min, field.min + 0.1 * (field.max - field.min)),
+            None => (min, min + 0.1 * (max - min)),
         };
-        let low = low.max(field.min);
-        let high = high.min(field.max);
+        let low = low.max(min);
+        let high = high.min(max);
         (low < high).then_some((low, high))
+    }
+}
+
+/// Validation bounds of a planet parameter (all are `ParamKind::Float`).
+pub fn float_bounds(field: &ParamField) -> (f64, f64) {
+    match field.kind {
+        ParamKind::Float { min, max, .. } => (min, max),
+        _ => (f64::NEG_INFINITY, f64::INFINITY),
+    }
+}
+
+impl Params for PlanetParams {
+    fn descriptors() -> &'static [ParamField] {
+        PARAM_FIELDS
     }
 }
 
 impl PlanetParams {
     pub fn get(&self, name: &str) -> Option<f64> {
-        PARAM_FIELDS
-            .iter()
-            .find(|f| f.name == name)
-            .map(|f| (f.get)(self))
+        self.param(name).map(ParamValue::as_f64)
     }
 
     /// Override one named parameter; rejects unknown names and values outside
     /// the field's bounds.
     pub fn set(&mut self, name: &str, value: f64) -> Result<(), TerrainError> {
-        let field = PARAM_FIELDS
-            .iter()
-            .find(|f| f.name == name)
-            .ok_or(TerrainError::InvalidConfig)?;
-        if !value.is_finite() || !(field.min..=field.max).contains(&value) {
-            return Err(TerrainError::InvalidConfig);
-        }
-        (field.set)(self, value);
-        Ok(())
+        self.set_param(name, ParamValue::Float(value))
+            .map_err(|_| TerrainError::InvalidConfig)
     }
 
     /// Words participating in the owning definition's terrain identity.
@@ -908,7 +912,7 @@ impl PlanetParams {
         let words =
             PARAM_FIELDS
                 .iter()
-                .map(|f| (f.get)(self).to_bits())
+                .map(|f| (f.get)(self).as_f64().to_bits())
                 .chain([
                     u64::from(self.continent_octaves),
                     self.continent_lacunarity.to_bits(),
@@ -986,6 +990,23 @@ pub(crate) mod tests {
         let mut bad = terra.clone();
         bad.ocean_coverage = Range(0.9, 0.1);
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn planet_descriptors_are_unique_floats_and_round_trip() {
+        let mut params = terra().sample(3);
+        for (index, field) in PARAM_FIELDS.iter().enumerate() {
+            assert_eq!(PlanetParams::param_index(field.key), Some(index));
+            assert!(matches!(field.kind, ParamKind::Float { .. }), "{}", field.key);
+            let (min, max) = float_bounds(field);
+            let value = 0.5 * (min + max);
+            params.set(field.key, value).unwrap();
+            assert_eq!(params.get(field.key), Some(value));
+        }
+        assert_eq!(
+            params.set_param("rain", ParamValue::Int(0)),
+            Err(astrum_core::params::ParamError::WrongKind)
+        );
     }
 
     #[test]

@@ -4,6 +4,8 @@
 //! renders it and reports interactions as [`StudioAction`]s. Neither type
 //! references the UI toolkit, so headless sessions and tests use them directly.
 
+use astrum_core::params::{ParamDesc, ParamKind, ParamValue};
+
 /// Display tone shared with the UI theme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tone {
@@ -109,17 +111,46 @@ pub struct StudioView {
     pub planet: Option<PlanetView>,
 }
 
-/// One editable planet parameter (`archetype::PARAM_FIELDS` order).
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct PlanetParamItem {
-    pub name: String,
-    /// Editor section (`ParamField::group`).
+/// One editable parameter row, built from a shared descriptor
+/// (`astrum_core::params::ParamDesc`) of any content type. Studio renders a
+/// list of these generically (grouped sections, one widget per kind).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParamItem {
+    pub key: &'static str,
+    pub label: String,
+    /// Editor section (`ParamDesc::group`); sections keep list order.
     pub group: &'static str,
-    pub value: f64,
-    /// Slider range.
-    pub range: [f64; 2],
-    /// Overridden in the edit (else sampled from the archetype).
+    pub unit: &'static str,
+    pub help: &'static str,
+    /// The widget's kind and range. A producer may narrow a float range to an
+    /// editor range inside the descriptor's validation bounds.
+    pub kind: ParamKind,
+    pub value: ParamValue,
+    /// Differs from the content default (shows bold with a reset button).
     pub overridden: bool,
+}
+
+impl ParamItem {
+    /// Row for descriptor `desc` with the current value of `target`.
+    pub fn from_desc<T>(desc: &ParamDesc<T>, target: &T) -> Self {
+        Self {
+            key: desc.key,
+            label: desc.display_label().into_owned(),
+            group: desc.group,
+            unit: desc.unit,
+            help: desc.help,
+            kind: desc.kind,
+            value: (desc.get)(target),
+            overridden: false,
+        }
+    }
+}
+
+/// One edit from a generic parameter panel; the index is into the item list.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ParamEdit {
+    Set(usize, ParamValue),
+    Reset(usize),
 }
 
 /// Planet editor panel (pipeline §18.1, M1 Step 6).
@@ -130,7 +161,7 @@ pub struct PlanetView {
     pub seed: u64,
     /// Unsaved changes.
     pub dirty: bool,
-    pub params: Vec<PlanetParamItem>,
+    pub params: Vec<ParamItem>,
     pub stats: Vec<StatItem>,
     pub can_undo: bool,
     pub can_redo: bool,

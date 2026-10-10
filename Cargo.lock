@@ -154,6 +154,7 @@ name = "astrum_app"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "astrum_core",
  "astrum_math",
  "astrum_renderer",
  "astrum_simulation",
@@ -220,6 +221,7 @@ dependencies = [
 name = "astrum_world"
 version = "0.0.1"
 dependencies = [
+ "astrum_core",
  "astrum_math",
  "criterion",
  "glam",

@@ -1,8 +1,9 @@
 //! Planet editor v1 over the demo (M1 Step 6): publishes rebuilt world-map
 //! definitions, applies Studio planet actions and builds the panel view.
 use super::*;
-use crate::studio::view::{PlanetParamItem, PlanetView, StatItem, StudioAction, Tone};
-use astrum_world::terrain::archetype::PARAM_FIELDS;
+use crate::studio::view::{ParamItem, PlanetView, StatItem, StudioAction, Tone};
+use astrum_core::params::{ParamKind, ParamValue};
+use astrum_world::terrain::archetype::{PARAM_FIELDS, float_bounds};
 
 impl GravityOrbitsDemo {
     /// Publish definitions the planet editor rebuilt this frame. The terrain
@@ -35,7 +36,7 @@ impl GravityOrbitsDemo {
     /// Apply a planet editor action to the selected body.
     pub(super) fn planet_action(&mut self, action: StudioAction) {
         let index = self.selected_index();
-        let name = |i: usize| PARAM_FIELDS.get(i).map(|f| f.name);
+        let name = |i: usize| PARAM_FIELDS.get(i).map(|f| f.key);
         match action {
             StudioAction::PlanetSeed(seed) => self.planet_editor.set_seed(index, seed),
             StudioAction::PlanetRandomSeed => {
@@ -94,13 +95,13 @@ impl GravityOrbitsDemo {
         );
         for (name, _) in params {
             anyhow::ensure!(
-                PARAM_FIELDS.iter().any(|f| f.name == name),
+                PARAM_FIELDS.iter().any(|f| f.key == name),
                 "unknown planet parameter {name}"
             );
         }
         if reset {
             for field in PARAM_FIELDS {
-                self.planet_editor.reset_param(index, field.name);
+                self.planet_editor.reset_param(index, field.key);
             }
         }
         if let Some(seed) = seed {
@@ -124,19 +125,23 @@ impl GravityOrbitsDemo {
                 // Show the edit (not the published definition) so a slider does not
                 // snap back while the rebuild is pending or after a rejected value.
                 let value = editable
-                    .override_of(field.name)
-                    .or_else(|| world.params.get(field.name))
+                    .override_of(field.key)
+                    .or_else(|| world.params.get(field.key))
                     .unwrap_or_default();
                 let (low, high) = world
                     .archetype
-                    .editor_range(field.name, value)
-                    .unwrap_or((field.min, field.max));
-                PlanetParamItem {
-                    name: field.name.to_string(),
-                    group: field.group,
-                    value,
-                    range: [low.min(value), high.max(value)],
-                    overridden: editable.override_of(field.name).is_some(),
+                    .editor_range(field.key, value)
+                    .unwrap_or_else(|| float_bounds(field));
+                let (min, max) = (low.min(value), high.max(value));
+                ParamItem {
+                    kind: ParamKind::Float {
+                        min,
+                        max,
+                        log: min > 0.0 && max / min > 20.0,
+                    },
+                    value: ParamValue::Float(value),
+                    overridden: editable.override_of(field.key).is_some(),
+                    ..ParamItem::from_desc(field, &world.params)
                 }
             })
             .collect();

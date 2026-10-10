@@ -13,6 +13,7 @@ developer-tools = ["terrain-capture", "surface-profile", "astrum_renderer/develo
 [dependencies]
 anyhow.workspace = true
 glam.workspace = true
+astrum_core = { path = "../core" }
 astrum_math = { path = "../math" }
 astrum_renderer = { path = "../renderer" }
 astrum_simulation = { path = "../simulation" }

@@ -9,8 +9,9 @@ use std::ops::RangeInclusive;
 
 use astrum_app::render_settings::{SPECS, SettingKind, SettingValue};
 use astrum_app::studio::view::{
-    Overlay, PlanetParamItem, PlanetView, RATE_PRESETS, StatItem, StudioAction, StudioView,
+    Overlay, ParamEdit, ParamItem, PlanetView, RATE_PRESETS, StatItem, StudioAction, StudioView,
 };
+use astrum_core::params::{ParamKind, ParamValue};
 use astrum_renderer::TerrainViewMode;
 use egui::{Align, Color32, CornerRadius, Layout, RichText, Ui};
 
@@ -423,28 +424,36 @@ fn body_tab(ui: &mut Ui, view: &StudioView, panel: &StudioView, actions: &mut Ve
     });
 }
 
-/// Readable label of a `PlanetParams` field name (`ocean_depth_m` → "Ocean
-/// depth (m)").
-fn param_label(name: &str) -> String {
-    let (base, unit) = match name.rsplit_once('_') {
-        Some((base, unit @ ("m" | "c" | "deg" | "km"))) => (base, Some(unit)),
-        _ => (name, None),
-    };
-    let mut label = base.replace('_', " ");
-    if let Some(first) = label.get_mut(..1) {
-        first.make_ascii_uppercase();
+/// Generic parameter panel (docs/STUDIO_UI.md amendment 2026-10-10b): one
+/// collapsible section per group, in item order, and one property row per
+/// item, whatever content type the items describe. `open` picks the groups
+/// that start expanded.
+pub fn param_sections(
+    ui: &mut Ui,
+    items: &[ParamItem],
+    open: impl Fn(&str) -> bool,
+    edits: &mut Vec<ParamEdit>,
+) {
+    let mut groups: Vec<&str> = Vec::new();
+    for item in items {
+        if !groups.contains(&item.group) {
+            groups.push(item.group);
+        }
     }
-    match unit {
-        Some("c") => format!("{label} (°C)"),
-        Some(unit) => format!("{label} ({unit})"),
-        None => label,
+    for group in groups {
+        section(ui, group, open(group), |ui| {
+            for (index, item) in items.iter().enumerate() {
+                if item.group == group {
+                    param_row(ui, index, item, edits);
+                }
+            }
+        });
     }
 }
 
-/// One planet parameter row: label (bold when overridden, with a reset
-/// button) and a slider with its value box. Sliders apply on release, so each
-/// drag re-bakes the planet once.
-fn param_row(ui: &mut Ui, index: usize, param: &PlanetParamItem, actions: &mut Vec<StudioAction>) {
+/// One parameter row: label (bold when overridden, with a reset button) and
+/// the kind's widget. Sliders apply on release, so a drag costs one rebuild.
+fn param_row(ui: &mut Ui, index: usize, item: &ParamItem, edits: &mut Vec<ParamEdit>) {
     ui.horizontal(|ui| {
         ui.set_min_height(ROW_HEIGHT);
         let width = (ui.available_width() * LABEL_SHARE).floor();
@@ -454,35 +463,72 @@ fn param_row(ui: &mut Ui, index: usize, param: &PlanetParamItem, actions: &mut V
             |ui| {
                 ui.set_width(width);
                 ui.spacing_mut().item_spacing.x = 2.0;
-                if param.overridden {
+                if item.overridden {
                     if ui
                         .small_button("↺")
-                        .on_hover_text("Back to the sampled value")
+                        .on_hover_text("Back to the default value")
                         .clicked()
                     {
-                        actions.push(StudioAction::PlanetResetParam(index));
+                        edits.push(ParamEdit::Reset(index));
                     }
                 } else {
                     // Same footprint as the reset button, so labels line up.
                     ui.add_space(18.0);
                 }
-                let text = RichText::new(param_label(&param.name));
-                ui.add(
-                    egui::Label::new(if param.overridden {
+                let label = if item.unit.is_empty() {
+                    item.label.clone()
+                } else {
+                    format!("{} ({})", item.label, item.unit)
+                };
+                let text = RichText::new(label);
+                let response = ui.add(
+                    egui::Label::new(if item.overridden {
                         text.color(TEXT_PRIMARY).strong()
                     } else {
                         text.color(TEXT_SECONDARY)
                     })
                     .truncate(),
                 );
+                if !item.help.is_empty() {
+                    response.on_hover_text(item.help);
+                }
             },
         );
-        let mut value = param.value;
-        let [low, high] = param.range;
-        let logarithmic = low > 0.0 && high / low > 20.0;
-        let response = fill_slider(ui, &mut value, low..=high, logarithmic, "");
-        if response.drag_stopped() || (response.changed() && !response.dragged()) {
-            actions.push(StudioAction::PlanetParam(index, value));
+        let released = |r: &egui::Response| r.drag_stopped() || (r.changed() && !r.dragged());
+        let edit = match (item.kind, item.value) {
+            (ParamKind::Float { min, max, log }, ParamValue::Float(mut x)) => {
+                let response = fill_slider(ui, &mut x, min..=max, log, "");
+                released(&response).then_some(ParamValue::Float(x))
+            }
+            (ParamKind::Int { min, max }, ParamValue::Int(mut i)) => {
+                let response = fill_slider(ui, &mut i, min..=max, false, "");
+                released(&response).then_some(ParamValue::Int(i))
+            }
+            (ParamKind::Choice { options }, ParamValue::Choice(selected)) => {
+                let mut chosen = None;
+                egui::ComboBox::from_id_salt(("param", item.key))
+                    .width(ui.available_width() - SPACE_1)
+                    .selected_text(options.get(selected).copied().unwrap_or("—"))
+                    .show_ui(ui, |ui| {
+                        for (option_index, option) in options.iter().enumerate() {
+                            if ui
+                                .selectable_label(option_index == selected, *option)
+                                .clicked()
+                            {
+                                chosen = Some(ParamValue::Choice(option_index));
+                            }
+                        }
+                    });
+                chosen
+            }
+            (ParamKind::Bool, ParamValue::Bool(mut on)) => ui
+                .checkbox(&mut on, "")
+                .changed()
+                .then_some(ParamValue::Bool(on)),
+            _ => None,
+        };
+        if let Some(value) = edit {
+            edits.push(ParamEdit::Set(index, value));
         }
     });
 }
@@ -573,22 +619,18 @@ fn planet_tab(ui: &mut Ui, planet: Option<&PlanetView>, actions: &mut Vec<Studio
             }
         });
     });
-    // Sections in registry order (`archetype::ParamField::group`).
-    let mut groups: Vec<&str> = Vec::new();
-    for param in &planet.params {
-        if !groups.contains(&param.group) {
-            groups.push(param.group);
-        }
-    }
-    for group in groups {
-        section(ui, group, group == "Continents", |ui| {
-            for (index, param) in planet.params.iter().enumerate() {
-                if param.group == group {
-                    param_row(ui, index, param, actions);
-                }
-            }
-        });
-    }
+    // Generic descriptor panel (`archetype::PARAM_FIELDS`, registry order).
+    let mut edits = Vec::new();
+    param_sections(
+        ui,
+        &planet.params,
+        |group| group == "Continents",
+        &mut edits,
+    );
+    actions.extend(edits.into_iter().map(|edit| match edit {
+        ParamEdit::Set(index, value) => StudioAction::PlanetParam(index, value.as_f64()),
+        ParamEdit::Reset(index) => StudioAction::PlanetResetParam(index),
+    }));
     section(ui, "Status", false, |ui| {
         for stat in &planet.stats {
             stat_row(ui, stat);
