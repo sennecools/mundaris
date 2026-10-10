@@ -2,11 +2,14 @@
 //! inputs (f32, radians and cycles per unit direction), narrowed once.
 use astrum_renderer::{
     AtlasWorldSurface,
-    tier_a::{TierABakeInputs, stage},
+    tier_a::{TIER_A_MAX_PLATES, TierABakeInputs, stage},
 };
 use astrum_world::terrain::{
     archetype::TierAStage,
-    tier_a::{OCEAN_BLUR_PASSES, TierAInputs},
+    tier_a::{
+        OCEAN_BLUR_PASSES, TierAInputs, climate::smoothing_step_rad, erosion, height_bound_m,
+        tectonics,
+    },
     world_field::WorldLook,
 };
 
@@ -23,8 +26,21 @@ pub fn bake_inputs(inputs: &TierAInputs) -> TierABakeInputs {
             TierAStage::Temperature => stage::TEMPERATURE,
             TierAStage::Wind => stage::WIND,
             TierAStage::Moisture => stage::MOISTURE,
+            TierAStage::Tectonics => stage::TECTONICS,
+            TierAStage::RainShadow => stage::RAIN_SHADOW,
+            TierAStage::Erosion => stage::EROSION,
         })
         .fold(0, |a, b| a | b);
+    let tectonics_on = inputs.has(TierAStage::Tectonics);
+    let set = tectonics::plates(p, p.tectonic_seed);
+    let mut plates = [[0.0f32; 16]; TIER_A_MAX_PLATES];
+    for (slot, plate) in plates
+        .iter_mut()
+        .zip(set.packed().chunks(16).take(TIER_A_MAX_PLATES))
+    {
+        slot.copy_from_slice(plate);
+    }
+    let erosion = erosion::ErosionConstants::new(p);
     TierABakeInputs {
         face_cells: inputs.face_cells as u32,
         stages,
@@ -62,6 +78,59 @@ pub fn bake_inputs(inputs: &TierAInputs) -> TierABakeInputs {
         precipitation_scale: p.precipitation_scale as f32,
         rain_convergence: p.rain_convergence as f32,
         pole: inputs.pole.as_vec3().to_array(),
+        height_bound_m: height_bound_m(p, &inputs.stages) as f32,
+        flow_normaliser: erosion::flow_normaliser(r) as f32,
+        crust_weight: if tectonics_on {
+            p.crust_weight as f32
+        } else {
+            0.0
+        },
+        tectonic_seed: p.tectonic_seed,
+        hardness_seed: p.hardness_seed,
+        plate_count: set.plates.len().min(TIER_A_MAX_PLATES) as u32,
+        plates,
+        plate_warp_frequency: (r / p.plate_warp_wavelength_m) as f32,
+        plate_warp_scale: (p.plate_warp_strength * p.plate_warp_wavelength_m / r) as f32,
+        boundary_softness_m: p.boundary_softness_m as f32,
+        boundary_clamp_m: p.boundary_clamp_m as f32,
+        collision_height_m: p.collision_height_m as f32,
+        arc_height_m: p.arc_height_m as f32,
+        trench_depth_m: p.trench_depth_m as f32,
+        ridge_height_m: p.ridge_height_m as f32,
+        rift_depth_m: p.rift_depth_m as f32,
+        transform_height_m: p.transform_height_m as f32,
+        orogen_roughness: p.orogen_roughness as f32,
+        roughness_frequency: (r / p.orogen_roughness_wavelength_m) as f32,
+        orogen_width_m: p.orogen_width_m as f32,
+        arc_width_m: p.arc_width_m as f32,
+        arc_offset_m: p.arc_offset_m as f32,
+        trench_width_m: p.trench_width_m as f32,
+        ridge_width_m: p.ridge_width_m as f32,
+        rift_width_m: p.rift_width_m as f32,
+        transform_width_m: p.transform_width_m as f32,
+        crust_width_m: p.crust_width_m as f32,
+        hardness_noise: p.hardness_noise as f32,
+        hardness_noise_frequency: (r / p.hardness_noise_wavelength_m) as f32,
+        smoothing_step_rad: smoothing_step_rad(p, r) as f32,
+        wind_deflection: p.wind_deflection as f32,
+        deflection_slope: p.deflection_slope as f32,
+        wind_slowdown: p.wind_slowdown as f32,
+        orographic_rain: p.orographic_rain as f32,
+        lee_drying: p.lee_drying as f32,
+        orographic_slope: p.orographic_slope as f32,
+        erosion_strength: erosion.strength as f32,
+        erosion_uplift_m: erosion.uplift_m as f32,
+        tan_talus: erosion.tan_talus as f32,
+        deposition: erosion.deposition as f32,
+        erosion_capacity: erosion.capacity as f32,
+        erosion_area_exponent: erosion.m as f32,
+        erosion_slope_exponent: erosion.n as f32,
+        erosion_flow_exponent: erosion.p as f32,
+        thermal_rate: erosion.thermal as f32,
+        sediment_depth_m: p.sediment_depth_m as f32,
+        erosion_cascade: p
+            .erosion_cascade
+            .map(|(divisor, iterations)| [divisor, iterations]),
     }
 }
 

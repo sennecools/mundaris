@@ -26,7 +26,22 @@ impl Range {
     }
 }
 
-/// Tier A stages (§6.5) available in M1 (World map and planet editor).
+/// Inclusive integer `(min, max)` authored range, sampled uniformly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CountRange(pub u32, pub u32);
+
+impl CountRange {
+    fn valid(self, low: u32, high: u32) -> bool {
+        low <= self.0 && self.0 <= self.1 && self.1 <= high
+    }
+    fn sample(self, unit: f64) -> u32 {
+        let span = f64::from(self.1 - self.0 + 1);
+        (self.0 + (unit * span).floor() as u32).min(self.1)
+    }
+}
+
+/// Tier A stages (§6.5): M1 (World map and planet editor) plus M2 (Shape)
+/// tectonics, rain shadow and macro erosion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TierAStage {
     Continents,
@@ -35,6 +50,14 @@ pub enum TierAStage {
     Temperature,
     Wind,
     Moisture,
+    /// Plates, boundary profiles (uplift, trenches, ridges), crust type and
+    /// rock hardness (§6.5.1, §6.5.3).
+    Tectonics,
+    /// Wind deflected around smoothed relief, orographic rain and lee drying
+    /// (§6.5.5–6.5.6).
+    RainShadow,
+    /// Stream-power macro erosion with thermal talus and deposition (§6.5.7).
+    Erosion,
 }
 
 /// Face resolution for bodies up to `max_radius_km` (§6.2; resolution never
@@ -112,6 +135,116 @@ pub struct MoistureRanges {
     /// cells converge (equator, ~60°) and drier where they diverge (~30°,
     /// poles). 0 disables it.
     pub convergence: f64,
+}
+
+/// Plates and their boundary profiles (§6.5.1, M2 design §1). Heights and
+/// depths are the full-strength profile amplitudes; widths are distances from
+/// the plate boundary on the surface.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TectonicsRanges {
+    /// Major plates on a jittered Fibonacci lattice (rounded).
+    pub plate_count: Range,
+    pub microplates: CountRange,
+    /// Lattice jitter as a fraction of `π / √plates`.
+    pub jitter: f64,
+    /// Power-diagram weight deficit of microplates (smaller cells).
+    pub micro_shrink: f64,
+    pub continental_fraction: Range,
+    /// Domain warp of plate assignment: jagged instead of straight boundaries.
+    pub warp_wavelength_km: f64,
+    pub warp_strength: Range,
+    /// Angular speed scale of the plates' Euler rotations (relative units:
+    /// convergence saturates towards 0.4).
+    pub speed: Range,
+    /// Share of crust type (continental or oceanic) in the continent field
+    /// before the sea-level percentile.
+    pub crust_weight: Range,
+    pub collision_height_m: Range,
+    pub arc_height_m: Range,
+    pub trench_depth_m: Range,
+    pub ridge_height_m: Range,
+    pub rift_depth_m: f64,
+    pub transform_height_m: f64,
+    /// Half width of continental collision belts.
+    pub orogen_width_km: Range,
+    /// Relative roughness of orogenic relief (belts, arcs) from 4-octave
+    /// noise: seeds the drainage network erosion incises.
+    pub roughness: f64,
+    pub roughness_wavelength_km: f64,
+    pub arc_width_km: f64,
+    /// Distance of coastal ranges and island arcs from the boundary (at least
+    /// `arc_width_km`, so they vanish at the boundary itself).
+    pub arc_offset_km: f64,
+    pub trench_width_km: f64,
+    pub ridge_width_km: f64,
+    pub rift_width_km: f64,
+    pub transform_width_km: f64,
+    /// Distance over which crust type blends across a boundary.
+    pub crust_width_km: f64,
+    /// Soft-minimum length over neighbouring boundaries: outputs stay
+    /// continuous where the nearest boundary switches.
+    pub softness_km: f64,
+    /// `boundary_coord` is clamped to ± this distance.
+    pub boundary_clamp_km: f64,
+}
+
+/// Rock hardness (§6.5.3): per-plate rock family (oceanic plates volcanic,
+/// continental crystalline or sedimentary), hard volcanic belts, noise.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HardnessRanges {
+    pub crystalline: f64,
+    pub volcanic: f64,
+    pub sedimentary: f64,
+    /// Amplitude of 3-octave noise added to hardness.
+    pub noise: f64,
+    pub noise_wavelength_km: f64,
+}
+
+/// Rain shadow (§6.5.5–6.5.6): wind deflected around relief smoothed over the
+/// moisture step, orographic rain on windward slopes, drying in the lee.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RainShadowRanges {
+    /// Share of the uphill wind component turned along the relief.
+    pub deflection: f64,
+    /// Slope at which deflection reaches half strength.
+    pub deflection_slope: f64,
+    /// Wind slow-down over steep relief (fraction at saturated slope).
+    pub slowdown: f64,
+    /// Extra rain-out per step at `reference_slope` of uphill wind.
+    pub orographic_rain: f64,
+    /// Rain reduction per step at `reference_slope` of downhill wind.
+    pub lee_drying: f64,
+    pub reference_slope: f64,
+}
+
+/// Macro erosion (§6.5.7, M2 design §1): stream power
+/// `dh/dt = U − K(1 − 0.8·hardness)·Q^m·S^n` on multiple flow directions,
+/// with thermal talus and deposition, as a coarse-to-fine cascade.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ErosionRanges {
+    /// K: incision in metres per iteration at `Q^m·S^n = 1` (Q in km²).
+    pub strength: Range,
+    /// Total rock uplift over the cascade where tectonic uplift is 1.
+    pub uplift_m: Range,
+    pub talus_deg: f64,
+    /// Share of excess sediment deposited per iteration.
+    pub deposition: f64,
+    /// Transport capacity relative to the local incision rate.
+    pub capacity: f64,
+    pub area_exponent: f64,
+    pub slope_exponent: f64,
+    /// Multiple-flow-direction exponent (weights ∝ slope^p).
+    pub flow_exponent: f64,
+    /// Share of the excess over the talus slope moved per iteration.
+    pub thermal_rate: f64,
+    /// Deposit thickness that maps to sediment `1 − 1/e`.
+    pub sediment_depth_m: f64,
+    /// Cascade levels, coarse to fine: (face-cell divisor, iterations).
+    pub cascade: [(u32, u32); 3],
 }
 
 /// Snow cover rule (§10.1): `temperature < T_snow` blended over `blend_c`,
@@ -207,6 +340,22 @@ impl MaterialAsset {
     }
 }
 
+/// Most plates (major plus micro) a body may have: the GPU `Plates` uniform.
+pub const MAX_PLATES: usize = 32;
+/// Most microplates; major plates are capped at `MAX_PLATES - MAX_MICROPLATES`.
+pub const MAX_MICROPLATES: u32 = 6;
+/// Most major plates (`plate_count` rounds and clamps to this).
+pub const MAX_MAJOR_PLATES: f64 = (MAX_PLATES - MAX_MICROPLATES as usize) as f64;
+
+/// Erosion cascade levels with iterations: divisors are powers of two up to
+/// 16, strictly decreasing (coarse to fine).
+pub fn cascade_valid(cascade: &[(u32, u32); 3]) -> bool {
+    let active: Vec<(u32, u32)> = cascade.iter().copied().filter(|l| l.1 > 0).collect();
+    cascade.iter().all(|(divisor, iterations)| {
+        divisor.is_power_of_two() && *divisor <= 16 && *iterations <= 2000
+    }) && active.windows(2).all(|pair| pair[0].0 > pair[1].0)
+}
+
 fn colour_valid(c: (f32, f32, f32)) -> bool {
     [c.0, c.1, c.2].iter().all(|v| (0.0..=1.0).contains(v))
 }
@@ -224,6 +373,10 @@ pub struct PlanetArchetype {
     pub temperature: TemperatureRanges,
     pub wind: WindRanges,
     pub moisture: MoistureRanges,
+    pub tectonics: TectonicsRanges,
+    pub hardness: HardnessRanges,
+    pub rain_shadow: RainShadowRanges,
+    pub erosion: ErosionRanges,
     /// Biome LUT metadata (`biome_lut::LutMetadata`), relative to the content
     /// root.
     pub biome_lut: String,
@@ -296,12 +449,79 @@ impl PlanetArchetype {
             && colour_valid(self.water.deep_linear)
             && self.water.depth_scale_m.is_finite()
             && self.water.depth_scale_m > 0.0
-            && colour_valid(self.average_colour);
+            && colour_valid(self.average_colour)
+            && self.shape_valid();
         if ok {
             Ok(())
         } else {
             Err(TerrainError::InvalidConfig)
         }
+    }
+
+    /// M2 (Shape) sections: tectonics, hardness, rain shadow, erosion.
+    fn shape_valid(&self) -> bool {
+        let t = &self.tectonics;
+        let h = &self.hardness;
+        let r = &self.rain_shadow;
+        let e = &self.erosion;
+        let km = |v: f64, low: f64, high: f64| v.is_finite() && (low..=high).contains(&v);
+        let unit = |v: f64| (0.0..=1.0).contains(&v);
+        t.plate_count.valid(2.0, MAX_MAJOR_PLATES)
+            && t.microplates.valid(0, MAX_MICROPLATES)
+            && unit(t.jitter)
+            && (0.0..=0.5).contains(&t.micro_shrink)
+            && t.continental_fraction.valid(0.0, 1.0)
+            && km(t.warp_wavelength_km, 1.0, 1.0e5)
+            && t.warp_strength.valid(0.0, 1.0)
+            && t.speed.valid(0.01, 2.0)
+            && t.crust_weight.valid(0.0, 0.9)
+            && t.collision_height_m.valid(0.0, 1.0e4)
+            && t.arc_height_m.valid(0.0, 1.0e4)
+            && t.trench_depth_m.valid(0.0, 1.2e4)
+            && t.ridge_height_m.valid(0.0, 5.0e3)
+            && km(t.rift_depth_m, 0.0, 5.0e3)
+            && km(t.transform_height_m, 0.0, 5.0e3)
+            && t.orogen_width_km.valid(10.0, 1.0e3)
+            && unit(t.roughness)
+            && km(t.roughness_wavelength_km, 1.0, 1.0e4)
+            && [
+                t.arc_width_km,
+                t.trench_width_km,
+                t.ridge_width_km,
+                t.rift_width_km,
+                t.transform_width_km,
+                t.crust_width_km,
+                t.softness_km,
+            ]
+            .iter()
+            .all(|w| km(*w, 1.0, 1.0e3))
+            && km(t.arc_offset_km, t.arc_width_km, 1.0e3)
+            && km(t.boundary_clamp_km, 10.0, 1.0e3)
+            && [h.crystalline, h.volcanic, h.sedimentary]
+                .iter()
+                .all(|v| unit(*v))
+            && (0.0..=0.5).contains(&h.noise)
+            && km(h.noise_wavelength_km, 1.0, 1.0e5)
+            && unit(r.deflection)
+            && km(r.deflection_slope, 1.0e-4, 1.0)
+            && (0.0..=0.9).contains(&r.slowdown)
+            && unit(r.orographic_rain)
+            && unit(r.lee_drying)
+            && km(r.reference_slope, 1.0e-4, 1.0)
+            && e.strength.valid(0.0, 100.0)
+            && e.uplift_m.valid(0.0, 5.0e3)
+            && (5.0..=80.0).contains(&e.talus_deg)
+            && unit(e.deposition)
+            && km(e.capacity, 0.0, 100.0)
+            && km(e.area_exponent, 0.1, 1.0)
+            && km(e.slope_exponent, 0.5, 2.0)
+            && km(e.flow_exponent, 0.5, 8.0)
+            && (0.0..=0.2).contains(&e.thermal_rate)
+            && km(e.sediment_depth_m, 0.1, 1.0e4)
+            && e.cascade.iter().all(|(divisor, iterations)| {
+                divisor.is_power_of_two() && *divisor <= 16 && *iterations <= 2000
+            })
+            && cascade_valid(&e.cascade)
     }
 
     /// Face cells for a body of `radius_m`: the first band that contains it,
@@ -321,7 +541,62 @@ impl PlanetArchetype {
         let t = &self.temperature;
         let m = &self.moisture;
         let draw = |stage: u64, index: u64| unit(stage_seed(body_seed, stage) ^ index);
+        let tc = &self.tectonics;
+        let hd = &self.hardness;
+        let rs = &self.rain_shadow;
+        let er = &self.erosion;
         PlanetParams {
+            plate_count: tc.plate_count.sample(draw(STAGE_TECTONICS, 0)).round(),
+            micro_count: tc.microplates.sample(draw(STAGE_TECTONICS, 1)),
+            plate_jitter: tc.jitter,
+            micro_shrink: tc.micro_shrink,
+            continental_fraction: tc.continental_fraction.sample(draw(STAGE_TECTONICS, 2)),
+            plate_warp_wavelength_m: 1000.0 * tc.warp_wavelength_km,
+            plate_warp_strength: tc.warp_strength.sample(draw(STAGE_TECTONICS, 3)),
+            plate_speed: tc.speed.sample(draw(STAGE_TECTONICS, 4)),
+            crust_weight: tc.crust_weight.sample(draw(STAGE_TECTONICS, 5)),
+            collision_height_m: tc.collision_height_m.sample(draw(STAGE_TECTONICS, 6)),
+            arc_height_m: tc.arc_height_m.sample(draw(STAGE_TECTONICS, 7)),
+            trench_depth_m: tc.trench_depth_m.sample(draw(STAGE_TECTONICS, 8)),
+            ridge_height_m: tc.ridge_height_m.sample(draw(STAGE_TECTONICS, 9)),
+            rift_depth_m: tc.rift_depth_m,
+            transform_height_m: tc.transform_height_m,
+            orogen_width_m: 1000.0 * tc.orogen_width_km.sample(draw(STAGE_TECTONICS, 10)),
+            orogen_roughness: tc.roughness,
+            orogen_roughness_wavelength_m: 1000.0 * tc.roughness_wavelength_km,
+            arc_width_m: 1000.0 * tc.arc_width_km,
+            arc_offset_m: 1000.0 * tc.arc_offset_km,
+            trench_width_m: 1000.0 * tc.trench_width_km,
+            ridge_width_m: 1000.0 * tc.ridge_width_km,
+            rift_width_m: 1000.0 * tc.rift_width_km,
+            transform_width_m: 1000.0 * tc.transform_width_km,
+            crust_width_m: 1000.0 * tc.crust_width_km,
+            boundary_softness_m: 1000.0 * tc.softness_km,
+            boundary_clamp_m: 1000.0 * tc.boundary_clamp_km,
+            hardness_crystalline: hd.crystalline,
+            hardness_volcanic: hd.volcanic,
+            hardness_sedimentary: hd.sedimentary,
+            hardness_noise: hd.noise,
+            hardness_noise_wavelength_m: 1000.0 * hd.noise_wavelength_km,
+            wind_deflection: rs.deflection,
+            deflection_slope: rs.deflection_slope,
+            wind_slowdown: rs.slowdown,
+            orographic_rain: rs.orographic_rain,
+            lee_drying: rs.lee_drying,
+            orographic_slope: rs.reference_slope,
+            erosion_strength: er.strength.sample(draw(STAGE_EROSION, 0)),
+            erosion_uplift_m: er.uplift_m.sample(draw(STAGE_EROSION, 1)),
+            talus_deg: er.talus_deg,
+            deposition: er.deposition,
+            erosion_capacity: er.capacity,
+            erosion_area_exponent: er.area_exponent,
+            erosion_slope_exponent: er.slope_exponent,
+            erosion_flow_exponent: er.flow_exponent,
+            thermal_rate: er.thermal_rate,
+            sediment_depth_m: er.sediment_depth_m,
+            erosion_cascade: er.cascade,
+            tectonic_seed: stage_seed(body_seed, STAGE_TECTONICS) as u32,
+            hardness_seed: stage_seed(body_seed, STAGE_HARDNESS) as u32,
             ocean_coverage: self.ocean_coverage.sample(draw(STAGE_SEA_LEVEL, 0)),
             continent_wavelength_m: 1000.0 * c.wavelength_km.sample(draw(STAGE_CONTINENTS, 0)),
             continent_octaves: c.octaves,
@@ -363,6 +638,9 @@ const STAGE_WARP: u64 = 0x5741_5250;
 const STAGE_SEA_LEVEL: u64 = 0x5345_414c;
 const STAGE_TEMPERATURE: u64 = 0x5445_4d50;
 const STAGE_MOISTURE: u64 = 0x4d4f_4953;
+const STAGE_TECTONICS: u64 = 0x5445_4354;
+const STAGE_HARDNESS: u64 = 0x4841_5244;
+const STAGE_EROSION: u64 = 0x4552_4f44;
 
 /// `hash(body_seed, stage)` (§5.1).
 pub fn stage_seed(body_seed: u64, stage: u64) -> u64 {
@@ -415,6 +693,74 @@ pub struct PlanetParams {
     pub continent_seed: u32,
     pub warp_seed: u32,
     pub temperature_seed: u32,
+    // Tectonics (M2): see `TectonicsRanges`; lengths in metres.
+    /// Major plates; rounded and clamped to `2..=MAX_MAJOR_PLATES` on use.
+    pub plate_count: f64,
+    pub micro_count: u32,
+    pub plate_jitter: f64,
+    pub micro_shrink: f64,
+    pub continental_fraction: f64,
+    pub plate_warp_wavelength_m: f64,
+    pub plate_warp_strength: f64,
+    pub plate_speed: f64,
+    pub crust_weight: f64,
+    pub collision_height_m: f64,
+    pub arc_height_m: f64,
+    pub trench_depth_m: f64,
+    pub ridge_height_m: f64,
+    pub rift_depth_m: f64,
+    pub transform_height_m: f64,
+    pub orogen_width_m: f64,
+    pub orogen_roughness: f64,
+    pub orogen_roughness_wavelength_m: f64,
+    pub arc_width_m: f64,
+    pub arc_offset_m: f64,
+    pub trench_width_m: f64,
+    pub ridge_width_m: f64,
+    pub rift_width_m: f64,
+    pub transform_width_m: f64,
+    pub crust_width_m: f64,
+    pub boundary_softness_m: f64,
+    pub boundary_clamp_m: f64,
+    // Hardness (M2): see `HardnessRanges`.
+    pub hardness_crystalline: f64,
+    pub hardness_volcanic: f64,
+    pub hardness_sedimentary: f64,
+    pub hardness_noise: f64,
+    pub hardness_noise_wavelength_m: f64,
+    // Rain shadow (M2): see `RainShadowRanges`.
+    pub wind_deflection: f64,
+    pub deflection_slope: f64,
+    pub wind_slowdown: f64,
+    pub orographic_rain: f64,
+    pub lee_drying: f64,
+    pub orographic_slope: f64,
+    // Erosion (M2): see `ErosionRanges`.
+    pub erosion_strength: f64,
+    pub erosion_uplift_m: f64,
+    pub talus_deg: f64,
+    pub deposition: f64,
+    pub erosion_capacity: f64,
+    pub erosion_area_exponent: f64,
+    pub erosion_slope_exponent: f64,
+    pub erosion_flow_exponent: f64,
+    pub thermal_rate: f64,
+    pub sediment_depth_m: f64,
+    pub erosion_cascade: [(u32, u32); 3],
+    pub tectonic_seed: u32,
+    pub hardness_seed: u32,
+}
+
+impl PlanetParams {
+    /// Major plates in use: `plate_count` rounded, within `2..=MAX_MAJOR_PLATES`.
+    pub fn major_plates(&self) -> usize {
+        self.plate_count.round().clamp(2.0, MAX_MAJOR_PLATES) as usize
+    }
+
+    /// Microplates in use (at most `MAX_MICROPLATES`).
+    pub fn microplates(&self) -> usize {
+        self.micro_count.min(MAX_MICROPLATES) as usize
+    }
 }
 
 /// One editor-adjustable parameter: name, authored bounds and accessors.
@@ -457,6 +803,25 @@ pub const PARAM_FIELDS: &[ParamField] = fields! {
     rain: 0.0, 1.0;
     precipitation_scale: 1.0e-3, 1.0e3;
     rain_convergence: 0.0, 0.95;
+    plate_count: 2.0, MAX_MAJOR_PLATES;
+    continental_fraction: 0.0, 1.0;
+    plate_warp_strength: 0.0, 1.0;
+    plate_speed: 0.01, 2.0;
+    crust_weight: 0.0, 0.9;
+    collision_height_m: 0.0, 1.0e4;
+    arc_height_m: 0.0, 1.0e4;
+    trench_depth_m: 0.0, 1.2e4;
+    ridge_height_m: 0.0, 5.0e3;
+    orogen_width_m: 1.0e4, 1.0e6;
+    orogen_roughness: 0.0, 1.0;
+    hardness_noise: 0.0, 0.5;
+    wind_deflection: 0.0, 1.0;
+    orographic_rain: 0.0, 1.0;
+    lee_drying: 0.0, 1.0;
+    erosion_strength: 0.0, 100.0;
+    erosion_uplift_m: 0.0, 5.0e3;
+    talus_deg: 5.0, 80.0;
+    deposition: 0.0, 1.0;
 };
 
 impl PlanetArchetype {
@@ -481,6 +846,18 @@ impl PlanetArchetype {
             "axial_tilt_deg" => Some(t.axial_tilt_deg),
             "evaporation" => Some(m.evaporation),
             "rain" => Some(m.rain),
+            "plate_count" => Some(self.tectonics.plate_count),
+            "continental_fraction" => Some(self.tectonics.continental_fraction),
+            "plate_warp_strength" => Some(self.tectonics.warp_strength),
+            "plate_speed" => Some(self.tectonics.speed),
+            "crust_weight" => Some(self.tectonics.crust_weight),
+            "collision_height_m" => Some(self.tectonics.collision_height_m),
+            "arc_height_m" => Some(self.tectonics.arc_height_m),
+            "trench_depth_m" => Some(self.tectonics.trench_depth_m),
+            "ridge_height_m" => Some(self.tectonics.ridge_height_m),
+            "orogen_width_m" => Some(km(self.tectonics.orogen_width_km)),
+            "erosion_strength" => Some(self.erosion.strength),
+            "erosion_uplift_m" => Some(self.erosion.uplift_m),
             _ => None,
         };
         let (low, high) = match authored {
@@ -521,23 +898,61 @@ impl PlanetParams {
 
     /// Words participating in the owning definition's terrain identity.
     pub fn identity(&self) -> u64 {
-        let words = PARAM_FIELDS.iter().map(|f| (f.get)(self).to_bits()).chain([
-            u64::from(self.continent_octaves),
-            self.continent_lacunarity.to_bits(),
-            self.continent_gain.to_bits(),
-            self.land_exponent.to_bits(),
-            self.shelf_fraction.to_bits(),
-            self.ocean_blur_m.to_bits(),
-            self.temperature_noise_wavelength_m.to_bits(),
-            u64::from(self.wind_cells),
-            self.wind_meridional.to_bits(),
-            u64::from(self.moisture_iterations),
-            self.moisture_step_m.to_bits(),
-            self.moisture_spread.to_bits(),
-            u64::from(self.continent_seed),
-            u64::from(self.warp_seed),
-            u64::from(self.temperature_seed),
-        ]);
+        let words =
+            PARAM_FIELDS
+                .iter()
+                .map(|f| (f.get)(self).to_bits())
+                .chain([
+                    u64::from(self.continent_octaves),
+                    self.continent_lacunarity.to_bits(),
+                    self.continent_gain.to_bits(),
+                    self.land_exponent.to_bits(),
+                    self.shelf_fraction.to_bits(),
+                    self.ocean_blur_m.to_bits(),
+                    self.temperature_noise_wavelength_m.to_bits(),
+                    u64::from(self.wind_cells),
+                    self.wind_meridional.to_bits(),
+                    u64::from(self.moisture_iterations),
+                    self.moisture_step_m.to_bits(),
+                    self.moisture_spread.to_bits(),
+                    u64::from(self.continent_seed),
+                    u64::from(self.warp_seed),
+                    u64::from(self.temperature_seed),
+                    u64::from(self.micro_count),
+                    self.plate_jitter.to_bits(),
+                    self.micro_shrink.to_bits(),
+                    self.plate_warp_wavelength_m.to_bits(),
+                    self.orogen_roughness_wavelength_m.to_bits(),
+                    self.rift_depth_m.to_bits(),
+                    self.transform_height_m.to_bits(),
+                    self.arc_width_m.to_bits(),
+                    self.arc_offset_m.to_bits(),
+                    self.trench_width_m.to_bits(),
+                    self.ridge_width_m.to_bits(),
+                    self.rift_width_m.to_bits(),
+                    self.transform_width_m.to_bits(),
+                    self.crust_width_m.to_bits(),
+                    self.boundary_softness_m.to_bits(),
+                    self.boundary_clamp_m.to_bits(),
+                    self.hardness_crystalline.to_bits(),
+                    self.hardness_volcanic.to_bits(),
+                    self.hardness_sedimentary.to_bits(),
+                    self.hardness_noise_wavelength_m.to_bits(),
+                    self.deflection_slope.to_bits(),
+                    self.wind_slowdown.to_bits(),
+                    self.orographic_slope.to_bits(),
+                    self.erosion_capacity.to_bits(),
+                    self.erosion_area_exponent.to_bits(),
+                    self.erosion_slope_exponent.to_bits(),
+                    self.erosion_flow_exponent.to_bits(),
+                    self.thermal_rate.to_bits(),
+                    self.sediment_depth_m.to_bits(),
+                    u64::from(self.tectonic_seed),
+                    u64::from(self.hardness_seed),
+                ])
+                .chain(self.erosion_cascade.iter().map(|(divisor, iterations)| {
+                    u64::from(*divisor) << 32 | u64::from(*iterations)
+                }));
         words.fold(0x5449_4552_4100_0001, |hash, word| splitmix(hash ^ word))
     }
 }
@@ -582,5 +997,26 @@ pub(crate) mod tests {
             stage_seed(7, STAGE_CONTINENTS),
             stage_seed(7, STAGE_MOISTURE)
         );
+        // M2 stages draw from their own seeds: erosion overrides leave the
+        // plates alone, and the new sliders are bounded.
+        let mut eroded = before;
+        eroded.set("erosion_strength", 5.0).unwrap();
+        assert_eq!(eroded.tectonic_seed, before.tectonic_seed);
+        assert_eq!(eroded.plate_count, before.plate_count);
+        assert!(eroded.set("plate_count", 64.0).is_err());
+        let seeds = [
+            STAGE_TECTONICS,
+            STAGE_HARDNESS,
+            STAGE_EROSION,
+            STAGE_MOISTURE,
+        ];
+        for (i, a) in seeds.iter().enumerate() {
+            for b in &seeds[i + 1..] {
+                assert_ne!(stage_seed(7, *a), stage_seed(7, *b));
+            }
+        }
+        assert!((2..=26).contains(&before.major_plates()));
+        assert!(cascade_valid(&[(4, 200), (2, 100), (1, 60)]));
+        assert!(!cascade_valid(&[(1, 20), (2, 10), (0, 0)]));
     }
 }
