@@ -809,6 +809,24 @@ fn page_climate(st: vec2<f32>) -> vec4<f32> {
 
 // ---------------------------------------------------------------- entry points
 
+// `producer::COAST_BLEND_M`.
+const COAST_BLEND_M: f32 = 40.0;
+
+// Relief `r` (value, gradient per unit direction) on macro height `m`,
+// kept by m²/(m² + A²) (`producer::coast_blend`): relief within |r| ≤ 2A
+// can never cross sea level, so the coastline follows the macro contour at
+// every LOD and no islets pop in as finer octaves arrive.
+fn coast_blend(m: HeightSample, r: vec4<f32>) -> HeightSample {
+    let m2 = m.height * m.height;
+    let a2 = COAST_BLEND_M * COAST_BLEND_M;
+    let keep = m2 / (m2 + a2);
+    let dkeep = 2.0 * m.height * a2 / ((m2 + a2) * (m2 + a2));
+    var out = m;
+    out.height = m.height + r.x * keep;
+    out.gradient = m.gradient + r.yzw * keep + m.gradient * (r.x * dkeep);
+    return out;
+}
+
 fn evaluate(st: vec2<f32>) -> vec4<f32> {
     let p = chart_point(st);
     var sample_value: HeightSample;
@@ -818,12 +836,17 @@ fn evaluate(st: vec2<f32>) -> vec4<f32> {
         sample_value = evaluate_fields(p);
     } else {
         sample_value = evaluate_world(p, st);
-        // Landform relief (landform_eval.wgsl); its gradient is per metre.
-        let relief = landform_relief(p.diff * tile.scale.x, normalize(p.n));
-        sample_value.height += relief.x;
-        sample_value.gradient += relief.yzw * tile.scale.x;
+        // Landform relief (landform_eval.wgsl, gradient per metre) and detail
+        // noise, blended out near sea level (`producer::coast_blend`).
+        let landform = landform_relief(p.diff * tile.scale.x, normalize(p.n));
+        var relief = vec4<f32>(landform.x, landform.yzw * tile.scale.x);
+        if ((tile.detail.y >> 8u) & 255u) > 0u {
+            let detail = detail_fbm(p.diff * tile.scale.x);
+            relief += vec4<f32>(detail.x, detail.yzw * tile.scale.x);
+        }
+        sample_value = coast_blend(sample_value, relief);
     }
-    if ((tile.detail.y >> 8u) & 255u) > 0u {
+    if tile.info.y != 2u && ((tile.detail.y >> 8u) & 255u) > 0u {
         // Ladder anchors: the CPU anchors the exact f64 chart centre n0 * R, so
         // local = diff * R places samples at the true surface point.
         let detail = detail_fbm(p.diff * tile.scale.x);

@@ -3472,8 +3472,8 @@ pub fn producer_pipeline_compile_seconds(
     );
     if variant & 1 != 0 {
         source = source.replace(
-            "let relief = landform_relief(p.diff * tile.scale.x, normalize(p.n));",
-            "let relief = vec4<f32>(0.0);",
+            "let landform = landform_relief(p.diff * tile.scale.x, normalize(p.n));",
+            "let landform = vec4<f32>(0.0);",
         );
     }
     if variant & 2 != 0 {
