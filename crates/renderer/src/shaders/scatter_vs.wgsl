@@ -16,10 +16,10 @@ struct ScatterOut {
 fn vs_scatter(@builtin(vertex_index) vertex: u32, @builtin(instance_index) index: u32) -> ScatterOut {
     let p = plants[index];
     let kind = p.info.x & 0xffu;
-    let species = p.info.x >> 8u;
+    let species = (p.info.x >> 8u) & 0xffu;
     let seed = p.info.y;
     let scale = p.base.w;
-    let spread = p.e1.w;
+    let spread = 1.0;
     let e1 = p.e1.xyz;
     let up = p.up.xyz;
     let e2 = cross(up, e1);

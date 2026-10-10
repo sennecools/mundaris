@@ -248,6 +248,8 @@ fn fs_main(input: VertexOut) -> SceneOut {
     var land_albedo = mix(inst.material.rgb, atlas_srgb_to_linear(page.rgb), page.a);
     // Base cells per pixel, continuous across nodes (uniform control flow).
     let cell_footprint = max(length(fwidth(sc_cells(inst, input.grid_st))), 1.0e-3);
+    // Flora: share of the fragment that stands for canopy (crown tops).
+    var canopy_lift = 0.0;
     if inst.surface.x > 0.5 && page.a >= 0.5 {
         // PROTOTYPE (M5 Life): forest floor and canopy tint where the scatter
         // would grow trees, so forests read from a distance (§12.5 hand-off).
@@ -258,8 +260,9 @@ fn fs_main(input: VertexOut) -> SceneOut {
         let own_s = textureSampleLevel(shape_atlas, normal_sampler, input.own_uv, input.layers.x, 0.0).z;
         let parent_s = textureSampleLevel(shape_atlas, normal_sampler, input.parent_uv, input.layers.y, 0.0).z;
         let sediment = mix(mix(parent_s, own_s, input.blend.x), parent_s, input.blend.y);
-        let canopy = forest_cover(inst, input.grid_st, normalize(sampled.xyz), climate.xy, sediment, input.ground, length(input.view_pos), cell_footprint);
+        let canopy = forest_cover(inst, input.grid_st, normalize(sampled.xyz), climate.xy, sediment, input.ground, input.view_pos, cell_footprint);
         land_albedo = mix(land_albedo, canopy.rgb, canopy.a);
+        canopy_lift = canopy.a;
         let detail = ground_detail(inst, input.grid_st, cell_footprint);
         let tint = mix(vec3<f32>(0.95, 1.04, 0.9), vec3<f32>(1.05, 0.97, 1.06), detail.y);
         land_albedo *= detail.x * tint;
@@ -337,5 +340,17 @@ fn fs_main(input: VertexOut) -> SceneOut {
         out.ambient = vec4<f32>(0.0);
         return out;
     }
-    return shade(input.view_pos, n_view, up, albedo, inst.material.w, true);
+    let lit = shade(input.view_pos, n_view, up, albedo, inst.material.w, true);
+    // Flora: the canopy tint stands for crown tops level with the drawn
+    // trees, so their shadows mostly miss it (its own self-shadow is in the
+    // tint colour): lift the cascade shadow by the tint's share.
+    let lift = canopy_lift * (1.0 - water_mask);
+    if lift > 0.01 {
+        let open = shade(input.view_pos, n_view, up, albedo, inst.material.w, false);
+        var out = lit;
+        out.direct = mix(lit.direct, open.direct, lift);
+        out.ambient = mix(lit.ambient, open.ambient, lift);
+        return out;
+    }
+    return lit;
 }

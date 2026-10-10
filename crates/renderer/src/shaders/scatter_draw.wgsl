@@ -15,10 +15,10 @@
 // keep(d) = (SCATTER_FULL_M / d)² continuous in view distance. CDLOD draws a
 // node of size S only beyond ~1.5 S, where keep ≤ 4^-k, so every node holds
 // all the plants its distance asks for: density is continuous across node
-// levels and refinement adds nothing that pops. Plants grow in as keep(d)
-// passes their rank. Beyond the drawn plants the terrain fragment shader
-// lays the canopy colour (forest_cover) with a strength that rises as keep
-// falls, so forests read as forests from orbit.
+// levels and refinement adds nothing that pops. Plants dissolve in (dither,
+// constant size) as keep(d) passes their rank. Beyond the drawn plants the
+// terrain fragment shader lays the canopy colour (forest_cover) with the
+// coverage the thinned plants no longer provide.
 //
 // Forest field (scatter_niche.wgsl): the species niches (content/flora/species,
 // compiled in as scatter_species.wgsl) set how much of the land is forest;
@@ -178,20 +178,33 @@ fn sc_cells(inst: Instance, st: vec2<f32>) -> vec2<f32> {
 }
 
 // Canopy colour and strength (0..1) for the terrain fragment at node
-// position `st` and view distance `d`: the forest field band-limited to the
-// drawn grid, near the camera only the darker forest floor (the drawn trees
-// carry the canopy), far away the full canopy.
+// position `st` and view position `view_pos`: the forest field band-limited
+// to the drawn grid. Strength = share of the view hidden by the crowns the
+// thinning no longer draws (Boolean model, crowns seen at the view angle):
+// with mean crown count λ over the point, the drawn plants hide
+// 1 - exp(-keep·λ) and the tint 1 - exp(-(1 - keep)·λ) of the rest, so
+// together they hide the full 1 - exp(-λ) at every distance.
 // `footprint`: base cells per pixel (screen-space derivative of `c`, taken
 // by the caller in uniform control flow). A per-node footprint would differ
 // between neighbouring nodes of different levels and turn the octave fades
 // into node-shaped blocks.
-fn forest_cover(inst: Instance, st: vec2<f32>, normal_body: vec3<f32>, climate: vec2<f32>, sediment: f32, ground: f32, d: f32, footprint_px: f32) -> vec4<f32> {
+fn forest_cover(inst: Instance, st: vec2<f32>, normal_body: vec3<f32>, climate: vec2<f32>, sediment: f32, ground: f32, view_pos: vec3<f32>, footprint_px: f32) -> vec4<f32> {
     let c = sc_cells(inst, st);
     // Fade each octave once it spans fewer than about eight pixels.
     let footprint = 2.0 * footprint_px;
     let up_body = normalize(inst.n0.xyz + chart_diff(inst, st));
     let slope = acos(clamp(dot(normal_body, up_body), -1.0, 1.0));
-    let site = sc_forest(sc_face(inst.n0.xyz), c.x, c.y, footprint, FlSite(climate.x, climate.y, ground, slope, sediment));
+    // View angle against the local vertical and the base cell's area
+    // (gnomonic cube: (R / cells per unit)² / |q0|³).
+    let n0_view = inst.b2v_x.xyz * inst.n0.x + inst.b2v_y.xyz * inst.n0.y + inst.b2v_z.xyz * inst.n0.z;
+    let up_view = normalize(view_pos - (inst.anchor.xyz - n0_view * inst.anchor.w));
+    let d = length(view_pos);
+    let cos_v = dot(up_view, -view_pos / max(d, 1.0e-3));
+    let cell_m = inst.anchor.w / f32(1u << (SCATTER_CELL_BITS - 1u));
+    let cell_m2 = cell_m * cell_m / (inst.n0.w * inst.n0.w * inst.n0.w);
+    let k = sc_keep(d);
+    let view = vec2<f32>((1.0 - k) / max(cell_m2, 1.0e-3), cos_v);
+    let site = sc_forest(sc_face(inst.n0.xyz), c.x, c.y, footprint, FlSite(climate.x, climate.y, ground, slope, sediment), view);
     var colour = site.color;
     // Canopy texture: crowns and gaps (~30 m) and clumps (~90 m), each fading
     // to its mean once the drawn grid is too coarse to carry it.
@@ -199,9 +212,7 @@ fn forest_cover(inst: Instance, st: vec2<f32>, normal_body: vec3<f32>, climate: 
     let crowns = mix(sc_value(face, c.x / 3.0, c.y / 3.0, 44u), 0.5, smoothstep(0.75, 1.5, footprint));
     let clumps = mix(sc_value(face, c.x / 9.0, c.y / 9.0, 45u), 0.5, smoothstep(2.25, 4.5, footprint));
     colour *= 0.55 + 0.6 * crowns + 0.35 * (clumps - 0.5);
-    let cover = site.cover;
-    let far = 1.0 - sc_keep(d);
-    return vec4<f32>(colour, cover * mix(0.7, 0.9, far));
+    return vec4<f32>(colour, clamp(site.cover, 0.0, 0.98));
 }
 
 // PROTOTYPE (M4/M5): mean-preserving ground detail near the camera: four
@@ -236,8 +247,9 @@ fn sc_node_distance(inst: Instance) -> f32 {
 }
 
 // One placed plant for the draw, in view space: stem foot and scale, yawed
-// horizontal axis and crown spread, up, then kind and three hash seeds
-// (shape, brightness, hue).
+// horizontal axis and rank fade (0..1), up and tier split (flora), then
+// kind (bits 0..7 shape, 8..15 species + 1, 16.. flora bucket) and three
+// hash seeds (variant, brightness, hue).
 struct Plant {
     base: vec4<f32>,
     e1: vec4<f32>,
@@ -337,7 +349,7 @@ fn sc_place(index: u32) -> Placed {
     // Shape page: hardness (.y) picks the rock archetype, sediment (.z) is soil.
     let shape = textureSampleLevel(shape_atlas, normal_sampler, own_uv, i32(inst.own.x), 0.0);
     let fsite = FlSite(climate.x, climate.y, ground, slope, shape.z);
-    let site = sc_forest(face, f32(ci), f32(cj), 0.0, fsite);
+    let site = sc_forest(face, f32(ci), f32(cj), 0.0, fsite, vec2<f32>(0.0, 1.0));
     let roll = sc_unit(h.z);
     // kind: low byte = procedural far shape (0 conifer, 1 broadleaf, 2 shrub,
     // 3 boulder), bits 8.. = species index + 1 (0 = none).
@@ -372,22 +384,18 @@ fn sc_place(index: u32) -> Placed {
     } else {
         return out;
     }
-    scale *= smoothstep(0.0, 1.0, grow);
-    // Each kept tree or shrub stands for the 1 / keep candidates around it:
-    // its crown spreads sideways (not up) so far forests close into a
-    // canopy at true canopy height with a bumpy silhouette.
-    var spread = 1.0;
-    if (kind & 0xffu) <= 2u {
-        spread = clamp(1.25 * inverseSqrt(max(keep, 1.0e-6)), 1.0, 30.0);
-    }
+    // A plant keeps its size at every distance (no grow-in, no sideways
+    // spread): as keep(d) passes its rank it dissolves with a screen-door
+    // dither (`fade` in e1.w), and the canopy tint takes over its coverage.
+    let fade = smoothstep(0.0, 1.0, grow);
     let yaw = sc_unit(h2.z) * 6.2831853;
     let e1r = normalize(inst.face_u.xyz - up_body * dot(inst.face_u.xyz, up_body));
     let e2r = cross(up_body, e1r);
     let e1 = e1r * cos(yaw) + e2r * sin(yaw);
     let to_view_dir = mat3x3<f32>(inst.b2v_x.xyz, inst.b2v_y.xyz, inst.b2v_z.xyz);
     out.plant.base = vec4<f32>(to_view(inst, body_position(inst, st, ground - 0.15 * scale)), scale);
-    out.plant.e1 = vec4<f32>(to_view_dir * e1, spread);
-    out.plant.up = vec4<f32>(to_view_dir * up_body, 0.0);
+    out.plant.e1 = vec4<f32>(to_view_dir * e1, fade);
+    out.plant.up = vec4<f32>(to_view_dir * up_body, 1.0);
     out.plant.info = vec4<u32>(kind, variant_bits, h2.x ^ h2.y, h.y ^ h2.z);
     out.ok = true;
     return out;
@@ -489,7 +497,7 @@ fn sc_place_grass(index: u32) -> Placed {
     // Forest field on the plant grid (8 m cells) for the shade of forest cores.
     let plant_cells = f32(1u << (SCATTER_CELL_BITS - 1u));
     let sediment = textureSampleLevel(shape_atlas, normal_sampler, own_uv, i32(inst.own.x), 0.0).z;
-    let site = sc_forest(face, (u + 1.0) * plant_cells, (v + 1.0) * plant_cells, 0.0, FlSite(climate.x, climate.y, ground, slope, sediment));
+    let site = sc_forest(face, (u + 1.0) * plant_cells, (v + 1.0) * plant_cells, 0.0, FlSite(climate.x, climate.y, ground, slope, sediment), vec2<f32>(0.0, 1.0));
     let meadow = (1.0 - 0.75 * site.core)
         * smoothstep(-3.0, 4.0, climate.x)
         * smoothstep(0.06, 0.3, climate.y)

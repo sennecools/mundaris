@@ -46,14 +46,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let p = probes[i];
     let s = FlSite(p.site.x, p.site.y, p.site.z, p.site.w, p.extra.x);
-    let f = sc_forest(2u, p.extra.y, p.extra.z, 0.0, s);
+    let f = sc_forest(2u, p.extra.y, p.extra.z, 0.0, s, vec2<f32>(0.01, 1.0));
     results[i * 4u] = vec4<f32>(f.tree, f.shrub, f.boulder, f.core);
     results[i * 4u + 1u] = vec4<f32>(f.canopy, f.shrubland, f.stature, sc_value(2u, p.extra.y / 25.0, p.extra.z / 25.0, 42u));
     let pc = fl_pick(FL_CANOPY_MASK, s, p.extra.w);
     let ps = fl_pick(FL_SHRUB_MASK, s, p.extra.w);
     results[i * 4u + 2u] = vec4<f32>(pc.x, pc.y, ps.x, ps.y);
     results[i * 4u + 3u] = vec4<f32>(f.color, f.cover);
-    let far = sc_forest(2u, p.extra.y, p.extra.z, 30.0 + 300.0 * p.extra.w, s);
+    let far = sc_forest(2u, p.extra.y, p.extra.z, 30.0 + 300.0 * p.extra.w, s, vec2<f32>(0.004, 0.3 + 0.7 * p.extra.w));
     results[arrayLength(&probes) * 4u + i * 2u] = vec4<f32>(far.tree, far.shrub, far.core, far.cover);
     results[arrayLength(&probes) * 4u + i * 2u + 1u] = vec4<f32>(far.stature, far.boulder, f32(fl_pick_rock(p.site.x / 40.0 + 0.5, p.extra.w)), 0.0);
 }
@@ -180,7 +180,7 @@ fn gpu_forest_field_matches_the_cpu_reference() {
             (f.color[2], g[14]),
             (f.cover, g[15]),
         ];
-        let far = placement.forest(2, p[5] as f64, p[6] as f64, 30.0 + 300.0 * p[7] as f64, &s);
+        let far = placement.forest_view(2, p[5] as f64, p[6] as f64, 30.0 + 300.0 * p[7] as f64, &s, [0.004, 0.3 + 0.7 * p[7] as f64]);
         let o = input.len() * 16 + i * 8;
         let gf = &data[o..o + 8];
         let rock = astrum_flora::scatter::pick_rock(&rocks, (p[0] / 40.0 + 0.5) as f64, p[7] as f64).map_or(-1.0, |r| r as f64);

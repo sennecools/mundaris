@@ -33,6 +33,10 @@ pub struct SpeciesFile {
     /// override. Not stored.
     #[serde(skip)]
     pub look: Look,
+    /// Opaque crown areas (m², top and side) of the grown LOD0 at scale 1
+    /// (`scatter::crown_areas`), set by `measure_crowns`. Not stored.
+    #[serde(skip)]
+    pub crown: Option<[f64; 2]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

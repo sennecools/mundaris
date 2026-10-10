@@ -1213,7 +1213,7 @@ impl TerrainAtlasRenderer {
         let plants = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Terrain plants"),
             size: PLANT_CAPACITY * 64,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let grass = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1474,10 +1474,18 @@ impl TerrainAtlasRenderer {
         // PROTOTYPE (flora lane): grown species for the near plants.
         let flora = crate::flora_draw::FloraDraw::new(
             device,
-            &draw_shader,
-            &scatter_draw_layout,
-            &scatter_shadow_layout,
-            &color_targets,
+            crate::flora_draw::FloraSetup {
+                draw_shader: &draw_shader,
+                cull_shader: &cull_shader,
+                cull_layout: &cull_layout,
+                projection_layout,
+                draw_layout: &draw_layout,
+                lighting_layout,
+                light_layout,
+                empty_layout: &empty_layout,
+                plants: &plants,
+                color_targets: &color_targets,
+            },
         );
         let shadow_capacity = 1024;
         let shadow_instances = instance_buffer(device, shadow_capacity);
@@ -2021,6 +2029,7 @@ impl TerrainAtlasRenderer {
         let mut args = [0u32; (crate::flora_draw::ARGS_BYTES / 4) as usize];
         args[..16].copy_from_slice(&[96u32, 0, 0, 0, staged, 0, 0, 0, 18, 0, 0, 0, 0, 0, 0, 0]);
         // PROTOTYPE (flora lane): grown-species mask and bucket draws.
+        self.flora.prepare(queue);
         self.flora.write_args(&mut args);
         let bytes: Vec<u8> = args.iter().flat_map(|w| w.to_le_bytes()).collect();
         queue.write_buffer(&self.plant_args, 0, &bytes);
@@ -2040,9 +2049,11 @@ impl TerrainAtlasRenderer {
         pass.dispatch_workgroups(groups.min(65_535), groups.div_ceil(65_535), 1);
         pass.set_pipeline(&self.grass_cull);
         pass.dispatch_workgroups(groups.min(65_535), groups.div_ceil(65_535), 1);
+        // PROTOTYPE (flora lane): flora bucket prefix and scatter.
+        self.flora.cull(&mut pass);
         drop(pass);
         // PROTOTYPE (flora lane): read back the bucket overflow counters.
-        self.flora.copy_counters(encoder, &self.plant_args);
+        self.flora.copy_counters(encoder, &self.plant_args, &self._plants);
     }
 
     fn stage_instances(

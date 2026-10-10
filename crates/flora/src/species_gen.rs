@@ -213,6 +213,7 @@ pub fn generate(planet: &PlanetLife, templates: &[SpeciesFile], count: usize) ->
             niche,
             look_override: None,
             look: palette.alien_look(planet, key),
+            crown: None,
         };
         out.push(sp);
     }

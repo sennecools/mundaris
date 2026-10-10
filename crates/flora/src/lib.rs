@@ -12,6 +12,7 @@ pub mod bodyplan;
 pub mod genome;
 pub mod grow;
 pub mod hash;
+pub mod impostor;
 pub mod kit;
 pub mod mesh;
 pub mod niche;
@@ -113,5 +114,21 @@ pub fn load_species_for_body(
         }
         species = generated;
     }
+    measure_crowns(&mut species, &Kit::builtin());
     Ok(species)
+}
+
+/// Sets each species' crown areas from its grown LOD0 (variant 0, scale 1):
+/// the far canopy tint's coverage (scatter::crown_m2). Grows in parallel.
+pub fn measure_crowns(species: &mut [SpeciesFile], kit: &Kit) {
+    let crowns: Vec<[f64; 2]> = std::thread::scope(|scope| {
+        let handles: Vec<_> = species
+            .iter()
+            .map(|sp| scope.spawn(move || scatter::crown_areas(&grow_meshes(sp, kit, variant_seed(sp, 0)).1[0])))
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("crown growth thread")).collect()
+    });
+    for (sp, c) in species.iter_mut().zip(crowns) {
+        sp.crown = Some(c);
+    }
 }

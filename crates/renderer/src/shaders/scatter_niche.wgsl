@@ -90,6 +90,21 @@ fn fl_weight(k: u32, s: FlSite) -> f32 {
     return su * su * fl_niche(k).prior;
 }
 
+// Expected crown areas (m², top and side) of one plant of `mask`: species
+// weighted like the pick (Placement::layer_crown).
+fn fl_layer_crown(mask: u32, s: FlSite) -> vec2<f32> {
+    var a = vec2<f32>(0.0);
+    var wsum = 0.0;
+    for (var k = 0u; k < FL_SPECIES; k = k + 1u) {
+        if ((mask >> k) & 1u) != 0u {
+            let w = fl_weight(k, s);
+            a += w * fl_niche(k).crown;
+            wsum += w;
+        }
+    }
+    return select(vec2<f32>(0.0), a / max(wsum, 1.0e-6), wsum > 1.0e-6);
+}
+
 // Best suitability among the species of `mask`.
 fn fl_layer_suit(mask: u32, s: FlSite) -> f32 {
     var best = 0.0;
@@ -143,7 +158,8 @@ struct ForestSite {
     shrubland: f32,
     // Canopy size factor (niche edge and forest core).
     stature: f32,
-    // Expected ground cover (tree · stature + 0.4 · shrub): far tint strength.
+    // Expected share of the view the crowns hide for the `view` given to
+    // sc_forest (Boolean model): the far tint strength.
     cover: f32,
     // Canopy colour for the far tint (linear).
     color: vec3<f32>,
@@ -152,8 +168,19 @@ struct ForestSite {
 // Forest field at base-cell coordinates (ci, cj) of `face`. `footprint` is
 // the sample spacing in base cells: octaves finer than about four samples
 // fade to their mean (band limit for the far tint); 0 for single plants.
-fn sc_forest(face: u32, ci: f32, cj: f32, footprint: f32, s: FlSite) -> ForestSite {
+// `view` = (gain, cosine of the view zenith angle): `cover` is the expected
+// share of the view hidden when gain × crown area per cell is the mean crown
+// count over a point (Placement::forest_view).
+fn sc_forest(face: u32, ci: f32, cj: f32, footprint: f32, s: FlSite, view: vec2<f32>) -> ForestSite {
     var site: ForestSite;
+    // Single plants (gain 0) skip the crown weights.
+    var crown_c = vec2<f32>(0.0);
+    var crown_s = vec2<f32>(0.0);
+    if view.x > 0.0 {
+        crown_c = fl_layer_crown(FL_CANOPY_MASK, s);
+        crown_s = fl_layer_crown(FL_SHRUB_MASK, s);
+    }
+    let cos_v = clamp(view.y, 0.05, 1.0);
     let suit = fl_layer_suit(FL_CANOPY_MASK, s);
     let f1 = smoothstep(100.0, 200.0, footprint);
     let f2 = smoothstep(25.0, 50.0, footprint);
@@ -204,7 +231,11 @@ fn sc_forest(face: u32, ci: f32, cj: f32, footprint: f32, s: FlSite) -> ForestSi
         site.boulder += w * bould;
         site.core += w * core;
         site.stature += w * stature;
-        site.cover += w * clamp(tree * stature + 0.4 * shrub, 0.0, 1.0);
+        // Crown area per cell seen at the view angle (ellipsoid-like crowns).
+        let top = tree * stature * stature * crown_c.x + shrub * crown_s.x;
+        let side = tree * stature * stature * crown_c.y + shrub * crown_s.y;
+        let seen = sqrt(top * top * cos_v * cos_v + side * side * (1.0 - cos_v * cos_v)) / cos_v;
+        site.cover += w * (1.0 - exp(-view.x * seen));
     }
     var c = vec3<f32>(0.0);
     var wsum = 0.0;

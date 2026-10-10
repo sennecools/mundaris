@@ -67,8 +67,9 @@ pub struct ForestSite {
     pub shrubland: f64,
     /// Canopy size factor (suitability edge and core).
     pub stature: f64,
-    /// Expected ground cover of the plants (`tree·stature + 0.4·shrub`):
-    /// the far tint strength.
+    /// Expected share of the view the plants' crowns hide (Boolean model:
+    /// 1 - exp(-gain · crown area per cell seen at the view angle)) for the
+    /// `view` given to [`Placement::forest_view`]: the far tint strength.
     pub cover: f64,
     /// Canopy colour for the far tint (linear RGB).
     pub color: [f64; 3],
@@ -97,9 +98,35 @@ impl Placement<'_> {
             .fold(0.0, f64::max)
     }
 
-    /// Forest field (mirror of `sc_forest`); `footprint` in base cells, 0
-    /// for single plants.
+    /// Forest field at the nominal view (straight down, all plants, 100 m²
+    /// cells); see [`Self::forest_view`].
     pub fn forest(&self, face: u32, ci: f64, cj: f64, footprint: f64, s: &Site) -> ForestSite {
+        self.forest_view(face, ci, cj, footprint, s, [NOMINAL_GAIN, 1.0])
+    }
+
+    /// Expected crown areas (m², top and side) of one plant of `layer`
+    /// here: species weighted like the pick, scale² averaged over the
+    /// niche range (mirror of `fl_layer_crown`).
+    fn layer_crown(&self, layer: Layer, s: &Site) -> [f64; 2] {
+        let mut a = [0.0; 2];
+        let mut wsum = 0.0;
+        for k in (0..self.count()).filter(|&k| self.species[k].niche.layer == layer) {
+            let su = self.suit(k, s);
+            let w = su * su * self.species[k].niche.prior;
+            let c = crown_m2(&self.species[k]);
+            a[0] += w * c[0];
+            a[1] += w * c[1];
+            wsum += w;
+        }
+        if wsum > 1e-6 { a.map(|v| v / wsum) } else { [0.0; 2] }
+    }
+
+    /// Forest field (mirror of `sc_forest`); `footprint` in base cells, 0
+    /// for single plants. `view` = (gain, cosine of the view zenith angle):
+    /// `cover` is the expected share of the view hidden by the crowns, with
+    /// `gain` × crown area per cell the mean crown count over a point (gain
+    /// = 1 / cell area when every plant is drawn).
+    pub fn forest_view(&self, face: u32, ci: f64, cj: f64, footprint: f64, s: &Site, view: [f64; 2]) -> ForestSite {
         let suit = self.layer_suit(Layer::Canopy, s);
         let f1 = smoothstep(100.0, 200.0, footprint);
         let f2 = smoothstep(25.0, 50.0, footprint);
@@ -123,6 +150,9 @@ impl Placement<'_> {
         let threshold = 1.0 - 0.72 * suit;
         let soft = 0.05;
         let mut site = ForestSite { canopy: suit, shrubland: shrubby, ..Default::default() };
+        let crown_c = self.layer_crown(Layer::Canopy, s);
+        let crown_s = self.layer_crown(Layer::Shrub, s);
+        let cos_v = view[1].clamp(0.05, 1.0);
         let nodes: &[f64] = if sigma > 0.0 { &NOISE_QUANTILES } else { &[0.0] };
         let w = 1.0 / nodes.len() as f64;
         for &x in nodes {
@@ -144,7 +174,12 @@ impl Placement<'_> {
             site.boulder += w * bould;
             site.core += w * core;
             site.stature += w * stature;
-            site.cover += w * (tree * stature + 0.4 * shrub).clamp(0.0, 1.0);
+            // Crown area per cell seen at the view angle (ellipsoid-like
+            // crowns: projected area sqrt(top² cos² + side² sin²), path 1/cos).
+            let top = tree * stature * stature * crown_c[0] + shrub * crown_s[0];
+            let side = tree * stature * stature * crown_c[1] + shrub * crown_s[1];
+            let seen = (top * top * cos_v * cos_v + side * side * (1.0 - cos_v * cos_v)).sqrt() / cos_v;
+            site.cover += w * (1.0 - (-view[0] * seen).exp());
         }
         // Canopy colour: species colours weighted like the species choice.
         let mut c = [0.0; 3];
@@ -201,12 +236,75 @@ pub const NOISE_QUANTILES: [f64; 16] = [
 /// Fallback canopy colour (the old M5 broadleaf tint).
 pub const DEFAULT_CANOPY: [f64; 3] = [0.04, 0.07, 0.025];
 
+/// Gain of [`Placement::forest`]: every plant drawn, 100 m² cells.
+pub const NOMINAL_GAIN: f64 = 0.01;
+
+/// Crown areas (m², top and side) at scale 1 when none was measured.
+pub const DEFAULT_CROWN: [f64; 2] = [25.0, 35.0];
+
+/// Expected crown areas (m², top and side) of one plant of the species:
+/// the measured LOD0 areas times scale² averaged over the niche range.
+pub fn crown_m2(sp: &SpeciesFile) -> [f64; 2] {
+    let (s0, s1) = sp.niche.scale;
+    let s2 = (s0 * s0 + s0 * s1 + s1 * s1) / 3.0;
+    sp.crown.unwrap_or(DEFAULT_CROWN).map(|a| a * s2)
+}
+
+/// Opaque projected areas (m², at scale 1) of a mesh seen from above and
+/// from the side (mean of two side views), rasterised on a 256² grid.
+pub fn crown_areas(mesh: &crate::Mesh) -> [f64; 2] {
+    const N: usize = 256;
+    let p: Vec<[f64; 3]> = mesh.vertices.iter().map(|v| v.position.map(|x| x as f64)).collect();
+    let area = |ax: usize, ay: usize| {
+        let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
+        for q in &p {
+            for (i, a) in [ax, ay].into_iter().enumerate() {
+                lo[i] = lo[i].min(q[a]);
+                hi[i] = hi[i].max(q[a]);
+            }
+        }
+        let cell = ((hi[0] - lo[0]).max(hi[1] - lo[1]) / N as f64).max(1e-6);
+        let mut hit = vec![false; N * N];
+        let edge = |a: [f64; 2], b: [f64; 2], x: f64, y: f64| (b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0]);
+        for t in mesh.indices.as_chunks::<3>().0 {
+            let v = [0, 1, 2].map(|i| {
+                let q = p[t[i] as usize];
+                [(q[ax] - lo[0]) / cell, (q[ay] - lo[1]) / cell]
+            });
+            let d = edge(v[0], v[1], v[2][0], v[2][1]);
+            if d.abs() < 1e-12 {
+                continue;
+            }
+            let lo_x = v.iter().map(|q| q[0]).fold(f64::MAX, f64::min).floor().max(0.0) as usize;
+            let hi_x = (v.iter().map(|q| q[0]).fold(f64::MIN, f64::max).ceil() as usize).min(N);
+            let lo_y = v.iter().map(|q| q[1]).fold(f64::MAX, f64::min).floor().max(0.0) as usize;
+            let hi_y = (v.iter().map(|q| q[1]).fold(f64::MIN, f64::max).ceil() as usize).min(N);
+            for y in lo_y..hi_y {
+                for x in lo_x..hi_x {
+                    let (cx, cy) = (x as f64 + 0.5, y as f64 + 0.5);
+                    let inside = [edge(v[1], v[2], cx, cy), edge(v[2], v[0], cx, cy), edge(v[0], v[1], cx, cy)]
+                        .iter()
+                        .all(|&w| w * d.signum() >= 0.0);
+                    if inside {
+                        hit[y * N + x] = true;
+                    }
+                }
+            }
+        }
+        hit.iter().filter(|&&h| h).count() as f64 * cell * cell
+    };
+    [area(0, 1), 0.5 * (area(0, 2) + area(1, 2))]
+}
+
 /// Canopy colour seen from afar: the organ colour darkened by crown
 /// self-shadowing.
 pub fn canopy_color(sp: &SpeciesFile) -> [f64; 3] {
     let o = sp.look.organ;
     let t = sp.look.organ_tip;
-    [0, 1, 2].map(|a| 0.75 * (0.6 * o[a] as f64 + 0.4 * t[a] as f64))
+    // Calibrated against native captures (2026-10-10, evidence lod-v4): a
+    // closed canopy of drawn crowns (lit, with self-shadow and gaps) has the
+    // radiance of flat lit ground of about 0.38 of the organ/tip colour mix.
+    [0, 1, 2].map(|a| 0.38 * (0.5 * o[a] as f64 + 0.5 * t[a] as f64))
 }
 
 /// Procedural far shape (M5 kinds): 0 conifer, 1 broadleaf, 2 shrub.
@@ -254,14 +352,14 @@ pub fn species_wgsl(species: &[SpeciesFile], rocks: &[crate::palette::PlanetRock
     out.push_str(&format!("const FL_CANOPY_MASK: u32 = {canopy}u;\n"));
     out.push_str(&format!("const FL_SHRUB_MASK: u32 = {shrub}u;\n"));
     out.push_str(
-        "struct FlNiche {\n    t: vec3<f32>,\n    m: vec3<f32>,\n    h: vec3<f32>,\n    slope: vec2<f32>,\n    soil: f32,\n    prior: f32,\n    scale: vec2<f32>,\n    far_kind: u32,\n    color: vec3<f32>,\n}\n",
+        "struct FlNiche {\n    t: vec3<f32>,\n    m: vec3<f32>,\n    h: vec3<f32>,\n    slope: vec2<f32>,\n    soil: f32,\n    prior: f32,\n    scale: vec2<f32>,\n    far_kind: u32,\n    color: vec3<f32>,\n    // Expected crown area (m2) of one plant from above and from the side.\n    crown: vec2<f32>,\n}\n",
     );
     out.push_str("fn fl_niche(k: u32) -> FlNiche {\n    switch k {\n");
     let row = |sp: &SpeciesFile| {
         let ni = &sp.niche;
         let c = canopy_color(sp);
         format!(
-            "FlNiche(vec3<f32>({}, {}, {}), vec3<f32>({}, {}, {}), vec3<f32>({}, {}, {}), vec2<f32>({}, {}), {}, {}, vec2<f32>({}, {}), {}u, vec3<f32>({}, {}, {}))",
+            "FlNiche(vec3<f32>({}, {}, {}), vec3<f32>({}, {}, {}), vec3<f32>({}, {}, {}), vec2<f32>({}, {}), {}, {}, vec2<f32>({}, {}), {}u, vec3<f32>({}, {}, {}), vec2<f32>({}, {}))",
             f(ni.temperature_c.min),
             f(ni.temperature_c.max),
             f(ni.temperature_c.falloff.max(1e-6)),
@@ -281,13 +379,15 @@ pub fn species_wgsl(species: &[SpeciesFile], rocks: &[crate::palette::PlanetRock
             f(c[0]),
             f(c[1]),
             f(c[2]),
+            f(crown_m2(sp)[0]),
+            f(crown_m2(sp)[1]),
         )
     };
     for (k, sp) in species.iter().take(n).enumerate() {
         out.push_str(&format!("        // {}\n        case {k}u: {{ return {}; }}\n", sp.name, row(sp)));
     }
     out.push_str(
-        "        default: { return FlNiche(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 0.0, 1.0), vec2<f32>(0.0, 0.0), 1.0, 0.0, vec2<f32>(1.0, 1.0), 1u, vec3<f32>(0.04, 0.07, 0.025)); }\n    }\n}\n",
+        "        default: { return FlNiche(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 0.0, 1.0), vec2<f32>(0.0, 0.0), 1.0, 0.0, vec2<f32>(1.0, 1.0), 1u, vec3<f32>(0.04, 0.07, 0.025), vec2<f32>(0.0, 0.0)); }\n    }\n}\n",
     );
     let nr = rocks.len().min(MAX_ROCKS);
     out.push_str(&format!("const FL_ROCKS: u32 = {nr}u;\n"));
