@@ -122,29 +122,47 @@ fn lf4_across(face: u32, i: i32, j: i32) -> vec4<f32> {
     return (q[0] * (1.0 - tx) + q[1] * tx) * (1.0 - ty) + (q[2] * (1.0 - tx) + q[3] * tx) * ty;
 }
 
-// cube_bicubic_on for the four lanes.
-fn lf4_bicubic_on(face: u32, u: f32, v: f32) -> vec4<f32> {
+// cube_bicubic_on for the four lanes, with derivatives: [value, d/dfx,
+// d/dfy] (`CubeMap::bicubic_d_on`).
+fn lf4_bicubic_d_on(face: u32, u: f32, v: f32) -> array<vec4<f32>, 3> {
     let n = f32(tile.noise.y);
     let fx = (u + 1.0) * 0.5 * n - 0.5;
     let fy = (v + 1.0) * 0.5 * n - 0.5;
     let x0 = i32(floor(fx));
     let y0 = i32(floor(fy));
-    let wx = catmull_rom(fx - floor(fx));
-    let wy = catmull_rom(fy - floor(fy));
-    var sum = vec4<f32>(0.0);
+    let tx = fx - floor(fx);
+    let ty = fy - floor(fy);
+    let wx = catmull_rom(tx);
+    let wy = catmull_rom(ty);
+    let dx = 0.5 * vec4<f32>(-3.0 * tx * tx + 4.0 * tx - 1.0, 9.0 * tx * tx - 10.0 * tx,
+        -9.0 * tx * tx + 8.0 * tx + 1.0, 3.0 * tx * tx - 2.0 * tx);
+    let dy = 0.5 * vec4<f32>(-3.0 * ty * ty + 4.0 * ty - 1.0, 9.0 * ty * ty - 10.0 * ty,
+        -9.0 * ty * ty + 8.0 * ty + 1.0, 3.0 * ty * ty - 2.0 * ty);
+    var out: array<vec4<f32>, 3>;
     for (var j = 0; j < 4; j = j + 1) {
         for (var i = 0; i < 4; i = i + 1) {
-            sum += wx[i] * wy[j] * lf4_across(face, x0 - 1 + i, y0 - 1 + j);
+            let value = lf4_across(face, x0 - 1 + i, y0 - 1 + j);
+            out[0] += wx[i] * wy[j] * value;
+            out[1] += dx[i] * wy[j] * value;
+            out[2] += wx[i] * dy[j] * value;
         }
     }
-    return sum;
+    return out;
 }
 
-// cube_sample (bicubic) for the four lanes.
-fn lf4_sample(d: vec3<f32>) -> vec4<f32> {
-    let band = 1.0 / f32(tile.noise.y);
+// Four lanes' bicubic values and tangent gradients per unit direction at
+// `d` (`CubeMap::bicubic_gradient`): [value, ∂x, ∂y, ∂z], one vec4 lane each.
+fn lf4_sample_grad(d: vec3<f32>) -> array<vec4<f32>, 4> {
+    let nf = f32(tile.noise.y);
+    let band = 1.0 / nf;
+    let half_n = 0.5 * nf;
     var sum = vec4<f32>(0.0);
+    var g = array<vec4<f32>, 3>(vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0));
+    var vdw = array<vec4<f32>, 3>(vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0));
     var total = 0.0;
+    var total_dw = vec3<f32>(0.0);
+    var out: array<vec4<f32>, 4>;
+    var done = false;
     for (var f = 0u; f < 6u; f = f + 1u) {
         let b = face_basis(f);
         let w = dot(d, b[0]);
@@ -157,34 +175,58 @@ fn lf4_sample(d: vec3<f32>) -> vec4<f32> {
         if t <= 0.0 {
             continue;
         }
-        let value = lf4_bicubic_on(f, u, v);
+        let r = lf4_bicubic_d_on(f, u, v);
+        let grad_u = (b[1] - b[0] * u) / w;
+        let grad_v = (b[2] - b[0] * v) / w;
+        var fg: array<vec4<f32>, 3>;
+        for (var a = 0u; a < 3u; a = a + 1u) {
+            fg[a] = (grad_u[a] * r[1] + grad_v[a] * r[2]) * half_n;
+        }
         if t >= 1.0 {
-            return value;
+            out[0] = r[0];
+            out[1] = fg[0];
+            out[2] = fg[1];
+            out[3] = fg[2];
+            done = true;
+            break;
         }
         let weight = t * t * (3.0 - 2.0 * t);
-        sum += weight * value;
+        var grad_m = grad_v * select(-1.0, 1.0, v >= 0.0);
+        if abs(u) >= abs(v) {
+            grad_m = grad_u * select(-1.0, 1.0, u >= 0.0);
+        }
+        let dw = grad_m * (-6.0 * t * (1.0 - t) / (2.0 * band));
+        sum += weight * r[0];
         total += weight;
+        total_dw += dw;
+        for (var a = 0u; a < 3u; a = a + 1u) {
+            g[a] += weight * fg[a];
+            vdw[a] += dw[a] * r[0];
+        }
     }
-    return sum / max(total, 1.0e-30);
+    if !done {
+        let tot = max(total, 1.0e-30);
+        out[0] = sum / tot;
+        for (var a = 0u; a < 3u; a = a + 1u) {
+            out[a + 1u] = (g[a] + vdw[a]) / tot - total_dw[a] * (sum / (tot * tot));
+        }
+    }
+    // Tangent projection per lane.
+    let along = d.x * out[1] + d.y * out[2] + d.z * out[3];
+    out[1] -= d.x * along;
+    out[2] -= d.y * along;
+    out[3] -= d.z * along;
+    return out;
 }
 
 // Values and gradients (per metre) of the four lanes `ids` at direction `d`;
 // lane c is (value, gradient) in out[c].
 fn lf4_field(ids: vec4<u32>, d: vec3<f32>) -> array<vec4<f32>, 4> {
     lf4_ids = ids;
-    let delta = 0.5 / f32(tile.noise.y);
-    let e1 = any_orthonormal(d);
-    let e2 = cross(d, e1);
-    var offsets = array<vec3<f32>, 5>(vec3<f32>(0.0), e1, -e1, e2, -e2);
-    var s: array<vec4<f32>, 5>;
-    for (var i = 0u; i < 5u; i = i + 1u) {
-        s[i] = lf4_sample(normalize(d + offsets[i] * delta));
-    }
-    let g1 = s[1] - s[2];
-    let g2 = s[3] - s[4];
+    let s = lf4_sample_grad(d);
     var out: array<vec4<f32>, 4>;
     for (var c = 0u; c < 4u; c = c + 1u) {
-        out[c] = vec4<f32>(s[0][c], (e1 * g1[c] + e2 * g2[c]) / (2.0 * delta * tile.scale.x));
+        out[c] = vec4<f32>(s[0][c], vec3<f32>(s[1][c], s[2][c], s[3][c]) / tile.scale.x);
     }
     return out;
 }

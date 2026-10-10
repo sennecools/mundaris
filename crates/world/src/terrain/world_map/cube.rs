@@ -6,8 +6,8 @@
 //! along increasing v and columns along increasing u. Texel (i, j) covers
 //! u ∈ [−1 + 2i/n, −1 + 2(i+1)/n] and its value is taken at the centre.
 
-use glam::DVec3;
 use astrum_math::surface::CubeFace;
+use glam::DVec3;
 
 /// One value per texel of a six-face cube map.
 #[derive(Debug, Clone, PartialEq)]
@@ -146,6 +146,96 @@ impl CubeMap<f32> {
         sum
     }
 
+    /// Catmull-Rom value of `face` at chart (u, v) and its derivatives with
+    /// respect to the texel coordinates (fx, fy).
+    fn bicubic_d_on(&self, face: usize, u: f64, v: f64) -> (f64, f64, f64) {
+        let n = self.n as f64;
+        let fx = (u + 1.0) * 0.5 * n - 0.5;
+        let fy = (v + 1.0) * 0.5 * n - 0.5;
+        let (x0, y0) = (fx.floor() as i64, fy.floor() as i64);
+        let (tx, ty) = (fx - x0 as f64, fy - y0 as f64);
+        let weights = |t: f64| {
+            let (t2, t3) = (t * t, t * t * t);
+            [
+                0.5 * (-t3 + 2.0 * t2 - t),
+                0.5 * (3.0 * t3 - 5.0 * t2 + 2.0),
+                0.5 * (-3.0 * t3 + 4.0 * t2 + t),
+                0.5 * (t3 - t2),
+            ]
+        };
+        let derivatives = |t: f64| {
+            let t2 = t * t;
+            [
+                0.5 * (-3.0 * t2 + 4.0 * t - 1.0),
+                0.5 * (9.0 * t2 - 10.0 * t),
+                0.5 * (-9.0 * t2 + 8.0 * t + 1.0),
+                0.5 * (3.0 * t2 - 2.0 * t),
+            ]
+        };
+        let (wx, wy, dx, dy) = (weights(tx), weights(ty), derivatives(tx), derivatives(ty));
+        let (mut sum, mut sx, mut sy) = (0.0, 0.0, 0.0);
+        for j in 0..4 {
+            for i in 0..4 {
+                let value = self.value_across(face, x0 - 1 + i as i64, y0 - 1 + j as i64);
+                sum += wx[i] * wy[j] * value;
+                sx += dx[i] * wy[j] * value;
+                sy += wx[i] * dy[j] * value;
+            }
+        }
+        (sum, sx, sy)
+    }
+
+    /// [`Self::bicubic`] and its tangent gradient per unit direction, from
+    /// the analytic Catmull-Rom derivative: on face (normal b0, axes b1, b2),
+    /// `∇u = (b1 − u·b0)/(d·b0)` and `∂fx/∂u = n/2`. In the one-texel blend
+    /// band at face edges the blend `Σ wf/W` differentiates as
+    /// `(Σ w∇f + Σ f∇w)/W − (Σ wf)(Σ ∇w)/W²`, with `w = s(t)` and
+    /// `t = (1 − max(|u|, |v|) + band)/(2·band)`.
+    pub fn bicubic_gradient(&self, direction: DVec3) -> (f64, DVec3) {
+        let band = 1.0 / self.n as f64;
+        let half_n = 0.5 * self.n as f64;
+        let (mut sum, mut gradient, mut total) = (0.0, DVec3::ZERO, 0.0);
+        let (mut value_dw, mut total_dw) = (DVec3::ZERO, DVec3::ZERO);
+        for (face, f) in CubeFace::ALL.iter().enumerate() {
+            let [normal, u_axis, v_axis] = f.basis();
+            let w = direction.dot(normal);
+            if w <= 0.0 {
+                continue;
+            }
+            let (u, v) = (direction.dot(u_axis) / w, direction.dot(v_axis) / w);
+            let t = (1.0 - u.abs().max(v.abs()) + band) / (2.0 * band);
+            let weight = if t >= 1.0 {
+                1.0
+            } else if t <= 0.0 {
+                continue;
+            } else {
+                t * t * (3.0 - 2.0 * t)
+            };
+            let (value, dfx, dfy) = self.bicubic_d_on(face, u, v);
+            let grad_u = (u_axis - normal * u) / w;
+            let grad_v = (v_axis - normal * v) / w;
+            let g = (grad_u * dfx + grad_v * dfy) * half_n;
+            if weight >= 1.0 {
+                return (value, g - direction * direction.dot(g));
+            }
+            // ∇w = s'(t)·∇t, ∇t = −∇max(|u|, |v|)/(2·band).
+            let grad_m = if u.abs() >= v.abs() {
+                grad_u * u.signum()
+            } else {
+                grad_v * v.signum()
+            };
+            let dw = grad_m * (-6.0 * t * (1.0 - t) / (2.0 * band));
+            sum += weight * value;
+            gradient += g * weight;
+            total += weight;
+            value_dw += dw * value;
+            total_dw += dw;
+        }
+        let total = total.max(1e-300);
+        let g = (gradient + value_dw) / total - total_dw * (sum / (total * total));
+        (sum / total, g - direction * direction.dot(g))
+    }
+
     /// Bilinear sample at `direction`, continuous across face edges.
     pub fn bilinear(&self, direction: DVec3) -> f64 {
         self.across_faces(direction, |f, u, v| self.bilinear_on(f, u, v))
@@ -233,6 +323,57 @@ mod tests {
         for (k, d) in texel_directions(n).iter().enumerate() {
             assert_eq!(map.nearest(*d), k as u32);
         }
+    }
+
+    #[test]
+    fn bicubic_gradient_matches_the_value_and_central_differences() {
+        let n = 64;
+        let f = |d: DVec3| (3.0 * d.x).sin() + d.y * d.z + 0.5 * (2.0 * d.z).cos();
+        let mut map = CubeMap::new(n, 0.0f32);
+        for (k, d) in texel_directions(n).iter().enumerate() {
+            map.data_mut()[k] = f(*d) as f32;
+        }
+        let delta = 0.5 / n as f64;
+        let mut worst = (0.0f64, 0.0f64);
+        let mut edge_errors = Vec::new();
+        for k in 0..2000 {
+            // Fibonacci directions: interiors, edges and corners.
+            let y = 1.0 - 2.0 * (k as f64 + 0.5) / 2000.0;
+            let r = (1.0 - y * y).sqrt();
+            let a = 2.399_963_229_728_653 * k as f64;
+            let d = DVec3::new(r * a.cos(), y, r * a.sin());
+            let (value, gradient) = map.bicubic_gradient(d);
+            assert_eq!(value, map.bicubic(d));
+            let e1 = d.any_orthonormal_vector();
+            let e2 = d.cross(e1);
+            let at = |v: DVec3| map.bicubic((d + v * delta).normalize());
+            let fd = e1 * ((at(e1) - at(-e1)) / (2.0 * delta))
+                + e2 * ((at(e2) - at(-e2)) / (2.0 * delta));
+            let error = (gradient - fd).length() / (1.0 + fd.length());
+            let (u, v) = (locate(d).1, locate(d).2);
+            let edge = u.abs().max(v.abs()) > 1.0 - 2.0 / n as f64;
+            if edge {
+                worst.1 = worst.1.max(error);
+                edge_errors.push(error);
+            } else {
+                worst.0 = worst.0.max(error);
+            }
+        }
+        edge_errors.sort_by(f64::total_cmp);
+        let p95 = edge_errors[edge_errors.len() * 95 / 100];
+        println!(
+            "bicubic gradient vs central differences: interior {:.2e}, edge band p95 {p95:.2e}, max {:.2e}",
+            worst.0, worst.1
+        );
+        // Central differences straddle the kinks of max(|u|, |v|) at face
+        // corners and the clamped cross-face taps, so the edge band is
+        // checked by quantile.
+        assert!(worst.0 < 5e-3, "interior {}", worst.0);
+        assert!(
+            p95 < 1e-2 && worst.1 < 0.1,
+            "edge band p95 {p95}, max {}",
+            worst.1
+        );
     }
 
     #[test]

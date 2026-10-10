@@ -4,8 +4,8 @@
 //!
 //! Prototype shortcuts (hardened in Step 6b): weights are evaluated per
 //! sample from level-0 fields instead of the Tier A weight run and its
-//! B-spline lookup; field gradients are central differences over a quarter
-//! texel of the bicubic level-0 maps; the weight gradient is left out of the
+//! B-spline lookup; field gradients are the analytic gradients of the bicubic
+//! level-0 maps; the weight gradient is left out of the
 //! composed gradient; the landform seed comes from the continent seed.
 use super::eval::{Dual, FieldSource, LandformParams};
 use super::expr::{RuleFields, field};
@@ -77,13 +77,10 @@ impl MapsFields {
 
     /// Value and body-space gradient (per metre) of `map` at direction `d`.
     fn sample(&self, map: &CubeMap<f32>, d: DVec3) -> Dual {
-        let delta = 0.5 / map.n() as f64;
-        let e1 = d.any_orthonormal_vector();
-        let e2 = d.cross(e1);
-        let at = |v: DVec3| map.bicubic((d + v * delta).normalize());
-        let g =
-            e1 * ((at(e1) - at(-e1)) / (2.0 * delta)) + e2 * ((at(e2) - at(-e2)) / (2.0 * delta));
-        Dual::new(map.bicubic(d), g / self.radius_m)
+        // Analytic Catmull-Rom gradient (`CubeMap::bicubic_gradient`); the
+        // GPU producer mirrors it.
+        let (value, gradient) = map.bicubic_gradient(d);
+        Dual::new(value, gradient / self.radius_m)
     }
 
     /// Weight-rule inputs at direction `d`.
