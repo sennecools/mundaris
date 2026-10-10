@@ -8,8 +8,7 @@
 // Plants keep their size at every tier. Fades are screen-door dithers:
 // e1.w = rank fade (plant dissolving as the thinning drops it), up.w = tier
 // split of a cross-fade (> 0 keeps dither < s, < 0 keeps dither ≥ 1 + s), so
-// the two tiers of one plant cover complementary pixels (per MSAA sample in
-// the main pass: fl_sample_mask).
+// the two tiers of one plant cover complementary pixels.
 
 @group(3) @binding(1) var flora_albedo: texture_2d_array<f32>;
 @group(3) @binding(2) var flora_normal: texture_2d_array<f32>;
@@ -37,46 +36,6 @@ fn fl_keep(px: vec2<f32>, seed: u32, fade: f32, split: f32) -> bool {
     }
     let d = fl_dither(px.yx + vec2<f32>(17.0, 31.0), seed ^ 0x2c1b3c6du);
     return select(d >= 1.0 + split, (d < split), (split > 0.0));
-}
-
-// Per-sample version for the MSAA main pass: each covered sample i gets its
-// own thresholds (the pixel's dithers shifted by i·golden ratio), so a
-// 4× pixel resolves fades in quarter steps instead of an on/off stipple. The
-// split thresholds are the same for both tiers of a plant, so their samples
-// stay complementary. With one sample it equals fl_keep.
-fn fl_sample_mask(px: vec2<f32>, seed: u32, fade: f32, split: f32, covered: u32) -> u32 {
-    let d = fl_dither(px, seed);
-    let d2 = fl_dither(px.yx + vec2<f32>(17.0, 31.0), seed ^ 0x2c1b3c6du);
-    var mask = 0u;
-    for (var i = 0u; i < 8u; i = i + 1u) {
-        if ((covered >> i) & 1u) == 0u {
-            continue;
-        }
-        let o = f32(i) * 0.618034;
-        let t = fract(d + o);
-        let t2 = fract(d2 + o);
-        if t < fade && select(t2 >= 1.0 + split, (t2 < split), (split > 0.0)) {
-            mask = mask | (1u << i);
-        }
-    }
-    return mask;
-}
-
-// Main-pass output with the dithered sample mask.
-struct FloraScene {
-    @location(0) direct: vec4<f32>,
-    @location(1) normal: vec2<f32>,
-    @location(2) ambient: vec4<f32>,
-    @builtin(sample_mask) mask: u32,
-}
-
-fn fl_scene(s: SceneOut, mask: u32) -> FloraScene {
-    var out: FloraScene;
-    out.direct = s.direct;
-    out.normal = s.normal;
-    out.ambient = s.ambient;
-    out.mask = mask;
-    return out;
 }
 
 struct FloraIn {
@@ -127,9 +86,8 @@ fn vs_flora(v: FloraIn, @builtin(instance_index) index: u32) -> FloraOut {
 }
 
 @fragment
-fn fs_flora(input: FloraOut, @builtin(sample_mask) covered: u32) -> FloraScene {
-    let mask = fl_sample_mask(input.clip_position.xy, bitcast<u32>(input.fade.z), input.fade.x, input.fade.y, covered);
-    if mask == 0u {
+fn fs_flora(input: FloraOut) -> SceneOut {
+    if !fl_keep(input.clip_position.xy, bitcast<u32>(input.fade.z), input.fade.x, input.fade.y) {
         discard;
     }
     var n = normalize(input.normal);
@@ -137,7 +95,7 @@ fn fs_flora(input: FloraOut, @builtin(sample_mask) covered: u32) -> FloraScene {
     if dot(n, input.view_pos) > 0.0 {
         n = -n;
     }
-    return fl_scene(shade(input.view_pos, n, input.up, input.albedo, 0.0, true), mask);
+    return shade(input.view_pos, n, input.up, input.albedo, 0.0, true);
 }
 
 // Shadow casters: same instances, same dither.
@@ -249,15 +207,14 @@ fn fl_impostor_sample(input: ImpostorOut) -> vec4<f32> {
 }
 
 @fragment
-fn fs_impostor(input: ImpostorOut, @builtin(sample_mask) covered: u32) -> FloraScene {
+fn fs_impostor(input: ImpostorOut) -> SceneOut {
     let a = fl_impostor_sample(input);
-    let mask = fl_sample_mask(input.clip_position.xy, bitcast<u32>(input.fade.z), input.fade.x, input.fade.y, covered);
-    if a.a < 0.5 || mask == 0u {
+    if a.a < 0.5 || !fl_keep(input.clip_position.xy, bitcast<u32>(input.fade.z), input.fade.x, input.fade.y) {
         discard;
     }
     let nt = textureSampleLevel(flora_normal, flora_sampler, input.uv, i32(input.layer), 0.0).xyz * 2.0 - 1.0;
     let n = normalize(input.e1 * nt.x + input.e2 * nt.y + input.up * nt.z);
-    return fl_scene(shade(input.view_pos, n, input.up, a.rgb * input.tint, 0.0, true), mask);
+    return shade(input.view_pos, n, input.up, a.rgb * input.tint, 0.0, true);
 }
 
 @fragment
