@@ -288,9 +288,9 @@ pub struct Palette {
 /// Style pass: foliage lightness band and chroma cap by the realism dial.
 fn style(lch: [f64; 3], realism: f64) -> [f64; 3] {
     // Scale (not clamp) so dim-star foliage stays darker than sunlit green.
-    let l = (0.75 * lch[0]).clamp(0.22, 0.47);
+    let l = (0.75 * lch[0]).clamp(0.22, 0.45);
     // Stylised floor: never grey foliage (no "blobs of nothingness").
-    let c = (lch[1] * (1.0 + 0.6 * realism)).clamp(0.05 + 0.03 * realism, 0.08 + 0.08 * realism);
+    let c = (lch[1] * (1.0 + 0.6 * realism)).clamp(0.05 + 0.03 * realism, 0.07 + 0.05 * realism);
     [l, c, lch[2]]
 }
 
@@ -345,6 +345,13 @@ impl Palette {
             leaf[0] += 0.03;
         }
         leaf[0] -= 0.05 * coldness;
+        // Needles carry a thick waxy cuticle: glaucous, bluer and a little
+        // darker (blue-spruce effect).
+        if sp.genome.organ == crate::genome::OrganKind::Needle {
+            leaf[2] = (leaf[2] + 28.0).rem_euclid(360.0);
+            leaf[0] -= 0.03;
+            leaf[1] *= 0.85;
+        }
         let tip = [leaf[0] + 0.07, leaf[1] * 1.15, (leaf[2] + 4.0 * st.signed(1, 0)).rem_euclid(360.0)];
         let bark = [self.bark[0] + 0.04 * st.signed(2, 0), self.bark[1], (self.bark[2] + 12.0 * st.signed(3, 0)).rem_euclid(360.0)];
         let accent = [self.accent[0], self.accent[1], (self.accent[2] + 20.0 * st.signed(4, 0)).rem_euclid(360.0)];
