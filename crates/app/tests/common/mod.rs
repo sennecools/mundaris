@@ -7,25 +7,54 @@ use astrum_renderer::{AtlasProduceJob, AtlasSource, GpuContext, TerrainAtlasConf
 use astrum_world::terrain::producer::ProducerRecipe;
 use std::sync::Arc;
 
-/// Hardware adapter first, then the platform software adapter (WARP on
-/// Windows). With neither, the test fails unless `ASTRUM_SKIP_GPU_TESTS=1`
-/// explicitly allows skipping, so a missing GPU is never a silent pass.
+/// The hardware adapter, retried briefly because device creation can fail
+/// while other processes load the GPU. A software adapter (WARP on Windows)
+/// computes measurably different results, so tests use it only when asked:
+/// `ASTRUM_SOFTWARE_GPU=1` forces it (with WGPU_BACKEND=dx12 on Windows:
+/// WARP, to tell driver behaviour from ours), `ASTRUM_ALLOW_SOFTWARE_GPU=1`
+/// allows it as a fallback on machines without a GPU. Landing on it otherwise
+/// fails the test instead of silently comparing different numbers. With no
+/// adapter at all, the test fails unless `ASTRUM_SKIP_GPU_TESTS=1` explicitly
+/// allows skipping, so a missing GPU is never a silent pass.
 pub fn gpu() -> Option<GpuContext> {
-    // ASTRUM_SOFTWARE_GPU=1 forces the software adapter (with
-    // WGPU_BACKEND=dx12 on Windows: WARP), to tell driver behaviour from ours.
-    let context = if std::env::var("ASTRUM_SOFTWARE_GPU").as_deref() == Ok("1") {
+    let flag = |name: &str| std::env::var(name).as_deref() == Ok("1");
+    let forced = flag("ASTRUM_SOFTWARE_GPU");
+    let allowed = forced || flag("ASTRUM_ALLOW_SOFTWARE_GPU");
+    let context = if forced {
         GpuContext::new_software()
     } else {
-        GpuContext::new().or_else(|_| GpuContext::new_software())
+        let mut attempt = GpuContext::new();
+        for _ in 0..3 {
+            if attempt.is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            attempt = GpuContext::new();
+        }
+        match attempt {
+            Err(error) if allowed => {
+                println!("hardware adapter failed ({error}); software fallback allowed");
+                GpuContext::new_software()
+            }
+            other => other,
+        }
     };
-    if let Ok(context) = context {
-        let info = context.adapter.get_info();
-        println!("adapter: {} ({:?})", info.name, info.backend);
-        return Some(context);
+    match context {
+        Ok(context) => {
+            let info = context.adapter.get_info();
+            println!("adapter: {} ({:?})", info.name, info.backend);
+            assert!(
+                allowed || info.device_type != wgpu::DeviceType::Cpu,
+                "landed on the software adapter {}; set ASTRUM_ALLOW_SOFTWARE_GPU=1 to allow it",
+                info.name
+            );
+            return Some(context);
+        }
+        Err(error) => println!("no GPU context: {error}"),
     }
     assert!(
         std::env::var("ASTRUM_SKIP_GPU_TESTS").as_deref() == Ok("1"),
-        "no GPU or software adapter; set ASTRUM_SKIP_GPU_TESTS=1 to skip explicitly"
+        "no usable GPU adapter; set ASTRUM_SKIP_GPU_TESTS=1 to skip explicitly"
     );
     println!("SKIPPED: no adapter and ASTRUM_SKIP_GPU_TESTS=1");
     None
