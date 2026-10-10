@@ -1219,6 +1219,7 @@ impl TerrainAtlasRenderer {
             label: Some("Terrain plants cull"),
             source: wgpu::ShaderSource::Wgsl(CULL_SHADER.into()),
         });
+        let started = std::time::Instant::now();
         let scatter_cull = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Terrain plants cull"),
             layout: Some(&cull_layout),
@@ -1227,6 +1228,7 @@ impl TerrainAtlasRenderer {
             compilation_options: Default::default(),
             cache: None,
         });
+        log_pipeline_time("cs_scatter", started);
         let scatter_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Terrain scatter (prototype trees and boulders)"),
             layout: Some(&scatter_draw_layout),
@@ -2849,6 +2851,14 @@ fn upload_source(
         world_fields: None,
         hydrology,
     })
+}
+
+/// `ASTRUM_PIPELINE_TIMING=1` prints how long each slow pipeline took to
+/// create (driver shader compilation; cached by the driver afterwards).
+fn log_pipeline_time(name: &str, started: std::time::Instant) {
+    if std::env::var_os("ASTRUM_PIPELINE_TIMING").is_some() {
+        eprintln!("pipeline {name}: {:.0} ms", started.elapsed().as_secs_f64() * 1e3);
+    }
 }
 
 /// PROTOTYPE (M5 Life): `ASTRUM_NO_SCATTER=1` turns the plant draw off (for

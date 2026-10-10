@@ -53,6 +53,21 @@ impl HydrologyJobs {
                     started.elapsed().as_secs_f64() * 1e3,
                     words.len() * 4 / 1024
                 );
+                // Dev aid: where to look (largest river upstream of its
+                // mouth, deepest valley), as unit body directions.
+                let vertices = &result.rivers.vertices;
+                let pick = |key: &dyn Fn(&hydrology::RiverVertex) -> f64| {
+                    vertices
+                        .iter()
+                        .filter(|v| v.mouth == hydrology::rivers::Mouth::None)
+                        .max_by(|a, b| key(a).total_cmp(&key(b)))
+                        .map(|v| v.pos.to_array())
+                };
+                eprintln!(
+                    "hydrology: largest river at {:?}, deepest valley at {:?}",
+                    pick(&|v| v.discharge_km2),
+                    pick(&|v| v.incision_m)
+                );
                 let _ = sender.send(words);
             });
         if spawned.is_err() {

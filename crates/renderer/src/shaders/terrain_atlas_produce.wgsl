@@ -741,7 +741,7 @@ fn world_albedo(d: vec3<f32>, normal: vec3<f32>, local: vec3<f32>, height: f32) 
     let stride = 6u * cube_level_n * cube_level_n;
     let detail = climate_detail(local);
     let t = cube_sample(tile.noise.z + stride, d, false) + detail.x;
-    let m = cube_sample(tile.noise.z + 2u * stride, d, false) + detail.y;
+    let m = riparian_moisture(cube_sample(tile.noise.z + 2u * stride, d, false) + detail.y);
     let slope = acos(clamp(dot(normal, d), -1.0, 1.0));
     let snow = (1.0 - smoothstep(surface_f32(8u) - surface_f32(9u), surface_f32(8u) + surface_f32(9u), t))
         * (1.0 - smoothstep(surface_f32(10u), surface_f32(11u), slope));
@@ -796,7 +796,7 @@ fn page_climate(st: vec2<f32>) -> vec4<f32> {
     cube_level_n = tile.noise.w;
     let stride = 6u * cube_level_n * cube_level_n;
     let t = cube_sample(tile.noise.z + stride, d, false);
-    let m = cube_sample(tile.noise.z + 2u * stride, d, false);
+    let m = riparian_moisture(cube_sample(tile.noise.z + 2u * stride, d, false));
     cube_level_n = tile.noise.y;
     let run = 6u * cube_level_n * cube_level_n;
     let east = cube_sample(3u * run, d, false);
@@ -831,11 +831,13 @@ fn evaluate(st: vec2<f32>) -> vec4<f32> {
     // PROTOTYPE (M3 Water): carve rivers into world tiles and lay lakes and
     // river ribbons as flat water (river_carve.wgsl).
     sample_water_depth = -1.0e30;
+    sample_riparian = 0.0;
     if tile.info.y == 2u {
         let texel = tile.scale.x * tile.face_u.w / f32(dispatch_cells);
         let carve = river_carve(n, sample_value.height, sample_value.gradient, 0.75 * texel);
         sample_value.height = carve.height;
         sample_value.gradient = carve.gradient;
+        sample_riparian = carve.riparian;
         let ground_gradient = carve.gradient - n * dot(n, carve.gradient);
         sample_ground_slope = length(ground_gradient) / (tile.scale.x + carve.height);
         if carve.water > -1.0e29 {
@@ -855,6 +857,13 @@ fn evaluate(st: vec2<f32>) -> vec4<f32> {
 // evaluated sample (-1e30 without lake or river water) and the ground slope,
 // for the water contour in page_water.
 var<private> sample_water_depth: f32;
+// PROTOTYPE (M3 Water): riparian corridor strength at the last sample; wets
+// the climate moisture for colour and plants (gallery forests in dry land).
+var<private> sample_riparian: f32;
+
+fn riparian_moisture(m: f32) -> f32 {
+    return mix(m, max(m, 0.72), sample_riparian);
+}
 var<private> sample_ground_slope: f32;
 
 fn ordered(value: f32) -> u32 {
