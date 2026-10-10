@@ -1107,12 +1107,18 @@ impl CelestialRenderer {
             .filter(|_| settings.shadows.enabled && storage.lighting.is_some())
             .filter(|_| !storage.passthrough || storage.view_mode == 11);
         let cascades = shadow.map(|s| s.cascades);
+        // The stylised look of the body whose atmosphere surrounds the camera.
+        let look = storage
+            .atmosphere
+            .as_ref()
+            .map_or_else(crate::StylisedLook::default, |a| a.look);
         queue.write_buffer(
             &self.lighting,
             0,
             &crate::lighting::pack_lighting(
                 storage.lighting.as_ref(),
                 &settings,
+                &look,
                 cascades.as_ref(),
                 near,
                 storage.view_mode,
@@ -1250,6 +1256,7 @@ impl CelestialRenderer {
                 passthrough: storage.passthrough,
                 taa,
                 atmosphere,
+                look,
             },
             timestamps,
         );

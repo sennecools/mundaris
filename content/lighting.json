@@ -60,6 +60,30 @@
         "mie_per_m": 2.1e-5,
         "mie_scale_height_m": 1200,
         "mie_g": 0.76
+      },
+      "look": {
+        "sky_tint": [
+          0.7,
+          1.05,
+          1.35
+        ],
+        "sky_saturation": 1.8,
+        "haze": 1.4,
+        "sky": 2.0,
+        "shadow_sky": 3.0,
+        "bloom": 2.5,
+        "grade_lift": [
+          0.02,
+          0.018,
+          0.055
+        ],
+        "grade_gain": [
+          1.06,
+          1.0,
+          0.94
+        ],
+        "grade_saturation": 1.5,
+        "grade_contrast": 1.0
       }
     }
   }

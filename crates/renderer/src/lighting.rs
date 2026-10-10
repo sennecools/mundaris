@@ -318,6 +318,7 @@ pub(crate) const LIGHTING_BYTES: usize = 528;
 pub(crate) fn pack_lighting(
     lighting: Option<&FrameLighting>,
     settings: &crate::RenderSettings,
+    look: &crate::StylisedLook,
     cascades: Option<&Cascades>,
     near_m: f64,
     view_mode: u32,
@@ -400,13 +401,17 @@ pub(crate) fn pack_lighting(
     }
     if let Some(l) = lighting {
         // Row 32 (after the cascade matrices): sky light.
-        // The stylised look triples the sky light (lifted, sky-coloured
-        // shadows) and turns on the soft rim light (w = 1).
+        // The stylised look scales the sky light by the planet's `shadow_sky`
+        // (lifted, sky-coloured shadows) and turns on the soft rim (w = 1).
         let stylised = settings.look.preset == crate::LookPreset::Stylised;
         let sky = (l.sky_fraction
             * f64::from(settings.lighting.ambient_scale)
             * f64::from(settings.lighting.sky_scale)
-            * if stylised { 3.0 } else { 1.0 }) as f32;
+            * if stylised {
+                f64::from(look.shadow_sky)
+            } else {
+                1.0
+            }) as f32;
         floats[128..132].copy_from_slice(&[
             l.sky_color[0] * sky,
             l.sky_color[1] * sky,
