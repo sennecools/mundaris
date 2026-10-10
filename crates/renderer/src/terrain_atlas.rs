@@ -2071,6 +2071,62 @@ fn f16_to_f32(bits: u16) -> f32 {
     }
 }
 
+/// Diagnostic: seconds per producer batch on one long-lived producer. Each
+/// batch of `jobs` (at most `config.layers`) is prepared, submitted and
+/// waited for; `warmup` untimed batches first (pipelines, Tier A bake).
+#[doc(hidden)]
+pub fn producer_batch_seconds_for_validation(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    config: TerrainAtlasConfig,
+    sources: &[(u64, Arc<AtlasSource>)],
+    batches: &[Vec<AtlasProduceJob>],
+    warmup: usize,
+) -> Result<Vec<f64>, String> {
+    let projection_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("Timing projection"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: wgpu::BufferSize::new(64),
+            },
+            count: None,
+        }],
+    });
+    let mut atlas = TerrainAtlasRenderer::new(
+        device,
+        &crate::post::SCENE_TARGETS,
+        &projection_layout,
+        &crate::celestial::lighting_layout(device),
+        &crate::shadows::ShadowMaps::light_layout(device),
+        config,
+    )?;
+    let mut times = Vec::new();
+    for (index, jobs) in batches.iter().enumerate() {
+        let frame = TerrainAtlasFrame {
+            config: Some(config),
+            sources: sources.to_vec(),
+            jobs: jobs.clone(),
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let mut encoder = device.create_command_encoder(&Default::default());
+        atlas.prepare(device, queue, &mut encoder, &frame)?;
+        queue.submit([encoder.finish()]);
+        atlas.on_submitted();
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| e.to_string())?;
+        if index >= warmup {
+            times.push(started.elapsed().as_secs_f64());
+        }
+    }
+    Ok(times)
+}
+
 /// Run the producer for `jobs` on a caller-owned device and read every job's
 /// layer back. Validation-only path: blocking, allocates per call.
 pub fn produce_for_validation(

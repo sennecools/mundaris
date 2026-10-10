@@ -56,34 +56,154 @@ fn lf_field_run(field: u32) -> vec2<u32> {
     }
 }
 
-// Bicubic level-0 value of `field` at unit direction `d`. The only
-// cube_sample call site of the landform code: drivers inline every call
-// site, so callers loop over this one (pipeline compile time).
-fn lf_value(field: u32, d: vec3<f32>) -> f32 {
-    let saved = cube_level_n;
-    cube_level_n = tile.noise.y;
-    let rd = lf_field_run(field);
-    cube_decode = rd.y;
-    let v = cube_sample(rd.x * 6u * cube_level_n * cube_level_n, d, true);
-    cube_decode = 0u;
-    cube_level_n = saved;
-    return v;
+// Field sampling (prototype). Fields at one direction share the cube-map
+// addressing (face choice, cross-face texels, weights), so four fields are
+// sampled per addressing pass, and every field at the sample direction is
+// cached once per sample (`lf_fill_cache`). Same formulas as cube_sample and
+// `MapsFields` (bicubic level 0; gradients by central differences over a
+// quarter texel). Few call sites, because drivers inline every one.
+
+// Per-sample cache: (value, gradient per metre) by field id at the sample
+// direction.
+var<private> lf_cache: array<vec4<f32>, 9>;
+// Field ids of the four lanes of a 4-field sample (> 8: unused lane).
+var<private> lf4_ids: vec4<u32>;
+
+// The four lanes' decoded values of texel `index` of a level-0 run.
+fn lf4_fetch(index: u32) -> vec4<f32> {
+    let n = tile.noise.y;
+    let len = 6u * n * n;
+    var out = vec4<f32>(0.0);
+    for (var c = 0u; c < 4u; c = c + 1u) {
+        let id = lf4_ids[c];
+        if id > 8u {
+            continue;
+        }
+        let rd = lf_field_run(id);
+        let word = world_fields[rd.x * len + index];
+        var v = bitcast<f32>(word);
+        if rd.y == 1u {
+            v = f32(bitcast<i32>(word)) / 16.0;
+        } else if rd.y >= 2u {
+            v = f32((word >> (8u * (rd.y - 2u))) & 255u) / 255.0;
+        }
+        out[c] = v;
+    }
+    return out;
 }
 
-// Bicubic level-0 value of `field` at unit direction `d` and its gradient
-// per metre (central differences over a quarter texel; `MapsFields`).
-fn lf_field(field: u32, d: vec3<f32>) -> vec4<f32> {
+// cube_value_across for the four lanes.
+fn lf4_across(face: u32, i: i32, j: i32) -> vec4<f32> {
+    let n = tile.noise.y;
+    let ni = i32(n);
+    if i >= 0 && i < ni && j >= 0 && j < ni {
+        return lf4_fetch(cube_index(face, u32(i), u32(j), n));
+    }
+    let b = face_basis(face);
+    let u = -1.0 + (2.0 * f32(i) + 1.0) / f32(n);
+    let v = -1.0 + (2.0 * f32(j) + 1.0) / f32(n);
+    let at = cube_locate(normalize(b[0] + u * b[1] + v * b[2]));
+    let fx = clamp((at.u + 1.0) * 0.5 * f32(n) - 0.5, 0.0, f32(n) - 1.0);
+    let fy = clamp((at.v + 1.0) * 0.5 * f32(n) - 0.5, 0.0, f32(n) - 1.0);
+    let x0 = u32(floor(fx));
+    let y0 = u32(floor(fy));
+    let x1 = min(x0 + 1u, n - 1u);
+    let y1 = min(y0 + 1u, n - 1u);
+    let tx = fx - f32(x0);
+    let ty = fy - f32(y0);
+    var q: array<vec4<f32>, 4>;
+    var xs = array<u32, 4>(x0, x1, x0, x1);
+    var ys = array<u32, 4>(y0, y0, y1, y1);
+    for (var k = 0u; k < 4u; k = k + 1u) {
+        q[k] = lf4_fetch(cube_index(at.face, xs[k], ys[k], n));
+    }
+    return (q[0] * (1.0 - tx) + q[1] * tx) * (1.0 - ty) + (q[2] * (1.0 - tx) + q[3] * tx) * ty;
+}
+
+// cube_bicubic_on for the four lanes.
+fn lf4_bicubic_on(face: u32, u: f32, v: f32) -> vec4<f32> {
+    let n = f32(tile.noise.y);
+    let fx = (u + 1.0) * 0.5 * n - 0.5;
+    let fy = (v + 1.0) * 0.5 * n - 0.5;
+    let x0 = i32(floor(fx));
+    let y0 = i32(floor(fy));
+    let wx = catmull_rom(fx - floor(fx));
+    let wy = catmull_rom(fy - floor(fy));
+    var sum = vec4<f32>(0.0);
+    for (var j = 0; j < 4; j = j + 1) {
+        for (var i = 0; i < 4; i = i + 1) {
+            sum += wx[i] * wy[j] * lf4_across(face, x0 - 1 + i, y0 - 1 + j);
+        }
+    }
+    return sum;
+}
+
+// cube_sample (bicubic) for the four lanes.
+fn lf4_sample(d: vec3<f32>) -> vec4<f32> {
+    let band = 1.0 / f32(tile.noise.y);
+    var sum = vec4<f32>(0.0);
+    var total = 0.0;
+    for (var f = 0u; f < 6u; f = f + 1u) {
+        let b = face_basis(f);
+        let w = dot(d, b[0]);
+        if w <= 0.0 {
+            continue;
+        }
+        let u = dot(d, b[1]) / w;
+        let v = dot(d, b[2]) / w;
+        let t = (1.0 - max(abs(u), abs(v)) + band) / (2.0 * band);
+        if t <= 0.0 {
+            continue;
+        }
+        let value = lf4_bicubic_on(f, u, v);
+        if t >= 1.0 {
+            return value;
+        }
+        let weight = t * t * (3.0 - 2.0 * t);
+        sum += weight * value;
+        total += weight;
+    }
+    return sum / max(total, 1.0e-30);
+}
+
+// Values and gradients (per metre) of the four lanes `ids` at direction `d`;
+// lane c is (value, gradient) in out[c].
+fn lf4_field(ids: vec4<u32>, d: vec3<f32>) -> array<vec4<f32>, 4> {
+    lf4_ids = ids;
     let delta = 0.5 / f32(tile.noise.y);
     let e1 = any_orthonormal(d);
     let e2 = cross(d, e1);
     var offsets = array<vec3<f32>, 5>(vec3<f32>(0.0), e1, -e1, e2, -e2);
-    var s: array<f32, 5>;
+    var s: array<vec4<f32>, 5>;
     for (var i = 0u; i < 5u; i = i + 1u) {
-        s[i] = lf_value(field, normalize(d + offsets[i] * delta));
+        s[i] = lf4_sample(normalize(d + offsets[i] * delta));
     }
     let g1 = s[1] - s[2];
     let g2 = s[3] - s[4];
-    return vec4<f32>(s[0], (e1 * g1 + e2 * g2) / (2.0 * delta * tile.scale.x));
+    var out: array<vec4<f32>, 4>;
+    for (var c = 0u; c < 4u; c = c + 1u) {
+        out[c] = vec4<f32>(s[0][c], (e1 * g1[c] + e2 * g2[c]) / (2.0 * delta * tile.scale.x));
+    }
+    return out;
+}
+
+// Fill `lf_cache` with every field at direction `d` (three passes of four
+// lanes).
+fn lf_fill_cache(d: vec3<f32>) {
+    var groups = array<vec4<u32>, 3>(
+        vec4<u32>(7u, 0u, 1u, 2u),
+        vec4<u32>(3u, 8u, 4u, 5u),
+        vec4<u32>(6u, 99u, 99u, 99u),
+    );
+    for (var gi = 0u; gi < 3u; gi = gi + 1u) {
+        let ids = groups[gi];
+        let f = lf4_field(ids, d);
+        for (var c = 0u; c < 4u; c = c + 1u) {
+            if ids[c] <= 8u {
+                lf_cache[ids[c]] = f[c];
+            }
+        }
+    }
 }
 
 // `RecipeField::range`.
@@ -96,10 +216,10 @@ fn lf_field_range(field: u32) -> vec2<f32> {
     }
 }
 
-// `eval::clamped_field`: out of range gives the constant bound.
-fn lf_clamped_field(field: u32, d: vec3<f32>) -> vec4<f32> {
+// `eval::clamped_field` on a sampled (value, gradient): out of range gives
+// the constant bound.
+fn lf_clamp_field(field: u32, f: vec4<f32>) -> vec4<f32> {
     let range = lf_field_range(field);
-    let f = lf_field(field, d);
     if f.x < range.x {
         return vec4<f32>(range.x, vec3<f32>(0.0));
     }
@@ -131,15 +251,14 @@ fn lf_bump(x: f32, a: f32, b: f32) -> f32 {
     return 0.0;
 }
 
-// Rule inputs at direction `d` (`MapsFields::rule_fields`). Values come from
-// one lf_value call site in a loop (pipeline compile time): uplift,
-// sediment, moisture, temperature, hardness, |boundary|, volcanic.
-fn lf_fill_rule_fields(d: vec3<f32>) {
-    let elevation = lf_field(7u, d);
+// Rule inputs (`MapsFields::rule_fields`) from the field cache: uplift,
+// sediment, moisture, temperature, hardness, |boundary|, volcanic, elevation.
+fn lf_fill_rule_fields() {
+    let elevation = lf_cache[7];
     var ids = array<u32, 7>(0u, 1u, 4u, 5u, 3u, 8u, 6u);
     var v: array<f32, 7>;
     for (var i = 0u; i < 7u; i = i + 1u) {
-        v[i] = lf_value(ids[i], d);
+        v[i] = lf_cache[ids[i]].x;
     }
     let t = v[3];
     let m = clamp(v[2], 0.0, 1.0);
@@ -358,6 +477,11 @@ fn lf_stack(at: u32, local: vec3<f32>, amplitude: f32, body_seed: u32) -> vec4<f
         }
     }
     let normal = normalize(tile.n0.xyz + q / radius);
+    // Boundary and hardness at the (warped) stack position, one 4-lane pass.
+    var stack_fields: array<vec4<f32>, 4>;
+    if (flags & 9u) != 0u {
+        stack_fields = lf4_field(vec4<u32>(8u, 3u, 99u, 99u), normal);
+    }
     let aniso = (flags & 1u) != 0u;
     let stretch_log2 = lf_word(at + 9u);
     let kappa = lf_f32(at + 10u);
@@ -365,7 +489,7 @@ fn lf_stack(at: u32, local: vec3<f32>, amplitude: f32, body_seed: u32) -> vec4<f
     var delta = vec4<f32>(0.0);
     if aniso {
         let clamp_m = lf_f32(at + 12u);
-        delta = lf_clamped_field(8u, normal);
+        delta = lf_clamp_field(8u, stack_fields[0]);
         if abs(delta.x) > clamp_m {
             delta = vec4<f32>(sign(delta.x) * clamp_m, vec3<f32>(0.0));
         }
@@ -431,7 +555,7 @@ fn lf_stack(at: u32, local: vec3<f32>, amplitude: f32, body_seed: u32) -> vec4<f
         let e_octaves = lf_word(at + 22u);
         let e_mean = lf_f32(at + 24u);
         let gully_seed = lf_node_seed(body_seed, lf_word(at + 23u), 4u);
-        let hardness = lf_clamped_field(3u, normal);
+        let hardness = lf_clamp_field(3u, stack_fields[1]);
         // `eval::GULLY_HARDNESS_FADE` = 0.6.
         let fade = vec4<f32>(1.0 - 0.6 * hardness.x, -0.6 * hardness.yzw);
         var gullies = vec3<f32>(0.0);
@@ -528,7 +652,10 @@ fn lf_program(index: u32, local: vec3<f32>, d: vec3<f32>) -> vec4<f32> {
                 r = lf_stack(at, local, amplitude, body_seed);
                 at = at + 25u;
             }
-            case 2u: { r = lf_clamped_field((header >> 8u) & 255u, d); }
+            case 2u: {
+                let id = min((header >> 8u) & 255u, 8u);
+                r = lf_clamp_field(id, lf_cache[id]);
+            }
             case 3u: {
                 r = vec4<f32>(lf_f32(at), vec3<f32>(0.0));
                 at = at + 1u;
@@ -585,7 +712,8 @@ fn landform_relief(local: vec3<f32>, d: vec3<f32>) -> vec4<f32> {
         return vec4<f32>(0.0);
     }
     let code = lf_word(1u);
-    lf_fill_rule_fields(d);
+    lf_fill_cache(d);
+    lf_fill_rule_fields();
     var sum = vec4<f32>(0.0);
     for (var i = 0u; i < count; i = i + 1u) {
         let w = lf_weight(code, i);

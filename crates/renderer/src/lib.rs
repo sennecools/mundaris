@@ -53,7 +53,8 @@ pub use terrain_atlas::{
     LadderNoiseProbe, LadderNoiseResult, MAX_ATLAS_JOBS_PER_FRAME, MAX_COLLISION_CELLS,
     MAX_COLLISION_JOBS_PER_FRAME, ProducedTileReadback, TerrainAtlasConfig, TerrainAtlasFrame,
     TerrainAtlasReport, TerrainViewMode, collision_for_validation, ladder_noise_for_validation,
-    lattice_hash_for_validation, produce_for_validation, producer_pipeline_compile_seconds,
+    lattice_hash_for_validation, produce_for_validation, producer_batch_seconds_for_validation,
+    producer_pipeline_compile_seconds,
 };
 pub use terrain_rivers::AtlasWorldFields;
 pub use view::*;
