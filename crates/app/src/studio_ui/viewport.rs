@@ -3,12 +3,13 @@
 //! viewport logical pixels.
 
 use astrum_app::{
-    studio::view::{LabelState, Shortcut, StatItem, StudioView},
+    studio::view::{CAMERA_MODES, LabelState, Shortcut, StatItem, StudioAction, StudioView},
     viewport::{FlightKey, PointerButton, ViewportEvent},
 };
+use astrum_renderer::TerrainViewMode;
 use egui::{
     Align2, Color32, CornerRadius, CursorIcon, Event, EventFilter, FontId, Key, MouseWheelUnit,
-    Pos2, Rect, Sense, Stroke, StrokeKind, TextureId, Ui,
+    Pos2, Rect, RichText, Sense, Stroke, StrokeKind, TextureId, Ui,
 };
 
 use super::theme::{self, *};
@@ -295,9 +296,11 @@ pub fn paint(ui: &Ui, rect: Rect, scene: Option<TextureId>, view: &StudioView, h
     }
     if !hud.is_empty() {
         let row = 18.0;
+        let size = egui::vec2(170.0, row * hud.len() as f32 + 2.0 * SPACE_2);
+        // Top right; the camera and view controls sit top left.
         let hud_rect = Rect::from_min_size(
-            rect.min + egui::vec2(SPACE_3, SPACE_3),
-            egui::vec2(190.0, row * hud.len() as f32 + 2.0 * SPACE_2),
+            egui::pos2(rect.right() - SPACE_3 - size.x, rect.top() + SPACE_3),
+            size,
         );
         painter.rect(
             hud_rect,
@@ -323,5 +326,108 @@ pub fn paint(ui: &Ui, rect: Rect, scene: Option<TextureId>, view: &StudioView, h
                 theme::tone_color(stat.tone),
             );
         }
+    }
+}
+
+/// Movement hint per camera mode (`CAMERA_MODES` order).
+const CAMERA_HINTS: [&str; 4] = [
+    "Drag to orbit · wheel to zoom · double-click a body to focus",
+    "Drag to orbit · wheel to zoom · F focus · Alt+click flies to a point",
+    "Drag to look · WASD to move · Shift boosts · wheel sets speed · Esc free flight",
+    "Drag to look · WASD to move · Shift boosts · wheel sets speed",
+];
+
+/// Controls drawn over the viewport in their own layer (so clicks on them
+/// never reach the camera): camera mode and view mode top left, the movement
+/// hint bottom left and a rebuild notice top centre.
+pub fn overlay_controls(
+    ctx: &egui::Context,
+    rect: Rect,
+    view: &StudioView,
+    actions: &mut Vec<StudioAction>,
+) {
+    let chrome = egui::Frame::new()
+        .fill(Color32::from_rgba_premultiplied(0x08, 0x0a, 0x0d, 0xd0))
+        .corner_radius(CornerRadius::same(RADIUS))
+        .inner_margin(egui::Margin::same(SPACE_1 as i8));
+    egui::Area::new(egui::Id::new("viewport-controls"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(rect.min + egui::vec2(SPACE_3, SPACE_3))
+        .show(ctx, |ui| {
+            chrome.show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    for (index, mode) in CAMERA_MODES.iter().enumerate() {
+                        if super::panels::tool_button(ui, mode, view.camera_index == index)
+                            .clicked()
+                        {
+                            actions.push(StudioAction::SetCamera(index));
+                        }
+                    }
+                    ui.add_space(SPACE_2);
+                    let current = TerrainViewMode::ALL
+                        .get(view.view_index)
+                        .copied()
+                        .map_or("—", super::panels::view_mode_name);
+                    egui::ComboBox::from_id_salt("viewport-view-mode")
+                        .width(140.0)
+                        .selected_text(format!("View: {current}"))
+                        .show_ui(ui, |ui| {
+                            for (index, mode) in TerrainViewMode::ALL.iter().enumerate() {
+                                if ui
+                                    .selectable_label(
+                                        index == view.view_index,
+                                        super::panels::view_mode_name(*mode),
+                                    )
+                                    .clicked()
+                                {
+                                    actions.push(StudioAction::SetView(index));
+                                }
+                            }
+                        });
+                });
+            });
+        });
+    if let Some(hint) = CAMERA_HINTS.get(view.camera_index) {
+        // On a dark backdrop, so it stays readable over bright terrain.
+        let painter = ctx
+            .layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("viewport-hint"),
+            ))
+            .with_clip_rect(rect);
+        let galley = painter.layout_no_wrap(
+            (*hint).to_string(),
+            FontId::proportional(FONT_SMALL),
+            TEXT_SECONDARY,
+        );
+        let text_rect = Rect::from_min_size(
+            egui::pos2(
+                rect.left() + SPACE_3 + SPACE_2,
+                rect.bottom() - SPACE_3 - SPACE_1 - galley.size().y,
+            ),
+            galley.size(),
+        );
+        painter.rect_filled(
+            text_rect.expand2(egui::vec2(SPACE_2, SPACE_1)),
+            CornerRadius::same(RADIUS),
+            Color32::from_rgba_premultiplied(0x08, 0x0a, 0x0d, 0xd0),
+        );
+        painter.galley(text_rect.min, galley, TEXT_SECONDARY);
+    }
+    if view.planet.as_ref().is_some_and(|planet| planet.baking) {
+        egui::Area::new(egui::Id::new("viewport-rebuild"))
+            .order(egui::Order::Foreground)
+            .pivot(Align2::CENTER_TOP)
+            .fixed_pos(egui::pos2(rect.center().x, rect.top() + SPACE_3))
+            .interactable(false)
+            .show(ctx, |ui| {
+                chrome.show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(12.0).color(WARN));
+                        ui.label(RichText::new("Rebuilding the world map…").color(WARN));
+                    });
+                });
+            });
     }
 }

@@ -18,7 +18,8 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use egui::{Frame, Margin};
+use egui::{Frame, Key, KeyboardShortcut, Margin, Modifiers};
+use serde::{Deserialize, Serialize};
 use astrum_app::{
     GravityOrbitsDemo,
     engine_profile::span,
@@ -41,7 +42,6 @@ use viewport::{Interaction, ViewportInput};
 
 /// Refresh period for panel text (inspector, status bar, HUD, profiler).
 const PANEL_PERIOD: Duration = Duration::from_millis(100);
-const BOTTOM_HEIGHT: f32 = 340.0;
 
 /// Wakeups delivered to the event loop from other threads.
 #[derive(Debug, Clone, Copy)]
@@ -135,10 +135,6 @@ impl Engine {
                 profiler.selected_span = None;
             }
             ProfilerInput::SelectSpan(index) => profiler.selected_span = Some(index),
-            ProfilerInput::FullFrame(full) => {
-                profiler.full_frame = full;
-                profiler.selected_span = None;
-            }
         }
     }
 
@@ -190,12 +186,97 @@ struct SceneTexture {
     id: egui::TextureId,
 }
 
+/// Studio workspaces shown as tabs in the top bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Workspace {
+    /// Outliner, viewport, inspector and log drawer.
+    #[default]
+    Editor,
+    /// Viewport over the full-width profiler.
+    Performance,
+}
+
+impl Workspace {
+    pub const ALL: [Self; 2] = [Self::Editor, Self::Performance];
+    pub const NAMES: [&'static str; 2] = ["Editor", "Performance"];
+    pub fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Inspector tabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum InspectorTab {
+    #[default]
+    Body,
+    Planet,
+    Render,
+}
+
+impl InspectorTab {
+    pub const ALL: [Self; 3] = [Self::Body, Self::Planet, Self::Render];
+    pub const NAMES: [&'static str; 3] = ["Body", "Planet", "Render"];
+    pub fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Panel layout remembered between runs (`LAYOUT_PATH`, relative to the
+/// working directory's build output).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct StudioLayout {
+    workspace: Workspace,
+    inspector_tab: InspectorTab,
+    log_open: bool,
+    outliner_width: f32,
+    inspector_width: f32,
+    log_height: f32,
+    /// Profiler height in the Performance workspace; 0 picks 60 % of the window.
+    performance_height: f32,
+}
+
+impl Default for StudioLayout {
+    fn default() -> Self {
+        Self {
+            workspace: Workspace::Editor,
+            inspector_tab: InspectorTab::Body,
+            log_open: false,
+            outliner_width: 240.0,
+            inspector_width: 340.0,
+            log_height: 170.0,
+            performance_height: 0.0,
+        }
+    }
+}
+
+const LAYOUT_PATH: &str = "target/studio-layout.json";
+
+impl StudioLayout {
+    fn load() -> Self {
+        std::fs::read_to_string(LAYOUT_PATH)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self) {
+        let path = std::path::Path::new(LAYOUT_PATH);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(text) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(path, text);
+        }
+    }
+}
+
 /// UI-local presentation state.
 #[derive(Default)]
 struct UiState {
     viewport: ViewportInput,
-    bottom_open: bool,
-    bottom_tab: usize,
+    layout: StudioLayout,
+    timeline: profiler_panel::TimelineState,
     scene: Option<SceneTexture>,
 }
 
@@ -225,7 +306,7 @@ impl StudioApp {
             egui_ctx,
             presentation: None,
             ui: UiState {
-                bottom_open: true,
+                layout: StudioLayout::load(),
                 ..UiState::default()
             },
             occluded: false,
@@ -378,6 +459,18 @@ impl StudioApp {
     }
 }
 
+/// Runs `add` in a child of the panel that cannot grow it. egui panels
+/// report overflowing content by shrinking their outer rect, which slid the
+/// viewport over the inspector; content past the edge is clipped instead.
+fn contained<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let rect = ui.max_rect();
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+    child.set_clip_rect(rect.intersect(ui.clip_rect()));
+    let inner = add(&mut child);
+    ui.advance_cursor_after_rect(rect);
+    inner
+}
+
 /// Lays out the Studio for one frame and runs the engine frame inside the
 /// viewport. Returns the milliseconds spent in UI work (excluding the engine).
 fn draw(
@@ -395,53 +488,113 @@ fn draw(
     {
         let view = engine.demo.studio_view();
         let panel = &engine.panel_view;
+        let layout = &mut ui_state.layout;
+        // Planet undo and redo, unless a text field has the keyboard.
+        if view.planet.is_some() && !root.ctx().egui_wants_keyboard_input() {
+            let (undo, redo) = root.ctx().input_mut(|input| {
+                // Redo first: Ctrl+Z also matches Ctrl+Shift+Z.
+                let redo = input.consume_shortcut(&KeyboardShortcut::new(
+                    Modifiers::COMMAND | Modifiers::SHIFT,
+                    Key::Z,
+                )) || input.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Y));
+                let undo =
+                    input.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Z));
+                (undo, redo)
+            });
+            if undo {
+                actions.push(StudioAction::PlanetUndo);
+            }
+            if redo {
+                actions.push(StudioAction::PlanetRedo);
+            }
+        }
         let chrome = |margin: Margin| Frame::new().fill(theme::SURFACE_1).inner_margin(margin);
         egui::Panel::top("toolbar")
-            .exact_size(44.0)
+            .exact_size(40.0)
             .frame(chrome(Margin::symmetric(theme::SPACE_3 as i8, 0)))
             .show(root, |ui| {
                 panels::toolbar(
                     ui,
                     view,
                     &panel.time_text,
-                    &mut ui_state.bottom_open,
+                    &mut layout.workspace,
                     &mut actions,
                 )
             });
+        let editor = layout.workspace == Workspace::Editor;
         egui::Panel::bottom("status")
             .exact_size(26.0)
             .frame(chrome(Margin::symmetric(theme::SPACE_3 as i8, 0)))
             .show(root, |ui| {
-                stop_automation = panels::status_bar(ui, view, panel)
+                let log_open = editor.then_some(&mut layout.log_open);
+                stop_automation = panels::status_bar(ui, view, panel, log_open)
             });
-        egui::Panel::left("outliner")
-            .exact_size(240.0)
-            .frame(chrome(Margin::same(theme::SPACE_3 as i8)))
-            .show(root, |ui| panels::outliner(ui, view, &mut actions));
-        egui::Panel::right("inspector")
-            .exact_size(300.0)
-            .frame(chrome(Margin::same(theme::SPACE_3 as i8)))
-            .show(root, |ui| panels::inspector(ui, view, panel, &mut actions));
-        if ui_state.bottom_open {
-            egui::Panel::bottom("bottom")
-                .exact_size(BOTTOM_HEIGHT)
-                .frame(chrome(Margin::same(theme::SPACE_2 as i8)))
-                .show(root, |ui| {
-                    ui.horizontal(|ui| {
-                        for (index, tab) in ["Profiler", "Log"].into_iter().enumerate() {
-                            if panels::tool_button(ui, tab, ui_state.bottom_tab == index).clicked()
-                            {
-                                ui_state.bottom_tab = index;
-                            }
-                        }
+        match layout.workspace {
+            Workspace::Editor => {
+                let shown = egui::Panel::left("outliner")
+                    .resizable(true)
+                    .default_size(layout.outliner_width)
+                    .size_range(180.0..=420.0)
+                    .frame(chrome(Margin::same(theme::SPACE_3 as i8)))
+                    .show(root, |ui| {
+                        contained(ui, |ui| panels::outliner(ui, view, &mut actions))
                     });
-                    ui.add_space(theme::SPACE_1);
-                    if ui_state.bottom_tab == 0 {
-                        profiler_inputs = profiler_panel::show(ui, &engine.profiler_data);
-                    } else {
-                        panels::log(ui, panel);
-                    }
-                });
+                layout.outliner_width = shown.response.rect.width();
+                let shown = egui::Panel::right("inspector")
+                    .resizable(true)
+                    .default_size(layout.inspector_width)
+                    .size_range(280.0..=560.0)
+                    .frame(chrome(Margin::same(theme::SPACE_3 as i8)))
+                    .show(root, |ui| {
+                        contained(ui, |ui| {
+                            panels::inspector(
+                                ui,
+                                view,
+                                panel,
+                                &mut layout.inspector_tab,
+                                &mut actions,
+                            )
+                        })
+                    });
+                layout.inspector_width = shown.response.rect.width();
+                if layout.log_open {
+                    let shown = egui::Panel::bottom("log")
+                        .resizable(true)
+                        .default_size(layout.log_height)
+                        .size_range(90.0..=420.0)
+                        .frame(chrome(Margin::same(theme::SPACE_2 as i8)))
+                        .show(root, |ui| {
+                            contained(ui, |ui| {
+                                panels::section_header(ui, "LOG", "");
+                                panels::log(ui, panel);
+                            })
+                        });
+                    layout.log_height = shown.response.rect.height();
+                }
+            }
+            Workspace::Performance => {
+                let available = root.available_height();
+                let default = if layout.performance_height > 0.0 {
+                    layout.performance_height
+                } else {
+                    available * 0.6
+                };
+                let shown = egui::Panel::bottom("performance")
+                    .resizable(true)
+                    .default_size(default)
+                    .size_range(240.0..=(available - 160.0).max(260.0))
+                    .frame(chrome(Margin::same(theme::SPACE_2 as i8)))
+                    .show(root, |ui| {
+                        contained(ui, |ui| {
+                            profiler_inputs = profiler_panel::show(
+                                ui,
+                                &engine.profiler_data,
+                                &mut ui_state.timeline,
+                            );
+                        })
+                    });
+                layout.performance_height = shown.response.rect.height();
+            }
         }
     }
     drop(ui_span);
@@ -467,7 +620,8 @@ fn draw(
         let scale = ui.ctx().pixels_per_point();
         let width = (rect.width() * scale).round().max(0.0) as u32;
         let height = (rect.height() * scale).round().max(0.0) as u32;
-        engine.frame(width, height, scale, ui_state.bottom_open);
+        let profiler_open = ui_state.layout.workspace == Workspace::Performance;
+        engine.frame(width, height, scale, profiler_open);
 
         let overlay = Instant::now();
         let _span = span("UI draw");
@@ -506,6 +660,16 @@ fn draw(
             engine.demo.studio_view(),
             &engine.panel_view.hud,
         );
+        let mut overlay_actions = Vec::new();
+        viewport::overlay_controls(
+            ui.ctx(),
+            rect,
+            engine.demo.studio_view(),
+            &mut overlay_actions,
+        );
+        for action in overlay_actions {
+            engine.action(action);
+        }
         ui_ms += overlay.elapsed().as_secs_f64() * 1000.0;
     });
     ui_ms
@@ -533,7 +697,10 @@ impl ApplicationHandler<AppEvent> for StudioApp {
             .egui_state
             .on_window_event(presentation.window.as_ref(), &event);
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.ui.layout.save();
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => {
                 presentation
                     .surface

@@ -221,7 +221,9 @@ impl GravityOrbitsDemo {
             | StudioAction::PlanetParam(..)
             | StudioAction::PlanetResetParam(_)
             | StudioAction::PlanetRevert
-            | StudioAction::PlanetSave => self.planet_action(action),
+            | StudioAction::PlanetSave
+            | StudioAction::PlanetUndo
+            | StudioAction::PlanetRedo => self.planet_action(action),
         }
     }
 
@@ -329,10 +331,6 @@ impl GravityOrbitsDemo {
                 compact_distance(snapshot.camera.near_plane_m),
             ));
         }
-        camera_stats.push(StatItem::new(
-            "Fly speed",
-            format!("{:.2}×", self.controls.manual_speed),
-        ));
 
         let mut terrain_stats = Vec::new();
         let mut hud = Vec::new();
@@ -345,10 +343,13 @@ impl GravityOrbitsDemo {
                     _ => Tone::Warn,
                 },
             ));
-            if let Some(level) = terrain.desired_radial_lod {
-                terrain_stats.push(StatItem::new("Finest level", level.to_string()));
-                hud.push(StatItem::new("LOD", level.to_string()));
-            }
+            // Rows stay present (with "—") so the panel does not jump while
+            // the terrain rebuilds.
+            let level = terrain
+                .desired_radial_lod
+                .map_or_else(|| "—".to_string(), |level| level.to_string());
+            terrain_stats.push(StatItem::new("Finest level", level.clone()));
+            hud.push(StatItem::new("LOD", level));
             terrain_stats.push(StatItem::new(
                 "Drawn nodes",
                 terrain.visible_leaf_count.to_string(),
@@ -357,13 +358,14 @@ impl GravityOrbitsDemo {
                 "Resident tiles",
                 terrain.source_leaf_count.to_string(),
             ));
-            if let Some(jobs) = snapshot
+            let jobs = snapshot
                 .terrain_atlas
                 .as_ref()
-                .and_then(|atlas| atlas["jobs_total"].as_u64())
-            {
-                terrain_stats.push(StatItem::new("Tiles produced", jobs.to_string()));
-            }
+                .and_then(|atlas| atlas["jobs_total"].as_u64());
+            terrain_stats.push(StatItem::new(
+                "Tiles produced",
+                jobs.map_or_else(|| "—".to_string(), |jobs| jobs.to_string()),
+            ));
             terrain_stats.push(StatItem::new("Backend", terrain.backend.clone()));
             let performance = &snapshot.performance;
             if let Some(host) = performance.host_frame_ms {

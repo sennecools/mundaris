@@ -36,24 +36,19 @@ pub struct LaneRow {
     pub rows: i32,
 }
 
-/// A span placed in the shown timeline window (x and width are 0..1).
+/// A span of the shown frame in milliseconds from the frame start; the panel
+/// maps it through its own zoom and pan window.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpanBox {
-    pub x: f32,
-    pub width: f32,
-    pub row: i32,
+    pub start_ms: f64,
+    pub duration_ms: f64,
+    /// Index into [`ProfilerData::lanes`] and nesting row within that lane.
+    pub lane: usize,
+    pub lane_row: i32,
     pub name: String,
     pub color: i32,
     pub kind: SpanKind,
-    /// Clipped at the right edge of the shown window.
-    pub clipped: bool,
     pub selected: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Tick {
-    pub x: f32,
-    pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -72,14 +67,15 @@ pub struct ProfilerData {
     pub frozen: bool,
     pub capturing: bool,
     pub following: bool,
-    pub full_frame: bool,
     pub bars: Vec<FrameBar>,
     /// 16.7 ms budget line as a fraction of the strip height.
     pub budget: f32,
     pub lanes: Vec<LaneRow>,
     pub spans: Vec<SpanBox>,
-    pub rows: i32,
-    pub ticks: Vec<Tick>,
+    /// Shown frame: id, whole duration and end of engine work (ms).
+    pub frame_id: Option<u64>,
+    pub frame_ms: f64,
+    pub work_end_ms: f64,
     pub timeline_title: String,
     pub empty_hint: String,
     pub frame_stats: Vec<StatItem>,
@@ -229,7 +225,7 @@ fn main_thread_ms(host_ms: Option<f64>, ui_ms: Option<f64>) -> Option<f64> {
 }
 
 /// Tick spacing that yields roughly 4–8 labelled divisions.
-fn tick_step(duration_ms: f64) -> f64 {
+pub fn tick_step(duration_ms: f64) -> f64 {
     [0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0]
         .into_iter()
         .find(|step| duration_ms / step <= 8.0)
@@ -281,40 +277,23 @@ pub fn build(demo: &mut GravityOrbitsDemo, models: &ProfilerModels) -> (Profiler
     {
         profiler_view::add_gpu_lane(timeline, &gpu.scopes);
     }
-    let full_frame = profiler.full_frame;
     let selected_span = profiler.selected_span;
-    let (lanes, spans, rows, ticks, title) = match &timeline {
+    let (lanes, spans, title) = match &timeline {
         Some(timeline) => {
-            // "Engine work" fits the window to engine CPU work and GPU scopes;
-            // UI drawing and presentation waits are clipped at the right edge.
-            let view = if full_frame {
-                timeline.duration_ms
-            } else {
-                timeline.work_end_ms * 1.04
-            }
-            .max(1e-3);
             let spans = timeline
                 .spans
                 .iter()
                 .enumerate()
-                .filter(|(_, span)| span.start_ms < view)
                 .map(|(index, span)| {
-                    let end = span.start_ms + span.duration_ms;
-                    let clipped = end > view;
                     let precision = if span.duration_ms < 1.0 { 2 } else { 1 };
                     SpanBox {
-                        x: (span.start_ms / view) as f32,
-                        width: ((end.min(view) - span.start_ms) / view) as f32,
-                        row: span.row as i32,
-                        name: format!(
-                            "{} {:.precision$} ms{}",
-                            span.name,
-                            span.duration_ms,
-                            if clipped { " →" } else { "" }
-                        ),
+                        start_ms: span.start_ms,
+                        duration_ms: span.duration_ms,
+                        lane: span.lane,
+                        lane_row: (span.row - timeline.lanes[span.lane].first_row) as i32,
+                        name: format!("{} {:.precision$} ms", span.name, span.duration_ms),
                         color: profiler_view::color_slot(&span.name, SPAN_COLORS) as i32,
                         kind: span.kind,
-                        clipped,
                         selected: Some(index) == selected_span,
                     }
                 })
@@ -328,19 +307,6 @@ pub fn build(demo: &mut GravityOrbitsDemo, models: &ProfilerModels) -> (Profiler
                     rows: lane.rows as i32,
                 })
                 .collect();
-            let step = tick_step(view);
-            let ticks = (0..)
-                .map(|k| f64::from(k) * step)
-                .take_while(|t| *t < view)
-                .map(|t| Tick {
-                    x: (t / view) as f32,
-                    text: if step < 1.0 {
-                        format!("{t:.2} ms")
-                    } else {
-                        format!("{t:.0} ms")
-                    },
-                })
-                .collect();
             let gpu = timeline.gpu_ms.map_or_else(
                 || "GPU not sampled".to_string(),
                 |gpu| format!("GPU {gpu:.2} ms"),
@@ -348,8 +314,6 @@ pub fn build(demo: &mut GravityOrbitsDemo, models: &ProfilerModels) -> (Profiler
             (
                 lanes,
                 spans,
-                timeline.rows as i32,
-                ticks,
                 format!(
                     "frame {} · engine {:.2} ms · UI draw {:.2} ms · vsync wait {:.2} ms · other {:.2} ms · {gpu}{}",
                     timeline.frame_id,
@@ -360,12 +324,12 @@ pub fn build(demo: &mut GravityOrbitsDemo, models: &ProfilerModels) -> (Profiler
                     if following {
                         " · following latest"
                     } else {
-                        ""
+                        " · pinned"
                     }
                 ),
             )
         }
-        None => (Vec::new(), Vec::new(), 0, Vec::new(), String::new()),
+        None => (Vec::new(), Vec::new(), String::new()),
     };
     let empty_hint = if !profiler.enabled && profile.is_none() {
         "Turn on CPU spans to record a per-frame timeline."
@@ -493,13 +457,13 @@ pub fn build(demo: &mut GravityOrbitsDemo, models: &ProfilerModels) -> (Profiler
         frozen,
         capturing,
         following,
-        full_frame,
         bars,
         budget: (BUDGET_MS / STRIP_MS) as f32,
         lanes,
         spans,
-        rows,
-        ticks,
+        frame_id: timeline.as_ref().map(|t| t.frame_id),
+        frame_ms: timeline.as_ref().map_or(0.0, |t| t.duration_ms),
+        work_end_ms: timeline.as_ref().map_or(0.0, |t| t.work_end_ms),
         timeline_title: title,
         empty_hint: empty_hint.into(),
         frame_stats: frame_stats.to_vec(),

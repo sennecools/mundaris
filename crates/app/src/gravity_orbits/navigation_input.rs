@@ -121,12 +121,9 @@ impl ViewportInput {
                         }
                     } else {
                         self.keyboard_owner = true;
-                        let wanted = if local_look {
-                            PointerButton::Secondary
-                        } else {
-                            PointerButton::Primary
-                        };
-                        if button == wanted {
+                        // Either button drags (orbit, or look in surface and
+                        // free flight); a click without movement still selects.
+                        if self.gesture.is_none() {
                             self.gesture = Some(button);
                         }
                     }
@@ -224,6 +221,24 @@ mod tests {
         );
         assert_eq!(output[0].drag, [10.0, 0.0]);
         assert_eq!(output.len(), 2);
+    }
+    #[test]
+    fn local_look_also_drags_with_the_primary_button() {
+        let mut state = ViewportInput::default();
+        let output = run(
+            &mut state,
+            &[
+                ViewportEvent::PointerButton {
+                    pos: [200.0, 200.0],
+                    button: PointerButton::Primary,
+                    pressed: true,
+                },
+                ViewportEvent::PointerMoved([200.0, 215.0]),
+            ],
+            false,
+            true,
+        );
+        assert_eq!(output[0].drag, [0.0, 15.0]);
     }
     #[test]
     fn focus_blocking_and_fractional_scroll_are_isolated() {

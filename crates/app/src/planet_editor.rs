@@ -15,6 +15,10 @@ use std::time::{Duration, Instant, SystemTime};
 const APPLY_INTERVAL: Duration = Duration::from_millis(100);
 /// Authored files are checked for changes this often.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Same-kind changes closer together than this form one undo step.
+const COALESCE: Duration = Duration::from_millis(600);
+/// Undo steps kept per body.
+const UNDO_LIMIT: usize = 200;
 
 /// One editable world-map body.
 #[derive(Debug, Clone)]
@@ -31,12 +35,26 @@ pub struct EditableWorld {
     pub error: Option<String>,
     /// When the last definition was published, and why.
     pub published: Option<(Instant, &'static str)>,
+    /// Earlier edits for undo (newest last) and undone edits for redo.
+    undo: Vec<WorldEdit>,
+    redo: Vec<WorldEdit>,
+    /// Kind and time of the last recorded change, so a seed drag undoes as
+    /// one step.
+    last_change: Option<(Instant, &'static str)>,
 }
 
 impl EditableWorld {
     /// The edit differs from the terrain file.
     pub fn dirty(&self) -> bool {
         self.edit != self.source.saved
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
     }
 
     pub fn override_of(&self, name: &str) -> Option<f64> {
@@ -78,6 +96,9 @@ impl PlanetEditor {
                     source,
                     error: None,
                     published: None,
+                    undo: Vec::new(),
+                    redo: Vec::new(),
+                    last_change: None,
                 })
             })
             .collect();
@@ -96,35 +117,84 @@ impl PlanetEditor {
         self.worlds.iter_mut().find(|w| w.body_index == body_index)
     }
 
-    pub fn set_seed(&mut self, body_index: usize, seed: u64) {
-        if let Some(world) = self.world_mut(body_index) {
-            world.edit.seed = seed;
+    /// Apply `change` to the edit and record the previous edit for undo.
+    /// Consecutive changes of the same `kind` within [`COALESCE`] merge into
+    /// one undo step (seed drags, slider nudges of one parameter).
+    fn change(
+        &mut self,
+        body_index: usize,
+        kind: &'static str,
+        change: impl FnOnce(&mut WorldEdit),
+    ) {
+        let Some(world) = self.world_mut(body_index) else {
+            return;
+        };
+        let before = world.edit.clone();
+        change(&mut world.edit);
+        if world.edit == before {
+            return;
         }
+        let now = Instant::now();
+        let merge = world
+            .last_change
+            .is_some_and(|(at, last)| last == kind && now.duration_since(at) < COALESCE);
+        if !merge {
+            world.undo.push(before);
+            if world.undo.len() > UNDO_LIMIT {
+                world.undo.remove(0);
+            }
+        }
+        world.redo.clear();
+        world.last_change = Some((now, kind));
+    }
+
+    /// Step back to the edit before the last change.
+    pub fn undo(&mut self, body_index: usize) {
+        if let Some(world) = self.world_mut(body_index)
+            && let Some(previous) = world.undo.pop()
+        {
+            world.redo.push(std::mem::replace(&mut world.edit, previous));
+            world.last_change = None;
+        }
+    }
+
+    /// Re-apply the last undone change.
+    pub fn redo(&mut self, body_index: usize) {
+        if let Some(world) = self.world_mut(body_index)
+            && let Some(next) = world.redo.pop()
+        {
+            world.undo.push(std::mem::replace(&mut world.edit, next));
+            world.last_change = None;
+        }
+    }
+
+    pub fn set_seed(&mut self, body_index: usize, seed: u64) {
+        self.change(body_index, "seed", |edit| edit.seed = seed);
     }
 
     /// Override parameter `name`; validation happens on rebuild.
     pub fn set_param(&mut self, body_index: usize, name: &str, value: f64) {
-        let Some(world) = self.world_mut(body_index) else {
-            return;
-        };
-        match world.edit.overrides.iter_mut().find(|(n, _)| n == name) {
-            Some(entry) => entry.1 = value,
-            None => world.edit.overrides.push((name.to_string(), value)),
-        }
+        self.change(body_index, "param", |edit| {
+            match edit.overrides.iter_mut().find(|(n, _)| n == name) {
+                Some(entry) => entry.1 = value,
+                None => edit.overrides.push((name.to_string(), value)),
+            }
+        });
     }
 
     /// Drop the override of `name`, returning to the sampled value.
     pub fn reset_param(&mut self, body_index: usize, name: &str) {
-        if let Some(world) = self.world_mut(body_index) {
-            world.edit.overrides.retain(|(n, _)| n != name);
-        }
+        self.change(body_index, "reset", |edit| {
+            edit.overrides.retain(|(n, _)| n != name);
+        });
     }
 
     /// Discard unsaved changes.
     pub fn revert(&mut self, body_index: usize) {
-        if let Some(world) = self.world_mut(body_index) {
-            world.edit = world.source.saved.clone();
-        }
+        let Some(saved) = self.world(body_index).map(|w| w.source.saved.clone()) else {
+            return;
+        };
+        self.change(body_index, "revert", |edit| *edit = saved);
     }
 
     /// Write the current edit into the body's terrain file.
@@ -254,6 +324,32 @@ mod tests {
             world: Some(world),
         };
         PlanetEditor::new(&[presentation])
+    }
+
+    #[test]
+    fn undo_and_redo_step_through_edits_and_merge_a_seed_drag() {
+        let root = scratch_content("undo");
+        let mut editor = editor(&root);
+        let original = editor.world(0).unwrap().edit.clone();
+        editor.set_seed(0, 11);
+        editor.set_seed(0, 12);
+        editor.set_seed(0, 13);
+        editor.world_mut(0).unwrap().last_change = None;
+        editor.set_param(0, "warp_strength", 0.5);
+        assert!(editor.world(0).unwrap().can_undo());
+        editor.undo(0);
+        assert_eq!(editor.world(0).unwrap().edit.seed, 13);
+        assert!(editor.world(0).unwrap().override_of("warp_strength").is_none());
+        editor.undo(0);
+        assert_eq!(editor.world(0).unwrap().edit, original);
+        assert!(!editor.world(0).unwrap().can_undo());
+        editor.redo(0);
+        editor.redo(0);
+        assert_eq!(editor.world(0).unwrap().override_of("warp_strength"), Some(0.5));
+        editor.undo(0);
+        editor.set_seed(0, 99);
+        assert!(!editor.world(0).unwrap().can_redo());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

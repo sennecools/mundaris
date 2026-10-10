@@ -1,21 +1,69 @@
-//! Studio chrome: toolbar, outliner, inspector, status bar and log
+//! Studio chrome: top bar, outliner, tabbed inspector, status bar and log
 //! (docs/STUDIO_UI.md §4). Panels read the toolkit-free [`StudioView`] and
 //! report interactions as [`StudioAction`]s; they hold no engine state.
+//!
+//! Inspector rows follow one property-grid layout: a fixed label column and a
+//! value column, at a fixed row height, so values never shift the layout.
+
+use std::ops::RangeInclusive;
 
 use astrum_app::render_settings::{SPECS, SettingKind, SettingValue};
 use astrum_app::studio::view::{
-    CAMERA_MODES, Overlay, PlanetView, RATE_PRESETS, StatItem, StudioAction, StudioView,
+    Overlay, PlanetParamItem, PlanetView, RATE_PRESETS, StatItem, StudioAction, StudioView,
 };
 use astrum_renderer::TerrainViewMode;
-use egui::{Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, Stroke, Ui};
+use egui::{Align, Color32, CornerRadius, Layout, RichText, Ui};
 
 use super::theme::{self, *};
+use super::{InspectorTab, Workspace};
 
 const RATE_LABELS: [&str; RATE_PRESETS.len()] = ["1×", "10×", "100×", "1k×", "10k×", "100k×"];
 const ALTITUDE_LABELS: [&str; 6] = ["100 km", "10 km", "1 km", "100 m", "10 m", "2 m"];
 const OVERLAY_LABELS: [&str; Overlay::ALL.len()] = ["Markers", "Trails", "Orbit guides"];
+/// Property-grid row height and label column share.
+const ROW_HEIGHT: f32 = 24.0;
+const LABEL_SHARE: f32 = 0.42;
+/// Width of the value box beside a [`fill_slider`].
+const VALUE_WIDTH: f32 = 72.0;
 
-fn view_mode_name(mode: TerrainViewMode) -> &'static str {
+/// Planet parameter groups by field name. PROTOTYPE: the grouping lives in
+/// the UI until parameters carry their group in the archetype schema;
+/// unknown (new) fields land in "Other".
+const PARAM_GROUPS: [(&str, &[&str]); 4] = [
+    (
+        "Continents",
+        &[
+            "ocean_coverage",
+            "continent_wavelength_m",
+            "warp_wavelength_m",
+            "warp_strength",
+            "land_height_m",
+        ],
+    ),
+    ("Ocean", &["ocean_depth_m", "shelf_depth_m"]),
+    (
+        "Temperature",
+        &[
+            "equator_c",
+            "pole_c",
+            "axial_tilt_deg",
+            "lapse_c_per_km",
+            "ocean_moderation",
+            "temperature_noise_c",
+        ],
+    ),
+    (
+        "Moisture",
+        &[
+            "evaporation",
+            "rain",
+            "precipitation_scale",
+            "rain_convergence",
+        ],
+    ),
+];
+
+pub fn view_mode_name(mode: TerrainViewMode) -> &'static str {
     match mode {
         TerrainViewMode::Lit => "Lit",
         TerrainViewMode::Height => "Height",
@@ -48,18 +96,42 @@ pub fn tool_button_enabled(ui: &mut Ui, text: &str, active: bool, enabled: bool)
         TEXT_DISABLED
     }))
     .fill(if active { ACCENT_SOFT } else { SURFACE_2 })
-    .stroke(Stroke::new(1.0, if active { ACCENT } else { BORDER }))
+    .stroke(egui::Stroke::new(1.0, if active { ACCENT } else { BORDER }))
     .corner_radius(CornerRadius::same(RADIUS_SMALL));
     ui.add_enabled(enabled, button)
 }
 
-/// Joined option buttons; returns the chosen index when clicked.
 fn segmented(ui: &mut Ui, options: &[&str], selected: Option<usize>) -> Option<usize> {
     let mut chosen = None;
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         for (index, option) in options.iter().enumerate() {
             if tool_button(ui, option, selected == Some(index)).clicked() {
+                chosen = Some(index);
+            }
+        }
+    });
+    chosen
+}
+
+/// A tab strip; returns the clicked tab.
+fn tabs(ui: &mut Ui, names: &[&str], selected: usize) -> Option<usize> {
+    let mut chosen = None;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        for (index, name) in names.iter().enumerate() {
+            let active = index == selected;
+            let text =
+                RichText::new(*name).color(if active { TEXT_PRIMARY } else { TEXT_SECONDARY });
+            let button = egui::Button::new(text)
+                .fill(if active {
+                    SURFACE_3
+                } else {
+                    Color32::TRANSPARENT
+                })
+                .stroke(egui::Stroke::NONE)
+                .min_size(egui::vec2(0.0, ROW_HEIGHT));
+            if ui.add(button).clicked() {
                 chosen = Some(index);
             }
         }
@@ -77,45 +149,105 @@ pub fn section_header(ui: &mut Ui, title: &str, detail: &str) {
         );
         if !detail.is_empty() {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(RichText::new(detail).font(small()).color(TEXT_DISABLED));
+                ui.add(
+                    egui::Label::new(RichText::new(detail).font(small()).color(TEXT_DISABLED))
+                        .truncate(),
+                );
             });
         }
     });
 }
 
+/// Read-only property row: label left, value right.
 pub fn stat_row(ui: &mut Ui, stat: &StatItem) {
     ui.horizontal(|ui| {
+        ui.set_min_height(20.0);
         ui.label(RichText::new(&stat.label).color(TEXT_SECONDARY));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(
-                RichText::new(&stat.value)
-                    .font(mono())
-                    .color(theme::tone_color(stat.tone)),
+            // Long values (errors, cascade splits) truncate with a hover
+            // tooltip instead of running past the panel edge.
+            ui.add(
+                egui::Label::new(
+                    RichText::new(&stat.value)
+                        .font(mono())
+                        .color(theme::tone_color(stat.tone)),
+                )
+                .truncate(),
             );
         });
     });
 }
 
-pub fn card(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui)) {
-    Frame::new()
-        .fill(SURFACE_0)
-        .stroke(Stroke::new(1.0, BORDER))
-        .corner_radius(CornerRadius::same(RADIUS))
-        .inner_margin(Margin::same(SPACE_3 as i8))
+/// Editable property row: a fixed label column, then `add` fills the rest.
+fn prop_row<R>(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
+    ui.horizontal(|ui| {
+        ui.set_min_height(ROW_HEIGHT);
+        let width = (ui.available_width() * LABEL_SHARE).floor();
+        ui.allocate_ui_with_layout(
+            egui::vec2(width, ROW_HEIGHT),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.set_width(width);
+                ui.add(egui::Label::new(RichText::new(label).color(TEXT_SECONDARY)).truncate());
+            },
+        );
+        add(ui)
+    })
+    .inner
+}
+
+/// A collapsible inspector section.
+fn section(ui: &mut Ui, title: &str, open: bool, add: impl FnOnce(&mut Ui)) {
+    egui::CollapsingHeader::new(RichText::new(title).strong().color(TEXT_PRIMARY))
+        .id_salt(("inspector-section", title))
+        .default_open(open)
         .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.spacing_mut().item_spacing.y = SPACE_1;
-            section_header(ui, title, "");
-            add_contents(ui);
+            ui.spacing_mut().item_spacing.y = 2.0;
+            add(ui);
         });
 }
 
-/// Top toolbar. `bottom_open` is UI-local (the Profiler/Log panel).
+/// A slider that fills the rest of the row, with a fixed-width value box on
+/// its right, so long values never widen the panel past its edge.
+fn fill_slider<N: egui::emath::Numeric>(
+    ui: &mut Ui,
+    value: &mut N,
+    range: RangeInclusive<N>,
+    logarithmic: bool,
+    suffix: &str,
+) -> egui::Response {
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        let span = range.end().to_f64() - range.start().to_f64();
+        let drag = ui.add_sized(
+            [VALUE_WIDTH, ui.spacing().interact_size.y],
+            egui::DragValue::new(&mut *value)
+                .range(range.clone())
+                .speed(span / 300.0)
+                .max_decimals(3)
+                .suffix(suffix),
+        );
+        fill_row(ui);
+        let slider = ui.add(
+            egui::Slider::new(value, range)
+                .logarithmic(logarithmic)
+                .show_value(false),
+        );
+        slider.union(drag)
+    })
+    .inner
+}
+
+/// Sizes the next slider to the width left in the row.
+fn fill_row(ui: &mut Ui) {
+    ui.spacing_mut().slider_width = (ui.available_width() - ui.spacing().item_spacing.x).max(40.0);
+}
+
+/// Top bar: name, workspaces, playback, scene toggles.
 pub fn toolbar(
     ui: &mut Ui,
     view: &StudioView,
     time_text: &str,
-    bottom_open: &mut bool,
+    workspace: &mut Workspace,
     actions: &mut Vec<StudioAction>,
 ) {
     ui.horizontal_centered(|ui| {
@@ -125,7 +257,12 @@ pub fn toolbar(
                 .strong()
                 .color(TEXT_PRIMARY),
         );
-        ui.add_space(SPACE_2);
+        ui.add_space(SPACE_3);
+        if let Some(index) = tabs(ui, &Workspace::NAMES, workspace.index()) {
+            *workspace = Workspace::ALL[index];
+        }
+        ui.add_space(SPACE_3);
+        ui.separator();
         let play = if view.paused {
             "▶  Play"
         } else {
@@ -145,43 +282,12 @@ pub fn toolbar(
             if tool_button(ui, "Capture", false).clicked() {
                 actions.push(StudioAction::Capture);
             }
-            if tool_button(ui, "Profiler", *bottom_open).clicked() {
-                *bottom_open = !*bottom_open;
-            }
             if tool_button(ui, "Labels", view.labels_enabled).clicked() {
                 actions.push(StudioAction::ToggleLabels);
             }
             if tool_button(ui, "Terrain", view.terrain_enabled).clicked() {
                 actions.push(StudioAction::ToggleTerrain);
             }
-            let current = TerrainViewMode::ALL
-                .get(view.view_index)
-                .copied()
-                .map_or("—", view_mode_name);
-            egui::ComboBox::from_id_salt("view-mode")
-                .width(130.0)
-                .selected_text(current)
-                .show_ui(ui, |ui| {
-                    for (index, mode) in TerrainViewMode::ALL.iter().enumerate() {
-                        if ui
-                            .selectable_label(index == view.view_index, view_mode_name(*mode))
-                            .clicked()
-                        {
-                            actions.push(StudioAction::SetView(index));
-                        }
-                    }
-                });
-            ui.label(RichText::new("View").font(small()).color(TEXT_DISABLED));
-            // Right-to-left: add the camera options reversed so they read left to right.
-            ui.scope(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                for index in (0..CAMERA_MODES.len()).rev() {
-                    if tool_button(ui, CAMERA_MODES[index], view.camera_index == index).clicked() {
-                        actions.push(StudioAction::SetCamera(index));
-                    }
-                }
-            });
-            ui.label(RichText::new("Camera").font(small()).color(TEXT_DISABLED));
         });
     });
 }
@@ -196,7 +302,7 @@ pub fn outliner(ui: &mut Ui, view: &StudioView, actions: &mut Vec<StudioAction>)
         .show(ui, |ui| {
             for (index, body) in view.bodies.iter().enumerate() {
                 let (rect, response) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), 30.0),
+                    egui::vec2(ui.available_width(), 28.0),
                     egui::Sense::click(),
                 );
                 let fill = if body.selected {
@@ -240,141 +346,330 @@ pub fn outliner(ui: &mut Ui, view: &StudioView, actions: &mut Vec<StudioAction>)
         });
     ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
         ui.label(
-            RichText::new("Click selects · double-click focuses · Alt+click flies to a point")
+            RichText::new("Click selects · double-click focuses")
                 .font(small())
                 .color(TEXT_DISABLED),
         );
     });
 }
 
-/// Inspector for the selected body, camera, terrain and overlays.
-/// `panel` is the throttled copy used for readable text; `view` is live state.
+/// Tabbed inspector for the selected body. `panel` is the throttled copy used
+/// for readable text; `view` is live state.
 pub fn inspector(
     ui: &mut Ui,
     view: &StudioView,
     panel: &StudioView,
+    tab: &mut InspectorTab,
     actions: &mut Vec<StudioAction>,
 ) {
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        ui.label(
+            RichText::new(&panel.inspector_title)
+                .size(17.0)
+                .strong()
+                .color(TEXT_PRIMARY),
+        );
+        ui.label(RichText::new(&panel.inspector_subtitle).color(TEXT_SECONDARY));
+    });
+    ui.add_space(SPACE_1);
+    if let Some(index) = tabs(ui, &InspectorTab::NAMES, tab.index()) {
+        *tab = InspectorTab::ALL[index];
+    }
+    ui.separator();
     egui::ScrollArea::vertical()
+        .id_salt(("inspector-scroll", tab.index()))
         .auto_shrink([false, false])
-        .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = SPACE_3;
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
-                ui.label(
-                    RichText::new(&panel.inspector_title)
-                        .size(18.0)
-                        .strong()
-                        .color(TEXT_PRIMARY),
-                );
-                ui.label(RichText::new(&panel.inspector_subtitle).color(TEXT_SECONDARY));
-            });
-            ui.horizontal(|ui| {
-                if tool_button(ui, "Frame", false).clicked() {
-                    actions.push(StudioAction::FrameSelected);
-                }
-                if tool_button_enabled(ui, "Walk surface", false, view.surface_available).clicked()
-                {
-                    actions.push(StudioAction::SurfaceNavigation);
-                }
-            });
-            card(ui, "BODY", |ui| {
-                for stat in &panel.body_stats {
-                    stat_row(ui, stat);
-                }
-            });
-            card(ui, "CAMERA", |ui| {
-                for stat in &panel.camera_stats {
-                    stat_row(ui, stat);
-                }
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("0.01×").font(small()).color(TEXT_DISABLED));
-                    let mut exponent = view.speed_exponent;
-                    ui.spacing_mut().slider_width = (ui.available_width() - 40.0).max(60.0);
-                    if ui
-                        .add(egui::Slider::new(&mut exponent, -2.0..=2.0).show_value(false))
-                        .changed()
-                    {
-                        actions.push(StudioAction::SetSpeedExponent(exponent));
-                    }
-                    ui.label(RichText::new("100×").font(small()).color(TEXT_DISABLED));
-                });
-                section_header(ui, "GO TO ALTITUDE", "");
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
-                    for (index, label) in ALTITUDE_LABELS.iter().enumerate() {
-                        if tool_button(ui, label, false).clicked() {
-                            actions.push(StudioAction::Approach(index));
-                        }
-                    }
-                });
-            });
-            card(ui, "TERRAIN", |ui| {
-                for stat in &panel.terrain_stats {
-                    stat_row(ui, stat);
-                }
-            });
-            if let Some(planet) = &view.planet {
-                planet_card(ui, planet, actions);
-            }
-            card(ui, "OVERLAYS", |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for (index, overlay) in Overlay::ALL.iter().enumerate() {
-                        if tool_button(ui, OVERLAY_LABELS[index], view.overlays[index]).clicked() {
-                            actions.push(StudioAction::ToggleOverlay(*overlay));
-                        }
-                    }
-                });
-            });
-            render_card(ui, view, panel, actions);
+        .show(ui, |ui| match tab {
+            InspectorTab::Body => body_tab(ui, view, panel, actions),
+            InspectorTab::Planet => planet_tab(ui, view.planet.as_ref(), actions),
+            InspectorTab::Render => render_tab(ui, view, panel, actions),
         });
 }
 
-/// Render settings generated from the registry, grouped, plus per-pass GPU
-/// times. The view mode lives in the toolbar.
-fn render_card(
-    ui: &mut Ui,
-    view: &StudioView,
-    panel: &StudioView,
-    actions: &mut Vec<StudioAction>,
-) {
-    card(ui, "RENDER", |ui| {
-        for stat in &panel.render_stats {
+fn body_tab(ui: &mut Ui, view: &StudioView, panel: &StudioView, actions: &mut Vec<StudioAction>) {
+    ui.horizontal(|ui| {
+        if tool_button(ui, "Frame", false).clicked() {
+            actions.push(StudioAction::FrameSelected);
+        }
+        if tool_button_enabled(ui, "Walk surface", false, view.surface_available).clicked() {
+            actions.push(StudioAction::SurfaceNavigation);
+        }
+    });
+    section(ui, "Body", true, |ui| {
+        for stat in &panel.body_stats {
             stat_row(ui, stat);
         }
-        let mut groups: Vec<&str> = Vec::new();
-        for spec in SPECS.iter().filter(|spec| spec.id != "render.view_mode") {
-            if !groups.contains(&spec.group) {
-                groups.push(spec.group);
+    });
+    section(ui, "Camera", true, |ui| {
+        for stat in &panel.camera_stats {
+            stat_row(ui, stat);
+        }
+        prop_row(ui, "Fly speed", |ui| {
+            let mut exponent = view.speed_exponent;
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                // The current multiplier sits where the slider ends.
+                ui.add_sized(
+                    [48.0, ROW_HEIGHT],
+                    egui::Label::new(
+                        RichText::new(format!("{:.2}×", 10f32.powf(exponent)))
+                            .font(mono())
+                            .color(TEXT_PRIMARY),
+                    ),
+                );
+                fill_row(ui);
+                if ui
+                    .add(egui::Slider::new(&mut exponent, -2.0..=2.0).show_value(false))
+                    .changed()
+                {
+                    actions.push(StudioAction::SetSpeedExponent(exponent));
+                }
+            });
+        });
+        ui.label(
+            RichText::new("Go to altitude")
+                .font(small())
+                .color(TEXT_DISABLED),
+        );
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for (index, label) in ALTITUDE_LABELS.iter().enumerate() {
+                if tool_button(ui, label, false).clicked() {
+                    actions.push(StudioAction::Approach(index));
+                }
             }
+        });
+    });
+    section(ui, "Terrain", true, |ui| {
+        for stat in &panel.terrain_stats {
+            stat_row(ui, stat);
         }
-        for group in groups {
-            egui::CollapsingHeader::new(RichText::new(group).color(TEXT_SECONDARY))
-                .id_salt(("render-group", group))
-                .default_open(false)
-                .show(ui, |ui| {
-                    for (index, spec) in SPECS.iter().enumerate() {
-                        if spec.group != group || spec.id == "render.view_mode" {
-                            continue;
-                        }
-                        let Some(value) = view.render_settings.get(index).copied() else {
-                            continue;
-                        };
-                        if let Some(value) =
-                            setting_widget(ui, spec.id, spec.label, spec.kind, value)
-                        {
-                            actions.push(StudioAction::SetSetting(index, value));
-                        }
+    });
+    section(ui, "Overlays", false, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            for (index, overlay) in Overlay::ALL.iter().enumerate() {
+                if tool_button(ui, OVERLAY_LABELS[index], view.overlays[index]).clicked() {
+                    actions.push(StudioAction::ToggleOverlay(*overlay));
+                }
+            }
+        });
+    });
+}
+
+/// Readable label of a `PlanetParams` field name (`ocean_depth_m` → "Ocean
+/// depth (m)").
+fn param_label(name: &str) -> String {
+    let (base, unit) = match name.rsplit_once('_') {
+        Some((base, unit @ ("m" | "c" | "deg" | "km"))) => (base, Some(unit)),
+        _ => (name, None),
+    };
+    let mut label = base.replace('_', " ");
+    if let Some(first) = label.get_mut(..1) {
+        first.make_ascii_uppercase();
+    }
+    match unit {
+        Some("c") => format!("{label} (°C)"),
+        Some(unit) => format!("{label} ({unit})"),
+        None => label,
+    }
+}
+
+/// One planet parameter row: label (bold when overridden, with a reset
+/// button) and a slider with its value box. Sliders apply on release, so each
+/// drag re-bakes the planet once.
+fn param_row(ui: &mut Ui, index: usize, param: &PlanetParamItem, actions: &mut Vec<StudioAction>) {
+    ui.horizontal(|ui| {
+        ui.set_min_height(ROW_HEIGHT);
+        let width = (ui.available_width() * LABEL_SHARE).floor();
+        ui.allocate_ui_with_layout(
+            egui::vec2(width, ROW_HEIGHT),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.set_width(width);
+                ui.spacing_mut().item_spacing.x = 2.0;
+                if param.overridden {
+                    if ui
+                        .small_button("↺")
+                        .on_hover_text("Back to the sampled value")
+                        .clicked()
+                    {
+                        actions.push(StudioAction::PlanetResetParam(index));
                     }
-                });
-        }
-        if tool_button(ui, "Reset render settings", false).clicked() {
-            actions.push(StudioAction::ResetRenderSettings);
+                } else {
+                    // Same footprint as the reset button, so labels line up.
+                    ui.add_space(18.0);
+                }
+                let text = RichText::new(param_label(&param.name));
+                ui.add(
+                    egui::Label::new(if param.overridden {
+                        text.color(TEXT_PRIMARY).strong()
+                    } else {
+                        text.color(TEXT_SECONDARY)
+                    })
+                    .truncate(),
+                );
+            },
+        );
+        let mut value = param.value;
+        let [low, high] = param.range;
+        let logarithmic = low > 0.0 && high / low > 20.0;
+        let response = fill_slider(ui, &mut value, low..=high, logarithmic, "");
+        if response.drag_stopped() || (response.changed() && !response.dragged()) {
+            actions.push(StudioAction::PlanetParam(index, value));
         }
     });
 }
 
-/// One registry widget; returns the new value when the user changed it.
+/// Planet editor (pipeline §18.1): seed, grouped parameters, undo, save.
+fn planet_tab(ui: &mut Ui, planet: Option<&PlanetView>, actions: &mut Vec<StudioAction>) {
+    let Some(planet) = planet else {
+        ui.add_space(SPACE_3);
+        ui.label(
+            RichText::new("This body has no editable world map. Select Rust in the scene list.")
+                .color(TEXT_SECONDARY),
+        );
+        return;
+    };
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(&planet.archetype)
+                .strong()
+                .color(TEXT_PRIMARY),
+        );
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let (text, color) = if planet.dirty {
+                ("unsaved changes", WARN)
+            } else {
+                (planet.terrain_file.as_str(), TEXT_DISABLED)
+            };
+            ui.add(egui::Label::new(RichText::new(text).font(small()).color(color)).truncate());
+        });
+    });
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        if tool_button_enabled(ui, "Undo", false, planet.can_undo)
+            .on_hover_text("Ctrl+Z")
+            .clicked()
+        {
+            actions.push(StudioAction::PlanetUndo);
+        }
+        if tool_button_enabled(ui, "Redo", false, planet.can_redo)
+            .on_hover_text("Ctrl+Shift+Z")
+            .clicked()
+        {
+            actions.push(StudioAction::PlanetRedo);
+        }
+        ui.add_space(SPACE_2);
+        if tool_button_enabled(ui, "Save", planet.dirty, planet.dirty).clicked() {
+            actions.push(StudioAction::PlanetSave);
+        }
+        if tool_button_enabled(ui, "Revert", false, planet.dirty).clicked() {
+            actions.push(StudioAction::PlanetRevert);
+        }
+    });
+    // Fixed-height status line, so the rows below never move.
+    ui.horizontal(|ui| {
+        ui.set_min_height(20.0);
+        if planet.baking {
+            ui.add(egui::Spinner::new().size(12.0).color(WARN));
+            ui.label(
+                RichText::new("Rebuilding the world map…")
+                    .font(small())
+                    .color(WARN),
+            );
+        } else {
+            ui.label(
+                RichText::new("World map up to date")
+                    .font(small())
+                    .color(TEXT_DISABLED),
+            );
+        }
+    });
+    ui.separator();
+    prop_row(ui, "Seed", |ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if tool_button(ui, "Random", false).clicked() {
+                actions.push(StudioAction::PlanetRandomSeed);
+            }
+            let mut seed = planet.seed;
+            // The view shows the edit's seed, so drags accumulate; rebuilds
+            // are throttled by the editor and a drag undoes as one step.
+            let width = ui.available_width() - ui.spacing().item_spacing.x;
+            if ui
+                .add_sized(
+                    [width.max(40.0), ui.spacing().interact_size.y],
+                    egui::DragValue::new(&mut seed).speed(1.0),
+                )
+                .changed()
+            {
+                actions.push(StudioAction::PlanetSeed(seed));
+            }
+        });
+    });
+    let mut shown = vec![false; planet.params.len()];
+    for (group, names) in PARAM_GROUPS {
+        section(ui, group, group == "Continents", |ui| {
+            for name in names {
+                if let Some(index) = planet.params.iter().position(|p| p.name == *name) {
+                    shown[index] = true;
+                    param_row(ui, index, &planet.params[index], actions);
+                }
+            }
+        });
+    }
+    if shown.iter().any(|shown| !shown) {
+        section(ui, "Other", true, |ui| {
+            for (index, param) in planet.params.iter().enumerate() {
+                if !shown[index] {
+                    param_row(ui, index, param, actions);
+                }
+            }
+        });
+    }
+    section(ui, "Status", false, |ui| {
+        for stat in &planet.stats {
+            stat_row(ui, stat);
+        }
+    });
+}
+
+/// Render settings generated from the registry, grouped, plus per-pass GPU
+/// times. The view mode lives on the viewport.
+fn render_tab(ui: &mut Ui, view: &StudioView, panel: &StudioView, actions: &mut Vec<StudioAction>) {
+    section(ui, "GPU passes", true, |ui| {
+        for stat in &panel.render_stats {
+            stat_row(ui, stat);
+        }
+    });
+    let mut groups: Vec<&str> = Vec::new();
+    for spec in SPECS.iter().filter(|spec| spec.id != "render.view_mode") {
+        if !groups.contains(&spec.group) {
+            groups.push(spec.group);
+        }
+    }
+    for group in groups {
+        section(ui, group, false, |ui| {
+            for (index, spec) in SPECS.iter().enumerate() {
+                if spec.group != group || spec.id == "render.view_mode" {
+                    continue;
+                }
+                let Some(value) = view.render_settings.get(index).copied() else {
+                    continue;
+                };
+                if let Some(value) = setting_widget(ui, spec.id, spec.label, spec.kind, value) {
+                    actions.push(StudioAction::SetSetting(index, value));
+                }
+            }
+        });
+    }
+    ui.add_space(SPACE_2);
+    if tool_button(ui, "Reset render settings", false).clicked() {
+        actions.push(StudioAction::ResetRenderSettings);
+    }
+}
+
+/// One registry widget as a property row; returns the new value when the
+/// user changed it.
 fn setting_widget(
     ui: &mut Ui,
     id: &str,
@@ -383,10 +678,11 @@ fn setting_widget(
     value: SettingValue,
 ) -> Option<SettingValue> {
     match (kind, value) {
-        (SettingKind::Bool, SettingValue::Bool(mut on)) => ui
-            .checkbox(&mut on, RichText::new(label).color(TEXT_PRIMARY))
-            .changed()
-            .then_some(SettingValue::Bool(on)),
+        (SettingKind::Bool, SettingValue::Bool(mut on)) => prop_row(ui, label, |ui| {
+            ui.checkbox(&mut on, "")
+                .changed()
+                .then_some(SettingValue::Bool(on))
+        }),
         (
             SettingKind::Float {
                 min,
@@ -396,22 +692,22 @@ fn setting_widget(
             },
             SettingValue::Float(mut x),
         ) => {
-            ui.label(RichText::new(label).font(small()).color(TEXT_SECONDARY));
-            ui.spacing_mut().slider_width = (ui.available_width() - 70.0).max(60.0);
-            let slider = egui::Slider::new(&mut x, min..=max)
-                .logarithmic(logarithmic)
-                .suffix(if unit.is_empty() {
-                    String::new()
-                } else {
-                    format!(" {unit}")
-                });
-            ui.add(slider).changed().then_some(SettingValue::Float(x))
+            let suffix = if unit.is_empty() {
+                String::new()
+            } else {
+                format!(" {unit}")
+            };
+            prop_row(ui, label, |ui| {
+                fill_slider(ui, &mut x, min..=max, logarithmic, &suffix)
+                    .changed()
+                    .then_some(SettingValue::Float(x))
+            })
         }
         (SettingKind::Choice(options), SettingValue::Choice(selected)) => {
-            let mut chosen = None;
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(label).color(TEXT_SECONDARY));
+            prop_row(ui, label, |ui| {
+                let mut chosen = None;
                 egui::ComboBox::from_id_salt(id)
+                    .width(ui.available_width() - SPACE_1)
                     .selected_text(options.get(selected).copied().unwrap_or("—"))
                     .show_ui(ui, |ui| {
                         for (index, option) in options.iter().enumerate() {
@@ -420,18 +716,32 @@ fn setting_widget(
                             }
                         }
                     });
-            });
-            chosen
+                chosen
+            })
         }
         _ => None,
     }
 }
 
 /// Status bar; returns true when the user stops an automation lease.
-pub fn status_bar(ui: &mut Ui, view: &StudioView, panel: &StudioView) -> bool {
+/// `log_open` toggles the Editor's log drawer.
+pub fn status_bar(
+    ui: &mut Ui,
+    view: &StudioView,
+    panel: &StudioView,
+    log_open: Option<&mut bool>,
+) -> bool {
     let mut stop = false;
     ui.horizontal_centered(|ui| {
         ui.spacing_mut().item_spacing.x = SPACE_1;
+        if let Some(log_open) = log_open {
+            let warn = panel.log.iter().any(|line| line.tone != Default::default());
+            let text = if warn { "Log •" } else { "Log" };
+            if tool_button(ui, text, *log_open).clicked() {
+                *log_open = !*log_open;
+            }
+            ui.add_space(SPACE_2);
+        }
         for item in &panel.status {
             ui.label(
                 RichText::new(&item.label)
@@ -478,89 +788,4 @@ pub fn log(ui: &mut Ui, panel: &StudioView) {
                 });
             }
         });
-}
-
-/// Readable label of a `PlanetParams` field name (`ocean_depth_m` → "Ocean
-/// depth (m)").
-fn param_label(name: &str) -> String {
-    let (base, unit) = match name.rsplit_once('_') {
-        Some((base, unit @ ("m" | "c" | "deg" | "km"))) => (base, Some(unit)),
-        _ => (name, None),
-    };
-    let mut label = base.replace('_', " ");
-    if let Some(first) = label.get_mut(..1) {
-        first.make_ascii_uppercase();
-    }
-    match unit {
-        Some("c") => format!("{label} (°C)"),
-        Some(unit) => format!("{label} ({unit})"),
-        None => label,
-    }
-}
-
-/// Planet editor v1 (pipeline §18.1): seed, parameter overrides, save.
-/// Sliders apply on release, so each drag re-bakes the planet once.
-fn planet_card(ui: &mut Ui, planet: &PlanetView, actions: &mut Vec<StudioAction>) {
-    card(ui, "PLANET", |ui| {
-        section_header(
-            ui,
-            &planet.archetype,
-            if planet.dirty {
-                "unsaved"
-            } else {
-                &planet.terrain_file
-            },
-        );
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Seed").color(TEXT_SECONDARY));
-            let mut seed = planet.seed;
-            // The view shows the edit's seed, so drags accumulate; rebuilds
-            // are throttled by the editor.
-            if ui.add(egui::DragValue::new(&mut seed).speed(1.0)).changed() {
-                actions.push(StudioAction::PlanetSeed(seed));
-            }
-            if tool_button(ui, "Random", false).clicked() {
-                actions.push(StudioAction::PlanetRandomSeed);
-            }
-        });
-        for (index, param) in planet.params.iter().enumerate() {
-            ui.horizontal(|ui| {
-                let label = param_label(&param.name);
-                let text = RichText::new(label).font(small());
-                ui.label(if param.overridden {
-                    text.color(TEXT_PRIMARY).strong()
-                } else {
-                    text.color(TEXT_SECONDARY)
-                });
-                if param.overridden
-                    && ui
-                        .small_button("↺")
-                        .on_hover_text("Back to the sampled value")
-                        .clicked()
-                {
-                    actions.push(StudioAction::PlanetResetParam(index));
-                }
-            });
-            let mut value = param.value;
-            let [low, high] = param.range;
-            ui.spacing_mut().slider_width = (ui.available_width() - 70.0).max(60.0);
-            let logarithmic = low > 0.0 && high / low > 20.0;
-            let response =
-                ui.add(egui::Slider::new(&mut value, low..=high).logarithmic(logarithmic));
-            if response.drag_stopped() || (response.changed() && !response.dragged()) {
-                actions.push(StudioAction::PlanetParam(index, value));
-            }
-        }
-        ui.horizontal(|ui| {
-            if tool_button_enabled(ui, "Save", false, planet.dirty).clicked() {
-                actions.push(StudioAction::PlanetSave);
-            }
-            if tool_button_enabled(ui, "Revert", false, planet.dirty).clicked() {
-                actions.push(StudioAction::PlanetRevert);
-            }
-        });
-        for stat in &planet.stats {
-            stat_row(ui, stat);
-        }
-    });
 }

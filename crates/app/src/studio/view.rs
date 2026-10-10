@@ -130,6 +130,10 @@ pub struct PlanetView {
     pub dirty: bool,
     pub params: Vec<PlanetParamItem>,
     pub stats: Vec<StatItem>,
+    pub can_undo: bool,
+    pub can_redo: bool,
+    /// A Tier A bake of the latest edit is still running.
+    pub baking: bool,
 }
 
 /// Playback-rate presets shown in the toolbar.
@@ -172,6 +176,8 @@ pub enum StudioAction {
     PlanetResetParam(usize),
     PlanetRevert,
     PlanetSave,
+    PlanetUndo,
+    PlanetRedo,
 }
 
 /// Keyboard shortcuts handled by the viewport.

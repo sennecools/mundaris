@@ -58,6 +58,8 @@ impl GravityOrbitsDemo {
                 }
             }
             StudioAction::PlanetRevert => self.planet_editor.revert(index),
+            StudioAction::PlanetUndo => self.planet_editor.undo(index),
+            StudioAction::PlanetRedo => self.planet_editor.redo(index),
             StudioAction::PlanetSave => match self.planet_editor.save(index) {
                 Ok(()) => {
                     let file = self
@@ -146,6 +148,9 @@ impl GravityOrbitsDemo {
                     .face_cells(body.properties().reference_radius_m())
             ),
         )];
+        let body_id = self.ids[index];
+        let baking = self.atlas.world_bake_error(body_id).is_none()
+            && (self.atlas.world_bake_seconds(body_id).is_none() || self.atlas.replacing(body_id));
         if let Some(error) = self.atlas.world_bake_error(self.ids[index]) {
             stats.push(StatItem::new("Bake", format!("failed: {error}")).tone(Tone::Error));
         } else if let Some(seconds) = self.atlas.world_bake_seconds(self.ids[index]) {
@@ -157,9 +162,11 @@ impl GravityOrbitsDemo {
             "Overrides",
             editable.edit.overrides.len().to_string(),
         ));
-        if let Some(error) = &editable.error {
-            stats.push(StatItem::new("Error", error.clone()).tone(Tone::Error));
-        }
+        // Always present so the card keeps its height when an edit fails.
+        stats.push(match &editable.error {
+            Some(error) => StatItem::new("Error", error.clone()).tone(Tone::Error),
+            None => StatItem::new("Error", "none"),
+        });
         Some(PlanetView {
             archetype: world.archetype.name.clone(),
             terrain_file: editable.source.terrain.clone(),
@@ -167,6 +174,9 @@ impl GravityOrbitsDemo {
             dirty: editable.dirty(),
             params,
             stats,
+            can_undo: editable.can_undo(),
+            can_redo: editable.can_redo(),
+            baking,
         })
     }
 }
