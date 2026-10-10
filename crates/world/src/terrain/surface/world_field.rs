@@ -144,6 +144,8 @@ pub struct WorldDefinition {
     pub archetype: PlanetArchetype,
     /// Sampled from the archetype with the body seed, then overridden.
     pub params: PlanetParams,
+    /// Body seed the parameters and landforms are sampled with (§5.1).
+    pub body_seed: u64,
     /// Body-fixed rotation axis.
     pub pole: DVec3,
     pub look: Arc<WorldLook>,
@@ -153,10 +155,6 @@ pub struct WorldDefinition {
 }
 
 /// A body's compiled landform set with its sampled per-landform parameters.
-///
-/// PROTOTYPE (M2 Step 6a): the landform seed comes from the continent seed
-/// (the body seed is not kept); the GPU producer draws only the mountain
-/// landform (`landform_wgsl` codegen replaces it in Step 6b).
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorldLandforms {
     pub set: LandformSet,
@@ -164,8 +162,10 @@ pub struct WorldLandforms {
 }
 
 impl WorldLandforms {
-    pub fn new(set: LandformSet, params: &PlanetParams) -> Self {
-        let params = set.sample_params(u64::from(params.continent_seed));
+    /// Sample `set`'s per-landform parameters with the body seed (the
+    /// landform stage seed derives from it, §5.1).
+    pub fn new(set: LandformSet, body_seed: u64) -> Self {
+        let params = set.sample_params(body_seed);
         Self { set, params }
     }
 
@@ -208,6 +208,7 @@ impl WorldDefinition {
         Ok(Self {
             archetype,
             params,
+            body_seed,
             pole,
             look: Arc::new(look),
             landforms: None,
@@ -257,7 +258,7 @@ impl WorldDefinition {
 
     /// Attach a landform set (parameters sampled for this body).
     pub fn with_landforms(mut self, set: LandformSet) -> Self {
-        self.landforms = Some(Arc::new(WorldLandforms::new(set, &self.params)));
+        self.landforms = Some(Arc::new(WorldLandforms::new(set, self.body_seed)));
         self
     }
 
