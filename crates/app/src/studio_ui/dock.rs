@@ -4,12 +4,14 @@
 //! floating window. The viewport is a tab too, but it cannot be closed or
 //! floated (the engine renders into its rect).
 
+use astrum_app::studio::species::SpeciesView;
 use astrum_app::studio::view::{StudioAction, StudioView};
 use egui::{Color32, CornerRadius, Id, Margin, Painter, Rect, Stroke, Ui, WidgetText};
 use egui_dock::{DockState, NodeIndex, Style, SurfaceIndex, TabStyle, TabViewer};
 use serde::{Deserialize, Serialize};
 
 use super::profiler_panel::{self, ProfilerInput, TimelineState};
+use super::species_panel::{self, Thumbnails};
 use super::theme::*;
 use super::viewport::{Interaction, ViewportInput};
 use super::{InspectorTab, contained, panels};
@@ -26,11 +28,17 @@ pub enum Tab {
     Render,
     Log,
     Profiler,
+    /// Species browser: species files.
+    Species,
+    /// Species browser: genome (and niche) sliders.
+    Genome,
+    /// Species browser: grown variants and metrics.
+    LineUp,
 }
 
 impl Tab {
     /// Every tab, in the order the Panels menu lists them.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 10] = [
         Self::Viewport,
         Self::Scene,
         Self::Body,
@@ -38,6 +46,9 @@ impl Tab {
         Self::Render,
         Self::Log,
         Self::Profiler,
+        Self::Species,
+        Self::Genome,
+        Self::LineUp,
     ];
 
     pub fn title(self) -> &'static str {
@@ -49,6 +60,9 @@ impl Tab {
             Self::Render => "Render",
             Self::Log => "Log",
             Self::Profiler => "Profiler",
+            Self::Species => "Species",
+            Self::Genome => "Genome",
+            Self::LineUp => "Line-up",
         }
     }
 
@@ -104,6 +118,17 @@ pub fn performance_layout(profiler_share: f32) -> DockState<Tab> {
     state
         .main_surface_mut()
         .split_below(NodeIndex::root(), 1.0 - share, vec![Tab::Profiler]);
+    state
+}
+
+/// Default Flora layout: species list left, the line-up in the centre with
+/// the viewport stacked behind it (hidden, so the scene does not render),
+/// genome sliders right.
+pub fn flora_layout() -> DockState<Tab> {
+    let mut state = DockState::new(vec![Tab::LineUp, Tab::Viewport]);
+    let tree = state.main_surface_mut();
+    let [centre, _] = tree.split_left(NodeIndex::root(), 0.15, vec![Tab::Species]);
+    tree.split_right(centre, 0.66, vec![Tab::Genome]);
     state
 }
 
@@ -226,6 +251,10 @@ pub struct Tabs<'a> {
     pub interactions: Vec<Interaction>,
     pub viewport: Option<ViewportSlot>,
     pub profiler_shown: bool,
+    pub species: &'a SpeciesView,
+    pub thumbnails: &'a mut Thumbnails,
+    /// A species panel was drawn (the browser starts growing then).
+    pub species_shown: bool,
 }
 
 impl TabViewer for Tabs<'_> {
@@ -259,6 +288,24 @@ impl TabViewer for Tabs<'_> {
                 }
             }
             Tab::Log => contained(ui, |ui| panels::log(ui, self.panel)),
+            Tab::Species => {
+                self.species_shown = true;
+                contained(ui, |ui| {
+                    species_panel::species_list(ui, self.species, &mut self.actions)
+                });
+            }
+            Tab::Genome => {
+                self.species_shown = true;
+                contained(ui, |ui| {
+                    species_panel::genome(ui, self.species, &mut self.actions)
+                });
+            }
+            Tab::LineUp => {
+                self.species_shown = true;
+                contained(ui, |ui| {
+                    species_panel::line_up(ui, self.species, self.thumbnails, &mut self.actions)
+                });
+            }
             Tab::Profiler => {
                 self.profiler_shown = true;
                 contained(ui, |ui| {

@@ -1,7 +1,9 @@
 //! Planet editor v1 over the demo (M1 Step 6): publishes rebuilt world-map
 //! definitions, applies Studio planet actions and builds the panel view.
 use super::*;
-use crate::studio::view::{ParamItem, PlanetView, StatItem, StudioAction, Tone};
+use crate::studio::view::{
+    ParamEdit, ParamItem, ParamTarget, PlanetView, StatItem, StudioAction, Tone,
+};
 use astrum_core::params::{ParamKind, ParamValue};
 use astrum_world::terrain::archetype::{PARAM_FIELDS, float_bounds};
 
@@ -48,12 +50,12 @@ impl GravityOrbitsDemo {
                 let seed = (nanos ^ (nanos >> 29)).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 33;
                 self.planet_editor.set_seed(index, seed);
             }
-            StudioAction::PlanetParam(field, value) => {
+            StudioAction::EditParam(ParamTarget::Planet, ParamEdit::Set(field, value)) => {
                 if let Some(name) = name(field) {
-                    self.planet_editor.set_param(index, name, value);
+                    self.planet_editor.set_param(index, name, value.as_f64());
                 }
             }
-            StudioAction::PlanetResetParam(field) => {
+            StudioAction::EditParam(ParamTarget::Planet, ParamEdit::Reset(field)) => {
                 if let Some(name) = name(field) {
                     self.planet_editor.reset_param(index, name);
                 }

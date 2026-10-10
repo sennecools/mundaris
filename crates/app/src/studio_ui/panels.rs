@@ -9,7 +9,8 @@ use std::ops::RangeInclusive;
 
 use astrum_app::render_settings::{SPECS, SettingKind, SettingValue};
 use astrum_app::studio::view::{
-    Overlay, ParamEdit, ParamItem, PlanetView, RATE_PRESETS, StatItem, StudioAction, StudioView,
+    Overlay, ParamEdit, ParamItem, ParamTarget, PlanetView, RATE_PRESETS, StatItem, StudioAction,
+    StudioView,
 };
 use astrum_core::params::{ParamKind, ParamValue};
 use astrum_renderer::TerrainViewMode;
@@ -191,7 +192,7 @@ fn fill_slider<N: egui::emath::Numeric>(
             egui::DragValue::new(&mut *value)
                 .range(range.clone())
                 .speed(span / 300.0)
-                .max_decimals(3)
+                .max_decimals(if N::INTEGRAL { 0 } else { 3 })
                 .suffix(suffix),
         );
         fill_row(ui);
@@ -630,10 +631,11 @@ fn planet_tab(ui: &mut Ui, planet: Option<&PlanetView>, actions: &mut Vec<Studio
         |group| group == "Continents",
         &mut edits,
     );
-    actions.extend(edits.into_iter().map(|edit| match edit {
-        ParamEdit::Set(index, value) => StudioAction::PlanetParam(index, value.as_f64()),
-        ParamEdit::Reset(index) => StudioAction::PlanetResetParam(index),
-    }));
+    actions.extend(
+        edits
+            .into_iter()
+            .map(|edit| StudioAction::EditParam(ParamTarget::Planet, edit)),
+    );
     section(ui, "Status", false, |ui| {
         for stat in &planet.stats {
             stat_row(ui, stat);

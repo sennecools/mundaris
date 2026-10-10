@@ -1,7 +1,8 @@
 //! Studio view publication and UI actions over the existing command path.
 use super::*;
 use crate::studio::view::{
-    ALTITUDE_PRESETS_M, BodyItem, LabelItem, LabelState, LogItem, Overlay, RATE_PRESETS, StatItem,
+    ALTITUDE_PRESETS_M, BodyItem, LabelItem, LabelState, LogItem, Overlay, ParamTarget, RATE_PRESETS,
+    StatItem,
     StudioAction, StudioView, Tone, rate_preset_index,
 };
 
@@ -218,12 +219,13 @@ impl GravityOrbitsDemo {
             }
             StudioAction::PlanetSeed(_)
             | StudioAction::PlanetRandomSeed
-            | StudioAction::PlanetParam(..)
-            | StudioAction::PlanetResetParam(_)
+            | StudioAction::EditParam(ParamTarget::Planet, _)
             | StudioAction::PlanetRevert
             | StudioAction::PlanetSave
             | StudioAction::PlanetUndo
             | StudioAction::PlanetRedo => self.planet_action(action),
+            // The species browser lives in the Studio shell, outside the scene.
+            StudioAction::EditParam(ParamTarget::Species, _) | StudioAction::Species(_) => {}
         }
     }
 

@@ -158,6 +158,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "astrum_core",
+ "astrum_flora",
  "astrum_math",
  "astrum_renderer",
  "astrum_simulation",

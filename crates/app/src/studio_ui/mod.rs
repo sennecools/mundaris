@@ -9,6 +9,7 @@
 mod dock;
 mod panels;
 mod profiler_panel;
+mod species_panel;
 mod surface;
 mod theme;
 mod viewport;
@@ -22,7 +23,8 @@ use anyhow::{Context, Result, anyhow};
 use astrum_app::{
     GravityOrbitsDemo,
     engine_profile::span,
-    studio::view::{StudioAction, StudioView},
+    studio::species::{SpeciesEditor, SpeciesView, species_dir},
+    studio::view::{ParamTarget, StudioAction, StudioView},
 };
 use astrum_renderer::{GpuContext, Renderer};
 use dock::Tab;
@@ -68,6 +70,8 @@ pub struct Engine {
     /// Throttled copy of the view for readable panel text.
     panel_view: StudioView,
     last_panels: Option<Instant>,
+    /// Species browser (Flora workspace); grows on its own worker thread.
+    species: SpeciesEditor,
 }
 
 impl Engine {
@@ -84,6 +88,7 @@ impl Engine {
             bar_frames: Vec::new(),
             panel_view: StudioView::default(),
             last_panels: None,
+            species: SpeciesEditor::load(&species_dir()),
         }
     }
 
@@ -109,7 +114,11 @@ impl Engine {
 
     fn action(&mut self, action: StudioAction) {
         self.human_input("human_input_ui");
-        self.demo.studio_action(action);
+        match action {
+            StudioAction::Species(action) => self.species.action(action),
+            StudioAction::EditParam(ParamTarget::Species, edit) => self.species.edit(edit),
+            action => self.demo.studio_action(action),
+        }
     }
 
     fn interaction(&mut self, interaction: Interaction) {
@@ -197,11 +206,13 @@ pub enum Workspace {
     Editor,
     /// Viewport over the full-width profiler.
     Performance,
+    /// Species browser: species list, line-up, genome sliders.
+    Flora,
 }
 
 impl Workspace {
-    pub const ALL: [Self; 2] = [Self::Editor, Self::Performance];
-    pub const NAMES: [&'static str; 2] = ["Editor", "Performance"];
+    pub const ALL: [Self; 3] = [Self::Editor, Self::Performance, Self::Flora];
+    pub const NAMES: [&'static str; 3] = ["Editor", "Performance", "Flora"];
     pub fn index(self) -> usize {
         self as usize
     }
@@ -232,6 +243,7 @@ struct StudioLayout {
     workspace: Workspace,
     editor_dock: Option<DockState<Tab>>,
     performance_dock: Option<DockState<Tab>>,
+    flora_dock: Option<DockState<Tab>>,
     #[serde(skip_serializing)]
     inspector_tab: InspectorTab,
     #[serde(skip_serializing)]
@@ -253,6 +265,7 @@ impl Default for StudioLayout {
             workspace: Workspace::Editor,
             editor_dock: None,
             performance_dock: None,
+            flora_dock: None,
             inspector_tab: InspectorTab::Body,
             log_open: false,
             outliner_width: 240.0,
@@ -309,7 +322,7 @@ impl StudioLayout {
             }
         }
         let mut json = serde_json::to_value(self).unwrap_or_default();
-        for key in ["editor_dock", "performance_dock"] {
+        for key in ["editor_dock", "performance_dock", "flora_dock"] {
             if let Some(dock) = json.get_mut(key).filter(|dock| dock.is_object()) {
                 zero_nulls(dock);
             }
@@ -328,6 +341,7 @@ impl StudioLayout {
                 self.inspector_tab,
             ),
             Workspace::Performance => dock::performance_layout(self.performance_height / 830.0),
+            Workspace::Flora => dock::flora_layout(),
         }
     }
 
@@ -336,6 +350,7 @@ impl StudioLayout {
         let slot = match workspace {
             Workspace::Editor => &mut self.editor_dock,
             Workspace::Performance => &mut self.performance_dock,
+            Workspace::Flora => &mut self.flora_dock,
         };
         slot.get_or_insert(default)
     }
@@ -357,6 +372,8 @@ struct UiState {
     scene: Option<SceneTexture>,
     /// The profiler tab was visible last frame (keeps its data refreshed).
     profiler_shown: bool,
+    /// Species line-up thumbnails uploaded to egui.
+    thumbnails: species_panel::Thumbnails,
 }
 
 struct Presentation {
@@ -569,9 +586,19 @@ fn draw(
         timeline,
         scene: scene_texture,
         profiler_shown,
+        thumbnails,
     } = ui_state;
     let workspace = layout.workspace;
-    let (tab_actions, profiler_inputs, interactions, slot, shown) = {
+    // The species view is built only while a species panel is open.
+    let species_open = [Tab::Species, Tab::Genome, Tab::LineUp]
+        .into_iter()
+        .any(|tab| dock::is_open(layout.dock_mut(workspace), tab));
+    let species_view = if species_open {
+        engine.species.view()
+    } else {
+        SpeciesView::default()
+    };
+    let (tab_actions, profiler_inputs, interactions, slot, shown, species_shown) = {
         let view = engine.demo.studio_view();
         let panel = &engine.panel_view;
         // Planet undo and redo, unless a text field has the keyboard.
@@ -651,6 +678,9 @@ fn draw(
             interactions: Vec::new(),
             viewport: None,
             profiler_shown: false,
+            species: &species_view,
+            thumbnails,
+            species_shown: false,
         };
         let style = dock::style(root.style());
         egui::CentralPanel::no_frame().show(root, |ui| {
@@ -668,9 +698,13 @@ fn draw(
             tabs.interactions,
             tabs.viewport,
             tabs.profiler_shown,
+            tabs.species_shown,
         )
     };
     *profiler_shown = shown;
+    if species_shown {
+        engine.species.activate();
+    }
     drop(ui_span);
     let mut ui_ms = started.elapsed().as_secs_f64() * 1000.0;
     for action in actions.into_iter().chain(tab_actions) {

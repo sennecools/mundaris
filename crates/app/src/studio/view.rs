@@ -146,6 +146,15 @@ impl ParamItem {
     }
 }
 
+/// Which content a [`StudioAction::EditParam`] edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamTarget {
+    /// The selected world-map body (`archetype::PARAM_FIELDS` order).
+    Planet,
+    /// The selected species in the species browser (genome, then niche).
+    Species,
+}
+
 /// One edit from a generic parameter panel; the index is into the item list.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ParamEdit {
@@ -204,13 +213,14 @@ pub enum StudioAction {
     /// Planet editor (selected world-map body).
     PlanetSeed(u64),
     PlanetRandomSeed,
-    /// Override parameter `index` (`archetype::PARAM_FIELDS`).
-    PlanetParam(usize, f64),
-    PlanetResetParam(usize),
     PlanetRevert,
     PlanetSave,
     PlanetUndo,
     PlanetRedo,
+    /// Edits a parameter of a descriptor-driven panel (generic content edit).
+    EditParam(ParamTarget, ParamEdit),
+    /// Species browser (handled by the Studio shell, not the scene).
+    Species(super::species::SpeciesAction),
 }
 
 /// Keyboard shortcuts handled by the viewport.
