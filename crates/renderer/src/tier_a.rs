@@ -356,7 +356,12 @@ impl TierABakeInputs {
                 self.transform_width_m,
                 self.crust_width_m,
             ]),
-            f([self.hardness_noise, self.hardness_noise_frequency, self.junction_blend_m, 0.0]),
+            f([
+                self.hardness_noise,
+                self.hardness_noise_frequency,
+                self.junction_blend_m,
+                0.0,
+            ]),
             u([self.hardness_seed, 0, 0, 0]),
             f([
                 self.smoothing_step_rad,
@@ -915,15 +920,26 @@ fn schedule(
                     .scalars(inputs.smoothing_step_rad, 0.0),
             );
         }
-        s.push(PassSpec::new(Stage::ErodeSet, n, &[0, l.carried[0]]).mode(1));
-        s.push(PassSpec::new(Stage::ErodeSet, n, &[0, l.carried[1]]).mode(1));
     }
+    // Moisture starts from zero carried moisture and precipitation; the runs
+    // may hold wind-blur values (and never rely on buffer zero-init).
+    for run in [l.carried[0], l.carried[1], l.precipitation] {
+        s.push(PassSpec::new(Stage::ErodeSet, n, &[0, run]).mode(1));
+    }
+    // Precipitation ping-pongs with the (still unused) eroded run.
+    let rain = [l.precipitation, l.eroded];
+    let mut rain_total = l.precipitation;
     if inputs.has(stage::MOISTURE) {
         for pass in 0..inputs.moisture_iterations {
             let (src, dst) = if pass % 2 == 0 {
                 (l.carried[0], l.carried[1])
             } else {
                 (l.carried[1], l.carried[0])
+            };
+            let (rain_src, rain_dst) = if pass % 2 == 0 {
+                (rain[0], rain[1])
+            } else {
+                (rain[1], rain[0])
             };
             s.push(PassSpec::new(
                 Stage::MoistureStep,
@@ -935,17 +951,19 @@ fn schedule(
                     wind[1],
                     l.pre_erosion,
                     result(run::TEMPERATURE),
-                    l.precipitation,
+                    rain_src,
                     l.slope[0],
                     l.slope[1],
+                    rain_dst,
                 ],
             ));
+            rain_total = rain_dst;
         }
     }
     s.push(PassSpec::new(
         Stage::MoistureFinish,
         n,
-        &[l.precipitation, result(run::MOISTURE)],
+        &[rain_total, result(run::MOISTURE)],
     ));
 
     // Erosion cascade.
@@ -1796,5 +1814,28 @@ mod tests {
             ..inputs
         };
         assert!(4 * Layout::new(&big).words < 512 << 20);
+    }
+}
+
+/// Dx12 diagnostics (ignored): writes the naga HLSL of the Tier A shader to
+/// `ASTRUM_HLSL_OUT`, to inspect what FXC/DXC compile.
+#[cfg(test)]
+mod hlsl_dump {
+    #[test]
+    #[ignore]
+    fn dump_tier_a_hlsl() {
+        let module = naga::front::wgsl::parse_str(super::SHADER).unwrap();
+        let info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
+        let mut out = String::new();
+        let options = naga::back::hlsl::Options::default();
+        let pipeline = Default::default();
+        let mut writer = naga::back::hlsl::Writer::new(&mut out, &options, &pipeline);
+        writer.write(&module, &info, None).unwrap();
+        std::fs::write(std::env::var("ASTRUM_HLSL_OUT").unwrap(), out).unwrap();
     }
 }

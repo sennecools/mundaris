@@ -124,6 +124,72 @@ pub struct GpuContext {
     timestamp_availability: TimestampAvailability,
 }
 
+/// Instance options from the environment, with Microsoft's DXC for Dx12.
+/// FXC (wgpu's fallback without `dxcompiler.dll`) needs far too long for the
+/// terrain producer shader, so without DXC the Dx12 backend is left out
+/// unless `WGPU_BACKEND` asks for it; `WGPU_DX12_COMPILER` still overrides.
+fn instance_descriptor() -> wgpu::InstanceDescriptor {
+    let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+    if !cfg!(windows) || std::env::var_os("WGPU_DX12_COMPILER").is_some() {
+        return descriptor;
+    }
+    match dxc_directory() {
+        Some(dir) => {
+            tracing::info!(directory = %dir.display(), "Dx12 shaders compile with DXC");
+            descriptor.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::DynamicDxc {
+                dxc_path: dir.join("dxcompiler.dll").to_string_lossy().into_owned(),
+            };
+        }
+        None => {
+            if std::env::var_os("WGPU_BACKEND").is_none() {
+                descriptor.backends.remove(wgpu::Backends::DX12);
+            }
+            tracing::warn!(
+                "DXC (dxcompiler.dll, dxil.dll) not found: set ASTRUM_DXC_DIR or place it \
+                 next to the executable; Dx12 is not offered"
+            );
+        }
+    }
+    descriptor
+}
+
+/// Folder holding Microsoft's `dxcompiler.dll` and `dxil.dll`: `ASTRUM_DXC_DIR`,
+/// the executable's folder, or the newest `target/third-party/dxc-*/extracted/
+/// bin/x64` above the working directory (developer checkouts).
+fn dxc_directory() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let has_dxc =
+        |dir: &PathBuf| dir.join("dxcompiler.dll").is_file() && dir.join("dxil.dll").is_file();
+    if let Some(dir) = std::env::var_os("ASTRUM_DXC_DIR").map(PathBuf::from) {
+        return has_dxc(&dir).then_some(dir);
+    }
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(PathBuf::from))
+        .filter(has_dxc)
+    {
+        return Some(dir);
+    }
+    let mut cursor = std::env::current_dir().ok();
+    while let Some(dir) = cursor {
+        let third_party = dir.join("target").join("third-party");
+        if let Ok(entries) = std::fs::read_dir(&third_party) {
+            let mut found: Vec<PathBuf> = entries
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("dxc-"))
+                .map(|e| e.path().join("extracted").join("bin").join("x64"))
+                .filter(has_dxc)
+                .collect();
+            found.sort();
+            if let Some(dir) = found.pop() {
+                return Some(dir);
+            }
+        }
+        cursor = dir.parent().map(PathBuf::from);
+    }
+    None
+}
+
 impl GpuContext {
     /// Creates the high-performance device with the limits and features the
     /// scene renderer needs (texture-array layers for the terrain atlas,
@@ -140,8 +206,7 @@ impl GpuContext {
 
     async fn new_async(fallback: bool) -> Result<Self, RendererError> {
         // WGPU_BACKEND and related variables may select a backend for diagnosis.
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let instance = wgpu::Instance::new(instance_descriptor());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,

@@ -344,7 +344,11 @@ fn gpu_erosion_matches_the_cpu_pointwise_at_64() {
     };
     let n = 64;
     let mut input = inputs(n, 7);
-    input.params.erosion_cascade = [(1, 20), (1, 0), (1, 0)];
+    let iterations: u32 = std::env::var("ASTRUM_EROSION_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    input.params.erosion_cascade = [(1, iterations), (1, 0), (1, 0)];
     let validation = TierAValidation::new(&context.device);
     let gpu = validation
         .bake_with_scratch(
@@ -385,7 +389,10 @@ fn gpu_erosion_matches_the_cpu_pointwise_at_64() {
     let relative_q = relative[relative.len() * 99 / 100];
     let worst_q = relative[relative.len() - 1];
     let flipped = relative.iter().filter(|&&r| r > 0.15).count();
-    println!("discharge texels above 0.15: {flipped} of {}", relative.len());
+    println!(
+        "discharge texels above 0.15: {flipped} of {}",
+        relative.len()
+    );
     let change = pre
         .data()
         .iter()
@@ -857,4 +864,165 @@ fn gpu_landform_weights_match_the_cpu_oracle() {
         used[..3].iter().all(|&u| u > 0),
         "every terra landform appears"
     );
+}
+
+/// Backend diagnostics (ignored): bakes stage subsets twice and reports, per
+/// result run and scratch run, how many words differ between the repeats
+/// and the worst difference from the first bake of the full stage set's CPU
+/// oracle. Run with `WGPU_BACKEND=dx12 cargo test ... backend_diagnostics
+/// -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn backend_diagnostics() {
+    let Some(context) = common::gpu() else {
+        return;
+    };
+    let validation = TierAValidation::new(&context.device);
+    let diag_n: usize = std::env::var("ASTRUM_DIAG_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
+    let base = inputs(diag_n, 7);
+    use TierAStage::*;
+    let m1 = vec![Continents, SeaLevel, Shelf, Temperature, Wind, Moisture];
+    let sets: Vec<(&str, Vec<TierAStage>)> = vec![
+        ("continents", vec![Continents]),
+        ("+sea level", vec![Continents, SeaLevel, Shelf]),
+        ("m1", m1.clone()),
+        ("m1+tectonics", [&m1[..], &[Tectonics]].concat()),
+        ("+rain shadow", [&m1[..], &[Tectonics, RainShadow]].concat()),
+        (
+            "m1 no wind",
+            vec![Continents, SeaLevel, Shelf, Temperature, Moisture],
+        ),
+        ("all", base.stages.clone()),
+    ];
+    for (name, stages) in sets {
+        let mut input = base.clone();
+        if let Some(m) = std::env::var("ASTRUM_DIAG_MOISTURE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            input.params.moisture_iterations = m;
+        }
+        if let Ok(set) = std::env::var("ASTRUM_DIAG_SET") {
+            for pair in set.split(',').filter(|p| !p.is_empty()) {
+                let (name, value) = pair.split_once('=').unwrap();
+                input
+                    .params
+                    .set(name.trim(), value.trim().parse().unwrap())
+                    .unwrap();
+            }
+        }
+        input.stages.retain(|s| stages.contains(s));
+        let bake = || {
+            validation
+                .bake_with_scratch(
+                    &context.device,
+                    &context.queue,
+                    &bake_inputs(&input),
+                    usize::MAX,
+                )
+                .unwrap()
+        };
+        let (a, b) = (bake(), bake());
+        let len = 6 * diag_n * diag_n;
+        let runs = a.fields.len() / len;
+        let mut report = Vec::new();
+        for r in 0..runs.min(9) {
+            let differ = a
+                .run(r)
+                .iter()
+                .zip(b.run(r))
+                .filter(|(x, y)| x.to_bits() != y.to_bits())
+                .count();
+            if differ > 0 {
+                let n = diag_n;
+                let first: Vec<String> = a
+                    .run(r)
+                    .iter()
+                    .zip(b.run(r))
+                    .enumerate()
+                    .filter(|(_, (x, y))| x.to_bits() != y.to_bits())
+                    .take(4)
+                    .map(|(k, (x, y))| {
+                        format!("f{} ({},{}) {x} vs {y}", k / (n * n), k % n, (k / n) % n)
+                    })
+                    .collect();
+                report.push(format!("run {r}: {differ} [{}]", first.join("; ")));
+            }
+        }
+        for s in [
+            TierAScratch::PreErosion,
+            TierAScratch::Uplift,
+            TierAScratch::Hardness,
+            TierAScratch::BoundaryDistance,
+            TierAScratch::SlopeEast,
+            TierAScratch::Eroded,
+        ] {
+            if let (Some(x), Some(y)) = (a.scratch_f32(s), b.scratch_f32(s)) {
+                let differ = x
+                    .iter()
+                    .zip(&y)
+                    .filter(|(p, q)| p.to_bits() != q.to_bits())
+                    .count();
+                if differ > 0 {
+                    report.push(format!("{s:?}: {differ}"));
+                }
+            }
+        }
+        let cpu = bake_full(&input).unwrap();
+        let f = &cpu.fields;
+        println!(
+            "{name}: sea level gpu {} / {} cpu {:.6}; repeat diffs [{}]; vs cpu: elevation {:.3e} temperature {:.3e} moisture {:.3e} wind {:.3e}",
+            a.sea_level,
+            b.sea_level,
+            f.sea_level,
+            report.join(", "),
+            worst(a.run(0), f.elevation.data()),
+            worst(a.run(1), f.temperature.data()),
+            worst(a.run(2), f.moisture.data()),
+            worst(a.run(3), f.wind_east.data()),
+        );
+    }
+}
+
+/// Backend diagnostics (ignored): sea level of whole and frame-split bakes at
+/// production size, each repeated.
+#[test]
+#[ignore]
+fn backend_split_diagnostics() {
+    let Some(context) = common::gpu() else {
+        return;
+    };
+    let n: usize = std::env::var("ASTRUM_SPLIT_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(512);
+    let mut input = inputs(n, 7);
+    if std::env::var("ASTRUM_SPLIT_M1").is_ok() {
+        use TierAStage::*;
+        input
+            .stages
+            .retain(|s| [Continents, SeaLevel, Shelf, Temperature, Wind, Moisture].contains(s));
+    }
+    let packed = bake_inputs(&input);
+    let validation = TierAValidation::new(&context.device);
+    let splits: Vec<usize> = std::env::var("ASTRUM_SPLIT_LIST")
+        .map(|v| v.split(',').map(|s| s.trim().parse().unwrap()).collect())
+        .unwrap_or_else(|_| vec![usize::MAX, usize::MAX, 24, 24, 1]);
+    for split in splits {
+        let bake = validation
+            .bake(&context.device, &context.queue, &packed, split)
+            .unwrap();
+        println!(
+            "split {split}: sea level {} ({:08x}), s2 {} m, field hash {:016x}",
+            bake.sea_level,
+            bake.sea_level.to_bits(),
+            bake.sea_level_m,
+            bake.fields
+                .iter()
+                .fold(0u64, |h, v| h.rotate_left(5) ^ u64::from(v.to_bits()))
+        );
+    }
 }
