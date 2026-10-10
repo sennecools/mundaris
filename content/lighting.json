@@ -17,7 +17,13 @@
       0.8,
       1
     ],
-    "bounce_fraction": 0.12
+    "bounce_fraction": 0.12,
+    "sky_fraction": 0.15,
+    "sky_color": [
+      0.62,
+      0.76,
+      1
+    ]
   },
   "bodies": {
     "sol": {

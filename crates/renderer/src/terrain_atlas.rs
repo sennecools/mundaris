@@ -687,14 +687,14 @@ pub(crate) struct TerrainAtlasRenderer {
     collision_readbacks: Vec<Readback>,
     collision_results: Vec<AtlasCollisionPage>,
     sources: std::collections::HashMap<u64, SourceGpu>,
-    pipeline: wgpu::RenderPipeline,
+    pipeline: crate::aa::MsaaPipeline,
     /// PROTOTYPE (M5 Life): procedural trees and boulders on drawn nodes.
-    scatter_pipeline: wgpu::RenderPipeline,
+    scatter_pipeline: crate::aa::MsaaPipeline,
     scatter_shadow_pipeline: wgpu::RenderPipeline,
     scatter_cull: wgpu::ComputePipeline,
     flora: crate::flora_draw::FloraDraw,
     grass_cull: wgpu::ComputePipeline,
-    grass_pipeline: wgpu::RenderPipeline,
+    grass_pipeline: crate::aa::MsaaPipeline,
     grass_ro_group: wgpu::BindGroup,
     _grass: wgpu::Buffer,
     plants_ro_group: wgpu::BindGroup,
@@ -1139,41 +1139,49 @@ impl TerrainAtlasRenderer {
                 })
             })
             .collect();
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Terrain atlas reverse-Z instanced draw"),
-            layout: Some(&draw_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &draw_shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: 12,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3],
-                })],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &draw_shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &color_targets,
-            }),
-            primitive: wgpu::PrimitiveState {
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        // One variant per MSAA sample count (crate::aa).
+        let pipeline = {
+            let draw_shader = draw_shader.clone();
+            let draw_pipeline_layout = draw_pipeline_layout.clone();
+            let color_targets = color_targets.clone();
+            crate::aa::MsaaPipeline::new(device, move |device, samples| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("Terrain atlas reverse-Z instanced draw"),
+                    layout: Some(&draw_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &draw_shader,
+                        entry_point: Some("vs_main"),
+                        compilation_options: Default::default(),
+                        buffers: &[Some(wgpu::VertexBufferLayout {
+                            array_stride: 12,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+                        })],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &draw_shader,
+                        entry_point: Some("fs_main"),
+                        compilation_options: Default::default(),
+                        targets: &color_targets,
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        front_face: wgpu::FrontFace::Ccw,
+                        cull_mode: None,
+                        ..Default::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: wgpu::TextureFormat::Depth32Float,
+                        depth_write_enabled: Some(true),
+                        depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                        stencil: Default::default(),
+                        bias: Default::default(),
+                    }),
+                    multisample: crate::aa::multisample(samples),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            })
+        };
         // PROTOTYPE (M5 Life): placed plants (culled per frame by cs_scatter)
         // and their indirect draw arguments.
         let plant_storage = |binding, read_only, visibility| wgpu::BindGroupLayoutEntry {
@@ -1315,66 +1323,82 @@ impl TerrainAtlasRenderer {
             compilation_options: Default::default(),
             cache: None,
         });
-        let scatter_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Terrain scatter (prototype trees and boulders)"),
-            layout: Some(&scatter_draw_layout),
-            vertex: wgpu::VertexState {
-                module: &draw_shader,
-                entry_point: Some("vs_scatter"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &draw_shader,
-                entry_point: Some("fs_scatter"),
-                compilation_options: Default::default(),
-                targets: &color_targets,
-            }),
-            primitive: wgpu::PrimitiveState {
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-        let grass_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Terrain grass (prototype)"),
-            layout: Some(&scatter_draw_layout),
-            vertex: wgpu::VertexState {
-                module: &draw_shader,
-                entry_point: Some("vs_grass"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &draw_shader,
-                entry_point: Some("fs_scatter"),
-                compilation_options: Default::default(),
-                targets: &color_targets,
-            }),
-            primitive: wgpu::PrimitiveState {
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        // One variant per MSAA sample count (crate::aa).
+        let scatter_pipeline = {
+            let draw_shader = draw_shader.clone();
+            let scatter_draw_layout = scatter_draw_layout.clone();
+            let color_targets = color_targets.clone();
+            crate::aa::MsaaPipeline::new(device, move |device, samples| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("Terrain scatter (prototype trees and boulders)"),
+                    layout: Some(&scatter_draw_layout),
+                    vertex: wgpu::VertexState {
+                        module: &draw_shader,
+                        entry_point: Some("vs_scatter"),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &draw_shader,
+                        entry_point: Some("fs_scatter"),
+                        compilation_options: Default::default(),
+                        targets: &color_targets,
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        cull_mode: None,
+                        ..Default::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: wgpu::TextureFormat::Depth32Float,
+                        depth_write_enabled: Some(true),
+                        depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                        stencil: Default::default(),
+                        bias: Default::default(),
+                    }),
+                    multisample: crate::aa::multisample(samples),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            })
+        };
+        // One variant per MSAA sample count (crate::aa).
+        let grass_pipeline = {
+            let draw_shader = draw_shader.clone();
+            let scatter_draw_layout = scatter_draw_layout.clone();
+            let color_targets = color_targets.clone();
+            crate::aa::MsaaPipeline::new(device, move |device, samples| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("Terrain grass (prototype)"),
+                    layout: Some(&scatter_draw_layout),
+                    vertex: wgpu::VertexState {
+                        module: &draw_shader,
+                        entry_point: Some("vs_grass"),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &draw_shader,
+                        entry_point: Some("fs_scatter"),
+                        compilation_options: Default::default(),
+                        targets: &color_targets,
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        cull_mode: None,
+                        ..Default::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: wgpu::TextureFormat::Depth32Float,
+                        depth_write_enabled: Some(true),
+                        depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                        stencil: Default::default(),
+                        bias: Default::default(),
+                    }),
+                    multisample: crate::aa::multisample(samples),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            })
+        };
         let shadow_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Terrain atlas shadow caster layout"),
@@ -2086,6 +2110,15 @@ impl TerrainAtlasRenderer {
         }
     }
 
+    /// Selects the MSAA sample count of the main-pass pipelines (crate::aa):
+    /// terrain, scatter, grass and grown flora. Shadow casters stay single-sample.
+    pub(crate) fn set_samples(&mut self, device: &wgpu::Device, samples: u32) {
+        self.pipeline.set_samples(device, samples);
+        self.scatter_pipeline.set_samples(device, samples);
+        self.grass_pipeline.set_samples(device, samples);
+        self.flora.set_samples(device, samples);
+    }
+
     pub(crate) fn draw(
         &self,
         pass: &mut wgpu::RenderPass<'_>,
@@ -2095,7 +2128,7 @@ impl TerrainAtlasRenderer {
         if self.staged_instances == 0 {
             return;
         }
-        pass.set_pipeline(&self.pipeline);
+        pass.set_pipeline(self.pipeline.get());
         pass.set_bind_group(0, projection_group, &[]);
         pass.set_bind_group(1, &self.draw_group, &[]);
         pass.set_bind_group(2, lighting_group, &[]);
@@ -2105,11 +2138,11 @@ impl TerrainAtlasRenderer {
         // PROTOTYPE (M5 Life): 1024 scatter slots of 72 procedural vertices per
         // drawn node (scatter_draw.wgsl); bind groups are shared.
         if scatter_enabled() {
-            pass.set_pipeline(&self.scatter_pipeline);
+            pass.set_pipeline(self.scatter_pipeline.get());
             pass.set_bind_group(3, &self.plants_ro_group, &[]);
             pass.draw_indirect(&self.plant_args, 0);
             self.flora.draw(pass, &self.plant_args);
-            pass.set_pipeline(&self.grass_pipeline);
+            pass.set_pipeline(self.grass_pipeline.get());
             pass.set_bind_group(3, &self.grass_ro_group, &[]);
             pass.draw_indirect(&self.plant_args, 32);
         }

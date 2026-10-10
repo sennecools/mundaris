@@ -302,7 +302,21 @@ pub fn paint(
     }
     if !hud.is_empty() {
         let row = 18.0;
-        let size = egui::vec2(170.0, row * hud.len() as f32 + 2.0 * SPACE_2);
+        // Wide enough for the longest row (the adapter name can be long).
+        let width = hud
+            .iter()
+            .map(|stat| {
+                let label = painter.layout_no_wrap(
+                    stat.label.clone(),
+                    FontId::proportional(FONT_UI),
+                    TEXT_SECONDARY,
+                );
+                let value = painter.layout_no_wrap(stat.value.clone(), mono(), TEXT_PRIMARY);
+                label.size().x + value.size().x + 3.0 * SPACE_2
+            })
+            .fold(170.0_f32, f32::max)
+            .min(rect.width() - 2.0 * SPACE_3);
+        let size = egui::vec2(width, row * hud.len() as f32 + 2.0 * SPACE_2);
         // Top right; the camera and view controls sit top left.
         let hud_rect = Rect::from_min_size(
             egui::pos2(rect.right() - SPACE_3 - size.x, rect.top() + SPACE_3),

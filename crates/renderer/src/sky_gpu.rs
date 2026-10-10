@@ -14,8 +14,8 @@ pub(crate) struct SkyRenderer {
     detail_uniforms: wgpu::Buffer,
     bind_group_layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
-    star_pipeline: wgpu::RenderPipeline,
-    background_pipeline: wgpu::RenderPipeline,
+    star_pipeline: crate::aa::MsaaPipeline,
+    background_pipeline: crate::aa::MsaaPipeline,
     star_buffer: wgpu::Buffer,
     star_capacity: u64,
     star_count: u32,
@@ -175,70 +175,76 @@ impl SkyRenderer {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-        let attributes = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4];
-        let star_layout = [Some(wgpu::VertexBufferLayout {
-            array_stride: 32,
-            step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &attributes,
-        })];
+        // One variant per MSAA sample count (crate::aa).
         let make_pipeline = |label: &'static str, entry: &'static str, star: bool| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some(entry),
-                    compilation_options: Default::default(),
-                    buffers: if star { &star_layout } else { &[] },
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some(if star {
-                        "star_fragment"
-                    } else {
-                        "background_fragment"
-                    }),
-                    compilation_options: Default::default(),
-                    targets: &std::iter::once(Some(wgpu::ColorTargetState {
-                        format,
-                        blend: if star {
-                            Some(wgpu::BlendState {
-                                color: wgpu::BlendComponent {
-                                    src_factor: wgpu::BlendFactor::One,
-                                    dst_factor: wgpu::BlendFactor::One,
-                                    operation: wgpu::BlendOperation::Add,
-                                },
-                                alpha: wgpu::BlendComponent {
-                                    src_factor: wgpu::BlendFactor::Zero,
-                                    dst_factor: wgpu::BlendFactor::One,
-                                    operation: wgpu::BlendOperation::Add,
-                                },
-                            })
+            let pipeline_layout = pipeline_layout.clone();
+            let shader = shader.clone();
+            let targets = targets.to_vec();
+            crate::aa::MsaaPipeline::new(device, move |device, samples| {
+                let attributes = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4];
+                let star_layout = [Some(wgpu::VertexBufferLayout {
+                    array_stride: 32,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &attributes,
+                })];
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some(entry),
+                        compilation_options: Default::default(),
+                        buffers: if star { &star_layout } else { &[] },
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some(if star {
+                            "star_fragment"
                         } else {
-                            None
-                        },
-                        write_mask: wgpu::ColorWrites::ALL,
-                    }))
-                    .chain(targets[1..].iter().map(|&format| {
-                        Some(wgpu::ColorTargetState {
+                            "background_fragment"
+                        }),
+                        compilation_options: Default::default(),
+                        targets: &std::iter::once(Some(wgpu::ColorTargetState {
                             format,
-                            blend: None,
-                            write_mask: wgpu::ColorWrites::empty(),
-                        })
-                    }))
-                    .collect::<Vec<_>>(),
-                }),
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: Some(false),
-                    depth_compare: Some(wgpu::CompareFunction::Always),
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: Default::default(),
-                multiview_mask: None,
-                cache: None,
+                            blend: if star {
+                                Some(wgpu::BlendState {
+                                    color: wgpu::BlendComponent {
+                                        src_factor: wgpu::BlendFactor::One,
+                                        dst_factor: wgpu::BlendFactor::One,
+                                        operation: wgpu::BlendOperation::Add,
+                                    },
+                                    alpha: wgpu::BlendComponent {
+                                        src_factor: wgpu::BlendFactor::Zero,
+                                        dst_factor: wgpu::BlendFactor::One,
+                                        operation: wgpu::BlendOperation::Add,
+                                    },
+                                })
+                            } else {
+                                None
+                            },
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }))
+                        .chain(targets[1..].iter().map(|&format| {
+                            Some(wgpu::ColorTargetState {
+                                format,
+                                blend: None,
+                                write_mask: wgpu::ColorWrites::empty(),
+                            })
+                        }))
+                        .collect::<Vec<_>>(),
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: wgpu::TextureFormat::Depth32Float,
+                        depth_write_enabled: Some(false),
+                        depth_compare: Some(wgpu::CompareFunction::Always),
+                        stencil: Default::default(),
+                        bias: Default::default(),
+                    }),
+                    multisample: crate::aa::multisample(samples),
+                    multiview_mask: None,
+                    cache: None,
+                })
             })
         };
         let star_pipeline = make_pipeline("Distant star Gaussian sprites", "star_vertex", true);
@@ -529,6 +535,12 @@ impl SkyRenderer {
         upload_bytes
     }
 
+    /// Selects the MSAA sample count of the sky pipelines (crate::aa).
+    pub(crate) fn set_samples(&mut self, device: &wgpu::Device, samples: u32) {
+        self.background_pipeline.set_samples(device, samples);
+        self.star_pipeline.set_samples(device, samples);
+    }
+
     pub(crate) fn draw(&self, pass: &mut wgpu::RenderPass<'_>, frame: &SkyPrepared) {
         let report = frame.report();
         if !report.stars_drawn && !report.background_drawn {
@@ -536,11 +548,11 @@ impl SkyRenderer {
         }
         pass.set_bind_group(0, &self.bind_group, &[]);
         if report.background_drawn {
-            pass.set_pipeline(&self.background_pipeline);
+            pass.set_pipeline(self.background_pipeline.get());
             pass.draw(0..3, 0..1);
         }
         if report.stars_drawn && self.star_count > 0 {
-            pass.set_pipeline(&self.star_pipeline);
+            pass.set_pipeline(self.star_pipeline.get());
             pass.set_vertex_buffer(0, self.star_buffer.slice(..));
             pass.draw(0..6, 0..self.star_count);
         }

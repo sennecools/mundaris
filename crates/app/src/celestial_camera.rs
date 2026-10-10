@@ -173,6 +173,8 @@ pub struct CelestialCamera {
     base_speed_m_s: f64,
     user_multiplier: f64,
     boost_multiplier: f64,
+    /// Drag response multiplier (look and orbit), user setting.
+    look_sensitivity: f64,
     response_clearance_m: f64,
     base_source: &'static str,
     clearance_sample: Option<crate::terrain_inspection::TerrainClearance>,
@@ -235,6 +237,7 @@ impl CelestialCamera {
             base_speed_m_s: 1.0,
             user_multiplier: 1.0,
             boost_multiplier: 1.0,
+            look_sensitivity: 1.0,
             response_clearance_m: 2.5 * extent_m,
             base_source: "overview_distance",
             clearance_sample: None,
@@ -271,10 +274,25 @@ impl CelestialCamera {
         self.fov_y_rad = projection.vertical_fov_rad();
         Ok(())
     }
+    /// Look (surface and free flight) radians per logical pixel: one pixel of
+    /// drag turns the view by one pixel's angle (the scene follows the
+    /// pointer) at every altitude, times the user's look sensitivity. User
+    /// direction 2026-10-10: the former near-ground damping (4 % at 2 m) made
+    /// dragging feel far too slow.
     fn local_response(&self) -> f64 {
-        let c = self.response_clearance_m.max(1.0);
-        2.0 * (self.fov_y_rad * 0.5).tan() / self.logical_viewport_height
-            * (0.04 + 0.96 * c / (c + 10_000.0))
+        2.0 * (self.fov_y_rad * 0.5).tan() / self.logical_viewport_height * self.look_sensitivity
+    }
+    /// Multiplier on drag look and orbit response (1 = the scene follows the pointer).
+    pub fn set_look_sensitivity(&mut self, sensitivity: f64) -> Result<()> {
+        ensure!(
+            sensitivity.is_finite() && (0.05..=20.0).contains(&sensitivity),
+            "look sensitivity must be within 0.05..20"
+        );
+        self.look_sensitivity = sensitivity;
+        Ok(())
+    }
+    pub fn look_sensitivity(&self) -> f64 {
+        self.look_sensitivity
     }
     fn orbit_response(&self) -> f64 {
         let gain = if self.mode == CameraMode::SystemOrbit {
@@ -284,7 +302,7 @@ impl CelestialCamera {
                 .sqrt()
                 .clamp(1e-8, 1.0)
         };
-        2.0 * (self.fov_y_rad * 0.5).tan() / self.logical_viewport_height * gain
+        2.0 * (self.fov_y_rad * 0.5).tan() / self.logical_viewport_height * gain * self.look_sensitivity
     }
     fn wheel_response(&self) -> f64 {
         (1.25_f64.ln() * (self.fov_y_rad * 0.5).tan() / 30_f64.to_radians().tan()).clamp(0.05, 0.6)

@@ -76,7 +76,7 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(demo: GravityOrbitsDemo, renderer: Renderer) -> Self {
-        Self {
+        let mut engine = Self {
             demo,
             renderer,
             #[cfg(feature = "developer-tools")]
@@ -89,6 +89,58 @@ impl Engine {
             panel_view: StudioView::default(),
             last_panels: None,
             species: SpeciesEditor::load(&species_dir()),
+        };
+        engine.load_graphics();
+        engine
+    }
+
+    /// Applies the saved graphics options (`GRAPHICS_PATH`), if any.
+    fn load_graphics(&mut self) {
+        use astrum_app::render_settings as registry;
+        let Some(saved) = std::fs::read_to_string(GRAPHICS_PATH)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        else {
+            return;
+        };
+        for (index, spec) in registry::SPECS.iter().enumerate() {
+            if !spec.id.starts_with(GRAPHICS_PREFIX) {
+                continue;
+            }
+            if let Some(value) = saved.get(spec.id)
+                && let Ok(value) = registry::value_from_json(index, value)
+            {
+                self.demo.studio_action(StudioAction::SetSetting(index, value));
+            }
+        }
+        if let Some(sensitivity) = saved.get(LOOK_KEY).and_then(serde_json::Value::as_f64)
+            && sensitivity > 0.0
+        {
+            self.demo
+                .studio_action(StudioAction::SetLookSensitivity(sensitivity.log10() as f32));
+        }
+    }
+
+    /// Saves the graphics options (anti-aliasing) for the next run.
+    fn save_graphics(&self) {
+        use astrum_app::render_settings as registry;
+        let values = &self.demo.studio_view().render_settings;
+        let map: serde_json::Map<String, serde_json::Value> = registry::SPECS
+            .iter()
+            .enumerate()
+            .filter(|(_, spec)| spec.id.starts_with(GRAPHICS_PREFIX))
+            .filter_map(|(index, spec)| {
+                let value = values.get(index).copied()?;
+                Some((spec.id.to_string(), registry::value_json(index, value)))
+            })
+            .collect();
+        let mut map = map;
+        map.insert(
+            LOOK_KEY.to_string(),
+            serde_json::json!(10f64.powf(f64::from(self.demo.studio_view().look_exponent))),
+        );
+        if let Ok(text) = serde_json::to_string_pretty(&map) {
+            let _ = std::fs::write(GRAPHICS_PATH, text);
         }
     }
 
@@ -277,6 +329,12 @@ impl Default for StudioLayout {
 }
 
 const LAYOUT_PATH: &str = "target/studio-layout.json";
+/// Graphics options (render settings under `GRAPHICS_PREFIX`) remembered
+/// between runs; session state, not content.
+const GRAPHICS_PATH: &str = "target/studio-graphics.json";
+const GRAPHICS_PREFIX: &str = "render.aa.";
+/// Drag look sensitivity, saved with the graphics options.
+const LOOK_KEY: &str = "camera.look_sensitivity";
 
 impl StudioLayout {
     fn load() -> Self {
@@ -852,6 +910,7 @@ impl ApplicationHandler<AppEvent> for StudioApp {
     /// the panel layout.
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.ui.layout.save();
+        self.engine.save_graphics();
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {

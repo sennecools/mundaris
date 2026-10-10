@@ -160,6 +160,10 @@ impl<'a> PreparedView<'a> {
             budget: self.budget,
         })
     }
+    /// Camera pose (frame, position, camera-to-frame orientation).
+    pub fn observer(&self) -> FramePose {
+        self.observer
+    }
     pub fn budget(&self) -> RenderPrecisionBudget {
         self.budget
     }

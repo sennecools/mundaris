@@ -277,6 +277,8 @@ impl GravityOrbitsDemo {
             ambient_lux: 0.0,
             ambient_color: [1.0; 3],
             bounce_fraction: 0.0,
+            sky_fraction: 0.0,
+            sky_color: [1.0; 3],
             occluders: Vec::new(),
         };
         light.sun_disk_radiance() * f64::from(self.controls.render_settings.lighting.sun_scale)
@@ -1685,6 +1687,8 @@ impl GravityOrbitsDemo {
             ambient_lux: self.lighting.ambient_lux,
             ambient_color: self.lighting.ambient_color,
             bounce_fraction: self.lighting.bounce_fraction,
+            sky_fraction: self.lighting.sky_fraction,
+            sky_color: self.lighting.sky_color,
             occluders: centres
                 .iter()
                 .enumerate()
@@ -1891,6 +1895,8 @@ impl GravityOrbitsDemo {
         self.atlas
             .annotate_terrain(&mut snapshot.terrain, &self.ids, &self.system);
         let shadows = renderer.shadow_report();
+        let aa = renderer.anti_aliasing_report();
+        let adapter = renderer.adapter_label();
         snapshot.render_settings = Some(serde_json::json!({
             "settings": crate::render_settings::listing(&crate::render_settings::RenderState {
                 settings: self.controls.render_settings,
@@ -1906,6 +1912,14 @@ impl GravityOrbitsDemo {
                 "casters": shadows.casters,
                 "splits_m": shadows.splits_m,
                 "texel_m": shadows.texel_m,
+            },
+            "adapter": adapter,
+            "anti_aliasing": {
+                "requested_samples": aa.requested_samples,
+                "samples": aa.samples,
+                "supported_mask": aa.supported_mask,
+                "fxaa": aa.fxaa,
+                "last_compile_ms": aa.last_compile_ms,
             },
         }));
         // Opt-in native evidence scratch export of this exact prepared state.

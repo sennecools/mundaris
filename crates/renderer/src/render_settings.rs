@@ -50,6 +50,58 @@ impl ExposureMode {
     }
 }
 
+/// Anti-aliasing method (amendment 2026-10-10 anti-aliasing). MSAA counts the
+/// adapter lacks fall back to the largest supported count below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AntiAliasing {
+    Off,
+    /// Post-process edge blur on the tonemapped image (FXAA 3.11 quality).
+    Fxaa,
+    Msaa2,
+    /// Default: user choice 2026-10-10 after the side-by-side comparison.
+    #[default]
+    Msaa4,
+    Msaa8,
+    /// Temporal: jittered frames reprojected and clipped (camera motion only).
+    Taa,
+}
+
+impl AntiAliasing {
+    pub const ALL: [Self; 6] = [
+        Self::Off,
+        Self::Fxaa,
+        Self::Msaa2,
+        Self::Msaa4,
+        Self::Msaa8,
+        Self::Taa,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Fxaa => "fxaa",
+            Self::Msaa2 => "msaa2",
+            Self::Msaa4 => "msaa4",
+            Self::Msaa8 => "msaa8",
+            Self::Taa => "taa",
+        }
+    }
+    /// Main-pass samples per pixel this method asks for.
+    pub fn samples(self) -> u32 {
+        match self {
+            Self::Off | Self::Fxaa | Self::Taa => 1,
+            Self::Msaa2 => 2,
+            Self::Msaa4 => 4,
+            Self::Msaa8 => 8,
+        }
+    }
+    pub fn fxaa(self) -> bool {
+        self == Self::Fxaa
+    }
+    pub fn taa(self) -> bool {
+        self == Self::Taa
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ExposureSettings {
     pub mode: ExposureMode,
@@ -112,6 +164,8 @@ pub struct LightingSettings {
     pub sun_scale: f32,
     /// Multiplier on the authored ambient illuminance.
     pub ambient_scale: f32,
+    /// Multiplier on the authored sky light (0 = off).
+    pub sky_scale: f32,
     /// Place the sun at a fixed local elevation/azimuth above the nearest
     /// body instead of at the star (terrain review); illuminance unchanged.
     pub studio_sun: bool,
@@ -139,6 +193,7 @@ pub struct RenderSettings {
     pub ao: AoSettings,
     pub lighting: LightingSettings,
     pub overlays: OverlaySettings,
+    pub anti_aliasing: AntiAliasing,
 }
 
 impl Default for RenderSettings {
@@ -182,6 +237,7 @@ impl Default for RenderSettings {
             lighting: LightingSettings {
                 sun_scale: 1.0,
                 ambient_scale: 1.0,
+                sky_scale: 1.0,
                 studio_sun: false,
                 sun_elevation_deg: 15.0,
                 sun_azimuth_deg: 100.0,
@@ -190,6 +246,8 @@ impl Default for RenderSettings {
                 line_width_scale: 1.0,
                 opacity: 1.0,
             },
+            // User choice 2026-10-10 after the side-by-side comparison.
+            anti_aliasing: AntiAliasing::Msaa4,
         }
     }
 }
@@ -220,6 +278,7 @@ impl RenderSettings {
             self.ao.intensity,
             self.lighting.sun_scale,
             self.lighting.ambient_scale,
+            self.lighting.sky_scale,
             self.lighting.sun_elevation_deg,
             self.lighting.sun_azimuth_deg,
             self.overlays.line_width_scale,
@@ -266,7 +325,9 @@ impl RenderSettings {
             "ambient occlusion parameters out of range",
         )?;
         check(
-            self.lighting.sun_scale >= 0.0 && self.lighting.ambient_scale >= 0.0,
+            self.lighting.sun_scale >= 0.0
+                && self.lighting.ambient_scale >= 0.0
+                && self.lighting.sky_scale >= 0.0,
             "lighting scales must be non-negative",
         )?;
         check(

@@ -73,6 +73,12 @@ impl FrameHost<'_> {
     pub fn shadow_report(&self) -> astrum_renderer::ShadowReport {
         self.renderer.shadow_report()
     }
+    pub fn anti_aliasing_report(&self) -> astrum_renderer::AaReport {
+        self.renderer.anti_aliasing_report()
+    }
+    pub fn adapter_label(&self) -> String {
+        self.renderer.adapter_label().to_string()
+    }
     pub fn render_empty(&mut self) -> Result<()> {
         Ok(self.renderer.render_empty()?)
     }

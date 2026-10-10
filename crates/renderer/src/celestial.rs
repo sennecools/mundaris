@@ -653,7 +653,7 @@ pub struct ShadowReport {
 
 pub(crate) struct CelestialRenderer {
     sky: crate::sky::SkyRenderer,
-    sphere_pipeline: wgpu::RenderPipeline,
+    sphere_pipeline: crate::aa::MsaaPipeline,
     polyline_pipeline: wgpu::RenderPipeline,
     projection: wgpu::Buffer,
     projection_layout: wgpu::BindGroupLayout,
@@ -676,6 +676,57 @@ pub(crate) struct CelestialRenderer {
     settings: crate::RenderSettings,
     size: [u32; 2],
     shadow_report: ShadowReport,
+    /// Sample counts the adapter supports (bit mask, crate::aa).
+    msaa_support: u32,
+    /// Main-pass samples in use.
+    samples: u32,
+    aa_report: AaReport,
+    /// TAA jitter sequence index and the previous frame's camera.
+    taa_frame: u64,
+    taa_previous: Option<TaaPose>,
+}
+
+/// Camera of one frame, for TAA reprojection.
+#[derive(Debug, Clone, Copy)]
+struct TaaPose {
+    frame: FrameId,
+    position: DVec3,
+    /// Camera-to-frame rotation.
+    orientation: glam::DQuat,
+    tan_half: f64,
+    aspect: f64,
+    size: [u32; 2],
+}
+
+/// Radical inverse of `index` in `base` (Halton sequence), in [0, 1).
+fn halton(mut index: u64, base: u64) -> f64 {
+    let mut result = 0.0;
+    let mut fraction = 1.0 / base as f64;
+    while index > 0 {
+        result += (index % base) as f64 * fraction;
+        index /= base;
+        fraction /= base as f64;
+    }
+    result
+}
+
+/// TAA sub-pixel jitter cycle length (Halton 2,3).
+const TAA_JITTER_PHASES: u64 = 8;
+/// Weight of the current frame in the TAA blend.
+const TAA_CURRENT_WEIGHT: f32 = 0.1;
+/// Camera moves larger than this per frame drop the history (teleports).
+const TAA_MAX_STEP_M: f64 = 10_000.0;
+
+/// Anti-aliasing state for diagnostics: what the setting asks for, what the
+/// adapter allows, and the one-time pipeline compile cost of the last switch.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AaReport {
+    pub requested_samples: u32,
+    pub samples: u32,
+    pub supported_mask: u32,
+    pub fxaa: bool,
+    /// Wall time spent compiling pipeline variants at the last sample-count switch.
+    pub last_compile_ms: f64,
 }
 impl CelestialRenderer {
     pub(crate) fn last_sky_resource_report(&self) -> crate::sky::SkyResourceReport {
@@ -725,6 +776,7 @@ impl CelestialRenderer {
         output_format: wgpu::TextureFormat,
         width: u32,
         height: u32,
+        msaa_support: u32,
     ) -> Self {
         let settings = crate::RenderSettings::default();
         let projection = buffer(
@@ -808,16 +860,122 @@ impl CelestialRenderer {
             settings,
             size: [width.max(1), height.max(1)],
             shadow_report: ShadowReport::default(),
+            msaa_support,
+            samples: 1,
+            aa_report: AaReport::default(),
+            taa_frame: 0,
+            taa_previous: None,
         };
+        renderer.apply_samples(device);
+        renderer.ensure_post(device);
         renderer
-            .post
-            .ensure(device, renderer.size, renderer.settings.ao.half_res);
-        renderer
+    }
+    /// Selects the main-pass sample count from the anti-aliasing setting and
+    /// the adapter, compiling pipeline variants on first use.
+    fn apply_samples(&mut self, device: &wgpu::Device) {
+        let requested = self.settings.anti_aliasing.samples();
+        let samples = crate::aa::clamp_samples(requested, self.msaa_support);
+        if samples != self.samples {
+            let started = std::time::Instant::now();
+            self.sky.set_samples(device, samples);
+            self.sphere_pipeline.set_samples(device, samples);
+            if let Some(atlas) = &mut self.terrain_atlas {
+                atlas.set_samples(device, samples);
+            }
+            self.samples = samples;
+            self.aa_report.last_compile_ms = started.elapsed().as_secs_f64() * 1000.0;
+        }
+        self.aa_report.requested_samples = requested;
+        self.aa_report.samples = samples;
+        self.aa_report.supported_mask = self.msaa_support;
+        self.aa_report.fxaa = self.settings.anti_aliasing.fxaa();
+    }
+    fn ensure_post(&mut self, device: &wgpu::Device) {
+        self.post.ensure(
+            device,
+            self.size,
+            self.settings.ao.half_res,
+            self.samples,
+            self.settings.anti_aliasing.fxaa(),
+            self.settings.anti_aliasing.taa(),
+        );
+    }
+    /// TAA parameters of this frame (shader `Taa` struct, aa_taa.wgsl): the
+    /// Halton jitter, current and previous projection shape, and the rigid
+    /// transform from this frame's view space to the previous one. History is
+    /// dropped when the camera's frame, the viewport or a huge step changes.
+    fn taa_frame_params(
+        &mut self,
+        frame: &CelestialFrame<'_, '_, '_>,
+        enabled: bool,
+    ) -> Option<[[f32; 4]; 6]> {
+        if !enabled {
+            self.taa_previous = None;
+            return None;
+        }
+        let projection = frame.projection;
+        let [width, height] = projection.viewport();
+        let observer = frame.view.observer();
+        let pose = TaaPose {
+            frame: observer.position().frame(),
+            position: observer.position().local().metres(),
+            orientation: observer.orientation().quaternion(),
+            tan_half: f64::from(height) * 0.5 / projection.focal_pixels(),
+            aspect: f64::from(width) / f64::from(height.max(1)),
+            size: [width, height],
+        };
+        self.taa_frame = self.taa_frame.wrapping_add(1);
+        let phase = self.taa_frame % TAA_JITTER_PHASES + 1;
+        let jitter = [
+            (halton(phase, 2) - 0.5) * 2.0 / f64::from(width.max(1)),
+            (halton(phase, 3) - 0.5) * 2.0 / f64::from(height.max(1)),
+        ];
+        let previous = self.taa_previous.replace(pose).filter(|previous| {
+            previous.frame == pose.frame
+                && previous.size == pose.size
+                && previous.position.distance(pose.position) < TAA_MAX_STEP_M
+        });
+        let (reset, rotation, translation, previous) = match previous {
+            Some(previous) => {
+                let to_previous = previous.orientation.inverse();
+                (
+                    0.0,
+                    glam::DMat3::from_quat(to_previous * pose.orientation),
+                    to_previous * (pose.position - previous.position),
+                    previous,
+                )
+            }
+            None => (1.0, glam::DMat3::IDENTITY, DVec3::ZERO, pose),
+        };
+        // Rows of [R | t]; glam matrices are column-major.
+        let row = |r: usize| {
+            [
+                rotation.col(0)[r] as f32,
+                rotation.col(1)[r] as f32,
+                rotation.col(2)[r] as f32,
+                translation[r] as f32,
+            ]
+        };
+        Some([
+            [jitter[0] as f32, jitter[1] as f32, 0.0, 0.0],
+            [
+                pose.tan_half as f32,
+                pose.aspect as f32,
+                previous.tan_half as f32,
+                previous.aspect as f32,
+            ],
+            row(0),
+            row(1),
+            row(2),
+            [projection.near_m() as f32, TAA_CURRENT_WEIGHT, reset, 0.0],
+        ])
+    }
+    pub(crate) fn aa_report(&self) -> AaReport {
+        self.aa_report
     }
     pub(crate) fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         self.size = [width.max(1), height.max(1)];
-        self.post
-            .ensure(device, self.size, self.settings.ao.half_res);
+        self.ensure_post(device);
     }
     /// Applies validated settings; reallocates only what changed.
     pub(crate) fn set_settings(&mut self, device: &wgpu::Device, settings: crate::RenderSettings) {
@@ -832,7 +990,8 @@ impl CelestialRenderer {
             );
         }
         self.settings = settings;
-        self.post.ensure(device, self.size, settings.ao.half_res);
+        self.apply_samples(device);
+        self.ensure_post(device);
     }
     pub(crate) fn draw(
         &mut self,
@@ -847,7 +1006,7 @@ impl CelestialRenderer {
         frame.validate()?;
         let storage = &frame.staging;
         let settings = self.settings;
-        self.post.ensure(device, self.size, settings.ao.half_res);
+        self.ensure_post(device);
         self.sky.upload(device, queue, storage.sky.as_ref());
         if let Some(atlas_frame) = &storage.terrain_atlas
             && let Some(config) = atlas_frame.config
@@ -868,6 +1027,9 @@ impl CelestialRenderer {
                     )
                     .map_err(RenderPreparationError::TerrainAtlas)?,
                 );
+                if let Some(atlas) = &mut self.terrain_atlas {
+                    atlas.set_samples(device, self.samples);
+                }
             }
             if let Some(atlas) = &mut self.terrain_atlas {
                 atlas
@@ -904,7 +1066,13 @@ impl CelestialRenderer {
                 DRAW_UNIFORM_BYTES,
             );
         }
-        queue.write_buffer(&self.projection, 0, &frame.projection.gpu_bytes());
+        let taa =
+            self.taa_frame_params(frame, settings.anti_aliasing.taa() && !storage.passthrough);
+        let mut projection = frame.projection.gpu_bytes();
+        if let Some(values) = &taa {
+            jitter_projection(&mut projection, values[0][0], values[0][1]);
+        }
+        queue.write_buffer(&self.projection, 0, &projection);
         for (buffer, bytes) in [
             (&self.vertices, &storage.vertices),
             (&self.polylines, &storage.polylines),
@@ -1053,6 +1221,7 @@ impl CelestialRenderer {
                 focal_px: frame.projection.focal_pixels(),
                 view_mode: storage.view_mode,
                 passthrough: storage.passthrough,
+                taa,
             },
             timestamps,
         );
@@ -1099,7 +1268,7 @@ impl CelestialRenderer {
     // Each section owns its complete draw state. In particular, a new pass has
     // no bindings.
     fn bind_sphere_state(&self, pass: &mut wgpu::RenderPass<'_>, draw: u32, start: u32) {
-        pass.set_pipeline(&self.sphere_pipeline);
+        pass.set_pipeline(self.sphere_pipeline.get());
         pass.set_bind_group(0, &self.projection_group, &[]);
         pass.set_bind_group(1, &self.uniform_group, &[draw * 256]);
         pass.set_bind_group(2, &self.lighting_group, &[]);
@@ -1260,7 +1429,7 @@ fn scene_pipeline(
     device: &wgpu::Device,
     layouts: &[&wgpu::BindGroupLayout],
     source: &str,
-) -> wgpu::RenderPipeline {
+) -> crate::aa::MsaaPipeline {
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("Celestial sphere pipeline layout"),
         bind_group_layouts: &layouts.iter().copied().map(Some).collect::<Vec<_>>(),
@@ -1270,49 +1439,52 @@ fn scene_pipeline(
         label: Some("Observer-relative lit spheres"),
         source: wgpu::ShaderSource::Wgsl(source.into()),
     });
-    let targets: Vec<_> = crate::post::SCENE_TARGETS
-        .iter()
-        .map(|&format| {
-            Some(wgpu::ColorTargetState {
-                format,
-                blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
+    // One variant per MSAA sample count (crate::aa).
+    crate::aa::MsaaPipeline::new(device, move |device, samples| {
+        let targets: Vec<_> = crate::post::SCENE_TARGETS
+            .iter()
+            .map(|&format| {
+                Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })
             })
+            .collect();
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Celestial spheres reverse-Z pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: 32,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0=>Float32x4,1=>Float32x4],
+                })],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &targets,
+            }),
+            primitive: wgpu::PrimitiveState {
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: crate::post::DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: crate::aa::multisample(samples),
+            multiview_mask: None,
+            cache: None,
         })
-        .collect();
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("Celestial spheres reverse-Z pipeline"),
-        layout: Some(&layout),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: Some("vs_main"),
-            compilation_options: Default::default(),
-            buffers: &[Some(wgpu::VertexBufferLayout {
-                array_stride: 32,
-                step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &wgpu::vertex_attr_array![0=>Float32x4,1=>Float32x4],
-            })],
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: Some("fs_main"),
-            compilation_options: Default::default(),
-            targets: &targets,
-        }),
-        primitive: wgpu::PrimitiveState {
-            cull_mode: Some(wgpu::Face::Back),
-            ..Default::default()
-        },
-        depth_stencil: Some(wgpu::DepthStencilState {
-            format: crate::post::DEPTH_FORMAT,
-            depth_write_enabled: Some(true),
-            depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-            stencil: Default::default(),
-            bias: Default::default(),
-        }),
-        multisample: Default::default(),
-        multiview_mask: None,
-        cache: None,
     })
 }
 /// Anti-aliased guide quads over the tonemapped image, depth-tested against
@@ -1365,4 +1537,20 @@ fn overlay_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat) -> wgpu:
         multiview_mask: None,
         cache: None,
     })
+}
+
+/// Adds a clip-space offset of `jitter` NDC units (x right, y up) to a
+/// column-major projection: clip.xy += jitter * clip.w.
+fn jitter_projection(bytes: &mut [u8; 64], jx: f32, jy: f32) {
+    let mut m = [0f32; 16];
+    for (value, chunk) in m.iter_mut().zip(bytes.as_chunks::<4>().0) {
+        *value = f32::from_le_bytes(*chunk);
+    }
+    for column in m.as_chunks_mut::<4>().0 {
+        column[0] += jx * column[3];
+        column[1] += jy * column[3];
+    }
+    for (value, chunk) in m.iter().zip(bytes.as_chunks_mut::<4>().0) {
+        chunk.copy_from_slice(&value.to_le_bytes());
+    }
 }
