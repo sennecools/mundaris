@@ -514,8 +514,9 @@ fn planet_card(ui: &mut Ui, planet: &PlanetView, actions: &mut Vec<StudioAction>
         ui.horizontal(|ui| {
             ui.label(RichText::new("Seed").color(TEXT_SECONDARY));
             let mut seed = planet.seed;
-            let response = ui.add(egui::DragValue::new(&mut seed).speed(1.0));
-            if response.changed() && !response.dragged() || response.drag_stopped() {
+            // The view shows the edit's seed, so drags accumulate; rebuilds
+            // are throttled by the editor.
+            if ui.add(egui::DragValue::new(&mut seed).speed(1.0)).changed() {
                 actions.push(StudioAction::PlanetSeed(seed));
             }
             if tool_button(ui, "Random", false).clicked() {

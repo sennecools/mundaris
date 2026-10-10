@@ -70,6 +70,6 @@
         deep_linear: (0.004, 0.014, 0.035),
         depth_scale_m: 120.0,
     ),
-    // Measured for the canonical seed by gpu_terrain_colour.rs (within 0.02).
+    // Measured for the canonical seed; gpu_terrain_colour.rs checks it (0.005).
     average_colour: (0.103, 0.113, 0.105),
 )

@@ -168,21 +168,26 @@ impl PlanetEditor {
             if !files_changed && !edited {
                 continue;
             }
-            if files_changed {
-                world.stamps = stamps(&world.source.dependencies);
-            }
+            // Stamps are taken before the files are read, so a write that
+            // lands during the rebuild is seen on the next poll.
+            let new_stamps = stamps(&world.source.dependencies);
             applied_edit |= edited;
-            let used = world.edit.clone();
-            match world.source.rebuild(&used) {
+            let mut used = world.edit.clone();
+            let mut result = world.source.rebuild(&used);
+            // An external change of the terrain file replaces the saved edit;
+            // adopt it unless there are unsaved changes, and build with it
+            // now so one change publishes once.
+            if let Ok((_, source)) = &result
+                && source.saved != world.source.saved
+                && world.edit == world.source.saved
+            {
+                world.edit = source.saved.clone();
+                used = world.edit.clone();
+                result = world.source.rebuild(&used);
+            }
+            world.stamps = new_stamps;
+            match result {
                 Ok((definition, source)) => {
-                    // An external change of the terrain file replaces the
-                    // saved edit; adopt it unless there are unsaved changes.
-                    // The adopted edit differs from `used`, so the next
-                    // update rebuilds with it.
-                    if source.saved != world.source.saved && world.edit == world.source.saved {
-                        world.edit = source.saved.clone();
-                    }
-                    world.stamps = stamps(&source.dependencies);
                     world.source = source;
                     world.applied = used;
                     world.error = None;

@@ -539,10 +539,29 @@ pub fn tier_a_for_validation(
     queue: &wgpu::Queue,
     inputs: &TierABakeInputs,
 ) -> Result<TierAReadback, String> {
+    tier_a_for_validation_budgeted(device, queue, inputs, usize::MAX)
+}
+
+/// As [`tier_a_for_validation`], but encoding at most `passes` bake passes
+/// per submission, like the runtime spreads a bake over frames.
+pub fn tier_a_for_validation_budgeted(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    inputs: &TierABakeInputs,
+    passes: usize,
+) -> Result<TierAReadback, String> {
     let pipelines = TierAPipelines::new(device);
     let mut bake = TierABake::new(device, queue, &pipelines, inputs)?;
     let mut encoder = device.create_command_encoder(&Default::default());
-    bake.encode(&mut encoder, &pipelines, usize::MAX);
+    bake.encode(&mut encoder, &pipelines, passes.max(1));
+    while !bake.done() {
+        queue.submit([std::mem::replace(
+            &mut encoder,
+            device.create_command_encoder(&Default::default()),
+        )
+        .finish()]);
+        bake.encode(&mut encoder, &pipelines, passes.max(1));
+    }
     let read = |encoder: &mut wgpu::CommandEncoder, source: &wgpu::Buffer, size: u64| {
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Tier A validation readback"),

@@ -16,6 +16,8 @@ use std::{
 
 pub const SCENE_NAME: &str = "test-solar-system";
 const MAX_DEFINITION_BYTES: u64 = 256 * 1024;
+/// Authored images (biome LUTs up to 512²) are larger than definitions.
+const MAX_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -129,6 +131,26 @@ mod tests {
             assert!(local_path(root, invalid).is_err(), "{invalid}");
         }
         assert!(local_path(root, "terrain/moon.ron").is_ok());
+    }
+
+    #[test]
+    fn world_edit_rewrite_keeps_comments_neighbours_and_line_endings() {
+        let text = "(\n    schema: 1,\n    revision: 3, // bumped on save\n    seed: 7, // body seed\n    profile: None,\n    world: (\n        archetype: \"a.ron\",\n        // overrides: [ignored, a ] in a comment\n        overrides: [\n            (\"rain\", 0.03), // wet ]\n        ],\n    ),\n)\n";
+        let edit = WorldEdit {
+            seed: 1234,
+            overrides: vec![("equator_c".into(), 33.5)],
+        };
+        let out = rewrite_world_edit(text, &edit).unwrap();
+        assert!(out.contains("    revision: 4, // bumped on save\n"));
+        assert!(out.contains("    seed: 1234, // body seed\n    profile: None,\n"));
+        assert!(out.contains("// overrides: [ignored, a ] in a comment"));
+        assert!(out.contains("overrides: [\n            (\"equator_c\", 33.5),\n        ],"));
+        assert!(!out.contains("rain"));
+        // CRLF files stay CRLF.
+        let crlf = text.replace('\n', "\r\n");
+        let out = rewrite_world_edit(&crlf, &edit).unwrap();
+        assert!(!out.replace("\r\n", "").contains('\n'), "mixed line endings");
+        assert!(out.contains("seed: 1234, // body seed\r\n    profile: None,"));
     }
 }
 #[derive(Debug, Deserialize)]
@@ -292,7 +314,11 @@ fn world_look(
     let metadata_path = local_path(root, &archetype.biome_lut)?;
     let (metadata, _): (LutMetadata, _) = parse(&metadata_path)?;
     let image_path = local_path(root, &metadata.image)?;
-    let image = bounded_bytes(&image_path)?;
+    ensure!(
+        fs::metadata(&image_path)?.len() <= MAX_IMAGE_BYTES,
+        "biome LUT image exceeds 4 MiB"
+    );
+    let image = fs::read(&image_path)?;
     let lut = BiomeLut::from_png(&metadata, &image)
         .with_context(|| format!("invalid biome LUT {}", metadata.image))?;
     let snow_path = local_path(root, &archetype.snow.material)?;
@@ -323,15 +349,16 @@ fn local_path(root: &Path, relative: &str) -> Result<PathBuf> {
     Ok(result)
 }
 
-/// Body-fixed rotation axis: the spin axis expressed in the body's rest frame.
+/// Body-fixed rotation axis. `spin_axis` is already body-local (`AxialSpin`
+/// rotates about `axis_in_body`, which the spin leaves fixed), so the
+/// orientation at epoch does not enter.
 fn body_pole(body: &BodyContent) -> Result<glam::DVec3> {
-    let q = glam::DQuat::from_array(body.spin_orientation_xyzw);
     let axis = glam::DVec3::from_array(body.spin_axis);
     ensure!(
-        q.is_finite() && q.length() > 0.0 && axis.is_finite() && axis.length() > 0.0,
-        "invalid spin axis or orientation"
+        axis.is_finite() && axis.length() > 0.0,
+        "invalid spin axis"
     );
-    Ok((q.normalize().inverse() * axis).normalize())
+    Ok(axis.normalize())
 }
 
 /// A terrain definition loaded from content, with the editable world-map
@@ -378,6 +405,8 @@ impl WorldSource {
     /// Write `edit` into the terrain file: the `seed` and the `overrides` list.
     /// Everything else (comments included) is kept; the revision is bumped.
     pub fn save(&self, edit: &WorldEdit) -> Result<()> {
+        // Never persist an edit the loader would reject at the next start.
+        self.rebuild(edit).context("edit is invalid; not saved")?;
         let path = local_path(&self.root, &self.terrain)?;
         let text = String::from_utf8(bounded_bytes(&path)?)?;
         let saved = rewrite_world_edit(&text, edit)?;
@@ -386,7 +415,11 @@ impl WorldSource {
             check.seed == edit.seed && check.world.is_some_and(|w| w.overrides == edit.overrides),
             "saved terrain does not round-trip"
         );
-        fs::write(&path, saved).with_context(|| format!("writing {}", path.display()))
+        // Write a sibling and rename over the original so a failed write
+        // never leaves a truncated terrain file.
+        let temporary = path.with_extension("ron.saving");
+        fs::write(&temporary, saved).with_context(|| format!("writing {}", temporary.display()))?;
+        fs::rename(&temporary, &path).with_context(|| format!("replacing {}", path.display()))
     }
 }
 
@@ -398,40 +431,84 @@ pub fn load_world_source(root: &Path, terrain: &str, radius_m: f64) -> Result<Wo
         .context("terrain is not a world map")
 }
 
-/// Replace the first `seed: N,` and the `overrides: [...]` list of a terrain
-/// RON file and bump `revision`.
+/// Replace the value of the top-level field `name` (a line `    name: value,`
+/// with an optional trailing comment), keeping the rest of the line.
+fn replace_field(
+    text: &mut String,
+    name: &str,
+    value: impl FnOnce(&str) -> Result<String>,
+) -> Result<()> {
+    let key = format!("\n    {name}:");
+    let start = text
+        .find(&key)
+        .with_context(|| format!("terrain file has no top-level {name}"))?
+        + key.len();
+    let line_end = text[start..].find('\n').map_or(text.len(), |i| start + i);
+    let comma = start
+        + text[start..line_end]
+            .find(',')
+            .with_context(|| format!("{name} is not a one-line field"))?;
+    let new = value(text[start..comma].trim())?;
+    text.replace_range(start..comma, &format!(" {new}"));
+    Ok(())
+}
+
+/// Byte range of the `overrides: [...]` list (brackets included), skipping
+/// comments and strings.
+fn overrides_list(text: &str) -> Result<std::ops::Range<usize>> {
+    let mut offset = 0;
+    let key_end = text
+        .split_inclusive('\n')
+        .find_map(|line| {
+            let at = offset;
+            offset += line.len();
+            line.trim_start()
+                .starts_with("overrides:")
+                .then(|| at + line.find("overrides:").expect("checked") + "overrides:".len())
+        })
+        .context("terrain file has no world overrides")?;
+    let open = key_end + text[key_end..].find('[').context("overrides is not a list")?;
+    let bytes = text.as_bytes();
+    let mut i = open + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i += text[i..].find('\n').unwrap_or(text.len() - i);
+            }
+            b'"' => {
+                i += 1 + text[i + 1..].find('"').context("unterminated string")?;
+            }
+            b']' => return Ok(open..i + 1),
+            _ => {}
+        }
+        i += 1;
+    }
+    anyhow::bail!("unterminated overrides list")
+}
+
+/// Write `edit` into terrain RON text: the top-level `seed`, the world
+/// `overrides` list and a bumped `revision`. Comments, other fields and the
+/// file's line endings are kept.
 fn rewrite_world_edit(text: &str, edit: &WorldEdit) -> Result<String> {
-    let field = |text: &str, name: &str| -> Result<(usize, usize)> {
-        let key = format!("
-    {name}:");
-        let start = text.find(&key).with_context(|| format!("terrain file has no top-level {name}"))? + key.len();
-        let end = start + text[start..].find(",
-").context("unterminated field")?;
-        Ok((start, end))
-    };
     let mut out = text.to_string();
-    let (start, end) = field(&out, "revision")?;
-    let revision: u32 = out[start..end].trim().parse().context("revision is not a number")?;
-    out.replace_range(start..end, &format!(" {}", revision + 1));
-    let (start, end) = field(&out, "seed")?;
-    out.replace_range(start..end, &format!(" {}", edit.seed));
-    let key = "overrides:";
-    let start = out.find(key).context("terrain file has no world overrides")? + key.len();
-    let open = start + out[start..].find('[').context("overrides is not a list")?;
-    let close = open + out[open..].find(']').context("unterminated overrides")?;
+    replace_field(&mut out, "revision", |old| {
+        let revision: u32 = old.parse().context("revision is not a number")?;
+        Ok((revision + 1).to_string())
+    })?;
+    replace_field(&mut out, "seed", |_| Ok(edit.seed.to_string()))?;
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
     let list = if edit.overrides.is_empty() {
         "[]".to_string()
     } else {
         let items: String = edit
             .overrides
             .iter()
-            .map(|(name, value)| format!("
-            (\"{name}\", {value:?}),"))
+            .map(|(name, value)| format!("{newline}            (\"{name}\", {value:?}),"))
             .collect();
-        format!("[{items}
-        ]")
+        format!("[{items}{newline}        ]")
     };
-    out.replace_range(open..=close, &list);
+    let range = overrides_list(&out)?;
+    out.replace_range(range, &list);
     Ok(out)
 }
 

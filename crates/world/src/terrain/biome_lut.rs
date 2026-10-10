@@ -327,6 +327,6 @@ pub(crate) mod tests {
         assert!((lut.sample(5.0, 0.3)[0] - 0.5).abs() < 1e-12);
         let png = encode_png(2, &lut.srgb).unwrap();
         assert_eq!(BiomeLut::from_png(&metadata, &png).unwrap(), lut);
-        assert!(srgb_to_linear(linear_to_srgb(0.214)) - 0.214 < 1e-12);
+        assert!((srgb_to_linear(linear_to_srgb(0.214)) - 0.214).abs() < 1e-12);
     }
 }

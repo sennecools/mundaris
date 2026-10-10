@@ -263,6 +263,10 @@ pub fn mip_for(texel_m: f64, base_texel_m: f64, levels: usize) -> usize {
     ((texel_m / base_texel_m).log2().floor().max(0.0) as usize).min(levels - 1)
 }
 
+/// Highest Tier A noise frequency, in cycles per unit direction, that f32
+/// lattice coordinates on the GPU still resolve finely (ulp ~2.4e-4 at 4096).
+pub const MAX_TIER_A_NOISE_FREQUENCY: f64 = 4096.0;
+
 /// WorldV1 geology of a compiled generator: lazily baked CPU oracle maps.
 #[derive(Debug, Clone)]
 pub struct WorldField {
@@ -275,6 +279,23 @@ impl WorldField {
     pub fn new(definition: &WorldDefinition, radius_m: f64) -> Result<Self, TerrainError> {
         if !radius_m.is_finite() || radius_m <= 0.0 {
             return Err(TerrainError::InvalidRadius);
+        }
+        // The GPU bake evaluates noise at absolute f32 lattice coordinates
+        // (cycles per unit direction); beyond a few thousand f32 loses the
+        // sub-cell precision the noise needs.
+        let p = &definition.params;
+        let highest = [
+            radius_m / p.continent_wavelength_m
+                * p.continent_lacunarity
+                    .powi(p.continent_octaves.saturating_sub(1) as i32),
+            radius_m / p.warp_wavelength_m,
+            radius_m / p.temperature_noise_wavelength_m,
+        ];
+        if highest
+            .iter()
+            .any(|f| !f.is_finite() || *f > MAX_TIER_A_NOISE_FREQUENCY)
+        {
+            return Err(TerrainError::InvalidConfig);
         }
         Ok(Self {
             inputs: definition.inputs(radius_m),

@@ -481,6 +481,9 @@ impl CelestialCamera {
             )?
             .ready()),
         }
+        .map(|clearance| {
+            clearance.map(|c| crate::terrain_inspection::with_flat_water(celestial, c))
+        })
     }
     /// Evaluate clearance on the CPU test oracle instead of read-back GPU
     /// colliders. For headless tests that run the camera without a renderer.

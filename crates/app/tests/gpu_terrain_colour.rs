@@ -13,8 +13,9 @@
 //!   apart and the LUT is not linear, so the means differ slightly; allowed
 //!   0.01 per channel in linear colour (about 4 % of a mid-grey).
 //! - Average colour: area-weighted mean albedo of the body vs the archetype's
-//!   declared `average_colour`, shown while the bake runs (§6.1); 0.02 per
-//!   channel.
+//!   declared `average_colour`, shown while the bake runs (§6.1); 0.005 per
+//!   channel (about 5 % of these channels), so changing the LUT, snow, water
+//!   or archetype without updating the declared colour fails here.
 mod common;
 
 use astrum_app::{planet_lod::select, shared_system::SharedTestSystem};
@@ -27,7 +28,7 @@ const ALBEDO_TOLERANCE: f64 = 0.001;
 const ALBEDO_TOLERANCE_SCALE: f64 = 0.005;
 const SEA_LEVEL_MARGIN_M: f64 = 0.05;
 const STABILITY_TOLERANCE: f64 = 0.01;
-const AVERAGE_TOLERANCE: f64 = 0.02;
+const AVERAGE_TOLERANCE: f64 = 0.005;
 
 struct Body {
     name: String,

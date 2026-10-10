@@ -196,7 +196,7 @@ impl PlanetArchetype {
                 band.max_radius_km.is_finite()
                     && band.max_radius_km > 0.0
                     && band.face_cells.is_power_of_two()
-                    && (16..=2048).contains(&band.face_cells)
+                    && (16..=1024).contains(&band.face_cells)
             })
             && self.ocean_coverage.valid(0.0, 0.98)
             && c.wavelength_km.valid(1.0, 1.0e5)
@@ -208,7 +208,7 @@ impl PlanetArchetype {
             && c.warp_strength.valid(0.0, 2.0)
             && c.land_height_m.valid(0.0, 2.0e4)
             && (0.25..=4.0).contains(&c.land_exponent)
-            && c.ocean_depth_m.valid(0.0, 2.0e4)
+            && c.ocean_depth_m.valid(1.0, 2.0e4)
             && (0.0..=2.0e3).contains(&c.shelf_depth_m)
             && (0.0..0.9).contains(&c.shelf_fraction)
             && t.equator_c.valid(-250.0, 500.0)
@@ -220,7 +220,7 @@ impl PlanetArchetype {
             && (0.0..=1.0e4).contains(&t.ocean_blur_km)
             && (0.0..=50.0).contains(&t.noise_c)
             && t.noise_wavelength_km.is_finite()
-            && t.noise_wavelength_km > 0.0
+            && t.noise_wavelength_km >= 1.0
             && (1..=6).contains(&self.wind.cells_per_hemisphere)
             && (0.0..=1.0).contains(&self.wind.meridional_fraction)
             && (1..=512).contains(&m.iterations)
@@ -390,7 +390,7 @@ pub const PARAM_FIELDS: &[ParamField] = fields! {
     warp_wavelength_m: 1.0e3, 1.0e8;
     warp_strength: 0.0, 2.0;
     land_height_m: 0.0, 2.0e4;
-    ocean_depth_m: 0.0, 2.0e4;
+    ocean_depth_m: 1.0, 2.0e4;
     shelf_depth_m: 0.0, 2.0e3;
     equator_c: -250.0, 500.0;
     pole_c: -250.0, 500.0;

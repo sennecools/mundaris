@@ -154,6 +154,13 @@ impl GpuContext {
                 // portable default; request what the adapter offers, capped.
                 required_limits: wgpu::Limits {
                     max_texture_array_layers: adapter.limits().max_texture_array_layers.min(2048),
+                    // Tier A bakes of large bodies (1024² per face) need about
+                    // 300 MB of storage; the portable default is 128 MiB.
+                    max_storage_buffer_binding_size: adapter
+                        .limits()
+                        .max_storage_buffer_binding_size
+                        .min(512 << 20),
+                    max_buffer_size: adapter.limits().max_buffer_size.min(512 << 20),
                     ..wgpu::Limits::default()
                 },
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),

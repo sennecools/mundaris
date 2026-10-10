@@ -167,6 +167,27 @@ pub fn clearance_at_position(
     })
 }
 
+/// M1 flat water (pipeline §13 until M3): world-map bodies with a sea level
+/// draw opaque water at the reference radius over ground below it, so the
+/// camera treats that surface as its floor. Colliders stay on the sea floor.
+pub fn with_flat_water(body: &CelestialBody, mut clearance: TerrainClearance) -> TerrainClearance {
+    let has_ocean = body
+        .surface_definition()
+        .and_then(|d| d.world())
+        .is_some_and(|w| {
+            w.archetype
+                .stages
+                .contains(&astrum_world::terrain::archetype::TierAStage::SeaLevel)
+        });
+    if has_ocean && clearance.terrain_elevation_m < 0.0 {
+        clearance.surface_radius_m -= clearance.terrain_elevation_m;
+        clearance.terrain_elevation_m = 0.0;
+        clearance.clearance_m = clearance.camera_radius_m - clearance.surface_radius_m;
+        clearance.slope_angle_rad = 0.0;
+    }
+    clearance
+}
+
 #[cfg(test)]
 mod tests {
     /// ADR 0023: only this module's labelled oracle functions evaluate the CPU
@@ -221,5 +242,44 @@ mod tests {
             }
         }
         assert!(checked > 40, "{checked}");
+    }
+
+    #[test]
+    fn flat_water_is_the_camera_floor_over_oceans_only() {
+        use astrum_math::{Direction3, surface::SurfaceLocation};
+        let loaded = crate::shared_system::SharedTestSystem::load_canonical(
+            std::num::NonZeroU64::new(31).unwrap(),
+        )
+        .unwrap();
+        let body = |name: &str| {
+            loaded
+                .system
+                .bodies()
+                .find(|(_, b)| b.name() == name)
+                .map(|(id, b)| (id, b.clone()))
+                .unwrap()
+        };
+        let clearance = |id, elevation: f64| super::TerrainClearance {
+            body: id,
+            location: SurfaceLocation::new(Direction3::try_new(glam::DVec3::Y).unwrap()),
+            camera_radius_m: 1_000_100.0,
+            sphere_altitude_m: 100.0,
+            terrain_elevation_m: elevation,
+            surface_radius_m: 1_000_000.0 + elevation,
+            clearance_m: 100.0 - elevation,
+            slope_angle_rad: 0.3,
+        };
+        let (rust_id, rust) = body("Rust");
+        // Over 2 km of sea the camera is 100 m above the water, flat.
+        let water = super::with_flat_water(&rust, clearance(rust_id, -2000.0));
+        assert_eq!(water.clearance_m, 100.0);
+        assert_eq!(water.surface_radius_m, 1_000_000.0);
+        assert_eq!(water.slope_angle_rad, 0.0);
+        // Land and airless bodies are unchanged.
+        let land = clearance(rust_id, 500.0);
+        assert_eq!(super::with_flat_water(&rust, land), land);
+        let (moon_id, moon) = body("Moon");
+        let crater = clearance(moon_id, -2000.0);
+        assert_eq!(super::with_flat_water(&moon, crater), crater);
     }
 }

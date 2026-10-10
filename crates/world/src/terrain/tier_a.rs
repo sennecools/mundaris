@@ -89,8 +89,22 @@ pub fn continent_noise(d: DVec3, params: &PlanetParams, radius_m: f64) -> f64 {
     let warp_frequency = radius_m / params.warp_wavelength_m;
     let warp = DVec3::new(
         fbm(d, warp_frequency, 3, 2.0, 0.5, params.warp_seed),
-        fbm(d, warp_frequency, 3, 2.0, 0.5, params.warp_seed.wrapping_add(16)),
-        fbm(d, warp_frequency, 3, 2.0, 0.5, params.warp_seed.wrapping_add(32)),
+        fbm(
+            d,
+            warp_frequency,
+            3,
+            2.0,
+            0.5,
+            params.warp_seed.wrapping_add(16),
+        ),
+        fbm(
+            d,
+            warp_frequency,
+            3,
+            2.0,
+            0.5,
+            params.warp_seed.wrapping_add(32),
+        ),
     );
     // Displacement in radians, proportional to the continent wavelength.
     let warped =
@@ -171,7 +185,11 @@ pub fn base_temperature(x: f64, params: &PlanetParams) -> f64 {
     let tilt = params.axial_tilt_deg.to_radians();
     let (equator, pole) = (insolation(0.0, tilt), insolation(1.0, tilt));
     let span = equator - pole;
-    let t = if span.abs() < 1e-9 { 0.5 } else { (insolation(x, tilt) - pole) / span };
+    let t = if span.abs() < 1e-9 {
+        0.5
+    } else {
+        (insolation(x, tilt) - pole) / span
+    };
     params.pole_c + (params.equator_c - params.pole_c) * t
 }
 
@@ -250,7 +268,8 @@ pub fn bake(inputs: &TierAInputs) -> Result<TierAFields, TerrainError> {
     let shelf = has(TierAStage::Shelf);
     let mut elevation = CubeMap::new(n, 0.0f32);
     for (k, r) in raw.iter().enumerate() {
-        elevation.data_mut()[k] = shape_elevation(*r, sea_level, noise_low, noise_high, p, shelf) as f32;
+        elevation.data_mut()[k] =
+            shape_elevation(*r, sea_level, noise_low, noise_high, p, shelf) as f32;
     }
     let total_weight: u64 = weights.iter().map(|w| u64::from(*w)).sum();
     let ocean_weight: u64 = elevation
@@ -271,7 +290,11 @@ pub fn bake(inputs: &TierAInputs) -> Result<TierAFields, TerrainError> {
         .map(|d| tangent_frame(*d, inputs.pole))
         .collect();
     let blur_step = p.ocean_blur_m / f64::from(OCEAN_BLUR_PASSES).sqrt() / inputs.radius_m;
-    for _ in 0..if p.ocean_blur_m > 0.0 { OCEAN_BLUR_PASSES } else { 0 } {
+    for _ in 0..if p.ocean_blur_m > 0.0 {
+        OCEAN_BLUR_PASSES
+    } else {
+        0
+    } {
         let previous = ocean.clone();
         for (k, d) in directions.iter().enumerate() {
             let (east, north) = frames[k];
@@ -292,8 +315,10 @@ pub fn bake(inputs: &TierAInputs) -> Result<TierAFields, TerrainError> {
             let x = d.dot(inputs.pole);
             let h = f64::from(elevation.data()[k]);
             let t = base_temperature(x, p) - p.lapse_c_per_km * h.max(0.0) / 1000.0;
-            let moderated = middle + (t - middle) * (1.0 - p.ocean_moderation * f64::from(ocean.data()[k]));
-            let noise = p.temperature_noise_c * fbm(*d, noise_frequency, 3, 2.0, 0.5, p.temperature_seed);
+            let moderated =
+                middle + (t - middle) * (1.0 - p.ocean_moderation * f64::from(ocean.data()[k]));
+            let noise =
+                p.temperature_noise_c * fbm(*d, noise_frequency, 3, 2.0, 0.5, p.temperature_seed);
             temperature.data_mut()[k] = (moderated + noise) as f32;
         }
     }
@@ -319,7 +344,8 @@ pub fn bake(inputs: &TierAInputs) -> Result<TierAFields, TerrainError> {
             let previous = carried.clone();
             for (k, d) in directions.iter().enumerate() {
                 let (east, north) = frames[k];
-                let flow = east * f64::from(wind_east.data()[k]) + north * f64::from(wind_north.data()[k]);
+                let flow =
+                    east * f64::from(wind_east.data()[k]) + north * f64::from(wind_north.data()[k]);
                 let source = *d - flow * step;
                 let mut upwind = previous.bilinear(source.normalize());
                 if p.moisture_spread > 0.0 {
@@ -328,7 +354,8 @@ pub fn bake(inputs: &TierAInputs) -> Result<TierAFields, TerrainError> {
                         .iter()
                         .map(|offset| previous.bilinear((source + *offset * side).normalize()))
                         .sum();
-                    upwind = (1.0 - p.moisture_spread) * upwind + p.moisture_spread * 0.25 * lateral;
+                    upwind =
+                        (1.0 - p.moisture_spread) * upwind + p.moisture_spread * 0.25 * lateral;
                 }
                 let evaporate = if elevation.data()[k] < 0.0 {
                     p.evaporation * evaporation_factor(f64::from(temperature.data()[k]))
@@ -432,10 +459,29 @@ mod tests {
         let (tropics, mid, polar) = (band(0.0, 0.3), band(0.4, 0.7), band(0.85, 1.0));
         assert!(tropics > mid && mid > polar, "{tropics} {mid} {polar}");
         assert!(tropics - polar > 25.0);
-        // Altitude: the land lapse term only ever cools.
-        let p = &input.params;
-        let x = 0.2;
-        assert!(base_temperature(x, p) - p.lapse_c_per_km * 2.0 < base_temperature(x, p));
+        // Altitude, on the baked field: without the lapse rate every land
+        // texel is warmer by lapse · height, scaled by the ocean moderation
+        // factor 1 - moderation · mask (mask in 0..1); oceans are unchanged.
+        let mut flat = input.clone();
+        flat.params.lapse_c_per_km = 0.0;
+        let without = bake(&flat).unwrap();
+        let lapse = input.params.lapse_c_per_km;
+        let mut high_land = 0;
+        for k in 0..6 * n * n {
+            let h = f64::from(fields.elevation.data()[k]);
+            let cooling =
+                f64::from(without.temperature.data()[k]) - f64::from(fields.temperature.data()[k]);
+            let full = lapse * h.max(0.0) / 1000.0;
+            let least = full * (1.0 - input.params.ocean_moderation);
+            assert!(
+                cooling <= full + 1e-4 && cooling >= least - 1e-4,
+                "texel {k}: cooled {cooling}, expected within [{least}, {full}]"
+            );
+            if h > 1000.0 {
+                high_land += 1;
+            }
+        }
+        assert!(high_land > 0, "the bake has land above 1 km");
     }
 
     #[test]
@@ -464,8 +510,19 @@ mod tests {
                 .sum::<f64>()
                 / set.len() as f64
         };
-        assert!(mean(&coastal) > mean(&interior) + 0.05, "{} {}", mean(&coastal), mean(&interior));
-        assert!(fields.moisture.data().iter().all(|m| (0.0..=1.0).contains(m)));
+        assert!(
+            mean(&coastal) > mean(&interior) + 0.05,
+            "{} {}",
+            mean(&coastal),
+            mean(&interior)
+        );
+        assert!(
+            fields
+                .moisture
+                .data()
+                .iter()
+                .all(|m| (0.0..=1.0).contains(m))
+        );
     }
 
     #[test]

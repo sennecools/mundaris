@@ -119,7 +119,12 @@ impl GravityOrbitsDemo {
         let params = PARAM_FIELDS
             .iter()
             .map(|field| {
-                let value = world.params.get(field.name).unwrap_or_default();
+                // Show the edit (not the published definition) so a slider does not
+                // snap back while the rebuild is pending or after a rejected value.
+                let value = editable
+                    .override_of(field.name)
+                    .or_else(|| world.params.get(field.name))
+                    .unwrap_or_default();
                 let (low, high) = world
                     .archetype
                     .editor_range(field.name, value)

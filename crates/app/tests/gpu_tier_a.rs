@@ -3,9 +3,10 @@
 //!
 //! Tolerances: the GPU evaluates in f32. Continent noise differs by ~1e-7
 //! relative; elevation scales noise by land height / noise range (~10 km per
-//! unit), so f32 alone moves it by millimetres. Sea level can shift by a
-//! fraction of a histogram bin if a texel's noise lands on the other side of a
-//! bin edge. Temperature and wind are analytic per texel; moisture accumulates
+//! unit), so f32 alone moves it by millimetres. Sea level and the relief
+//! percentiles can shift by a fraction of a histogram bin if a texel's noise
+//! lands on the other side of a bin edge, which rescales land heights; the
+//! 0.1 m elevation allowance covers that (measured: about 1.5 cm). Temperature and wind are analytic per texel; moisture accumulates
 //! f32 rounding over ~100 advection steps.
 mod common;
 
@@ -124,4 +125,72 @@ fn gpu_tier_a_matches_the_cpu_oracle() {
             }
         }
     }
+}
+
+/// Production size (512² per face, the archetype's 96 moisture iterations) on
+/// the GPU only: the bake spread over 24-pass submissions, as at runtime, is
+/// bit-identical to a one-shot bake, and all eight field mip levels are the
+/// 2×2 averages of the level below (checked against the CPU mip builder fed
+/// with the GPU's own level 0).
+#[test]
+fn production_size_bake_is_frame_split_stable_with_full_mip_chains() {
+    let Some(context) = common::gpu() else {
+        return;
+    };
+    let archetype = terra();
+    let inputs = TierAInputs {
+        params: archetype.sample(7),
+        stages: archetype.stages.clone(),
+        radius_m: 338_950.0,
+        pole: DVec3::Y,
+        face_cells: archetype.face_cells(338_950.0) as usize,
+    };
+    assert_eq!(inputs.face_cells, 512);
+    let packed = bake_inputs(&inputs);
+    let whole =
+        astrum_renderer::tier_a::tier_a_for_validation(&context.device, &context.queue, &packed)
+            .unwrap();
+    let split = astrum_renderer::tier_a::tier_a_for_validation_budgeted(
+        &context.device,
+        &context.queue,
+        &packed,
+        24,
+    )
+    .unwrap();
+    assert_eq!(whole.sea_level, split.sea_level);
+    let differing = whole
+        .fields
+        .iter()
+        .zip(&split.fields)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    assert_eq!(differing, 0, "frame-split bake differs in {differing} values");
+    let n = inputs.face_cells;
+    let levels = astrum_renderer::tier_a::field_mip_layout(n as u32).len();
+    assert_eq!(levels, 8, "512 → 4 is eight levels");
+    let mut worst = [0.0f64; 3];
+    for (field, tolerance) in [ELEVATION_TOLERANCE_M, TEMPERATURE_TOLERANCE_C, MOISTURE_TOLERANCE]
+        .into_iter()
+        .enumerate()
+    {
+        let mut level0 = astrum_world::terrain::world_map::CubeMap::new(n, 0.0f32);
+        level0.data_mut().copy_from_slice(whole.field_mip(field, 0));
+        let cpu = astrum_world::terrain::world_field::field_mips(&level0);
+        assert_eq!(cpu.len(), levels);
+        for (level, mip) in cpu.iter().enumerate() {
+            let error = whole
+                .field_mip(field, level)
+                .iter()
+                .zip(mip.data())
+                .map(|(g, c)| (f64::from(*g) - f64::from(*c)).abs())
+                .fold(0.0f64, f64::max);
+            assert!(error <= tolerance, "field {field} level {level}: {error}");
+            worst[field] = worst[field].max(error);
+        }
+    }
+    println!(
+        "n=512: frame-split bake identical; mip chains (8 levels) worst |d| elevation {:.2e} m, \
+         temperature {:.2e} C, moisture {:.2e}",
+        worst[0], worst[1], worst[2]
+    );
 }
