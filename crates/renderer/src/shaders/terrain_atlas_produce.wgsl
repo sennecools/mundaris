@@ -12,8 +12,8 @@ struct Tile {
     scale: vec4<f32>,       // radius, unused, unused, unused
     layer_origin: array<vec4<f32>, 5>, // profile: chart origin x/y/z modulo width, w = K
     layer_info: array<vec4<f32>, 5>,   // profile: mip, width at mip, amplitude, cubic flag
-    band_cell: array<vec4<i32>, 6>,    // fields: base cell per band * 2 + layout
-    band_frac: array<vec4<f32>, 6>,    // fields: base cell fraction, w = edge
+    band_cell: array<vec4<i32>, 6>,    // fields: base cell per band * 2 + layout; world: [0] = texel origin xy, face
+    band_frac: array<vec4<f32>, 6>,    // fields: base cell fraction, w = edge; world: [0].xy = texel fraction, [1] = d texel / d st columns
     band_weight: vec4<f32>,            // fields: band footprint weights
     noise: vec4<u32>,                  // x = detail octave count (origins in `octaves`); world: y = Tier A face cells, z = elevation mip offset, w = mip cells
 }
@@ -495,18 +495,34 @@ fn any_orthonormal(d: vec3<f32>) -> vec3<f32> {
 }
 
 // Bicubic macro elevation of the tile's mip and its tangent gradient (central
-// differences over a quarter texel), mirroring WorldMaps::sample.
-fn evaluate_world(p: ChartPoint) -> HeightSample {
+// differences over a quarter texel), mirroring WorldMaps::sample. The tile's
+// own cube face is evaluated at its CPU-split texel coordinate (integer
+// origin + small f32 offset, affine in st), never from the rounded absolute
+// direction; the difference points are offset from it in texel space. Only
+// within half a texel of a face edge does the neighbouring face's blend
+// contribution still come from the f32 direction (a slope × ~1e-7 R residual,
+// confined to that band and to aprons beyond the face).
+fn evaluate_world(p: ChartPoint, st: vec2<f32>) -> HeightSample {
     cube_level_n = tile.noise.w;
     let base = tile.noise.z;
+    let face = u32(tile.band_cell[0].z);
+    let cell = tile.band_cell[0].xy;
+    let jacobian = mat2x2<f32>(tile.band_frac[1].xy, tile.band_frac[1].zw);
+    let local = tile.band_frac[0].xy + jacobian * st;
     let d = normalize(p.n);
     let delta = 0.5 / f32(cube_level_n);
     let e1 = any_orthonormal(d);
     let e2 = cross(d, e1);
+    let o1 = cube_split_offset(face, d, e1, delta);
+    let o2 = cube_split_offset(face, d, -e1, delta);
+    let o3 = cube_split_offset(face, d, e2, delta);
+    let o4 = cube_split_offset(face, d, -e2, delta);
     var out: HeightSample;
-    out.height = cube_sample(base, d, true);
-    let g1 = cube_sample(base, normalize(d + e1 * delta), true) - cube_sample(base, normalize(d - e1 * delta), true);
-    let g2 = cube_sample(base, normalize(d + e2 * delta), true) - cube_sample(base, normalize(d - e2 * delta), true);
+    out.height = cube_sample_split(base, face, cell, local, d);
+    let g1 = cube_sample_split(base, face, cell, local + o1, normalize(d + e1 * delta))
+        - cube_sample_split(base, face, cell, local + o2, normalize(d - e1 * delta));
+    let g2 = cube_sample_split(base, face, cell, local + o3, normalize(d + e2 * delta))
+        - cube_sample_split(base, face, cell, local + o4, normalize(d - e2 * delta));
     out.gradient = (e1 * g1 + e2 * g2) / (2.0 * delta);
     return out;
 }
@@ -532,6 +548,9 @@ fn detail_fbm(local: vec3<f32>) -> vec4<f32> {
 // World-map colour (pipeline §10, M1): biome LUT tint by temperature ×
 // moisture from the climate mips matching the node, snow by temperature and
 // slope, flat water below sea level. Mirrors `ProducerRecipe::albedo`.
+// Climate lookups (here and in page_climate) stay on the absolute f32
+// direction: unlike elevation, colour and overlays are insensitive to the
+// ~1e-7 R (sub-centimetre) sample offset.
 const SURFACE_LUT: u32 = 24u;
 
 fn surface_f32(i: u32) -> f32 {
@@ -623,7 +642,7 @@ fn evaluate(st: vec2<f32>) -> vec4<f32> {
     } else if tile.info.y == 1u {
         sample_value = evaluate_fields(p);
     } else {
-        sample_value = evaluate_world(p);
+        sample_value = evaluate_world(p, st);
     }
     if tile.noise.x > 0u {
         // Split lattice: the CPU origin is the exact f64 chart centre n0 * R, so

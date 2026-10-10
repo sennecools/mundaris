@@ -371,6 +371,19 @@ pub enum AtlasTileKind {
         mip_cells: u32,
         /// Tier A face cells: level 0 of the wind runs (page climate).
         base_cells: u32,
+        /// The tile's elevation lookup, split on the CPU in f64 (pipeline
+        /// §4.4) so f32 never holds an absolute texel coordinate: texel
+        /// (x, y) on cube face `face` (`CubeFace::ALL` order) of the mip,
+        /// `t = (u + 1)/2 · n − 0.5` as in `world_map::CubeMap`, is
+        /// `texel_origin + texel_fraction + texel_jacobian · st`. Gnomonic
+        /// tile charts make this affine map exact on the tile's own face.
+        face: u32,
+        /// Integer texel of st = (0, 0).
+        texel_origin: [i32; 2],
+        /// Fraction in [0, 1) of st = (0, 0).
+        texel_fraction: [f32; 2],
+        /// Columns d texel / d s and d texel / d t.
+        texel_jacobian: [[f32; 2]; 2],
     },
 }
 
@@ -2394,7 +2407,23 @@ fn pack_tile(out: &mut Vec<u8>, job: &AtlasProduceJob) {
             }
             weights = [band_weights[0], band_weights[1], band_weights[2], 0.0];
         }
-        AtlasTileKind::World { .. } => {}
+        AtlasTileKind::World {
+            face,
+            texel_origin,
+            texel_fraction,
+            texel_jacobian,
+            ..
+        } => {
+            // The Fields-only band slots carry the split texel lookup.
+            cells[0] = [texel_origin[0], texel_origin[1], *face as i32, 0];
+            fractions[0] = [texel_fraction[0], texel_fraction[1], 0.0, 0.0];
+            fractions[1] = [
+                texel_jacobian[0][0],
+                texel_jacobian[0][1],
+                texel_jacobian[1][0],
+                texel_jacobian[1][1],
+            ];
+        }
     }
     for value in origins.iter().chain(&infos) {
         out.extend(f32_bytes(value));
@@ -2413,6 +2442,7 @@ fn pack_tile(out: &mut Vec<u8>, job: &AtlasProduceJob) {
             mip_offset,
             mip_cells,
             base_cells,
+            ..
         } => (mip_offset, mip_cells, base_cells),
         _ => (0, 0, 0),
     };
@@ -2636,6 +2666,36 @@ mod tests {
             },
         );
         assert_eq!(bytes.len() as u64, TILE_BYTES);
+        let mut bytes = Vec::new();
+        pack_tile(
+            &mut bytes,
+            &AtlasProduceJob {
+                source: 0,
+                layer: 0,
+                token: 0,
+                chart: AtlasChart::default(),
+                radius_m: 1.0,
+                kind: AtlasTileKind::World {
+                    mip_offset: 0,
+                    mip_cells: 4,
+                    base_cells: 4,
+                    face: 5,
+                    texel_origin: [-3, 7],
+                    texel_fraction: [0.25, 0.5],
+                    texel_jacobian: [[2.0, 0.0], [0.0, 2.0]],
+                },
+                octaves: Vec::new(),
+            },
+        );
+        assert_eq!(bytes.len() as u64, TILE_BYTES);
+        // WGSL Tile: band_cell[0] at byte 240 (= (-3, 7, face 5)), band_frac[0]
+        // at 336 and the Jacobian in band_frac[1] at 352.
+        let word = |offset: usize| <[u8; 4]>::try_from(&bytes[offset..offset + 4]).unwrap();
+        assert_eq!(i32::from_le_bytes(word(240)), -3);
+        assert_eq!(i32::from_le_bytes(word(244)), 7);
+        assert_eq!(i32::from_le_bytes(word(248)), 5);
+        assert_eq!(f32::from_le_bytes(word(340)), 0.5);
+        assert_eq!(f32::from_le_bytes(word(352)), 2.0);
         assert_eq!(
             pack_octaves(&[AtlasOctave::default(); 3]).len() as u64,
             3 * OCTAVE_BYTES

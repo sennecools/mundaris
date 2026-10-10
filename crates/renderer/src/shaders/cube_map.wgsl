@@ -149,3 +149,86 @@ fn cube_sample(base: u32, d: vec3<f32>, cubic: bool) -> f32 {
     }
     return sum / max(total, 1.0e-30);
 }
+
+// ---------------------------------------------------------------- split lookups
+// Callers that know their texel coordinate on one face as an exact integer
+// `cell` plus a small f32 `local` offset (split on the CPU in f64, pipeline
+// §4.4) evaluate that face from it, so f32 never rounds an absolute
+// direction there. Same formulas as cube_bicubic_on / cube_sample.
+
+// Blend parameter t of cube_sample on `face` at texel coordinate cell + local:
+// its margin inside the face square in texels, plus a half. Each margin is
+// formed from the near edge, so it is exact where the blend is active.
+fn cube_split_t(cell: vec2<i32>, local: vec2<f32>) -> f32 {
+    let low = vec2<f32>(cell) + (local + vec2<f32>(0.5));
+    let high = vec2<f32>(vec2<i32>(i32(cube_n())) - cell) - (local + vec2<f32>(0.5));
+    return min(min(low.x, low.y), min(high.x, high.y)) + 0.5;
+}
+
+fn cube_bicubic_split(base: u32, face: u32, cell: vec2<i32>, local: vec2<f32>) -> f32 {
+    let whole = floor(local);
+    let origin = cell + vec2<i32>(whole);
+    let wx = catmull_rom(local.x - whole.x);
+    let wy = catmull_rom(local.y - whole.y);
+    var sum = 0.0;
+    for (var j = 0; j < 4; j = j + 1) {
+        for (var i = 0; i < 4; i = i + 1) {
+            sum += wx[i] * wy[j] * cube_value_across(base, face, origin.x - 1 + i, origin.y - 1 + j);
+        }
+    }
+    return sum;
+}
+
+// cube_sample(base, d, true) with `face`'s contribution taken at the split
+// coordinate cell + local. Other faces (only within the blend band, half a
+// texel around `face`'s edges, or beyond them) still use the direction `d`.
+fn cube_sample_split(base: u32, face: u32, cell: vec2<i32>, local: vec2<f32>, d: vec3<f32>) -> f32 {
+    let band = 1.0 / f32(cube_n());
+    var sum = 0.0;
+    var total = 0.0;
+    for (var f = 0u; f < 6u; f = f + 1u) {
+        var t: f32;
+        var u = 0.0;
+        var v = 0.0;
+        if f == face {
+            t = cube_split_t(cell, local);
+        } else {
+            let b = face_basis(f);
+            let w = dot(d, b[0]);
+            if w <= 0.0 {
+                continue;
+            }
+            u = dot(d, b[1]) / w;
+            v = dot(d, b[2]) / w;
+            t = (1.0 - max(abs(u), abs(v)) + band) / (2.0 * band);
+        }
+        if t <= 0.0 {
+            continue;
+        }
+        var value: f32;
+        if f == face {
+            value = cube_bicubic_split(base, face, cell, local);
+        } else {
+            value = cube_bicubic_on(base, f, u, v);
+        }
+        if t >= 1.0 {
+            return value;
+        }
+        let weight = t * t * (3.0 - 2.0 * t);
+        sum += weight * value;
+        total += weight;
+    }
+    return sum / max(total, 1.0e-30);
+}
+
+// Texel offset on `face` between directions d and d + e·delta (unnormalised;
+// the gnomonic chart is scale-free): from u(d + e δ) − u(d) =
+// δ (e·U − u e·N) / (d·N + δ e·N), formed as a small difference in f32.
+fn cube_split_offset(face: u32, d: vec3<f32>, e: vec3<f32>, delta: f32) -> vec2<f32> {
+    let b = face_basis(face);
+    let w = dot(d, b[0]);
+    let uv = vec2<f32>(dot(d, b[1]), dot(d, b[2])) / w;
+    let en = dot(e, b[0]);
+    let scale = delta / (w + delta * en) * 0.5 * f32(cube_n());
+    return (vec2<f32>(dot(e, b[1]), dot(e, b[2])) - uv * en) * scale;
+}

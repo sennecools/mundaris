@@ -8,10 +8,13 @@
 //!   which grows with tile size: on coarse tiles (levels 2-3, ~400 m texels)
 //!   it reaches a few mm on steep slopes, about 1e-5 of a texel. Allowed:
 //!   max(1 mm, 1e-5 texel) + 1e-6 |h|.
-//!   World-map (WorldV1) bodies look up macro elevation by absolute unit
-//!   direction, whose f32 rounding (~6e-8 per component) moves the sample by
-//!   about 1.2e-7 R; that costs slope × 1.2e-7 R (a few mm on Rust).
-//!   Allowed additionally: 1.2e-7 · R · |slope|.
+//!   World-map (WorldV1) bodies look up macro elevation at a texel coordinate
+//!   split on the CPU in f64 (integer origin + f32 offset, affine in st), so
+//!   no term for absolute f32 direction rounding (formerly 1.2e-7 R · slope)
+//!   is allowed. Within half a world-map texel of a cube-face edge the
+//!   neighbouring face's blend contribution still uses the f32 direction;
+//!   that residual (≤ slope × 1.2e-7 R × its blend weight) fits the budget
+//!   above on the canonical bodies.
 //! - Normals: stored as rgba8snorm (1/127 per component, up to ~0.45 deg of
 //!   quantisation) plus f32 gradient error; 0.75 deg.
 mod common;
@@ -28,8 +31,6 @@ use glam::DVec3;
 const HEIGHT_TOLERANCE_M: f64 = 1.0e-3;
 const HEIGHT_TOLERANCE_RELATIVE: f64 = 1.0e-6;
 const HEIGHT_TOLERANCE_TEXEL_FRACTION: f64 = 1.0e-5;
-/// f32 unit-direction rounding of absolute lookups, as a fraction of radius.
-const HEIGHT_TOLERANCE_DIRECTION: f64 = 1.2e-7;
 const NORMAL_TOLERANCE_DEG: f64 = 0.75;
 
 fn node_on_path(direction: DVec3, level: u8) -> CubePatchAddress {
@@ -140,15 +141,14 @@ fn gpu_tiles_match_the_cpu_oracle_within_documented_tolerances() {
                     let error = (gpu - reference.height_m).abs();
                     let slope = reference.gradient_m.length() / radius;
                     let allowed = HEIGHT_TOLERANCE_M.max(HEIGHT_TOLERANCE_TEXEL_FRACTION * texel)
-                        + HEIGHT_TOLERANCE_RELATIVE * reference.height_m.abs()
-                        + HEIGHT_TOLERANCE_DIRECTION * radius * slope;
+                        + HEIGHT_TOLERANCE_RELATIVE * reference.height_m.abs();
                     if error > allowed {
                         failures.push(format!(
                             "{node:?} texel ({i},{j}): |dh| {error} m > {allowed} m"
                         ));
                     }
                     if error / allowed > node_ratio.0 {
-                        node_ratio = (error / allowed, reference.gradient_m.length() / radius);
+                        node_ratio = (error / allowed, slope);
                     }
                     node_height = node_height.max(error);
                     low = low.min(gpu);
