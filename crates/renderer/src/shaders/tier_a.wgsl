@@ -193,16 +193,20 @@ struct Profile {
     kind: u32,
 }
 
-// Boundary profiles for own plate `i`, neighbour `j` at distance `delta`
-// (`tectonics::profiles`).
-fn profiles(i: u32, j: u32, a: Plate, b: Plate, delta: f32, conv: f32, div: f32, trans: f32) -> Profile {
+// Boundary profiles for plate `i` (the side of the point) and `j` at plane
+// distance `plane` and distance `beyond` past the boundary's end
+// (`tectonics::profiles`): capsule distance for the even profiles, a taper
+// for the one-sided arc.
+fn profiles(i: u32, j: u32, a: Plate, b: Plate, plane: f32, beyond: f32, conv: f32, div: f32,
+    trans: f32) -> Profile {
     var out: Profile;
     out.dh = 0.0;
     out.orogenic = 0.0;
     out.volcanic = 0.0;
     let ca = a.spin.w > 0.5;
     let cb = b.spin.w > 0.5;
-    let arc = bump((delta - params.widths.z) / params.widths.y);
+    let arc = bump((plane - params.widths.z) / params.widths.y) * bump(beyond / params.widths.y);
+    let delta = sqrt(plane * plane + beyond * beyond);
     let trench = -params.heights.z * conv * bump(delta / params.widths.w);
     if ca && cb {
         let belt = params.heights.x * conv * bump(delta / params.widths.x);
@@ -258,6 +262,75 @@ fn boundary_delta(w: vec3<f32>, a: Plate, b: Plate) -> vec4<f32> {
     return vec4<f32>(tangent, params.continents.x * f / max(length(tangent), 1.0e-12));
 }
 
+// Class weights (conv, div, trans) of plate `a` against `b` at `w`; `tangent`
+// is P_w(c_a − c_b) (`tectonics::Motion::new`).
+fn motion(w: vec3<f32>, a: Plate, b: Plate, tangent: vec3<f32>) -> vec3<f32> {
+    let normal = -tangent / max(length(tangent), 1.0e-12);
+    let v = cross(a.spin.xyz - b.spin.xyz, w);
+    let c = dot(v, normal);
+    let shear = abs(dot(v, cross(w, normal)));
+    let conv = smoothstep(0.05, 0.4, c);
+    let div = smoothstep(0.05, 0.4, -c);
+    return vec3<f32>(conv, div, smoothstep(0.05, 0.4, shear) * (1.0 - conv - div));
+}
+
+// `tectonics::EDGE_CANDIDATES`, `JUNCTION_BLEND_M`, `VOLCANIC_BLEND`.
+const EDGE_CANDIDATES: u32 = 6u;
+const EDGE_PAIRS: u32 = 15u;
+const JUNCTION_BLEND_M: f32 = 400.0;
+const VOLCANIC_BLEND: f32 = 0.1;
+
+// Distance (m) past the end of the boundary of candidates `a` and `b`
+// (`tectonics::beyond_end`).
+fn beyond_end(w: vec3<f32>, a: u32, b: u32, candidates: array<u32, 6>, n: u32) -> f32 {
+    let pa = plates[a];
+    let pb = plates[b];
+    let dc = pa.centre.xyz - pb.centre.xyz;
+    let along = dot(w, dc);
+    let f = along + (pa.centre.w - pb.centre.w);
+    let tangent = dc - w * along;
+    let foot = normalize(w - tangent * (f / max(dot(tangent, tangent), 1.0e-24)));
+    let score = max(dot(foot, pa.centre.xyz) + pa.centre.w, dot(foot, pb.centre.xyz) + pb.centre.w);
+    let normal = dc - foot * dot(foot, dc);
+    var edge = cross(foot, normal);
+    let edge_length = length(edge);
+    edge = select(vec3<f32>(0.0), edge / edge_length, edge_length > 0.0);
+    let middle = 0.5 * (pa.centre.xyz + pb.centre.xyz);
+    var beyond = 0.0;
+    for (var x = 0u; x < n; x = x + 1u) {
+        let k = candidates[x];
+        if k == a || k == b {
+            continue;
+        }
+        let pk = plates[k];
+        let margin = dot(foot, pk.centre.xyz) + pk.centre.w - score;
+        if margin > 0.0 {
+            var g = pk.centre.xyz - middle;
+            g = g - foot * dot(foot, g);
+            let rate = max(max(abs(dot(g, edge)), 0.2 * length(g)), 1.0e-12);
+            beyond = max(beyond, params.continents.x * margin / rate);
+        }
+    }
+    return beyond;
+}
+
+// Smooth maximum of `count` non-negative values (`tectonics::smooth_max`).
+fn smooth_max(values: array<f32, 15>, count: u32, t: f32) -> f32 {
+    var m = 0.0;
+    for (var k = 0u; k < count; k = k + 1u) {
+        m = max(m, values[k]);
+    }
+    if m <= 0.0 {
+        return 0.0;
+    }
+    let floor_term = exp(-m / t);
+    var sum = 0.0;
+    for (var k = 0u; k < count; k = k + 1u) {
+        sum += exp((values[k] - m) / t) - floor_term;
+    }
+    return m + t * log(sum + floor_term);
+}
+
 // Plates, boundary distance and profiles, crust, hardness (M2 design §1).
 // o0 crust, o1 dh, o2 uplift, o3 hardness, o4 boundary distance (m),
 // o5 boundary_coord (i32), o6 aux1 (plate, class, volcanic).
@@ -301,9 +374,6 @@ fn tectonics(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let tau = max(min(params.plates.z, delta_min), 1.0);
     var total = 0.0;
-    var dh = 0.0;
-    var orogenic = 0.0;
-    var volcanic = 0.0;
     var coord = 0.0;
     var crust = 0.0;
     var hardness = 0.0;
@@ -318,38 +388,73 @@ fn tectonics(@builtin(global_invocation_id) id: vec3<u32>) {
         let bd = boundary_delta(w, a, b);
         let delta = bd.w;
         let weight = exp(-(delta - delta_min) / tau);
-        let normal = -bd.xyz / max(length(bd.xyz), 1.0e-12);
-        let v = cross(a.spin.xyz - b.spin.xyz, w);
-        let c = dot(v, normal);
-        let shear = abs(dot(v, cross(w, normal)));
-        let conv = smoothstep(0.05, 0.4, c);
-        let div = smoothstep(0.05, 0.4, -c);
-        let trans = smoothstep(0.05, 0.4, shear) * (1.0 - conv - div);
-        let profile = profiles(own, j, a, b, delta, conv, div, trans);
         let blend = 0.5 * (1.0 - smoothstep(0.0, params.widths2.w, delta));
         let crust_b = select(-1.0, 1.0, b.spin.w > 0.5);
         total += weight;
-        dh += weight * profile.dh;
-        orogenic += weight * profile.orogenic;
-        volcanic += weight * profile.volcanic;
         coord += weight * select(-1.0, 1.0, j > own);
         crust += weight * (crust_a + (crust_b - crust_a) * blend);
         hardness += weight * (a.props.x + (b.props.x - a.props.x) * blend);
         if delta < nearest {
             nearest = delta;
-            kind = profile.kind;
+            let m = motion(w, a, b, bd.xyz);
+            kind = profiles(own, j, a, b, delta, 0.0, m.x, m.y, m.z).kind;
         }
     }
     total = max(total, 1.0e-30);
+    // Relief from every boundary between the candidate plates (highest
+    // scores, ties to the lower index), merged by smooth maxima.
+    var candidates = array<u32, 6>(0u, 0u, 0u, 0u, 0u, 0u);
+    var scores = array<f32, 6>(-1.0e30, -1.0e30, -1.0e30, -1.0e30, -1.0e30, -1.0e30);
+    let ranked = min(count, EDGE_CANDIDATES);
+    for (var k = 0u; k < count; k = k + 1u) {
+        let s = dot(w, plates[k].centre.xyz) + plates[k].centre.w;
+        // Insert after equal scores (lower indices come first).
+        var at = EDGE_CANDIDATES;
+        for (var x = 0u; x < EDGE_CANDIDATES; x = x + 1u) {
+            if s > scores[x] {
+                at = x;
+                break;
+            }
+        }
+        if at < EDGE_CANDIDATES {
+            for (var x = EDGE_CANDIDATES - 1u; x > at; x = x - 1u) {
+                scores[x] = scores[x - 1u];
+                candidates[x] = candidates[x - 1u];
+            }
+            scores[at] = s;
+            candidates[at] = k;
+        }
+    }
+    var raised: array<f32, 15>;
+    var lowered: array<f32, 15>;
+    var orogenic: array<f32, 15>;
+    var volcanic: array<f32, 15>;
+    var edges = 0u;
+    for (var x = 0u; x < ranked; x = x + 1u) {
+        for (var y = x + 1u; y < ranked; y = y + 1u) {
+            let i = candidates[x];
+            let j = candidates[y];
+            let bd = boundary_delta(w, plates[i], plates[j]);
+            let beyond = beyond_end(w, i, j, candidates, ranked);
+            let m = motion(w, plates[i], plates[j], bd.xyz);
+            let profile = profiles(i, j, plates[i], plates[j], bd.w, beyond, m.x, m.y, m.z);
+            raised[edges] = max(profile.dh, 0.0);
+            lowered[edges] = max(-profile.dh, 0.0);
+            orogenic[edges] = profile.orogenic;
+            volcanic[edges] = profile.volcanic;
+            edges += 1u;
+        }
+    }
     let rough = params.heights2.z * fbm(d, params.heights2.w, 4u, 2.0, 0.5, params.seeds.w + 64u);
-    let oro = orogenic / total;
+    let oro = smooth_max(orogenic, edges, JUNCTION_BLEND_M);
+    let dh = smooth_max(raised, edges, JUNCTION_BLEND_M) - smooth_max(lowered, edges, JUNCTION_BLEND_M);
     let uplift = clamp(oro * (1.0 + rough) / max(params.heights.x, 1.0), 0.0, 1.0);
-    let volc = clamp(volcanic / total, 0.0, 1.0);
+    let volc = clamp(smooth_max(volcanic, edges, VOLCANIC_BLEND), 0.0, 1.0);
     let bc = clamp(delta_min * coord / total, -params.plates.w, params.plates.w);
     let noise = fbm(d, params.hardness.y, 3u, 2.0, 0.5, params.seeds2.x);
     let hard = clamp(max(hardness / total, 0.8 * volc) + params.hardness.x * noise, 0.0, 1.0);
     write_f(o(0u), t.k, crust / total);
-    write_f(o(1u), t.k, dh / total + rough * oro);
+    write_f(o(1u), t.k, dh + rough * oro);
     write_f(o(2u), t.k, uplift);
     write_f(o(3u), t.k, hard);
     write_f(o(4u), t.k, delta_min);
