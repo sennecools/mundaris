@@ -144,8 +144,11 @@ pub fn carve(
         let length = ((a.pos - b.pos).length() * radius_m).max(1.0);
         let slope = (a.bed_m - b.bed_m) / length;
         let incision = lerp(a.incision_m, b.incision_m);
+        // Sized for the cut made here, so deep cuts through relief above the
+        // macro surface get side slopes instead of a narrow trench.
+        let cut = (h - bed).max(0.0);
         let half_valley = (width * p.valley_factor)
-            .max(incision / p.valley_side_slope)
+            .max(incision.max(cut) / p.valley_side_slope)
             .clamp(p.valley_min_m, p.valley_max_m);
         let edge = 0.5 * width;
         let x = ((distance - edge) / (half_valley - edge).max(1.0)).max(0.0);

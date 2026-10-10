@@ -87,7 +87,11 @@ fn river_carve(d: vec3<f32>, h: f32, gradient: vec3<f32>, ribbon_m: f32) -> Rive
         let bed = mix(rivers_f32(a + 6u), rivers_f32(b + 6u), t);
         let length_m = max(length(ab) * radius, 1.0);
         let slope = (rivers_f32(a + 6u) - rivers_f32(b + 6u)) / length_m;
-        let half_valley = clamp(max(width * valley_factor, incision / side_slope), valley_min, valley_max);
+        // Wide enough for the cut actually made here (the landform relief can
+        // rise far above the macro surface the bed was set on), so deep cuts
+        // get side slopes instead of a narrow trench.
+        let cut = max(h - bed, 0.0);
+        let half_valley = clamp(max(width * valley_factor, max(incision, cut) / side_slope), valley_min, valley_max);
         let edge = 0.5 * width;
         let span = max(half_valley - edge, 1.0);
         let x = max(distance - edge, 0.0) / span;
@@ -106,7 +110,13 @@ fn river_carve(d: vec3<f32>, h: f32, gradient: vec3<f32>, ribbon_m: f32) -> Rive
             // Away-from-channel tangent direction (per unit direction).
             let tangent = offset - d * dot(d, offset);
             let away = select(vec3<f32>(0.0), normalize(tangent), dot(tangent, tangent) > 1.0e-20);
-            out.gradient = gradient * profile + away * ((h - bed) * dprofile * radius / span);
+            // Where the cut sets the width, W = cut / side_slope also moves
+            // with h: d carved / d h gains -(h - bed) P'(x) x / (span · side_slope).
+            let w_cut = cut / side_slope;
+            let cut_sets_width = w_cut >= width * valley_factor && w_cut >= incision / side_slope
+                && w_cut > valley_min && w_cut < valley_max;
+            let width_term = select(0.0, (h - bed) * dprofile * x / (span * side_slope), cut_sets_width);
+            out.gradient = gradient * (profile - width_term) + away * ((h - bed) * dprofile * radius / span);
         }
         if distance <= max(edge, ribbon_m) {
             var surface = bed + depth;
