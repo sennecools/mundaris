@@ -5,8 +5,8 @@
 //!
 //! Tolerances:
 //! - Albedo pages hold the land colour everywhere (water is laid over it in
-//!   the draw through the coast contour, -height / 32 m clamped, in the
-//!   normal page's w; checked to within half an snorm8 step).
+//!   the draw through the coast contour in the normal page's w: the signed
+//!   distance to sea level in two-texel units, clamped; its sign is checked).
 //! - Albedo: pages store sRGB in 8 bits. Half a step in linear colour is
 //!   about 0.0045 · c^0.58 (0.0045 at albedo 1, 0.0012 at 0.1), plus f32
 //!   climate sampling; allowed 0.001 + 0.005 · c^0.6 per channel. Texels whose height is within 5 cm of sea level are skipped:
@@ -30,8 +30,8 @@ use glam::DVec3;
 const ALBEDO_TOLERANCE: f64 = 0.001;
 const ALBEDO_TOLERANCE_SCALE: f64 = 0.005;
 const SEA_LEVEL_MARGIN_M: f64 = 0.05;
-/// `WATER_CONTOUR_M` in terrain_atlas_produce.wgsl.
-const WATER_CONTOUR_M: f64 = 32.0;
+/// `WATER_CONTOUR_TEXELS` in terrain_atlas_produce.wgsl.
+const WATER_CONTOUR_TEXELS: f64 = 2.0;
 const STABILITY_TOLERANCE: f64 = 0.01;
 const AVERAGE_TOLERANCE: f64 = 0.005;
 
@@ -119,6 +119,7 @@ fn gpu_albedo_pages_match_the_cpu_oracle_and_water_follows_sea_level() {
             }
             let chart = select::chart(*node);
             let texel = tile_texel_m(body.radius, node.level(), config.cells);
+            let page_texel = texel / f64::from(config.normal_scale);
             for j in (0..nside).step_by(5) {
                 for i in (0..nside).step_by(5) {
                     let st = [
@@ -153,18 +154,24 @@ fn gpu_albedo_pages_match_the_cpu_oracle_and_water_follows_sea_level() {
                         sample.height_m
                     );
                     worst = worst.max(error);
-                    // The coast contour in the normal page's w: -height / 32 m,
-                    // clamped, stored as snorm8 (half a step is 1/254).
-                    let contour = (-sample.height_m / WATER_CONTOUR_M).clamp(-1.0, 1.0);
+                    // The coast contour in the normal page's w: signed distance
+                    // to sea level in units of two page texels (height over
+                    // slope), clamped. Its sign defines the coastline; the
+                    // magnitude depends on the slope, which a 0.4° normal
+                    // difference changes a lot on gentle shelves.
+                    let cosine = sample.normal.dot(d.normalize()).clamp(1e-3, 1.0);
+                    let slope = ((1.0 - cosine * cosine).sqrt() / cosine).max(1e-3);
+                    let contour = (-sample.height_m / (slope * page_texel * WATER_CONTOUR_TEXELS))
+                        .clamp(-1.0, 1.0);
                     let stored = f64::from(tile.water[j * nside + i]);
-                    assert!(
-                        (stored - contour).abs() <= 1.0 / 254.0 + 1e-6,
-                        "{} {node:?} ({i},{j}) h {:.3}: contour {stored} vs {contour}",
-                        body.name,
-                        sample.height_m
-                    );
-                    if contour.abs() > 1.0 / 127.0 {
-                        assert_eq!(stored > 0.0, sample.height_m < 0.0, "contour sign");
+                    if contour.abs() > 0.05 {
+                        assert_eq!(
+                            stored > 0.0,
+                            contour > 0.0,
+                            "{} {node:?} ({i},{j}) h {:.3}: contour {stored} vs {contour}",
+                            body.name,
+                            sample.height_m
+                        );
                     }
                     if sample.height_m < 0.0 {
                         water += 1;

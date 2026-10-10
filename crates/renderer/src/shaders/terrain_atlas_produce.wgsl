@@ -604,13 +604,22 @@ fn world_albedo(d: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
     return mix(biome_colour(t, m), surface_vec3(12u), snow);
 }
 
-// Coast contour in the normal page's w for world maps: -height / 32 m,
-// clamped to [-1, 1] (positive under the sea). Its bilinearly filtered zero
-// crossing is a smooth coastline at sub-texel precision.
-const WATER_CONTOUR_M: f32 = 32.0;
+// Coast contour in the normal page's w for world maps: the signed distance
+// to sea level in units of WATER_CONTOUR_TEXELS page texels (height over the
+// local slope), clamped to [-1, 1] and positive under the sea. It stays linear
+// across texels at every level, so its bilinearly filtered zero crossing is a
+// smooth coastline at sub-texel precision.
+const WATER_CONTOUR_TEXELS: f32 = 2.0;
 
-fn page_water(value: vec4<f32>) -> f32 {
-    return select(0.0, clamp(-value.w / WATER_CONTOUR_M, -1.0, 1.0), tile.info.y == 2u);
+fn page_water(st: vec2<f32>, value: vec4<f32>) -> f32 {
+    if tile.info.y != 2u {
+        return 0.0;
+    }
+    let up = normalize(chart_point(st).n);
+    let c = clamp(dot(value.xyz, up), 1.0e-3, 1.0);
+    let slope = max(sqrt(1.0 - c * c) / c, 1.0e-3);
+    let texel = tile.scale.x * tile.face_u.w / f32(dispatch.cells);
+    return clamp(-value.w / (slope * texel * WATER_CONTOUR_TEXELS), -1.0, 1.0);
 }
 
 // Page albedo texel for an evaluated sample `value` (normal, height) at `st`.
@@ -686,7 +695,7 @@ fn produce_heights(@builtin(global_invocation_id) id: vec3<u32>) {
     textureStore(height_out, vec2<i32>(id.xy), layer, vec4<f32>(value.w, 0.0, 0.0, 0.0));
     if dispatch.side == dispatch.cells + 3u {
         // Normal map at geometry resolution shares this evaluation.
-        textureStore(normal_out, vec2<i32>(id.xy), layer, vec4<f32>(value.xyz, page_water(value)));
+        textureStore(normal_out, vec2<i32>(id.xy), layer, vec4<f32>(value.xyz, page_water(st, value)));
         textureStore(albedo_out, vec2<i32>(id.xy), layer, page_albedo(st, value));
         textureStore(climate_out, vec2<i32>(id.xy), layer, page_climate(st));
     }
@@ -715,7 +724,7 @@ fn produce_normals(@builtin(global_invocation_id) id: vec3<u32>) {
     tile = tiles[dispatch.base + id.z];
     let st = (vec2<f32>(id.xy) - vec2<f32>(1.0)) / f32(dispatch.cells);
     let value = evaluate(st);
-    textureStore(normal_out, vec2<i32>(id.xy), i32(tile.info.x), vec4<f32>(value.xyz, page_water(value)));
+    textureStore(normal_out, vec2<i32>(id.xy), i32(tile.info.x), vec4<f32>(value.xyz, page_water(st, value)));
     textureStore(albedo_out, vec2<i32>(id.xy), i32(tile.info.x), page_albedo(st, value));
     textureStore(climate_out, vec2<i32>(id.xy), i32(tile.info.x), page_climate(st));
 }
