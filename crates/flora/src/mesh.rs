@@ -873,11 +873,14 @@ fn puffs(m: &mut Mesh, sk: &Skeleton, sp: &SpeciesFile, seed: u64, count: usize,
     let pointed = sp.genome.crown_shape == crate::genome::CrownShape::Cone;
     // Gradient inside the crown: deep shaded inner colour to bright warm
     // tips, by height in the crown and by how much the surface faces out.
+    let jitter = (0.1 * rng.signed(0, 17)) as f32;
     let gradient = |pos: DVec3, nrm: DVec3, crown_n: DVec3| {
         let h = ((pos.z - lo.z) / span).clamp(0.0, 1.0);
         let t = (0.55 * h + 0.45 * (0.5 + 0.5 * crown_n.dot(nrm))).clamp(0.0, 1.0);
         let t = (t * t * (3.0 - 2.0 * t)) as f32;
-        lerp3(scale3(sp.look.organ, 0.55), scale3(sp.look.organ_tip, 1.25), t)
+        let c = lerp3(scale3(sp.look.organ, 0.55), scale3(sp.look.organ_tip, 1.25), t);
+        // Per-plant hue jitter (warm/cool tilt) so neighbouring trees differ.
+        [c[0] * (1.0 + jitter), c[1], c[2] * (1.0 - jitter)]
     };
     let (unit, faces) = icosphere(detail);
     let wind = [2, 60, 0, class::ORGAN];
