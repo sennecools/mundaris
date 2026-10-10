@@ -278,6 +278,13 @@ pub struct PerformanceSnapshot {
     #[serde(default)]
     pub gpu_scopes: Vec<GpuScopeSnapshot>,
     pub upload_bytes: Option<u64>,
+    /// Plants the cull pass dropped because their region was full (latest
+    /// read-back): grown-flora buckets and procedural far plants. Zero means
+    /// nothing was capped (flora lane overflow counter).
+    #[serde(default)]
+    pub flora_dropped_grown: Option<u32>,
+    #[serde(default)]
+    pub flora_dropped_procedural: Option<u32>,
 }
 
 /// One GPU timestamp scope on the sampled frame's GPU clock.
@@ -295,6 +302,9 @@ impl PerformanceSnapshot {
         self.gpu_main_pass_ms = profile.celestial_pass.map(|d| d.as_secs_f64() * 1000.0);
         self.gpu_overlay_ms = profile.overlay_pass.map(|d| d.as_secs_f64() * 1000.0);
         self.gpu_terrain_ms = profile.terrain.map(|d| d.as_secs_f64() * 1000.0);
+        let (grown, procedural) = astrum_renderer::flora_overflow();
+        self.flora_dropped_grown = Some(grown);
+        self.flora_dropped_procedural = Some(procedural);
         self.gpu_transition_fallback_ms = profile
             .transition_fallback
             .map(|d| d.as_secs_f64() * 1000.0);

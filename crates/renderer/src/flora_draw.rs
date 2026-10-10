@@ -17,6 +17,7 @@
 //! Prototype debt: no hot reload, no wind animation, fixed LOD distances and
 //! bucket capacities in WGSL, growth blocks start-up (cached per process).
 
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use astrum_flora::hash::{derive, name_key};
@@ -190,7 +191,26 @@ fn flora_enabled() -> bool {
     std::env::var_os("ASTRUM_NO_FLORA").is_none_or(|v| v == "0")
 }
 
+/// Last read-back overflow counts: (flora buckets, procedural plants)
+/// rejected because their region was full, packed as hi/lo u32.
+static OVERFLOW: AtomicU64 = AtomicU64::new(0);
+
+/// Plants dropped last read-back frame because a bucket (first) or the
+/// procedural far region (second) was full. Zero means nothing was capped.
+pub fn flora_overflow() -> (u32, u32) {
+    let v = OVERFLOW.load(Ordering::Relaxed);
+    ((v >> 32) as u32, v as u32)
+}
+
+const READBACK_IDLE: u8 = 0;
+const READBACK_COPIED: u8 = 1;
+const READBACK_MAPPING: u8 = 2;
+const READBACK_READY: u8 = 3;
+
 pub(crate) struct FloraDraw {
+    /// Overflow counter read-back (async map, never stalls the frame).
+    readback: wgpu::Buffer,
+    readback_state: Arc<AtomicU8>,
     pipeline: wgpu::RenderPipeline,
     shadow_pipeline: wgpu::RenderPipeline,
     vertices: wgpu::Buffer,
@@ -313,7 +333,15 @@ impl FloraDraw {
             multiview_mask: None,
             cache: None,
         });
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Flora overflow read-back"),
+            size: 8,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         Self {
+            readback,
+            readback_state: Arc::new(AtomicU8::new(READBACK_IDLE)),
             pipeline,
             shadow_pipeline,
             vertices,
@@ -326,8 +354,48 @@ impl FloraDraw {
     /// Fill the flora words of this frame's plant arguments (instance counts
     /// zeroed). `words` covers the whole argument buffer.
     pub(crate) fn write_args(&self, words: &mut [u32]) {
+        self.poll_overflow();
         words[MASK_WORD] = if flora_enabled() { self.mask } else { 0 };
         words[ARGS_WORD..ARGS_WORD + self.args.len()].copy_from_slice(&self.args);
+    }
+
+    /// Copy this frame's overflow words (6, 7) for read-back; call after the
+    /// cull pass, before the encoder is submitted.
+    pub(crate) fn copy_counters(&self, encoder: &mut wgpu::CommandEncoder, plant_args: &wgpu::Buffer) {
+        if self.readback_state.load(Ordering::Acquire) == READBACK_IDLE {
+            encoder.copy_buffer_to_buffer(plant_args, 24, &self.readback, 0, 8);
+            self.readback_state.store(READBACK_COPIED, Ordering::Release);
+        }
+    }
+
+    /// Advance the read-back: map the copy submitted last frame, or read a
+    /// finished map.
+    fn poll_overflow(&self) {
+        match self.readback_state.load(Ordering::Acquire) {
+            READBACK_COPIED => {
+                self.readback_state.store(READBACK_MAPPING, Ordering::Release);
+                let state = self.readback_state.clone();
+                self.readback.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                    state.store(if r.is_ok() { READBACK_READY } else { READBACK_IDLE }, Ordering::Release);
+                });
+            }
+            READBACK_READY => {
+                let (flora, far) = {
+                    let data = self.readback.slice(..).get_mapped_range();
+                    match data {
+                        Ok(d) => (u32::from_le_bytes([d[0], d[1], d[2], d[3]]), u32::from_le_bytes([d[4], d[5], d[6], d[7]])),
+                        Err(_) => (0, 0),
+                    }
+                };
+                self.readback.unmap();
+                let packed = ((flora as u64) << 32) | far as u64;
+                if OVERFLOW.swap(packed, Ordering::Relaxed) != packed && packed != 0 {
+                    tracing::warn!("flora: plants dropped by full buckets: {flora} grown, {far} procedural");
+                }
+                self.readback_state.store(READBACK_IDLE, Ordering::Release);
+            }
+            _ => {}
+        }
     }
 
     fn draws(&self, pass: &mut wgpu::RenderPass<'_>, plant_args: &wgpu::Buffer) {

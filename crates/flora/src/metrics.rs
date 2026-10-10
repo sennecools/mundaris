@@ -34,6 +34,9 @@ pub struct SilhouetteMetrics {
     pub aspect: f64,
     /// Fraction of the silhouette's crown bounding box that is covered.
     pub crown_fill: f64,
+    /// Fraction of the crown's row-wise hull (left to right edge per row)
+    /// that is covered: 1 = solid crown, low = see-through.
+    pub crown_solidity: f64,
     /// Box-counting dimension of the silhouette outline.
     pub fractal_dimension: f64,
     /// Width at 10 % height / max width (trunk visibility; 1 = blob to ground).
@@ -228,7 +231,7 @@ pub fn silhouette(mesh: &Mesh) -> SilhouetteMetrics {
     let centre = Vec3::new((lo.x + hi.x) * 0.5, (lo.y + hi.y) * 0.5, lo.z);
     let mut acc = SilhouetteMetrics::default();
     for az in [0.0f32, std::f32::consts::FRAC_PI_2] {
-        let mut c = Canvas::new(N, N, Vec3::ZERO);
+        let mut c = Canvas::with_samples(N, N, Vec3::ZERO, 1);
         let cam = Camera {
             azimuth: az,
             elevation: 0.0,
@@ -241,6 +244,7 @@ pub fn silhouette(mesh: &Mesh) -> SilhouetteMetrics {
         let s = mask_metrics(&c.coverage, N);
         acc.aspect += s.aspect * 0.5;
         acc.crown_fill += s.crown_fill * 0.5;
+        acc.crown_solidity += s.crown_solidity * 0.5;
         acc.fractal_dimension += s.fractal_dimension * 0.5;
         acc.base_width_ratio += s.base_width_ratio * 0.5;
     }
@@ -277,8 +281,12 @@ fn mask_metrics(mask: &[bool], n: usize) -> SilhouetteMetrics {
         crown.iter().map(|r| r.0).max().unwrap(),
     );
     let mut covered = 0usize;
+    let mut hull = 0usize;
     for y in cy0..=cy1 {
         covered += (gx0..=gx1).filter(|&x| mask[y * n + x]).count();
+        if let Some(r) = rows.iter().find(|r| r.0 == y) {
+            hull += r.2 - r.1 + 1;
+        }
     }
     let crown_fill = covered as f64 / ((cy1 - cy0 + 1) as f64 * w);
     let base_row = y1.saturating_sub(((h * 0.1) as usize).max(1));
@@ -319,6 +327,7 @@ fn mask_metrics(mask: &[bool], n: usize) -> SilhouetteMetrics {
     SilhouetteMetrics {
         aspect: w / h,
         crown_fill,
+        crown_solidity: covered as f64 / hull.max(1) as f64,
         fractal_dimension: -slope,
         base_width_ratio: base_w / maxw,
     }
@@ -331,6 +340,10 @@ pub struct Bands {
     pub max_intersecting_fraction: f64,
     pub fractal_dimension: (f64, f64),
     pub crown_fill: (f64, f64),
+    /// Minimum crown solidity (user 2026-10-10: crowns read full, not
+    /// see-through; dense broadleaf crowns measure 0.95+, shrubs 0.8,
+    /// conifers 0.65).
+    pub crown_solidity_min: f64,
 }
 
 impl Bands {
@@ -340,6 +353,7 @@ impl Bands {
         max_intersecting_fraction: 0.03,
         fractal_dimension: (1.05, 1.78),
         crown_fill: (0.25, 0.92),
+        crown_solidity_min: 0.6,
     };
 }
 
@@ -369,6 +383,10 @@ impl PlantMetrics {
         let c = self.silhouette.crown_fill;
         if c < b.crown_fill.0 || c > b.crown_fill.1 {
             f.push(format!("fill {c:.2}"));
+        }
+        let sol = self.silhouette.crown_solidity;
+        if sol < b.crown_solidity_min {
+            f.push(format!("solid {sol:.2}"));
         }
         // Monotone LODs.
         if self.triangles[1] > self.triangles[0] || self.triangles[2] > self.triangles[1] {

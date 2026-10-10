@@ -13,6 +13,7 @@ mod celestial_view;
 mod cpu_profile;
 mod debug;
 mod flora_draw;
+pub use flora_draw::flora_overflow;
 mod gpu_profile;
 mod lighting;
 #[cfg(feature = "developer-tools")]

@@ -1219,7 +1219,8 @@ impl TerrainAtlasRenderer {
             size: crate::flora_draw::ARGS_BYTES,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::INDIRECT
-                | wgpu::BufferUsages::COPY_DST,
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let plants_ro_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2015,6 +2016,9 @@ impl TerrainAtlasRenderer {
         pass.dispatch_workgroups(groups.min(65_535), groups.div_ceil(65_535), 1);
         pass.set_pipeline(&self.grass_cull);
         pass.dispatch_workgroups(groups.min(65_535), groups.div_ceil(65_535), 1);
+        drop(pass);
+        // PROTOTYPE (flora lane): read back the bucket overflow counters.
+        self.flora.copy_counters(encoder, &self.plant_args);
     }
 
     fn stage_instances(

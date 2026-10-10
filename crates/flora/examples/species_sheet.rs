@@ -38,7 +38,7 @@ fn main() {
     let body = args.get(5).map(String::as_str).unwrap_or("rust");
     let species = load_species_for_body(&dir, &planets, body).unwrap_or_else(|e| panic!("{e}"));
     let mut md = String::from(
-        "| species | seed | grow ms | nodes | organs | tris L0/L1/L2 | KB L0/L1/L2 | height m | width m | base r m | aspect | fill | fd | base w | intersect | shed | fails |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
+        "| species | seed | grow ms | nodes | organs | tris L0/L1/L2 | KB L0/L1/L2 | height m | width m | base r m | aspect | fill | solid | fd | base w | intersect | shed | fails |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
     );
     for sp in &species {
         let mut plants = Vec::new();
@@ -123,7 +123,7 @@ fn main() {
             let s = &m.structure;
             let _ = writeln!(
                 md,
-                "| {} | {v} | {ms:.1} | {} | {} | {}/{}/{} | {:.0}/{:.0}/{:.0} | {:.1} | {:.1} | {:.3} | {:.2} | {:.2} | {:.2} | {:.2} | {} | {} | {} |",
+                "| {} | {v} | {ms:.1} | {} | {} | {}/{}/{} | {:.0}/{:.0}/{:.0} | {:.1} | {:.1} | {:.3} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {} | {} | {} |",
                 sp.name,
                 s.nodes,
                 s.organs,
@@ -138,6 +138,7 @@ fn main() {
                 s.base_radius_m,
                 m.silhouette.aspect,
                 m.silhouette.crown_fill,
+                m.silhouette.crown_solidity,
                 m.silhouette.fractal_dimension,
                 m.silhouette.base_width_ratio,
                 s.intersecting,

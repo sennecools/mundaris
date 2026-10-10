@@ -6,29 +6,58 @@ use glam::{Vec2, Vec3};
 use crate::mesh::Mesh;
 
 pub struct Canvas {
+    /// Output size in pixels.
     pub width: usize,
     pub height: usize,
-    /// Linear RGB.
+    /// Samples per pixel along each axis (2 = 4x supersampling).
+    pub samples: usize,
+    /// Linear RGB at sample resolution (`width·samples` wide).
     pub color: Vec<Vec3>,
     pub depth: Vec<f32>,
     pub coverage: Vec<bool>,
 }
 
 impl Canvas {
+    /// A canvas with 4x supersampling (2×2 samples per pixel), the default
+    /// for anything people look at (contact sheets, browser thumbnails).
     pub fn new(width: usize, height: usize, background: Vec3) -> Self {
-        Self {
-            width,
-            height,
-            color: vec![background; width * height],
-            depth: vec![f32::MAX; width * height],
-            coverage: vec![false; width * height],
-        }
+        Self::with_samples(width, height, background, 2)
     }
 
-    /// sRGB 8-bit bytes (RGB).
+    /// `samples` per axis; 1 = no anti-aliasing (silhouette metrics).
+    pub fn with_samples(width: usize, height: usize, background: Vec3, samples: usize) -> Self {
+        let s = samples.max(1);
+        let n = width * s * height * s;
+        Self { width, height, samples: s, color: vec![background; n], depth: vec![f32::MAX; n], coverage: vec![false; n] }
+    }
+
+    /// Width of the sample grid.
+    pub fn sample_width(&self) -> usize {
+        self.width * self.samples
+    }
+
+    /// Output pixels (box-filtered samples), linear RGB.
+    pub fn resolve(&self) -> Vec<Vec3> {
+        let (s, sw) = (self.samples, self.sample_width());
+        let mut out = Vec::with_capacity(self.width * self.height);
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let mut acc = Vec3::ZERO;
+                for dy in 0..s {
+                    for dx in 0..s {
+                        acc += self.color[(y * s + dy) * sw + x * s + dx];
+                    }
+                }
+                out.push(acc / (s * s) as f32);
+            }
+        }
+        out
+    }
+
+    /// sRGB 8-bit bytes (RGB) of the resolved pixels.
     pub fn to_srgb8(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.width * self.height * 3);
-        for c in &self.color {
+        for c in &self.resolve() {
             for v in [c.x, c.y, c.z] {
                 let v = v.clamp(0.0, 1.0);
                 let s = if v <= 0.003_130_8 {
@@ -43,9 +72,10 @@ impl Canvas {
     }
 
     pub fn fill_rect(&mut self, x0: usize, y0: usize, x1: usize, y1: usize, c: Vec3) {
-        for y in y0..y1.min(self.height) {
-            for x in x0..x1.min(self.width) {
-                self.color[y * self.width + x] = c;
+        let (s, sw) = (self.samples, self.sample_width());
+        for y in y0 * s..(y1.min(self.height)) * s {
+            for x in x0 * s..(x1.min(self.width)) * s {
+                self.color[y * sw + x] = c;
             }
         }
     }
@@ -79,6 +109,15 @@ impl Camera {
 
 /// Draw with Lambert lighting, two-sided normals and vertex AO.
 pub fn draw(canvas: &mut Canvas, mesh: &Mesh, cam: &Camera) {
+    // Work at sample resolution: scale the camera by the samples per axis.
+    let ss = canvas.samples as f32;
+    let cam = &Camera {
+        anchor_px: cam.anchor_px * ss,
+        px_per_m: cam.px_per_m * ss,
+        clip: cam.clip.map(|v| v * canvas.samples),
+        ..*cam
+    };
+    let sw = canvas.sample_width();
     let (right, up, fwd) = cam.axes();
     let light = Vec3::new(-0.45, -0.55, 0.7).normalize();
     let proj: Vec<(Vec2, f32)> = mesh
@@ -132,7 +171,7 @@ pub fn draw(canvas: &mut Canvas, mesh: &Mesh, cam: &Camera) {
                     continue;
                 }
                 let z = w0 * proj[a].1 + w1 * proj[b].1 + w2 * proj[c].1;
-                let i = y as usize * canvas.width + x as usize;
+                let i = y as usize * sw + x as usize;
                 if z >= canvas.depth[i] {
                     continue;
                 }
@@ -163,7 +202,7 @@ pub fn text(canvas: &mut Canvas, x: usize, y: usize, s: &str, scale: usize, c: V
                             let px = cx + col * scale + dx;
                             let py = y + row * scale + dy;
                             if px < canvas.width && py < canvas.height {
-                                canvas.color[py * canvas.width + px] = c;
+                                canvas.fill_rect(px, py, px + 1, py + 1, c);
                             }
                         }
                     }

@@ -21,6 +21,10 @@ const FLORA_VARIANTS: u32 = 2u;
 const FLORA_LODS: u32 = 3u;
 const FLORA_MASK_WORD: u32 = 5u;
 const FLORA_ARGS_WORD: u32 = 16u;
+// Plants rejected because their bucket (word 6) or the procedural region
+// (word 7) was full; read back by flora_draw.rs (flora_overflow()).
+const FLORA_OVERFLOW_WORD: u32 = 6u;
+const FAR_OVERFLOW_WORD: u32 = 7u;
 // Instances per bucket by LOD and their sum per (kind, variant).
 const FLORA_CAP0: u32 = 1024u;
 const FLORA_CAP1: u32 = 3072u;
@@ -62,6 +66,7 @@ fn flora_route(plant: Plant) -> bool {
     let slot = atomicAdd(&plant_args[word], 1u);
     if slot >= flora_capacity(lod) {
         atomicSub(&plant_args[word], 1u);
+        atomicAdd(&plant_args[FLORA_OVERFLOW_WORD], 1u);
         return true;
     }
     plants_out[flora_base(bucket) + slot] = plant;
@@ -86,6 +91,7 @@ fn cs_scatter(@builtin(global_invocation_id) id: vec3<u32>) {
     if slot >= min(arrayLength(&plants_out), FLORA_FAR_CAPACITY) {
         // Full: undo the count (the final count settles at the capacity).
         atomicSub(&plant_args[1], 1u);
+        atomicAdd(&plant_args[FAR_OVERFLOW_WORD], 1u);
         return;
     }
     plants_out[slot] = placed.plant;
