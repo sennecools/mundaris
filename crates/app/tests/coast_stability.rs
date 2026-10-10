@@ -178,6 +178,17 @@ fn coastline_flips_between_lod_levels() {
         if level == 3
             && let Some(p) = &previous
         {
+            let (mut wet, mut dry) = (0usize, 0usize);
+            for (k, d) in coastal.iter().enumerate() {
+                if p[4][k] != land[4][k] {
+                    if maps.sample(0, *d).0 < 0.0 {
+                        wet += 1;
+                    } else {
+                        dry += 1;
+                    }
+                }
+            }
+            println!("  level 3 oracle flips: {wet} over macro ocean, {dry} over macro land");
             // Where the unblended surface pops most: coarse direction bins.
             let mut bins: std::collections::HashMap<[i32; 3], usize> = Default::default();
             for (k, d) in coastal.iter().enumerate() {

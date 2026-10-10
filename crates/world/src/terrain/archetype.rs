@@ -90,6 +90,20 @@ pub struct ContinentRanges {
     /// of the noise distance from the coast to the deepest ocean.
     pub shelf_depth_m: f64,
     pub shelf_fraction: f64,
+    /// Shoreface: within the shelf, depth drops steeply from the coast to
+    /// this depth over the first `shoreface_fraction` of the shelf width, so
+    /// shelves do not hug sea level (0: the linear M1 shelf).
+    #[serde(default)]
+    pub shoreface_depth_m: f64,
+    #[serde(default)]
+    pub shoreface_fraction: f64,
+    /// Coastal rise: post-erosion land height z becomes z + r0·(1 − e^(−z/λ))
+    /// (r0 = `coast_rise_m`, λ = `coast_rise_scale_m`), so low coastal plains
+    /// do not hug sea level (0: off).
+    #[serde(default)]
+    pub coast_rise_m: f64,
+    #[serde(default)]
+    pub coast_rise_scale_m: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -438,6 +452,10 @@ impl PlanetArchetype {
             && c.ocean_depth_m.valid(1.0, 2.0e4)
             && (0.0..=2.0e3).contains(&c.shelf_depth_m)
             && (0.0..0.9).contains(&c.shelf_fraction)
+            && (0.0..=500.0).contains(&c.shoreface_depth_m)
+            && (0.0..0.9).contains(&c.shoreface_fraction)
+            && (0.0..=200.0).contains(&c.coast_rise_m)
+            && (0.0..=500.0).contains(&c.coast_rise_scale_m)
             && t.equator_c.valid(-250.0, 500.0)
             && t.pole_c.valid(-250.0, 500.0)
             && t.axial_tilt_deg.valid(0.0, 90.0)
@@ -635,6 +653,10 @@ impl PlanetArchetype {
             ocean_depth_m: c.ocean_depth_m.sample(draw(STAGE_CONTINENTS, 4)),
             shelf_depth_m: c.shelf_depth_m,
             shelf_fraction: c.shelf_fraction,
+            shoreface_depth_m: c.shoreface_depth_m,
+            shoreface_fraction: c.shoreface_fraction,
+            coast_rise_m: c.coast_rise_m,
+            coast_rise_scale_m: c.coast_rise_scale_m,
             equator_c: t.equator_c.sample(draw(STAGE_TEMPERATURE, 0)),
             pole_c: t.pole_c.sample(draw(STAGE_TEMPERATURE, 1)),
             axial_tilt_deg: t.axial_tilt_deg.sample(draw(STAGE_TEMPERATURE, 2)),
@@ -699,6 +721,10 @@ pub struct PlanetParams {
     pub ocean_depth_m: f64,
     pub shelf_depth_m: f64,
     pub shelf_fraction: f64,
+    pub shoreface_depth_m: f64,
+    pub shoreface_fraction: f64,
+    pub coast_rise_m: f64,
+    pub coast_rise_scale_m: f64,
     pub equator_c: f64,
     pub pole_c: f64,
     pub axial_tilt_deg: f64,
@@ -823,6 +849,10 @@ pub const PARAM_FIELDS: &[ParamField] = fields! {
     "Continents": land_height_m: 0.0, 2.0e4, "m";
     "Ocean": ocean_depth_m: 1.0, 2.0e4, "m";
     "Ocean": shelf_depth_m: 0.0, 2.0e3, "m";
+    "Ocean": shoreface_depth_m: 0.0, 500.0, "m";
+    "Ocean": shoreface_fraction: 0.0, 0.9;
+    "Coast": coast_rise_m: 0.0, 200.0, "m";
+    "Coast": coast_rise_scale_m: 0.0, 500.0, "m";
     "Temperature": equator_c: -250.0, 500.0, "°C";
     "Temperature": pole_c: -250.0, 500.0, "°C";
     "Temperature": axial_tilt_deg: 0.0, 90.0, "°";

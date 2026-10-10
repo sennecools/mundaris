@@ -28,11 +28,11 @@ struct Params {
     widths2: vec4<f32>,     // ridge, rift, transform, crust widths (m)
     hardness: vec4<f32>,    // noise amplitude, noise frequency, junction blend m, unused
     seeds2: vec4<u32>,      // hardness seed, unused...
-    shadow: vec4<f32>,      // unused, deflection, deflection slope, slowdown
-    orographic: vec4<f32>,  // orographic rain, lee drying, reference slope, unused
+    shadow: vec4<f32>,      // coast rise (m), deflection, deflection slope, slowdown
+    orographic: vec4<f32>,  // orographic rain, lee drying, reference slope, coast rise scale (m)
     erosion: vec4<f32>,     // strength K, uplift per iteration (m), tan talus, deposition
     erosion2: vec4<f32>,    // capacity, area exponent m, slope exponent n, MFD exponent p
-    erosion3: vec4<f32>,    // thermal rate, sediment depth (m), unused, unused
+    erosion3: vec4<f32>,    // thermal rate, sediment depth (m), shoreface depth (m), shoreface fraction
 }
 
 struct Plate {
@@ -1170,7 +1170,18 @@ fn shelf_depth(t: f32) -> f32 {
         return ocean_depth * deep(t);
     }
     if t < shelf_fraction {
-        return shelf_depth * t / shelf_fraction;
+        let s = t / shelf_fraction;
+        // Shoreface (`tier_a::shelf_depth`): erosion3.z depth, .w fraction.
+        let a = params.erosion3.w;
+        let d0 = min(params.erosion3.z, shelf_depth);
+        if a > 0.0 && d0 > 0.0 {
+            if s < a {
+                let x = 1.0 - s / a;
+                return d0 * (1.0 - x * x);
+            }
+            return d0 + (shelf_depth - d0) * (s - a) / (1.0 - a);
+        }
+        return shelf_depth * s;
     }
     let u = (t - shelf_fraction) / (1.0 - shelf_fraction);
     return shelf_depth + max(ocean_depth - shelf_depth, 0.0) * deep(u);
@@ -1200,6 +1211,9 @@ fn finish_shape(@builtin(global_invocation_id) id: vec3<u32>) {
     var z = read_f(o(0u), t.k) - s2;
     if z < 0.0 && has(STAGE_SHELF) {
         z = -shelf_remap(-z);
+    } else if z > 0.0 && has(STAGE_SHELF) && params.shadow.x > 0.0 && params.orographic.w > 0.0 {
+        // Coastal rise (`tier_a::coast_rise`): shadow.x m over orographic.w m.
+        z = z + params.shadow.x * (1.0 - exp(-z / params.orographic.w));
     }
     z = clamp(z, -bound, bound);
     write_f(o(6u), t.k, z);
