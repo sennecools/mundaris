@@ -3,7 +3,6 @@
 SpeciesFile(
     schema: 1,
     name: "bushel",
-    role: Shrub,
     genome: (
         form: Shrub,
         height_m: 2.2,
@@ -44,21 +43,15 @@ SpeciesFile(
         fruit_size_m: 0.05,
         fruit_chance: 0.15,
     ),
-    ecology: (
-        footprint_m: 1.2,
-        temperature_c: (min: -2.0, max: 32.0, falloff: 6.0),
-        moisture: (min: 0.20, max: 1.0, falloff: 0.10),
-        height_m: (min: 0.0, max: 2400.0, falloff: 300.0),
+    niche: (
+        layer: Shrub,
+        temperature_c: (min: -3.0, max: 32.0, falloff: 6.0),
+        moisture: (min: 0.3, max: 1.0, falloff: 0.24),
+        height_m: (min: 0.0, max: 3600.0, falloff: 400.0),
         max_slope_deg: 45.0,
         slope_falloff_deg: 10.0,
-        rock_affinity: -0.5,
-        soil_min: 0.05,
-        water_bonus: 0.3,
-        water_within_m: 30.0,
-        base_density: 0.7,
-        prior_weight: 0.35,
-        patch_scale_m: 300.0,
-        patch_coverage: 0.7,
+        soil_min: 0.2,
+        prior: 1.0,
         scale: (0.6, 1.4),
     ),
     look: (

@@ -15,31 +15,15 @@ use crate::params::{ParamDesc, ParamKind, ParamValue, Params};
 
 pub const SCHEMA: u32 = 1;
 
-/// One species: growth genome, ecology envelope (scatter), and look.
+/// One species: growth genome, climate niche (placement), and look.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpeciesFile {
     pub schema: u32,
     pub name: String,
-    /// PROTOTYPE: which M5 forest-field slot the species fills, until G2
-    /// places species from their ecology envelopes.
-    #[serde(default)]
-    pub role: Role,
     pub genome: Genome,
-    pub ecology: Ecology,
+    pub niche: crate::niche::Niche,
     pub look: Look,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum Role {
-    #[default]
-    Unplaced,
-    /// Cold-forest tree (M5 kind 0).
-    Conifer,
-    /// Temperate-forest tree (M5 kind 1).
-    Broadleaf,
-    /// Fringe shrub (M5 kind 2).
-    Shrub,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,37 +196,6 @@ pub struct Genome {
     pub fruit_chance: f64,
 }
 
-/// Trapezoid membership: 1 in `[min, max]`, linear to 0 over `falloff`.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct Envelope {
-    pub min: f64,
-    pub max: f64,
-    pub falloff: f64,
-}
-
-/// Where the species grows (consumed by scatter; mirrors the M5 placeholder
-/// species fields). PROTOTYPE: authored per species until G2 derives it from
-/// the planet's climate space.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Ecology {
-    pub footprint_m: f64,
-    pub temperature_c: Envelope,
-    pub moisture: Envelope,
-    pub height_m: Envelope,
-    pub max_slope_deg: f64,
-    pub slope_falloff_deg: f64,
-    pub rock_affinity: f64,
-    pub soil_min: f64,
-    pub water_bonus: f64,
-    pub water_within_m: f64,
-    pub base_density: f64,
-    pub prior_weight: f64,
-    pub patch_scale_m: f64,
-    pub patch_coverage: f64,
-    pub scale: (f64, f64),
-}
-
 /// PROTOTYPE colours (linear RGB) until the G1 palette derives them from the
 /// star spectrum.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -273,6 +226,7 @@ impl SpeciesFile {
             return Err(GenomeError::Schema(file.schema));
         }
         file.genome.validate()?;
+        file.niche.validate().map_err(GenomeError::Range)?;
         Ok(file)
     }
 

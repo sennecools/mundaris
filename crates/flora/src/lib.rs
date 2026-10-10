@@ -13,9 +13,11 @@ pub mod grow;
 pub mod hash;
 pub mod kit;
 pub mod mesh;
+pub mod niche;
 pub mod metrics;
 pub mod params;
 pub mod raster;
+pub mod scatter;
 
 pub use genome::{Genome, SpeciesFile};
 pub use kit::Kit;
