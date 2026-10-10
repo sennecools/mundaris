@@ -29,7 +29,7 @@ fn fl_niche(k: u32) -> FlNiche {
 }
 const FL_ROCKS: u32 = 2u;
 // Bucket entry of rock 0 (after the MAX_SPECIES plant entries).
-const FL_ROCK_ENTRY: u32 = 6u;
+const FL_ROCK_ENTRY: u32 = 12u;
 // Bedrock hardness envelope (min, max, falloff) of rock archetype `r`.
 fn fl_rock(r: u32) -> vec3<f32> {
     switch r {

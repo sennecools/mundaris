@@ -11,12 +11,21 @@ PlanetLife(
     // content/lighting.json body albedo of Rust.
     ground_albedo: (0.26, 0.15, 0.09),
     seed: 7,
-    // User decision 2026-10-10: a per-planet dial, Rust about 0.4; the look
-    // is plausible but stylised.
+    // Strangeness drives the look (realism follows it unless set):
+    // - 0.4 = the user's 2026-10-10 choice (familiar trees with alien
+    //   details, palette close to Earth greens, realism 0.5);
+    // - 0.7 = PROPOSAL after the user's alien line-up reference: mostly alien
+    //   body plans, saturated violet/red/orange families (realism 0.85).
+    // Currently 0.4 (the user's choice) until the user picks; set 0.7 for the
+    // proposal.
     strangeness: 0.4,
-    realism: 0.5,
     // Old continental surfaces: weathered, rounded rocks where it is wet.
     geology_age: 0.7,
+    // Species: 10 generated from the planet (body plans, niches, colours),
+    // the authored files in content/flora/species serving as tree/shrub
+    // templates. 0 = only the authored species. PROTOTYPE: 0 until the
+    // forest LOD chain is fixed (user 2026-10-10); 10 is the intended value.
+    generated_species: 0,
     // Hard bedrock (most of Rust, Tier A hardness ~0.85) breaks into granite
     // blocks; soft basins carry bedded sandstone.
     rocks: [

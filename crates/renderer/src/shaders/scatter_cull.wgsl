@@ -16,7 +16,7 @@
 @group(3) @binding(2) var<storage, read_write> grass_out: array<Plant>;
 
 // Procedural plants use slots [0, FLORA_FAR_CAPACITY); flora buckets follow.
-const FLORA_FAR_CAPACITY: u32 = 98304u;
+const FLORA_FAR_CAPACITY: u32 = 65536u;
 const FLORA_VARIANTS: u32 = 2u;
 const FLORA_LODS: u32 = 3u;
 const FLORA_MASK_WORD: u32 = 5u;
@@ -26,9 +26,9 @@ const FLORA_ARGS_WORD: u32 = 16u;
 const FLORA_OVERFLOW_WORD: u32 = 6u;
 const FAR_OVERFLOW_WORD: u32 = 7u;
 // Instances per bucket by LOD and their sum per (kind, variant).
-const FLORA_CAP0: u32 = 1024u;
-const FLORA_CAP1: u32 = 3072u;
-const FLORA_CAP2: u32 = 6144u;
+const FLORA_CAP0: u32 = 512u;
+const FLORA_CAP1: u32 = 2048u;
+const FLORA_CAP2: u32 = 4096u;
 // LOD switch distances (m) for a 1-scale tree; shrubs switch at half. Each
 // plant dithers its own switch over ±15 % so LOD changes never line up.
 const FLORA_LOD0_M: f32 = 90.0;

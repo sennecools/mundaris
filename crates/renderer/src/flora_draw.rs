@@ -38,9 +38,9 @@ pub const ARGS_WORD: usize = 16;
 /// Word holding the entry mask (`FLORA_MASK_WORD`).
 pub const MASK_WORD: usize = 5;
 /// Size of the shared plant argument buffer once flora is included.
-pub const ARGS_BYTES: u64 = 1024;
-const FAR_CAPACITY: u32 = 98_304;
-const CAPACITY: [u32; LOD_COUNT] = [1024, 3072, 6144];
+pub const ARGS_BYTES: u64 = 2048;
+const FAR_CAPACITY: u32 = 65_536;
+const CAPACITY: [u32; LOD_COUNT] = [512, 2048, 4096];
 /// GPU vertex: the 36-byte flora vertex plus the bucket's first instance slot.
 const VERTEX_BYTES: u64 = 40;
 
@@ -434,7 +434,7 @@ mod tests {
         let last = bucket_base(BUCKETS - 1) + CAPACITY[LOD_COUNT - 1];
         assert!(last as u64 <= 262_144, "plants buffer holds 262144");
         assert!(((ARGS_WORD + BUCKETS * 5) * 4) as u64 <= ARGS_BYTES);
-        // WGSL mirror: flora_base(b) = FAR + (b / 3) * 10240 + {0, 1024, 4096}.
-        assert_eq!(bucket_base(4), FAR_CAPACITY + 10_240 + 1024);
+        // WGSL mirror: flora_base(b) = FAR + (b / 3) * 6656 + {0, 512, 2560}.
+        assert_eq!(bucket_base(4), FAR_CAPACITY + 6656 + 512);
     }
 }

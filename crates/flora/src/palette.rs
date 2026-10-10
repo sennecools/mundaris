@@ -61,8 +61,10 @@ pub struct PlanetLife {
     pub seed: u64,
     /// 0 Earth-analogue .. 1 exotic (DECISIONS.md: Rust 0.4).
     pub strangeness: f64,
-    /// 0 grounded .. 1 stylised (DECISIONS.md: plausible but stylised).
-    pub realism: f64,
+    /// 0 grounded .. 1 stylised. Omitted: follows strangeness (0.5 at
+    /// strangeness 0.4, rising to 0.85 at 0.7), so one value flips the look.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realism: Option<f64>,
     /// Surface age 0 fresh .. 1 old (rock weathering, genesis §6).
     #[serde(default)]
     pub geology_age: f64,
@@ -70,6 +72,10 @@ pub struct PlanetLife {
     /// the bedrock hardness they occur on.
     #[serde(default)]
     pub rocks: Vec<PlanetRock>,
+    /// Species generated for this planet (`species_gen.rs`), the authored
+    /// species files serving as tree/shrub templates; 0 = authored only.
+    #[serde(default)]
+    pub generated_species: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -81,6 +87,11 @@ pub struct PlanetRock {
 }
 
 impl PlanetLife {
+    /// The realism dial, explicit or derived from strangeness.
+    pub fn realism(&self) -> f64 {
+        self.realism.unwrap_or_else(|| (0.5 + (self.strangeness - 0.4) * (0.35 / 0.3)).clamp(0.5, 1.0))
+    }
+
     pub fn from_ron(text: &str) -> Result<Self, String> {
         let p: PlanetLife = ron::from_str(text).map_err(|e| e.to_string())?;
         if p.schema != PLANET_SCHEMA {
@@ -89,7 +100,7 @@ impl PlanetLife {
         if !(1000.0..=50_000.0).contains(&p.star_temperature_k)
             || !(0.0..=100.0).contains(&p.atmosphere.pressure_bar)
             || !(0.0..=1.0).contains(&p.strangeness)
-            || !(0.0..=1.0).contains(&p.realism)
+            || !(0.0..=1.0).contains(&p.realism())
         {
             return Err("planet value out of range".into());
         }
@@ -302,10 +313,14 @@ pub struct Palette {
 
 /// Style pass: foliage lightness band and chroma cap by the realism dial.
 fn style(lch: [f64; 3], realism: f64) -> [f64; 3] {
+    // Above realism 0.5 the look turns stylised: brighter and much more
+    // saturated (user reference 2026-10-10); at or below 0.5 unchanged.
+    let stylised = ((realism - 0.5) / 0.5).clamp(0.0, 1.0);
     // Scale (not clamp) so dim-star foliage stays darker than sunlit green.
-    let l = (0.75 * lch[0]).clamp(0.22, 0.45);
+    let l = (0.75 * lch[0]).clamp(0.22, 0.45 + 0.12 * stylised);
     // Stylised floor: never grey foliage (no "blobs of nothingness").
-    let c = (lch[1] * (1.0 + 0.6 * realism)).clamp(0.05 + 0.03 * realism, 0.07 + 0.05 * realism);
+    let c = (lch[1] * (1.0 + 0.6 * realism + 1.5 * stylised))
+        .clamp(0.05 + 0.03 * realism, 0.07 + 0.05 * realism + 0.12 * stylised);
     [l, c, lch[2]]
 }
 
@@ -313,26 +328,26 @@ impl Palette {
     pub fn for_planet(p: &PlanetLife) -> Self {
         let pigment = primary_pigment(p);
         let physical = reflectance_rgb(p, |l| pigment.reflectance(l));
-        let foliage = style(to_lch(physical), p.realism);
+        let foliage = style(to_lch(physical), p.realism());
         // Dry stress: primary pigment fades, a carotenoid-like band (blue)
         // shows: yellower, paler.
         let mut dry_p = pigment.clone();
         dry_p.bands[0].2 *= 0.55;
         dry_p.bands.push((470.0, 35.0, 0.8));
-        let dry = style(to_lch(reflectance_rgb(p, |l| dry_p.reflectance(l))), p.realism);
+        let dry = style(to_lch(reflectance_rgb(p, |l| dry_p.reflectance(l))), p.realism());
         // Cold stress: the primary pigment breaks down and an anthocyanin-like
         // band (green) appears: redder (autumn colour).
         let mut cold_p = pigment.clone();
         cold_p.bands[0].2 *= 0.45;
         cold_p.bands.push((545.0, 38.0, 0.8));
-        let cold = style(to_lch(reflectance_rgb(p, |l| cold_p.reflectance(l))), p.realism);
+        let cold = style(to_lch(reflectance_rgb(p, |l| cold_p.reflectance(l))), p.realism());
         let ground = to_lch(p.ground_albedo);
         // Bark: the ground's hue, dark and barely saturated.
         let bark = [0.33, 0.035 + 0.25 * ground[1].min(0.1), ground[2]];
         // Accent: harmony template from the seed (complementary or split).
         let st = Stream::new(p.seed, 0x504c_5432);
         let split = [180.0, 150.0, 210.0][(st.unit(0, 0) * 3.0) as usize % 3];
-        let accent = [0.6, 0.15 + 0.04 * p.realism, (foliage[2] + split).rem_euclid(360.0)];
+        let accent = [0.6, 0.15 + 0.04 * p.realism(), (foliage[2] + split).rem_euclid(360.0)];
         Palette { physical, foliage, dry, cold, bark, accent, ground, pigment }
     }
 
@@ -393,6 +408,47 @@ pub fn load_planet(dir: &std::path::Path, body: &str) -> Result<PlanetLife, Stri
     PlanetLife::from_ron(&text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// Chroma cap of the style pass at `realism` (alien species use it fully).
+pub fn chroma_cap(realism: f64) -> f64 {
+    let stylised = ((realism - 0.5) / 0.5).clamp(0.0, 1.0);
+    0.07 + 0.05 * realism + 0.12 * stylised
+}
+
+impl Palette {
+    /// The planet's hue families for alien species: the foliage hue and two
+    /// more whose distance grows with strangeness (genesis §8.1: at most
+    /// 2–3 dominant hue families per planet).
+    pub fn hue_families(&self, p: &PlanetLife) -> [f64; 3] {
+        let st = Stream::new(p.seed, 0x504c_5434);
+        let h0 = self.foliage[2];
+        let spread = 35.0 + 140.0 * p.strangeness;
+        let d1 = spread * (0.7 + 0.3 * st.unit(0, 0));
+        let d2 = -spread * (0.8 + 0.4 * st.unit(1, 0));
+        [h0, (h0 + d1).rem_euclid(360.0), (h0 + d2).rem_euclid(360.0)]
+    }
+
+    /// Colours of a generated alien species: a hue family of the planet,
+    /// saturated to the realism dial's chroma cap, lighter tips, darker
+    /// stalks in the same hue, an accent from another family.
+    pub fn alien_look(&self, p: &PlanetLife, key: u64) -> Look {
+        let st = Stream::new(key ^ p.seed, 0x504c_5435);
+        let fam = self.hue_families(p);
+        let f = (st.unit(0, 0) * 3.0) as usize % 3;
+        let h = (fam[f] + 14.0 * st.signed(1, 0)).rem_euclid(360.0);
+        let cap = chroma_cap(p.realism());
+        let c = cap * (0.75 + 0.25 * st.unit(2, 0));
+        let l = 0.5 + 0.08 * st.signed(3, 0);
+        let accent_h = (fam[(f + 1 + (st.unit(4, 0) * 2.0) as usize) % 3] + 20.0 * st.signed(5, 0)).rem_euclid(360.0);
+        let lin = |lch: [f64; 3]| from_lch(lch).map(|v| v.clamp(0.0, 1.0) as f32);
+        Look {
+            organ: lin([l, c, h]),
+            organ_tip: lin([l + 0.12, c * 1.1, (h + 15.0).rem_euclid(360.0)]),
+            accent: lin([0.62, cap * 1.05, accent_h]),
+            bark: lin([0.36, c * 0.45, (h - 10.0).rem_euclid(360.0)]),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,9 +462,10 @@ mod tests {
             ground_albedo: [0.2, 0.15, 0.1],
             seed: 0,
             strangeness: 0.0,
-            realism: 0.0,
+            realism: Some(0.0),
             geology_age: 0.5,
             rocks: Vec::new(),
+            generated_species: 0,
         }
     }
 

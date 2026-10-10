@@ -15,7 +15,7 @@ use crate::genome::CrownShape;
 use crate::niche::{Layer, Site, smoothstep};
 
 /// Most species the GPU table and bucket layout hold.
-pub const MAX_SPECIES: usize = 6;
+pub const MAX_SPECIES: usize = 12;
 /// Most rock archetypes (entries after the species in the GPU tables).
 pub const MAX_ROCKS: usize = 2;
 
@@ -211,6 +211,14 @@ pub fn canopy_color(sp: &SpeciesFile) -> [f64; 3] {
 
 /// Procedural far shape (M5 kinds): 0 conifer, 1 broadleaf, 2 shrub.
 pub fn far_kind(sp: &SpeciesFile) -> u32 {
+    if let Some(p) = &sp.plan {
+        use crate::bodyplan::BodyPlan::*;
+        return match p.plan {
+            Crystal => 0,
+            Cap if sp.niche.layer == Layer::Canopy => 1,
+            _ => 2,
+        };
+    }
     match (sp.niche.layer, sp.genome.crown_shape) {
         (Layer::Shrub, _) => 2,
         (Layer::Canopy, CrownShape::Cone) => 0,

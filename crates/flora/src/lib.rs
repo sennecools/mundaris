@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bodyplan;
 pub mod genome;
 pub mod grow;
 pub mod hash;
@@ -20,6 +21,7 @@ pub mod params;
 pub mod raster;
 pub mod rock;
 pub mod scatter;
+pub mod species_gen;
 
 pub use genome::{Genome, SpeciesFile};
 pub use kit::Kit;
@@ -46,6 +48,9 @@ pub fn grow_meshes(
     kit: &Kit,
     seed: u64,
 ) -> (grow::Skeleton, [Mesh; LOD_COUNT]) {
+    if let Some(plan) = &species.plan {
+        return (grow::Skeleton::default(), bodyplan::grow_plan(plan, &species.look, seed));
+    }
     let skeleton = grow::grow(&species.genome, seed);
     let lods = mesh::build_lods(&skeleton, species, kit, seed);
     (skeleton, lods)
@@ -99,5 +104,14 @@ pub fn load_species_for_body(
     let mut species = load_species_dir(species_dir)?;
     let planet = palette::load_planet(planets_dir, body)?;
     palette::apply(&mut species, &planet);
+    if planet.generated_species > 0 {
+        let mut generated = species_gen::generate(&planet, &species, planet.generated_species as usize);
+        // Woody species take palette colours like authored ones; alien
+        // species keep their generated looks.
+        for sp in generated.iter_mut().filter(|s| s.plan.is_none()) {
+            sp.look = palette::Palette::for_planet(&planet).species_look(&planet, sp);
+        }
+        species = generated;
+    }
     Ok(species)
 }

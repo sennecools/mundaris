@@ -97,7 +97,7 @@ impl Mesh {
         (lo, hi)
     }
 
-    fn push(
+    pub(crate) fn push(
         &mut self,
         pos: DVec3,
         n: DVec3,

@@ -22,6 +22,9 @@ pub struct SpeciesFile {
     pub schema: u32,
     pub name: String,
     pub genome: Genome,
+    /// Alien body plan; when set it replaces the tree/shrub grower.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<crate::bodyplan::PlanGenome>,
     pub niche: crate::niche::Niche,
     /// Hand-set colours replacing the planet palette (art direction only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -232,6 +235,9 @@ impl SpeciesFile {
         }
         file.genome.validate()?;
         file.niche.validate().map_err(GenomeError::Range)?;
+        if let Some(p) = &file.plan {
+            p.validate().map_err(GenomeError::Range)?;
+        }
         Ok(file)
     }
 

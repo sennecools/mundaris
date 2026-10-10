@@ -31,7 +31,14 @@ fn main() {
     let base = load_planet(std::path::Path::new("content/flora/planets"), body).unwrap();
     let species_files = load_species_dir(std::path::Path::new("content/flora/species")).unwrap();
     let kit = Kit::builtin();
+    let at = |s: f64| {
+        let mut p = base.clone();
+        p.strangeness = s;
+        p.realism = None;
+        p
+    };
     let rows: Vec<(String, PlanetLife)> = std::iter::once((format!("{} {:.0}K", body.to_uppercase(), base.star_temperature_k), base.clone()))
+        .chain([("S0.4 USER", at(0.4)), ("S0.7 PROPOSAL", at(0.7))].into_iter().map(|(n, p)| (n.to_string(), p)))
         .chain([("F 6800K", 6800.0), ("G 5772K", 5772.0), ("K 4500K", 4500.0), ("M 3200K", 3200.0)].into_iter().map(|(n, t)| {
             let mut p = base.clone();
             p.star_temperature_k = t;
@@ -72,6 +79,13 @@ fn main() {
             c.fill_rect(x, y0 + 10, x + SW - 4, y0 + 10 + SW * 2, Vec3::new(col[0] as f32, col[1] as f32, col[2] as f32));
             text(&mut c, x, y0 + 14 + SW * 2, lab, 1, Vec3::ONE);
         }
+        // Alien hue families at the realism's chroma cap.
+        for (k, h) in pal.hue_families(planet).iter().enumerate() {
+            let col = lin([0.55, astrum_flora::palette::chroma_cap(planet.realism()), *h]);
+            let x = PLOT_W + k * SW;
+            c.fill_rect(x, y0 + 30 + SW * 2, x + SW - 4, y0 + 40 + SW * 3, Vec3::new(col[0] as f32, col[1] as f32, col[2] as f32));
+        }
+        text(&mut c, PLOT_W + 3 * SW, y0 + 34 + SW * 2, "ALIEN HUES", 1, Vec3::ONE);
         // Species.
         let mut species = species_files.clone();
         apply(&mut species, planet);

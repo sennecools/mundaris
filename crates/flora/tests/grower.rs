@@ -5,11 +5,15 @@ use std::path::Path;
 use astrum_flora::genome::{GrowthForm, OrganKind};
 use astrum_flora::metrics::Bands;
 use astrum_flora::params::{ParamKind, ParamValue, Params};
-use astrum_flora::{Genome, Kit, SpeciesFile, grow_plant, load_species_for_body, variant_seed};
+use astrum_flora::{Genome, Kit, SpeciesFile, grow_plant, load_species_dir, variant_seed};
 
 fn species() -> Vec<SpeciesFile> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content/flora/species");
-    load_species_for_body(&dir, &dir.join("../planets"), "rust").unwrap()
+    // Authored species with the planet palette (not the generated set).
+    let mut s = load_species_dir(&dir).unwrap();
+    let planet = astrum_flora::palette::load_planet(&dir.join("../planets"), "rust").unwrap();
+    astrum_flora::palette::apply(&mut s, &planet);
+    s
 }
 
 fn fnv(bytes: &[u8]) -> u64 {
