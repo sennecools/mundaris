@@ -217,18 +217,34 @@ fn band_weight(frequency_per_m: f64, texel_m: Option<f64>) -> f64 {
     texel_m.map_or(1.0, |t| octave_weight(frequency_per_m, t))
 }
 
+/// Rounding of the `|n|` crease of ridged and billow octaves, in noise units:
+/// `|n|` becomes `√(n² + k²) − k`. A hard crease is a gradient jump at every
+/// scale; close up a kilometre-wavelength crest showed as a long, perfectly
+/// sharp line. The rounding width scales with each octave's wavelength.
+pub const CREASE_ROUNDING: f64 = 0.08;
+
+/// Smooth `|n|` ([`CREASE_ROUNDING`]) and its derivative.
+fn soft_abs(n: f64) -> (f64, f64) {
+    let s = (n * n + CREASE_ROUNDING * CREASE_ROUNDING).sqrt();
+    (s - CREASE_ROUNDING, n / s)
+}
+
 /// Shape of one octave value `n` (gradient `g`) before the mean is removed.
 fn shape(kind: NoiseKind, n: f64, g: DVec3) -> (f64, DVec3) {
     match kind {
         NoiseKind::Fbm => (n, g),
-        NoiseKind::Billow => (n.abs(), g * n.signum()),
+        NoiseKind::Billow => {
+            let (a, da) = soft_abs(n);
+            (a, g * da)
+        }
         NoiseKind::Ridged { sharpness } => {
-            let r = 1.0 - n.abs();
+            let (a, da) = soft_abs(n);
+            let r = 1.0 - a;
             if r <= 0.0 {
                 (0.0, DVec3::ZERO)
             } else {
                 let v = r.powf(sharpness);
-                (v, g * (-n.signum() * sharpness * v / r))
+                (v, g * (-da * sharpness * v / r))
             }
         }
     }

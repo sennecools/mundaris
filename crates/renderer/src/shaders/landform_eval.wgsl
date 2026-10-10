@@ -342,15 +342,19 @@ fn lf_shape(kind: u32, sharpness: f32, n: f32, g: vec3<f32>) -> vec4<f32> {
     if kind == 0u {
         return vec4<f32>(n, g);
     }
+    // Rounded crease `√(n² + k²) − k` (`eval::CREASE_ROUNDING` = 0.08).
+    let s = sqrt(n * n + 0.0064);
+    let a = s - 0.08;
+    let da = n / s;
     if kind == 2u {
-        return vec4<f32>(abs(n), g * sign(n));
+        return vec4<f32>(a, g * da);
     }
-    let r = 1.0 - abs(n);
+    let r = 1.0 - a;
     if r <= 0.0 {
         return vec4<f32>(0.0);
     }
     let v = pow(r, sharpness);
-    return vec4<f32>(v, g * (-sign(n) * sharpness * v / r));
+    return vec4<f32>(v, g * (-da * sharpness * v / r));
 }
 
 // Unit-normalised gain-½ fBm (`eval::warp_fbm`) at chart-local `local`.
