@@ -46,24 +46,6 @@ pub fn tile_texel_m(radius_m: f64, level: u8, cells: u32) -> f64 {
     radius_m * 2.0 / ((1u64 << level) as f64 * f64::from(cells))
 }
 
-/// Coast blend scale A (m): world-body relief (landforms and detail noise)
-/// is kept by `m²/(m² + A²)` on macro height `m` (prototype constant, mirrored
-/// in `terrain_atlas_produce.wgsl`).
-pub const COAST_BLEND_M: f64 = 40.0;
-
-/// Macro height `m` (gradient `gm`) plus relief `r` (gradient `rg`) kept by
-/// `m²/(m² + A²)`. Relief within `|r| ≤ 2A` cannot cross sea level, so the
-/// coastline follows the macro contour at every band limit and no islets pop
-/// in as finer octaves arrive (scorer: `tests/coast_stability.rs`); smooth, so
-/// the shore gets no normal crease. Coastal lowlands within a few tens of
-/// metres of sea level flatten accordingly.
-pub fn coast_blend(m: f64, gm: DVec3, r: f64, rg: DVec3) -> (f64, DVec3) {
-    let (m2, a2) = (m * m, COAST_BLEND_M * COAST_BLEND_M);
-    let keep = m2 / (m2 + a2);
-    let dkeep = 2.0 * m * a2 / ((m2 + a2) * (m2 + a2));
-    (m + r * keep, gm + rg * keep + gm * (r * dkeep))
-}
-
 /// One pre-filtered periodic level of a height profile.
 #[derive(Debug)]
 pub struct ProfilePyramidLevel {
@@ -332,29 +314,21 @@ impl ProducerRecipe {
             }
             Self::World(recipe) => {
                 let maps = recipe.field.maps()?;
-                let radius = recipe.radius_m;
-                let (h, g) = maps.sample(maps.mip_for(texel_m, radius), n);
-                // Landform relief and detail noise (landform gradients are
-                // per metre; ours per unit direction), blended near sea level.
-                let (mut r, mut rg) = match recipe.field.landform_relief(n, texel_m)? {
-                    Some(relief) => (relief.value, relief.gradient * radius),
-                    None => (0.0, DVec3::ZERO),
-                };
-                if let Some(detail) = &recipe.detail_noise {
-                    let (dh, dg) = detail.evaluate(n * radius, Some(texel_m));
-                    r += dh;
-                    rg += dg * radius;
+                let (h, g) = maps.sample(maps.mip_for(texel_m, recipe.radius_m), n);
+                match recipe.field.landform_relief(n, texel_m)? {
+                    // Landform gradients are per metre; ours per unit direction.
+                    Some(relief) => (h + relief.value, g + relief.gradient * recipe.radius_m),
+                    None => (h, g),
                 }
-                coast_blend(h, g, r, rg)
             }
         };
         let (height_m, gradient) = match self.detail_noise() {
-            Some(detail) if !matches!(self, Self::World(_)) => {
+            Some(detail) => {
                 let radius = self.radius_m();
                 let (h, g) = detail.evaluate(n * radius, Some(texel_m));
                 (height_m + h, gradient + g * radius)
             }
-            _ => (height_m, gradient),
+            None => (height_m, gradient),
         };
         let gradient = gradient - n * n.dot(gradient);
         let normal = (n - gradient / (self.radius_m() + height_m)).normalize();
