@@ -12,13 +12,12 @@ PlanetLife(
     ground_albedo: (0.26, 0.15, 0.09),
     seed: 7,
     // Strangeness drives the look (realism follows it unless set):
-    // - 0.4 = the user's 2026-10-10 choice (familiar trees with alien
-    //   details, palette close to Earth greens, realism 0.5);
-    // - 0.7 = PROPOSAL after the user's alien line-up reference: mostly alien
-    //   body plans, saturated violet/red/orange families (realism 0.85).
-    // Currently 0.4 (the user's choice) until the user picks; set 0.7 for the
-    // proposal.
-    strangeness: 0.4,
+    // - 0.7 = the user's choice 2026-10-10 (after stylised-v6 next to the
+    //   NMS 2016 reference): mostly alien body plans, saturated
+    //   violet/red/orange families (realism 0.85);
+    // - 0.4 = the earlier choice (familiar trees with alien details, palette
+    //   close to Earth greens, realism 0.5). One value to flip back.
+    strangeness: 0.7,
     // Old continental surfaces: weathered, rounded rocks where it is wet.
     geology_age: 0.7,
     // Species: 10 generated from the planet (body plans, niches, colours),
