@@ -1,0 +1,18 @@
+[package]
+name = "astrum_flora"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+astrum_math = { path = "../math" }
+glam.workspace = true
+serde.workspace = true
+ron.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+png.workspace = true
+
+[lints]
+workspace = true

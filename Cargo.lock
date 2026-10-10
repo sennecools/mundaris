@@ -186,6 +186,18 @@ name = "astrum_core"
 version = "0.0.1"
 
 [[package]]
+name = "astrum_flora"
+version = "0.0.1"
+dependencies = [
+ "astrum_math",
+ "glam",
+ "png",
+ "ron",
+ "serde",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "astrum_math"
 version = "0.0.1"
 dependencies = [
