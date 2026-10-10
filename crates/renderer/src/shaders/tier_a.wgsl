@@ -1304,7 +1304,9 @@ fn landform_weights(@builtin(global_invocation_id) id: vec3<u32>) {
     // Set header: version, count, flags (bit 0 normalise), fallback, offsets.
     let count = min(landform_rules[1], 4u);
     let fallback = landform_rules[3];
-    var w = vec4<f32>(0.0);
+    // A local array, not a vec4: FXC (Dx12) cannot write vector components
+    // through a runtime index (X3500).
+    var lanes = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
     var sum = 0.0;
     for (var i = 0u; i < count; i = i + 1u) {
         var r = lw_rule(landform_rules[4u + i]);
@@ -1312,11 +1314,12 @@ fn landform_weights(@builtin(global_invocation_id) id: vec3<u32>) {
             r = 0.0;
         }
         r = min(r, 1.0);
-        w[i] = r;
+        lanes[i] = r;
         sum += r;
     }
     let lift = max(0.0625 - sum, 0.0);
-    w[min(fallback, 3u)] += lift;
+    lanes[min(fallback, 3u)] += lift;
+    var w = vec4<f32>(lanes[0], lanes[1], lanes[2], lanes[3]);
     if (landform_rules[2] & 1u) != 0u {
         w = w / (sum + lift);
     }
