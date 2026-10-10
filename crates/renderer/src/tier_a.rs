@@ -462,7 +462,7 @@ pub enum TierAScratch {
     Hardness,
     /// Distance to the nearest plate boundary (m).
     BoundaryDistance,
-    /// Smoothed relief slope (m/m); overwritten by erosion.
+    /// Smoothed relief slope (m/m); zero without a rain shadow.
     SlopeEast,
     SlopeNorth,
     /// Drainage area of the last erosion level, upsampled to full size (km²).
@@ -574,12 +574,13 @@ impl Layout {
                         .expect("every divisor reduced")
                         .1
                 };
-                // The full-size level reuses runs free after the moisture.
+                // The full-size level reuses runs free after the moisture. The
+                // slope runs stay intact: the landform weights read them last.
                 let (h, w, q, qs_in, qs_out, total) = if *divisor == 1 {
                     (
                         [raw, crust],
                         [dh, ocean[0]],
-                        slope,
+                        [take(n), take(n)],
                         carried[0],
                         carried[1],
                         precipitation,
@@ -621,7 +622,7 @@ impl Layout {
                 });
             }
             full_deposit = take(n);
-            full_discharge = slope[0];
+            full_discharge = take(n);
             full_flux = carried[1];
         } else {
             // No erosion: deposit and discharge read as zeros.

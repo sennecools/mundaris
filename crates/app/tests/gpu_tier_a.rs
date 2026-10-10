@@ -617,8 +617,7 @@ fn production_size_bake_is_frame_split_stable_with_geography_checks() {
 
     // Rain shadow (§19.4): high-uplift land whose deflected wind blows
     // downhill is drier than where it blows uphill; without orographic rain
-    // and lee drying the gap shrinks by at least 80 %. Slopes come from a
-    // bake without erosion (which reuses the slope runs).
+    // and lee drying the gap shrinks by at least 80 %.
     let shadow = |orographic: bool| {
         let mut input = without(input.clone(), TierAStage::Erosion);
         if !orographic {
@@ -803,6 +802,26 @@ fn gpu_landform_weights_match_the_cpu_oracle() {
     let (east, north) = (
         slope(TierAScratch::SlopeEast).expect("slope scratch"),
         slope(TierAScratch::SlopeNorth).expect("slope scratch"),
+    );
+    // The slope the weights read is the pre-erosion slope: erosion must not
+    // reuse its runs (a bake without erosion has the same slope).
+    let plain = TierAValidation::new(&context.device)
+        .bake_with_scratch(
+            &context.device,
+            &context.queue,
+            &bake_inputs(&without(input.clone(), TierAStage::Erosion)),
+            usize::MAX,
+        )
+        .unwrap();
+    assert_eq!(
+        east,
+        plain.scratch_f32(TierAScratch::SlopeEast).unwrap(),
+        "erosion overwrote the slope east run"
+    );
+    assert_eq!(
+        north,
+        plain.scratch_f32(TierAScratch::SlopeNorth).unwrap(),
+        "erosion overwrote the slope north run"
     );
     let (bc, aux0, aux1) = (gpu.run_words(5), gpu.run_words(6), gpu.run_words(7));
     for (k, g) in words.iter().enumerate() {

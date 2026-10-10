@@ -55,15 +55,15 @@ fn lf_field_run(field: u32) -> vec2<u32> {
     }
 }
 
-// Field sampling (prototype). Fields at one direction share the cube-map
-// addressing (face choice, cross-face texels, weights), so four fields are
-// sampled per addressing pass, and every field at the sample direction is
-// cached once per sample (`lf_fill_cache`). Same formulas as cube_sample and
-// `MapsFields` (bicubic level 0; gradients by central differences over a
-// quarter texel). Few call sites, because drivers inline every one.
+// Field sampling. Fields at one direction share the cube-map addressing (face
+// choice, cross-face texels, weights), so four fields are sampled per
+// addressing pass, and every field at the sample direction is cached once per
+// sample (`lf_fill_cache`). Same formulas as cube_sample and `MapsFields`
+// (bicubic level 0, analytic gradients). Few call sites, because drivers
+// inline every one.
 
-// Per-sample cache: (value, gradient per metre) by field id at the sample
-// direction.
+// Per-sample cache: (value, gradient per metre) by recipe field id (0..8) at
+// the sample direction; the weight lanes (ids 9..12) are not cached.
 var<private> lf_cache: array<vec4<f32>, 9>;
 // True once `lf_fill_cache` ran for this sample.
 var<private> lf_cache_valid: bool;
@@ -121,22 +121,39 @@ fn lf4_across(face: u32, i: i32, j: i32) -> vec4<f32> {
     return (q[0] * (1.0 - tx) + q[1] * tx) * (1.0 - ty) + (q[2] * (1.0 - tx) + q[3] * tx) * ty;
 }
 
-// cube_bicubic_on for the four lanes, with derivatives: [value, d/dfx,
-// d/dfy] (`CubeMap::bicubic_d_on`).
-fn lf4_bicubic_d_on(face: u32, u: f32, v: f32) -> array<vec4<f32>, 3> {
+// Cubic kernel weights of the four taps around `t` and their derivatives
+// (`world_map::cube::Kernel`): Catmull-Rom, or the uniform B-spline.
+fn lf_kernel(t: f32, bspline: bool) -> array<vec4<f32>, 2> {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    if bspline {
+        let s = 1.0 - t;
+        return array<vec4<f32>, 2>(
+            vec4<f32>(s * s * s, 3.0 * t3 - 6.0 * t2 + 4.0, -3.0 * t3 + 3.0 * t2 + 3.0 * t + 1.0, t3) / 6.0,
+            0.5 * vec4<f32>(-s * s, 3.0 * t2 - 4.0 * t, -3.0 * t2 + 2.0 * t + 1.0, t2),
+        );
+    }
+    return array<vec4<f32>, 2>(
+        catmull_rom(t),
+        0.5 * vec4<f32>(-3.0 * t2 + 4.0 * t - 1.0, 9.0 * t2 - 10.0 * t,
+            -9.0 * t2 + 8.0 * t + 1.0, 3.0 * t2 - 2.0 * t),
+    );
+}
+
+// Cubic value of `face` for the four lanes, with derivatives: [value,
+// d/dfx, d/dfy] (`CubeMap::cubic_d_on`).
+fn lf4_cubic_d_on(face: u32, u: f32, v: f32, bspline: bool) -> array<vec4<f32>, 3> {
     let n = f32(tile.noise.y);
     let fx = (u + 1.0) * 0.5 * n - 0.5;
     let fy = (v + 1.0) * 0.5 * n - 0.5;
     let x0 = i32(floor(fx));
     let y0 = i32(floor(fy));
-    let tx = fx - floor(fx);
-    let ty = fy - floor(fy);
-    let wx = catmull_rom(tx);
-    let wy = catmull_rom(ty);
-    let dx = 0.5 * vec4<f32>(-3.0 * tx * tx + 4.0 * tx - 1.0, 9.0 * tx * tx - 10.0 * tx,
-        -9.0 * tx * tx + 8.0 * tx + 1.0, 3.0 * tx * tx - 2.0 * tx);
-    let dy = 0.5 * vec4<f32>(-3.0 * ty * ty + 4.0 * ty - 1.0, 9.0 * ty * ty - 10.0 * ty,
-        -9.0 * ty * ty + 8.0 * ty + 1.0, 3.0 * ty * ty - 2.0 * ty);
+    let kx = lf_kernel(fx - floor(fx), bspline);
+    let ky = lf_kernel(fy - floor(fy), bspline);
+    let wx = kx[0];
+    let wy = ky[0];
+    let dx = kx[1];
+    let dy = ky[1];
     var out: array<vec4<f32>, 3>;
     for (var j = 0; j < 4; j = j + 1) {
         for (var i = 0; i < 4; i = i + 1) {
@@ -149,9 +166,10 @@ fn lf4_bicubic_d_on(face: u32, u: f32, v: f32) -> array<vec4<f32>, 3> {
     return out;
 }
 
-// Four lanes' bicubic values and tangent gradients per unit direction at
-// `d` (`CubeMap::bicubic_gradient`): [value, ∂x, ∂y, ∂z], one vec4 lane each.
-fn lf4_sample_grad(d: vec3<f32>) -> array<vec4<f32>, 4> {
+// Four lanes' cubic values and tangent gradients per unit direction at `d`
+// (`CubeMap::bicubic_gradient`, `bspline_gradient`): [value, ∂x, ∂y, ∂z],
+// one vec4 lane each.
+fn lf4_sample_grad(d: vec3<f32>, bspline: bool) -> array<vec4<f32>, 4> {
     let nf = f32(tile.noise.y);
     let band = 1.0 / nf;
     let half_n = 0.5 * nf;
@@ -174,7 +192,7 @@ fn lf4_sample_grad(d: vec3<f32>) -> array<vec4<f32>, 4> {
         if t <= 0.0 {
             continue;
         }
-        let r = lf4_bicubic_d_on(f, u, v);
+        let r = lf4_cubic_d_on(f, u, v, bspline);
         let grad_u = (b[1] - b[0] * u) / w;
         let grad_v = (b[2] - b[0] * v) / w;
         var fg: array<vec4<f32>, 3>;
@@ -222,7 +240,7 @@ fn lf4_sample_grad(d: vec3<f32>) -> array<vec4<f32>, 4> {
 // lane c is (value, gradient) in out[c].
 fn lf4_field(ids: vec4<u32>, d: vec3<f32>) -> array<vec4<f32>, 4> {
     lf4_ids = ids;
-    let s = lf4_sample_grad(d);
+    let s = lf4_sample_grad(d, false);
     var out: array<vec4<f32>, 4>;
     for (var c = 0u; c < 4u; c = c + 1u) {
         out[c] = vec4<f32>(s[0][c], vec3<f32>(s[1][c], s[2][c], s[3][c]) / tile.scale.x);
@@ -280,60 +298,18 @@ fn lf_clamp_field(field: u32, f: vec4<f32>) -> vec4<f32> {
 
 // ---------------------------------------------------------------- weights
 
-// cube_bicubic_on with cubic B-spline weights for the four lanes
-// (`CubeMap::bspline_on`).
-fn lf4_bspline_on(face: u32, u: f32, v: f32) -> vec4<f32> {
-    let n = f32(tile.noise.y);
-    let fx = (u + 1.0) * 0.5 * n - 0.5;
-    let fy = (v + 1.0) * 0.5 * n - 0.5;
-    let x0 = i32(floor(fx));
-    let y0 = i32(floor(fy));
-    let tx = fx - floor(fx);
-    let ty = fy - floor(fy);
-    let sx = 1.0 - tx;
-    let sy = 1.0 - ty;
-    let wx = vec4<f32>(sx * sx * sx, 3.0 * tx * tx * tx - 6.0 * tx * tx + 4.0,
-        -3.0 * tx * tx * tx + 3.0 * tx * tx + 3.0 * tx + 1.0, tx * tx * tx) / 6.0;
-    let wy = vec4<f32>(sy * sy * sy, 3.0 * ty * ty * ty - 6.0 * ty * ty + 4.0,
-        -3.0 * ty * ty * ty + 3.0 * ty * ty + 3.0 * ty + 1.0, ty * ty * ty) / 6.0;
-    var sum = vec4<f32>(0.0);
-    for (var j = 0; j < 4; j = j + 1) {
-        for (var i = 0; i < 4; i = i + 1) {
-            sum += wx[i] * wy[j] * lf4_across(face, x0 - 1 + i, y0 - 1 + j);
-        }
-    }
-    return sum;
-}
-
-// The four landform weights at `d` (`MapsFields::weights`): the Tier A weight
-// run (rules evaluated per texel in the bake) as a cubic B-spline, which
-// never overshoots and keeps normalised weights summing to one.
-fn lf_weights(d: vec3<f32>) -> vec4<f32> {
+// The four landform weights at `d` with gradients per metre
+// (`MapsFields::weights_gradient`): the Tier A weight run (rules evaluated per
+// texel in the bake) as a cubic B-spline, which never overshoots and keeps
+// normalised weights summing to one. Lane c is (value, gradient) in out[c].
+fn lf_weights(d: vec3<f32>) -> array<vec4<f32>, 4> {
     lf4_ids = vec4<u32>(9u, 10u, 11u, 12u);
-    let band = 1.0 / f32(tile.noise.y);
-    var sum = vec4<f32>(0.0);
-    var total = 0.0;
-    for (var f = 0u; f < 6u; f = f + 1u) {
-        let b = face_basis(f);
-        let w = dot(d, b[0]);
-        if w <= 0.0 {
-            continue;
-        }
-        let u = dot(d, b[1]) / w;
-        let v = dot(d, b[2]) / w;
-        let t = (1.0 - max(abs(u), abs(v)) + band) / (2.0 * band);
-        if t <= 0.0 {
-            continue;
-        }
-        let value = lf4_bspline_on(f, u, v);
-        if t >= 1.0 {
-            return value;
-        }
-        let weight = t * t * (3.0 - 2.0 * t);
-        sum += weight * value;
-        total += weight;
+    let s = lf4_sample_grad(d, true);
+    var out: array<vec4<f32>, 4>;
+    for (var c = 0u; c < 4u; c = c + 1u) {
+        out[c] = vec4<f32>(s[0][c], vec3<f32>(s[1][c], s[2][c], s[3][c]) / tile.scale.x);
     }
-    return sum / max(total, 1.0e-30);
+    return out;
 }
 
 // ---------------------------------------------------------------- stacks
@@ -689,11 +665,12 @@ fn landform_relief(local: vec3<f32>, d: vec3<f32>) -> vec4<f32> {
     var sum = vec4<f32>(0.0);
     for (var i = 0u; i < min(count, 4u); i = i + 1u) {
         let w = weights[i];
-        if w <= 0.0 {
+        // A zero B-spline of non-negative weights is a minimum: no gradient.
+        if w.x <= 0.0 {
             continue;
         }
         let h = lf_program(i, local, d);
-        sum += vec4<f32>(w * h.x, h.yzw * w);
+        sum += vec4<f32>(w.x * h.x, h.yzw * w.x + w.yzw * h.x);
     }
     return sum;
 }

@@ -146,33 +146,15 @@ impl CubeMap<f32> {
         sum
     }
 
-    /// Catmull-Rom value of `face` at chart (u, v) and its derivatives with
-    /// respect to the texel coordinates (fx, fy).
-    fn bicubic_d_on(&self, face: usize, u: f64, v: f64) -> (f64, f64, f64) {
+    /// Cubic value of `face` at chart (u, v) with `kernel` and its
+    /// derivatives with respect to the texel coordinates (fx, fy).
+    fn cubic_d_on(&self, face: usize, u: f64, v: f64, kernel: Kernel) -> (f64, f64, f64) {
         let n = self.n as f64;
         let fx = (u + 1.0) * 0.5 * n - 0.5;
         let fy = (v + 1.0) * 0.5 * n - 0.5;
         let (x0, y0) = (fx.floor() as i64, fy.floor() as i64);
         let (tx, ty) = (fx - x0 as f64, fy - y0 as f64);
-        let weights = |t: f64| {
-            let (t2, t3) = (t * t, t * t * t);
-            [
-                0.5 * (-t3 + 2.0 * t2 - t),
-                0.5 * (3.0 * t3 - 5.0 * t2 + 2.0),
-                0.5 * (-3.0 * t3 + 4.0 * t2 + t),
-                0.5 * (t3 - t2),
-            ]
-        };
-        let derivatives = |t: f64| {
-            let t2 = t * t;
-            [
-                0.5 * (-3.0 * t2 + 4.0 * t - 1.0),
-                0.5 * (9.0 * t2 - 10.0 * t),
-                0.5 * (-9.0 * t2 + 8.0 * t + 1.0),
-                0.5 * (3.0 * t2 - 2.0 * t),
-            ]
-        };
-        let (wx, wy, dx, dy) = (weights(tx), weights(ty), derivatives(tx), derivatives(ty));
+        let ((wx, dx), (wy, dy)) = (kernel.weights(tx), kernel.weights(ty));
         let (mut sum, mut sx, mut sy) = (0.0, 0.0, 0.0);
         for j in 0..4 {
             for i in 0..4 {
@@ -192,6 +174,16 @@ impl CubeMap<f32> {
     /// `(Σ w∇f + Σ f∇w)/W − (Σ wf)(Σ ∇w)/W²`, with `w = s(t)` and
     /// `t = (1 − max(|u|, |v|) + band)/(2·band)`.
     pub fn bicubic_gradient(&self, direction: DVec3) -> (f64, DVec3) {
+        self.cubic_gradient(direction, Kernel::CatmullRom)
+    }
+
+    /// [`Self::bspline`] and its tangent gradient per unit direction (as
+    /// [`Self::bicubic_gradient`], with B-spline derivative weights).
+    pub fn bspline_gradient(&self, direction: DVec3) -> (f64, DVec3) {
+        self.cubic_gradient(direction, Kernel::BSpline)
+    }
+
+    fn cubic_gradient(&self, direction: DVec3, kernel: Kernel) -> (f64, DVec3) {
         let band = 1.0 / self.n as f64;
         let half_n = 0.5 * self.n as f64;
         let (mut sum, mut gradient, mut total) = (0.0, DVec3::ZERO, 0.0);
@@ -211,7 +203,7 @@ impl CubeMap<f32> {
             } else {
                 t * t * (3.0 - 2.0 * t)
             };
-            let (value, dfx, dfy) = self.bicubic_d_on(face, u, v);
+            let (value, dfx, dfy) = self.cubic_d_on(face, u, v, kernel);
             let grad_u = (u_axis - normal * u) / w;
             let grad_v = (v_axis - normal * v) / w;
             let g = (grad_u * dfx + grad_v * dfy) * half_n;
@@ -272,6 +264,48 @@ impl CubeMap<f32> {
     /// piecewise constant and shade as facets.
     pub fn bicubic(&self, direction: DVec3) -> f64 {
         self.across_faces(direction, |f, u, v| self.bicubic_on(f, u, v))
+    }
+}
+
+/// Cubic interpolation kernel of the analytic-gradient samplers.
+#[derive(Debug, Clone, Copy)]
+enum Kernel {
+    CatmullRom,
+    BSpline,
+}
+
+impl Kernel {
+    /// Weights of the four taps around fraction `t` and their derivatives.
+    fn weights(self, t: f64) -> ([f64; 4], [f64; 4]) {
+        let (t2, t3) = (t * t, t * t * t);
+        match self {
+            Self::CatmullRom => (
+                [
+                    0.5 * (-t3 + 2.0 * t2 - t),
+                    0.5 * (3.0 * t3 - 5.0 * t2 + 2.0),
+                    0.5 * (-3.0 * t3 + 4.0 * t2 + t),
+                    0.5 * (t3 - t2),
+                ],
+                [
+                    0.5 * (-3.0 * t2 + 4.0 * t - 1.0),
+                    0.5 * (9.0 * t2 - 10.0 * t),
+                    0.5 * (-9.0 * t2 + 8.0 * t + 1.0),
+                    0.5 * (3.0 * t2 - 2.0 * t),
+                ],
+            ),
+            Self::BSpline => {
+                let s = 1.0 - t;
+                (
+                    bspline_weights(t),
+                    [
+                        -0.5 * s * s,
+                        0.5 * (3.0 * t2 - 4.0 * t),
+                        0.5 * (-3.0 * t2 + 2.0 * t + 1.0),
+                        0.5 * t2,
+                    ],
+                )
+            }
+        }
     }
 }
 
@@ -365,6 +399,19 @@ mod tests {
 
     #[test]
     fn bicubic_gradient_matches_the_value_and_central_differences() {
+        check_gradient("bicubic", CubeMap::bicubic, CubeMap::bicubic_gradient);
+    }
+
+    #[test]
+    fn bspline_gradient_matches_the_value_and_central_differences() {
+        check_gradient("bspline", CubeMap::bspline, CubeMap::bspline_gradient);
+    }
+
+    fn check_gradient(
+        name: &str,
+        sample: fn(&CubeMap<f32>, DVec3) -> f64,
+        gradient_of: fn(&CubeMap<f32>, DVec3) -> (f64, DVec3),
+    ) {
         let n = 64;
         let f = |d: DVec3| (3.0 * d.x).sin() + d.y * d.z + 0.5 * (2.0 * d.z).cos();
         let mut map = CubeMap::new(n, 0.0f32);
@@ -380,11 +427,11 @@ mod tests {
             let r = (1.0 - y * y).sqrt();
             let a = 2.399_963_229_728_653 * k as f64;
             let d = DVec3::new(r * a.cos(), y, r * a.sin());
-            let (value, gradient) = map.bicubic_gradient(d);
-            assert_eq!(value, map.bicubic(d));
+            let (value, gradient) = gradient_of(&map, d);
+            assert_eq!(value, sample(&map, d));
             let e1 = d.any_orthonormal_vector();
             let e2 = d.cross(e1);
-            let at = |v: DVec3| map.bicubic((d + v * delta).normalize());
+            let at = |v: DVec3| sample(&map, (d + v * delta).normalize());
             let fd = e1 * ((at(e1) - at(-e1)) / (2.0 * delta))
                 + e2 * ((at(e2) - at(-e2)) / (2.0 * delta));
             let error = (gradient - fd).length() / (1.0 + fd.length());
@@ -400,18 +447,47 @@ mod tests {
         edge_errors.sort_by(f64::total_cmp);
         let p95 = edge_errors[edge_errors.len() * 95 / 100];
         println!(
-            "bicubic gradient vs central differences: interior {:.2e}, edge band p95 {p95:.2e}, max {:.2e}",
+            "{name} gradient vs central differences: interior {:.2e}, edge band p95 {p95:.2e}, max {:.2e}",
             worst.0, worst.1
         );
         // Central differences straddle the kinks of max(|u|, |v|) at face
         // corners and the clamped cross-face taps, so the edge band is
         // checked by quantile.
-        assert!(worst.0 < 5e-3, "interior {}", worst.0);
+        assert!(worst.0 < 5e-3, "{name} interior {}", worst.0);
         assert!(
             p95 < 1e-2 && worst.1 < 0.1,
-            "edge band p95 {p95}, max {}",
+            "{name} edge band p95 {p95}, max {}",
             worst.1
         );
+    }
+
+    #[test]
+    fn bspline_weights_partition_unity_and_never_overshoot() {
+        for k in 0..=100 {
+            let t = f64::from(k) / 100.0;
+            let (w, dw) = Kernel::BSpline.weights(t);
+            assert!((w.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+            assert!(w.iter().all(|&x| x >= 0.0));
+            assert!(dw.iter().sum::<f64>().abs() < 1e-12);
+        }
+        // Complementary 0/1 weight maps stay in [0, 1] and sum to one after
+        // sampling, including across face edges and corners.
+        let n = 16;
+        let mut maps = [CubeMap::new(n, 0.0f32), CubeMap::new(n, 0.0f32)];
+        for (k, d) in texel_directions(n).iter().enumerate() {
+            let a = if (7.0 * d.x + 3.0 * d.y).sin() > 0.0 { 1.0 } else { 0.0 };
+            maps[0].data_mut()[k] = a;
+            maps[1].data_mut()[k] = 1.0 - a;
+        }
+        for k in 0..2000 {
+            let y = 1.0 - 2.0 * (k as f64 + 0.5) / 2000.0;
+            let r = (1.0 - y * y).sqrt();
+            let a = 2.399_963_229_728_653 * k as f64;
+            let d = DVec3::new(r * a.cos(), y, r * a.sin());
+            let (w0, w1) = (maps[0].bspline(d), maps[1].bspline(d));
+            assert!((-1e-12..=1.0 + 1e-12).contains(&w0), "{w0}");
+            assert!((w0 + w1 - 1.0).abs() < 1e-9, "{}", w0 + w1);
+        }
     }
 
     #[test]

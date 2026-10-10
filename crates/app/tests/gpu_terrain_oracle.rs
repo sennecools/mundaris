@@ -25,6 +25,19 @@ use astrum_renderer::TerrainAtlasConfig;
 use astrum_world::terrain::{SurfaceGenerator, noise, producer::tile_texel_m};
 use glam::DVec3;
 
+/// The GPU's literal crease constants (`lf_shape`) equal the oracle's
+/// `eval::CREASE_ROUNDING` (k and k²): the oracle test only sees gross
+/// mismatches.
+#[test]
+fn gpu_crease_rounding_matches_the_oracle_constant() {
+    let source = include_str!("../../renderer/src/shaders/landform_eval.wgsl");
+    let k = astrum_world::terrain::landform::eval::CREASE_ROUNDING;
+    let square = format!("sqrt(n * n + {})", (k * k * 1e6).round() / 1e6);
+    let offset = format!("let a = s - {k};");
+    assert!(source.contains(&square), "missing `{square}` in lf_shape");
+    assert!(source.contains(&offset), "missing `{offset}` in lf_shape");
+}
+
 const HEIGHT_TOLERANCE_M: f64 = 1.0e-3;
 const HEIGHT_TOLERANCE_RELATIVE: f64 = 1.0e-6;
 const HEIGHT_TOLERANCE_TEXEL_FRACTION: f64 = 1.0e-5;

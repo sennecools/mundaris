@@ -499,6 +499,9 @@ impl PlanetLod {
                     if let Some(collision) = &mut lod.collision {
                         // The far collider must contain the complete surface:
                         // pad by the relief this tile's band limit leaves out.
+                        // Not yet covered: macro peaks the averaged Tier A
+                        // elevation mip of a coarse tile flattens (open in
+                        // the M2 report; needs min/max mips).
                         let pad = lod
                             .unresolved_m
                             .get(usize::from(address.level()))
@@ -1523,10 +1526,12 @@ fn node_bounds(
             if depth == 0 {
                 return (range, true);
             }
-            // Finer bands can add relief the ancestor filtered away: at least
-            // the recipe's unresolved bound at the ancestor's level.
-            let margin = (0.15 * f64::from(depth) * (range[1] - range[0]) + 0.5)
-                .max(unresolved(node.level()));
+            // Finer bands can add relief the ancestor filtered away: finer
+            // macro mips (the heuristic) plus the recipe's unresolved bound at
+            // the ancestor's level.
+            let margin = 0.15 * f64::from(depth) * (range[1] - range[0])
+                + 0.5
+                + unresolved(node.level());
             return (
                 [
                     (range[0] - margin).max(-absolute_bound_m),

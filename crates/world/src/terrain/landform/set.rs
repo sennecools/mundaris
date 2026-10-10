@@ -180,7 +180,11 @@ impl LandformSet {
 
     fn combine(&self, bounds: impl Iterator<Item = f64>) -> f64 {
         if self.normalize {
-            bounds.fold(0.0, f64::max)
+            // Weights are stored as unorm8 per lane: rounding can lift a
+            // normalised sum by half a step per lane (the B-spline is a convex
+            // combination, so sampling adds nothing).
+            const QUANTISED_SUM: f64 = 1.0 + 4.0 * 0.5 / 255.0;
+            bounds.fold(0.0, f64::max) * QUANTISED_SUM
         } else {
             bounds.sum()
         }

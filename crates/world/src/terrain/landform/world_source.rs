@@ -8,8 +8,8 @@
 //! - Weights: the Tier A weight run (rules evaluated per texel in the bake,
 //!   `tier_a::landform_rule_fields`), sampled with a cubic B-spline, which
 //!   never overshoots and keeps normalised weights summing to one.
-//! - The weight gradient is left out of the composed gradient (weights vary
-//!   over Tier A texels, ~1 km; relief gradients dominate the normal).
+//! - The composed gradient is `Σ wᵢ·∇hᵢ + hᵢ·∇wᵢ` (B-spline gradients of the
+//!   weights, `CubeMap::bspline_gradient`).
 use super::eval::{Dual, FieldSource, LandformParams};
 use super::schema::RecipeField;
 use super::set::LandformSet;
@@ -94,6 +94,14 @@ impl MapsFields {
     pub fn weights(&self, d: DVec3) -> [f64; 4] {
         std::array::from_fn(|lane| self.weights[lane].bspline(d))
     }
+
+    /// The four landform weights and their body-space gradients (per metre).
+    pub fn weights_gradient(&self, d: DVec3) -> [Dual; 4] {
+        std::array::from_fn(|lane| {
+            let (value, gradient) = self.weights[lane].bspline_gradient(d);
+            Dual::new(value, gradient / self.radius_m)
+        })
+    }
 }
 
 impl FieldSource for MapsFields {
@@ -111,15 +119,19 @@ pub fn compose(
     d: DVec3,
     texel_m: f64,
 ) -> Dual {
-    let weights = fields.weights(d);
+    let weights = fields.weights_gradient(d);
     let p = d * fields.radius_m;
     let mut sum = Dual::default();
     for ((landform, param), w) in set.landforms().iter().zip(params).zip(weights) {
-        if w <= 0.0 {
+        // A zero B-spline of non-negative weights is a minimum: no gradient.
+        if w.value <= 0.0 {
             continue;
         }
         let h = landform.program.evaluate(p, param, Some(texel_m), fields);
-        sum = Dual::new(sum.value + w * h.value, sum.gradient + h.gradient * w);
+        sum = Dual::new(
+            sum.value + w.value * h.value,
+            sum.gradient + h.gradient * w.value + w.gradient * h.value,
+        );
     }
     sum
 }
