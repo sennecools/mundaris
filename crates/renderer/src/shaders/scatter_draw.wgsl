@@ -144,6 +144,30 @@ fn sc_corner(k: u32, tri: u32, corner: u32, scale: f32) -> vec3<f32> {
     return p * scale;
 }
 
+// Expected tree cover (0..1) at node chart position `st`: the scatter's
+// conifer and shrub densities times its clearing noise, for the far tint.
+fn forest_cover(inst: Instance, st: vec2<f32>, normal_body: vec3<f32>, climate: vec2<f32>, ground: f32) -> f32 {
+    let width = inst.face_u.w;
+    let q0 = inst.n0.w;
+    let cells_per_unit = f32(1u << (SCATTER_CELL_BITS - 1u));
+    let u = dot(inst.n0.xyz, inst.face_u.xyz) * q0 + (st.x - 0.5) * width;
+    let v = dot(inst.n0.xyz, inst.face_v.xyz) * q0 + (st.y - 0.5) * width;
+    let ci = (u + 1.0) * cells_per_unit;
+    let cj = (v + 1.0) * cells_per_unit;
+    let face = sc_face(inst.n0.xyz);
+    // Band limit: each octave fades to its mean once a drawn grid cell spans
+    // more than a quarter of its wavelength (in base cells).
+    let footprint = width * cells_per_unit / grid.draw.x;
+    let coarse = mix(sc_value(face, ci / 48.0, cj / 48.0, 40u), 0.5, smoothstep(12.0, 24.0, footprint));
+    let fine = mix(sc_value(face, ci / 12.0, cj / 12.0, 41u), 0.5, smoothstep(3.0, 6.0, footprint));
+    let wooded = smoothstep(0.38, 0.6, 0.65 * coarse + 0.35 * fine);
+    let up_body = normalize(inst.n0.xyz + chart_diff(inst, st));
+    let slope = acos(clamp(dot(normal_body, up_body), -1.0, 1.0));
+    let trees = sc_density(0u, climate.x, climate.y, slope, ground) * wooded
+        + 0.4 * sc_density(1u, climate.x, climate.y, slope, ground) * mix(0.3, 1.0, wooded);
+    return clamp(trees, 0.0, 1.0);
+}
+
 fn sc_hidden() -> ScatterOut {
     var out: ScatterOut;
     out.clip_position = vec4<f32>(2.0, 2.0, 2.0, 1.0);

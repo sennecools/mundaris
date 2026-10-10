@@ -206,7 +206,16 @@ fn fs_main(input: VertexOut) -> SceneOut {
     let own_a = textureSampleLevel(albedo_atlas, normal_sampler, input.own_uv, input.layers.x, 0.0);
     let parent_a = textureSampleLevel(albedo_atlas, normal_sampler, input.parent_uv, input.layers.y, 0.0);
     let page = mix(mix(parent_a, own_a, input.blend.x), parent_a, input.blend.y);
-    let land_albedo = mix(inst.material.rgb, atlas_srgb_to_linear(page.rgb), page.a);
+    var land_albedo = mix(inst.material.rgb, atlas_srgb_to_linear(page.rgb), page.a);
+    if inst.surface.x > 0.5 && page.a >= 0.5 {
+        // PROTOTYPE (M5 Life): forest floor and canopy tint where the scatter
+        // would grow trees, so forests read from a distance (§12.5 hand-off).
+        let own_c = textureSampleLevel(climate_atlas, normal_sampler, input.own_uv, input.layers.x, 0.0);
+        let parent_c = textureSampleLevel(climate_atlas, normal_sampler, input.parent_uv, input.layers.y, 0.0);
+        let climate = mix(mix(parent_c, own_c, input.blend.x), parent_c, input.blend.y);
+        let cover = forest_cover(inst, input.grid_st, normalize(sampled.xyz), climate.xy, input.ground);
+        land_albedo = mix(land_albedo, vec3<f32>(0.022, 0.04, 0.02), 0.75 * cover);
+    }
     let n0_view = inst.b2v_x.xyz * inst.n0.x + inst.b2v_y.xyz * inst.n0.y + inst.b2v_z.xyz * inst.n0.z;
     let up = normalize(input.view_pos - (inst.anchor.xyz - n0_view * inst.anchor.w));
     // Flat water: the normal page's w is -height / 32 m (clamped); its
