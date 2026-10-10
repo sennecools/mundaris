@@ -250,10 +250,12 @@ fn forest_cover(inst: Instance, st: vec2<f32>, normal_body: vec3<f32>, climate: 
         let mean = mix(0.3, 0.45 + 0.9 * (2.0 / 3.0) * max(sun_t.z, 0.0), share);
         colour *= mix(1.0, pattern / max(mean, 0.05), detail);
     }
-    // Stand-scale variation (~90 m clumps), fading once the grid is too
-    // coarse to carry it.
+    // Crown groups (~30 m) and stands (~90 m): light and shade that carry
+    // the canopy's roughness once single crowns are sub-pixel, each fading
+    // to its mean once the grid is too coarse to carry it.
+    let groups = mix(sc_value(face, c.x / 3.0, c.y / 3.0, 44u), 0.5, smoothstep(0.75, 1.5, footprint));
     let clumps = mix(sc_value(face, c.x / 9.0, c.y / 9.0, 45u), 0.5, smoothstep(2.25, 4.5, footprint));
-    colour *= 1.0 + 0.35 * (clumps - 0.5);
+    colour *= 1.0 + 0.7 * (groups - 0.5) * (1.0 - 0.5 * detail) + 0.7 * (clumps - 0.5);
     return vec4<f32>(colour, clamp(site.cover, 0.0, 0.98));
 }
 
