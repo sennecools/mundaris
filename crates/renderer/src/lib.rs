@@ -45,12 +45,14 @@ pub use render_settings::{
     OverlaySettings, RenderSettings, SHADOW_RESOLUTIONS, ShadowSettings, Tonemapper,
 };
 pub use terrain_atlas::{
-    ATLAS_BOUNDS_GRID, AtlasBounds, AtlasChart, AtlasCollisionPage, AtlasFieldsConstants,
-    AtlasImageLevel, AtlasInstance, AtlasOctave, AtlasProduceJob, AtlasProfileLayer,
-    AtlasSampleSource, AtlasShadowFrame, AtlasSource, AtlasTileKind, AtlasWater, AtlasWorldSource, AtlasWorldSurface, MAX_ATLAS_JOBS_PER_FRAME,
-    MAX_ATLAS_OCTAVES, MAX_COLLISION_CELLS, MAX_COLLISION_JOBS_PER_FRAME, ProducedTileReadback,
-    TerrainAtlasConfig, TerrainAtlasFrame, TerrainAtlasReport, TerrainViewMode,
-    collision_for_validation, lattice_hash_for_validation, produce_for_validation,
+    ATLAS_BOUNDS_GRID, ATLAS_LADDER_LEVELS, ATLAS_LADDERS, AtlasBounds, AtlasChart,
+    AtlasCollisionPage, AtlasFieldsConstants, AtlasImageLevel, AtlasInstance, AtlasLadderLayer,
+    AtlasOctaves, AtlasProduceJob, AtlasProfileLayer, AtlasSampleSource, AtlasShadowFrame,
+    AtlasSource, AtlasTileKind, AtlasWater, AtlasWorldSource, AtlasWorldSurface,
+    LadderNoiseProbe, LadderNoiseResult, MAX_ATLAS_JOBS_PER_FRAME, MAX_COLLISION_CELLS,
+    MAX_COLLISION_JOBS_PER_FRAME, ProducedTileReadback, TerrainAtlasConfig, TerrainAtlasFrame,
+    TerrainAtlasReport, TerrainViewMode, collision_for_validation, ladder_noise_for_validation,
+    lattice_hash_for_validation, produce_for_validation,
 };
 pub use view::*;
 

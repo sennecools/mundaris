@@ -357,6 +357,126 @@ fn gpu_lattice_hash_is_bit_identical_to_the_cpu_oracle() {
     assert_eq!(mismatches, 0);
 }
 
+/// Ladder noise (M2 design §3): octave seeds, sub-cell offsets, the 4D lattice
+/// hash and the integer split cells are bit-identical to the CPU; the f32
+/// split fraction and the 3D/4D octave values and gradients match the f64
+/// oracle at tile-sized offsets, for every ladder and level −11..=19 on tile
+/// centres at Rust's radius and 1,000 km.
+#[test]
+fn gpu_ladder_noise_matches_the_cpu_oracle() {
+    use astrum_renderer::LadderNoiseProbe;
+    use astrum_world::terrain::ladder::{self, LadderOctave};
+    let Some(context) = common::gpu() else {
+        return;
+    };
+    let mut rng = common::Rng(0x1add_e125);
+    let mut unit = move || (rng.next() >> 11) as f64 / (1u64 << 53) as f64;
+    let mut probes = Vec::new();
+    // (centre, octave, local in metres, w)
+    let mut cases = Vec::new();
+    for radius in [338_950.0, 1_000_000.0] {
+        for _ in 0..24 {
+            let z = 2.0 * unit() - 1.0;
+            let a = std::f64::consts::TAU * unit();
+            let r = (1.0 - z * z).sqrt();
+            let centre = DVec3::new(r * a.cos(), r * a.sin(), z) * radius;
+            let anchors = ladder::tile_anchors(centre).unwrap();
+            for ladder_index in 0..4u8 {
+                for level in ladder::MIN_LADDER_LEVEL..=ladder::MAX_LADDER_LEVEL {
+                    let octave = LadderOctave {
+                        ladder: ladder_index,
+                        level,
+                    };
+                    // Band limiting keeps an octave's tile extent below ~50 cells.
+                    let extent = 40.0 * octave.wavelength_m();
+                    let local =
+                        DVec3::new(unit() - 0.5, unit() - 0.5, 0.05 * (unit() - 0.5)) * extent;
+                    let local = local.as_vec3();
+                    let w = (unit() - 0.5) * 300.0;
+                    let m = usize::from(ladder_index);
+                    let salt = rng_word(&mut unit);
+                    probes.push(LadderNoiseProbe {
+                        anchor_cell: anchors.cells[m],
+                        anchor_residual: anchors.residual[m],
+                        ladder: u32::from(ladder_index),
+                        level,
+                        salt,
+                        local: local.to_array(),
+                        w_cell: w.floor() as i32,
+                        w_frac: (w - w.floor()) as f32,
+                        cell4: [0, 1, 2, 3].map(|_| rng_word(&mut unit) as i32),
+                    });
+                    cases.push((centre, anchors, octave, local, w));
+                }
+            }
+        }
+    }
+    let gpu =
+        astrum_renderer::ladder_noise_for_validation(&context.device, &context.queue, &probes)
+            .unwrap();
+    let (mut worst_fraction, mut worst3, mut worst4) = (0.0f64, 0.0f64, 0.0f64);
+    let (mut worst_gradient, mut worst_dw) = (0.0f64, 0.0f64);
+    for ((probe, result), (centre, anchors, octave, local, w)) in
+        probes.iter().zip(&gpu).zip(&cases)
+    {
+        let seed = ladder::octave_seed(probe.salt, *octave);
+        assert_eq!(result.seed, seed, "{octave:?}");
+        assert_eq!(
+            result.offset,
+            ladder::octave_offset(seed).as_vec3().to_array()
+        );
+        assert_eq!(
+            result.bits4,
+            ladder::lattice_bits4(probe.cell4, probe.salt),
+            "{probe:?}"
+        );
+        let (cell, fraction) = ladder::ladder_split(anchors, *octave, local.as_dvec3());
+        assert_eq!(result.cell, cell, "{octave:?}");
+        for axis in 0..3 {
+            worst_fraction =
+                worst_fraction.max((f64::from(result.fraction[axis]) - fraction[axis]).abs());
+        }
+        let p = *centre + local.as_dvec3();
+        let f = octave.frequency_per_m();
+        let (v3, g3) = ladder::octave_noise3(p, *octave, seed);
+        let (v4, g4, dw) = ladder::octave_noise4(p, *w, *octave, seed);
+        let gpu_g3 = DVec3::new(
+            result.noise3[1].into(),
+            result.noise3[2].into(),
+            result.noise3[3].into(),
+        );
+        let gpu_g4 = DVec3::new(
+            result.noise4[1].into(),
+            result.noise4[2].into(),
+            result.noise4[3].into(),
+        );
+        worst3 = worst3.max((f64::from(result.noise3[0]) - v3).abs());
+        worst4 = worst4.max((f64::from(result.noise4[0]) - v4).abs());
+        // Gradients in lattice units (per cell).
+        worst_gradient = worst_gradient
+            .max((gpu_g3 - g3).length() / f)
+            .max((gpu_g4 - g4).length() / f);
+        worst_dw = worst_dw.max((f64::from(result.noise4[4]) - dw).abs());
+    }
+    println!(
+        "ladder noise: {} probes; worst split fraction {worst_fraction:.3e} cell, value 3D \
+         {worst3:.3e}, 4D {worst4:.3e}, gradient {worst_gradient:.3e} per cell, d/dw {worst_dw:.3e}",
+        probes.len()
+    );
+    // f32 lattice coordinates up to ~25 cells from the anchor: ~2e-6 of a
+    // cell, times noise slopes of a few per cell.
+    assert!(worst_fraction < 1.0e-5, "{worst_fraction}");
+    assert!(worst3 < 5.0e-5 && worst4 < 5.0e-5, "{worst3} {worst4}");
+    assert!(
+        worst_gradient < 1.0e-3 && worst_dw < 1.0e-3,
+        "{worst_gradient} {worst_dw}"
+    );
+}
+
+fn rng_word(unit: &mut impl FnMut() -> f64) -> u32 {
+    (unit() * 4_294_967_296.0) as u32
+}
+
 #[test]
 fn shader_sources_never_hash_floats_with_fract_sin() {
     let shaders = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");

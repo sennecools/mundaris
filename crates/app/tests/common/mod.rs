@@ -58,7 +58,8 @@ pub fn provide_gpu_world(context: &GpuContext, recipe: &ProducerRecipe) {
     });
 }
 
-/// Producer jobs for `nodes` exactly as the runtime builds them.
+/// Producer jobs for `nodes` exactly as the runtime builds them (noise
+/// octaves as ladder anchors per tile).
 pub fn jobs(
     recipe: &ProducerRecipe,
     radius_m: f64,

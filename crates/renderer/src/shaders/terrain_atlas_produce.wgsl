@@ -8,14 +8,21 @@ struct Tile {
     n0: vec4<f32>,          // chart-centre direction (body axes), w = |q0|
     face_u: vec4<f32>,      // w = chart width on the cube face
     face_v: vec4<f32>,      // w = cells
-    info: vec4<u32>,        // atlas layer, kind (0 profile, 1 fields), macro count, detail count
-    scale: vec4<f32>,       // radius, unused, unused, unused
+    info: vec4<u32>,        // atlas layer, kind (0 profile, 1 fields, 2 world), macro count, profile detail count
+    scale: vec4<f32>,       // radius, band-limit texel (m), unused, unused
     layer_origin: array<vec4<f32>, 5>, // profile: chart origin x/y/z modulo width, w = K
     layer_info: array<vec4<f32>, 5>,   // profile: mip, width at mip, amplitude, cubic flag
     band_cell: array<vec4<i32>, 6>,    // fields: base cell per band * 2 + layout; world: [0] = texel origin xy, face
     band_frac: array<vec4<f32>, 6>,    // fields: base cell fraction, w = edge; world: [0].xy = texel fraction, [1] = d texel / d st columns
     band_weight: vec4<f32>,            // fields: band footprint weights
-    noise: vec4<u32>,                  // x = detail octave count (origins in `octaves`); world: y = Tier A face cells, z = elevation mip offset, w = mip cells
+    noise: vec4<u32>,                  // x unused; world: y = Tier A face cells, z = elevation mip offset, w = mip cells
+    // Fixed-point anchors of the chart centre per dyadic ladder (M2 design §3):
+    // ladder m's xyz are packed elements 3m..3m+2 of each array.
+    anchor_cell: array<vec4<i32>, 3>,
+    anchor_residual: array<vec4<f32>, 3>,
+    // Ladder fBm layers (see `ladder_layer`): height detail and climate detail.
+    detail: vec4<u32>,
+    climate: vec4<u32>,
 }
 
 struct Dispatch {
@@ -52,7 +59,6 @@ struct FieldsConstants {
 @group(0) @binding(2) var normal_out: texture_storage_2d_array<rgba8snorm, write>;
 @group(0) @binding(3) var<storage, read_write> bounds: array<atomic<u32>>;
 @group(0) @binding(4) var<uniform> dispatch: Dispatch;
-@group(0) @binding(5) var<storage, read> octaves: array<OctaveOrigin>;
 // Collision pages: (height, normal xyz) per sample (pipeline §15.1).
 @group(0) @binding(6) var<storage, read_write> collision_out: array<vec4<f32>>;
 // Page albedo: sRGB-encoded linear colour; alpha 1 where the page owns its
@@ -81,9 +87,6 @@ fn cube_field(index: u32) -> f32 {
 fn cube_n() -> u32 {
     return cube_level_n;
 }
-// Index of `tile` in the job list; its octave origins start at slot * MAX_OCTAVES.
-var<private> tile_slot: u32;
-const MAX_OCTAVES: u32 = 24u;
 
 // ---------------------------------------------------------------- chart
 
@@ -529,16 +532,70 @@ fn evaluate_world(p: ChartPoint, st: vec2<f32>) -> HeightSample {
 
 // ---------------------------------------------------------------- detail fBm
 
-// Band-limited fBm (pipeline §9.3, App. A.3). Band-limit weights are folded into
-// each origin's amplitude on the CPU; octaves above the node's limit are absent.
-// The fade towards the parent level shares the draw shader's morph `t`, which
+// One ladder fBm layer of a tile (`noise::DetailNoise`): `count` octaves on
+// `ladder` from `first_level` down by one level each, seeds
+// `ladder_octave_seed(salt, ladder, level)`, amplitude `amplitude · gain^k`.
+// Packed as (salt, ladder | count << 8 | (first_level + 128) << 16,
+// amplitude bits, gain bits).
+struct LadderLayer {
+    salt: u32,
+    ladder: u32,
+    count: u32,
+    first_level: i32,
+    amplitude: f32,
+    gain: f32,
+}
+
+fn ladder_layer(word: vec4<u32>) -> LadderLayer {
+    var layer: LadderLayer;
+    layer.salt = word.x;
+    layer.ladder = word.y & 3u;
+    layer.count = (word.y >> 8u) & 255u;
+    layer.first_level = i32((word.y >> 16u) & 255u) - 128;
+    layer.amplitude = bitcast<f32>(word.z);
+    layer.gain = bitcast<f32>(word.w);
+    return layer;
+}
+
+// Element `i` of the tile's packed anchor arrays (4 ladders × xyz).
+fn anchor_cell_at(i: u32) -> i32 {
+    return tile.anchor_cell[i / 4u][i % 4u];
+}
+
+fn anchor_residual_at(i: u32) -> f32 {
+    return tile.anchor_residual[i / 4u][i % 4u];
+}
+
+fn tile_anchor_cell(ladder: u32) -> vec3<i32> {
+    let i = 3u * ladder;
+    return vec3<i32>(anchor_cell_at(i), anchor_cell_at(i + 1u), anchor_cell_at(i + 2u));
+}
+
+fn tile_anchor_residual(ladder: u32) -> vec3<f32> {
+    let i = 3u * ladder;
+    return vec3<f32>(anchor_residual_at(i), anchor_residual_at(i + 1u), anchor_residual_at(i + 2u));
+}
+
+// Band-limited fBm (pipeline §9.3, App. A.3) on the tile's ladder anchors (M2
+// design §3). Band-limit weights `octave_weight(f, texel)` are computed here;
+// octaves go from coarse to fine, so the first zero weight ends the layer. The
+// fade towards the parent level shares the draw shader's morph `t`, which
 // blends this page with the parent page. Returns (height, d height / d local).
 fn detail_fbm(local: vec3<f32>) -> vec4<f32> {
+    let layer = ladder_layer(tile.detail);
+    let anchor = tile_anchor_cell(layer.ladder);
+    let residual = tile_anchor_residual(layer.ladder);
     var sum = vec4<f32>(0.0);
-    let first = tile_slot * MAX_OCTAVES;
-    for (var k = 0u; k < min(tile.noise.x, MAX_OCTAVES); k = k + 1u) {
-        let o = octaves[first + k];
-        sum += split_gradient_noise(o, local) * o.amplitude.x;
+    var amplitude = layer.amplitude;
+    for (var k = 0u; k < layer.count; k = k + 1u) {
+        let level = layer.first_level - i32(k);
+        let weight = octave_weight(ladder_frequency(layer.ladder, level), tile.scale.y);
+        if weight <= 0.0 {
+            break;
+        }
+        let seed = ladder_octave_seed(layer.salt, layer.ladder, level);
+        sum += ladder_noise3(anchor, residual, layer.ladder, level, seed, local) * (amplitude * weight);
+        amplitude *= layer.gain;
     }
     return sum;
 }
@@ -596,19 +653,28 @@ fn biome_colour(t: f32, m: f32) -> vec3<f32> {
 // Seed salt of the moisture detail field (`world_field::MOISTURE_SALT`).
 const MOISTURE_SALT: u32 = 0x6d6f6973u;
 
-// Tier B climate detail at chart-local `local` (metres): band-limited fBm from
-// the octaves stored after the height-detail octaves, temperature from their
-// seeds and moisture from the seeds xor MOISTURE_SALT, scaled by the
-// archetype's amplitudes (surface words 1 and 2).
+// Tier B climate detail at chart-local `local` (metres): the tile's climate
+// ladder layer, band-limited like the height detail, temperature from the
+// octave seeds and moisture from the seeds xor MOISTURE_SALT (each with its
+// own seed's sub-cell offset), scaled by the archetype's amplitudes (surface
+// words 1 and 2).
 fn climate_detail(local: vec3<f32>) -> vec2<f32> {
+    let layer = ladder_layer(tile.climate);
+    let anchor = tile_anchor_cell(layer.ladder);
+    let residual = tile_anchor_residual(layer.ladder);
     var sum = vec2<f32>(0.0);
-    let first = tile_slot * MAX_OCTAVES + tile.noise.x;
-    let count = min(tile.info.w, MAX_OCTAVES - min(tile.noise.x, MAX_OCTAVES));
-    for (var k = 0u; k < count; k = k + 1u) {
-        var o = octaves[first + k];
-        sum.x += split_gradient_noise(o, local).x * o.amplitude.x;
-        o.seed = o.seed ^ MOISTURE_SALT;
-        sum.y += split_gradient_noise(o, local).x * o.amplitude.x;
+    var amplitude = layer.amplitude;
+    for (var k = 0u; k < layer.count; k = k + 1u) {
+        let level = layer.first_level - i32(k);
+        let weight = octave_weight(ladder_frequency(layer.ladder, level), tile.scale.y);
+        if weight <= 0.0 {
+            break;
+        }
+        let seed = ladder_octave_seed(layer.salt, layer.ladder, level);
+        let a = amplitude * weight;
+        sum.x += ladder_noise3(anchor, residual, layer.ladder, level, seed, local).x * a;
+        sum.y += ladder_noise3(anchor, residual, layer.ladder, level, seed ^ MOISTURE_SALT, local).x * a;
+        amplitude *= layer.gain;
     }
     return sum * vec2<f32>(surface_f32(1u), surface_f32(2u));
 }
@@ -683,8 +749,8 @@ fn evaluate(st: vec2<f32>) -> vec4<f32> {
     } else {
         sample_value = evaluate_world(p, st);
     }
-    if tile.noise.x > 0u {
-        // Split lattice: the CPU origin is the exact f64 chart centre n0 * R, so
+    if ((tile.detail.y >> 8u) & 255u) > 0u {
+        // Ladder anchors: the CPU anchors the exact f64 chart centre n0 * R, so
         // local = diff * R places samples at the true surface point.
         let detail = detail_fbm(p.diff * tile.scale.x);
         sample_value.height += detail.x;
@@ -709,7 +775,6 @@ fn produce_heights(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= dispatch.side || id.y >= dispatch.side {
         return;
     }
-    tile_slot = dispatch.base + id.z;
     tile = tiles[dispatch.base + id.z];
     let st = (vec2<f32>(id.xy) - vec2<f32>(1.0)) / f32(dispatch.cells);
     let value = evaluate(st);
@@ -742,7 +807,6 @@ fn produce_normals(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= dispatch.side || id.y >= dispatch.side {
         return;
     }
-    tile_slot = dispatch.base + id.z;
     tile = tiles[dispatch.base + id.z];
     let st = (vec2<f32>(id.xy) - vec2<f32>(1.0)) / f32(dispatch.cells);
     let value = evaluate(st);
@@ -758,8 +822,7 @@ fn produce_collision(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= dispatch.side || id.y >= dispatch.side {
         return;
     }
-    tile_slot = dispatch.base + id.z;
-    tile = tiles[tile_slot];
+    tile = tiles[dispatch.base + id.z];
     let st = vec2<f32>(id.xy) / f32(dispatch.cells);
     let value = evaluate(st);
     let side = dispatch.side;

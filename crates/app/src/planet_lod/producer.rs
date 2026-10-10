@@ -4,9 +4,10 @@ use super::select::NodeChart;
 use anyhow::{Result, ensure};
 use astrum_math::surface::{CubeFace, CubePatchAddress};
 use astrum_renderer::{
-    AtlasChart, AtlasFieldsConstants, AtlasImageLevel, AtlasOctave, AtlasProfileLayer, AtlasSource,
-    AtlasTileKind, AtlasWorldSource, MAX_ATLAS_OCTAVES,
+    AtlasChart, AtlasFieldsConstants, AtlasImageLevel, AtlasLadderLayer, AtlasOctaves,
+    AtlasProfileLayer, AtlasSource, AtlasTileKind, AtlasWorldSource,
 };
+use astrum_world::terrain::noise::DetailNoise;
 use astrum_world::terrain::producer::{
     FieldsRecipe, MOON_FIELD_JITTER, MOON_FIELD_LAYOUT_SHIFTS, MOON_FIELD_SHELL,
     MOON_FIELD_SUPPORT, ProducerRecipe, ProfileLayer, ProfilePyramid, ProfileRecipe,
@@ -254,7 +255,6 @@ pub fn tile_kind(
         ProducerRecipe::Profile(profile) => Ok(profile_kind(profile, chart.n0, texel_m)),
         ProducerRecipe::Fields(fields) => fields_kind(fields, chart.n0, texel_m),
         ProducerRecipe::World(world) => {
-            let climate_octaves = climate_origins(recipe, address, chart, cells)?.len() as u32;
             let cells = world.field.inputs().face_cells as u32;
             let layout = astrum_renderer::tier_a::field_mip_layout(cells);
             let base_texel = 2.0 * world.radius_m / f64::from(cells);
@@ -275,7 +275,6 @@ pub fn tile_kind(
                 texel_origin: [whole.x as i32, whole.y as i32],
                 texel_fraction: (map.origin - whole).as_vec2().to_array(),
                 texel_jacobian: map.jacobian.map(|column| column.as_vec2().to_array()),
-                climate_octaves,
             })
         }
     }
@@ -334,63 +333,55 @@ pub fn world_texel_map(
     }
 }
 
-/// Detail-noise octave origins of one node, split in f64 at the exact chart
-/// centre `n0 * R` (pipeline §4.4). The GPU adds `diff * R`, its chart-relative
-/// offset from that same centre, so f32 never holds an absolute lattice
-/// coordinate. Octaves above the node's band limit are omitted.
+/// Noise octaves of one node (M2 design §3): fixed-point ladder anchors of
+/// the exact chart centre `n0 * R`, computed in f64. The GPU derives every
+/// octave's lattice cell and fraction from them and adds `diff * R`, its
+/// chart-relative offset from that same centre, so f32 never holds an
+/// absolute lattice coordinate. Band-limit weights at the node's texel are
+/// computed on the GPU.
 pub fn detail_octaves(
     recipe: &ProducerRecipe,
     address: CubePatchAddress,
     chart: &NodeChart,
     cells: u32,
-) -> Result<Vec<AtlasOctave>> {
+) -> Result<AtlasOctaves> {
     let texel_m =
         astrum_world::terrain::producer::tile_texel_m(recipe.radius_m(), address.level(), cells);
-    let mut origins = match recipe.detail_noise() {
-        Some(detail) => detail
-            .split(chart.n0 * recipe.radius_m(), texel_m)
-            .map_err(|_| anyhow::anyhow!("detail noise lattice exceeds the GPU integer range"))?,
-        None => Vec::new(),
+    let climate = match recipe {
+        ProducerRecipe::World(world) => world.field.look().climate.as_ref().map(|c| &c.noise),
+        _ => None,
     };
-    // World maps: climate-detail octaves follow the height-detail octaves
-    // (`AtlasTileKind::World::climate_octaves` counts them).
-    origins.extend(climate_origins(recipe, address, chart, cells)?);
-    ensure!(
-        origins.len() <= MAX_ATLAS_OCTAVES,
-        "detail noise has more octaves than the GPU producer supports"
-    );
-    Ok(origins
-        .into_iter()
-        .map(|o| AtlasOctave {
-            cell: o.cell,
-            seed: o.seed,
-            fraction: o.fraction,
-            frequency_per_m: o.frequency_per_m,
-            amplitude_m: o.amplitude_m,
-        })
-        .collect())
+    let mut octaves = AtlasOctaves {
+        texel_m: texel_m as f32,
+        detail: ladder_layer(recipe.detail_noise()),
+        climate: ladder_layer(climate),
+        ..Default::default()
+    };
+    if octaves.detail.octaves + octaves.climate.octaves > 0 {
+        let anchors = astrum_world::terrain::ladder::tile_anchors(chart.n0 * recipe.radius_m())
+            .map_err(|_| anyhow::anyhow!("noise anchors exceed the GPU integer range"))?;
+        octaves.anchor_cells = anchors.cells;
+        octaves.anchor_residuals = anchors.residual;
+    }
+    Ok(octaves)
 }
 
-/// Climate-detail octave origins of a world-map node (split like the height
-/// detail, §4.4); empty for other recipes.
-fn climate_origins(
-    recipe: &ProducerRecipe,
-    address: CubePatchAddress,
-    chart: &NodeChart,
-    cells: u32,
-) -> Result<Vec<astrum_world::terrain::noise::OctaveOrigin>> {
-    let ProducerRecipe::World(world) = recipe else {
-        return Ok(Vec::new());
+/// GPU description of a compiled ladder fBm layer (empty without one).
+fn ladder_layer(noise: Option<&DetailNoise>) -> AtlasLadderLayer {
+    let Some(noise) = noise else {
+        return AtlasLadderLayer::default();
     };
-    let Some(climate) = world.field.look().climate.as_ref() else {
-        return Ok(Vec::new());
+    let Some(first) = noise.octaves().first() else {
+        return AtlasLadderLayer::default();
     };
-    let texel_m =
-        astrum_world::terrain::producer::tile_texel_m(recipe.radius_m(), address.level(), cells);
-    climate
-        .noise
-        .split(chart.n0 * recipe.radius_m(), texel_m)
-        .map_err(|_| anyhow::anyhow!("climate detail lattice exceeds the GPU integer range"))
+    AtlasLadderLayer {
+        salt: noise.salt(),
+        ladder: u32::from(first.octave.ladder),
+        first_level: first.octave.level,
+        octaves: noise.octaves().len() as u32,
+        amplitude_m: noise.amplitude_m() as f32,
+        gain: noise.gain() as f32,
+    }
 }
 
 /// Conservative absolute radial-offset bound of a recipe, used before any

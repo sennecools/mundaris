@@ -28,7 +28,7 @@ const PRODUCE_SHADER: &str = concat!(
 
 /// Largest number of producer jobs accepted in one frame.
 pub const MAX_ATLAS_JOBS_PER_FRAME: usize = 256;
-const TILE_BYTES: u64 = 464;
+const TILE_BYTES: u64 = 592;
 const INSTANCE_BYTES: u64 = 224;
 const DISPATCH_STRIDE: u64 = 256;
 /// Largest number of collision pages produced in one frame.
@@ -45,10 +45,10 @@ const MAX_DISPATCHES: u64 = (2 * MAX_ATLAS_JOBS_PER_FRAME + MAX_COLLISION_JOBS_P
 const READBACK_SLOTS: usize = 4;
 /// Tier A bake passes encoded per frame for a world source nobody waits on.
 const TIER_A_PASSES_PER_FRAME: usize = 24;
-/// Detail-noise octave origins per producer job (`OctaveOrigin` in the shader).
-pub const MAX_ATLAS_OCTAVES: usize = 24;
-const OCTAVE_BYTES: u64 = 48;
-const OCTAVE_BUFFER_BYTES: u64 = OCTAVE_BYTES * (MAX_ATLAS_OCTAVES * MAX_TILE_SLOTS) as u64;
+/// Dyadic ladders of the producer's noise anchors (M2 design §3).
+pub const ATLAS_LADDERS: usize = 4;
+/// Ladder levels the producer's `ladder_split` supports.
+pub const ATLAS_LADDER_LEVELS: std::ops::RangeInclusive<i32> = -11..=19;
 /// Height bounds are reported per cell of a 4x4 grid over each tile.
 pub const ATLAS_BOUNDS_GRID: usize = 4;
 const BOUNDS_WORDS_PER_JOB: usize = 2 * ATLAS_BOUNDS_GRID * ATLAS_BOUNDS_GRID;
@@ -388,22 +388,69 @@ pub enum AtlasTileKind {
         texel_fraction: [f32; 2],
         /// Columns d texel / d s and d texel / d t.
         texel_jacobian: [[f32; 2]; 2],
-        /// Climate-detail octaves stored after the height-detail octaves in
-        /// the job's `octaves` (temperature from their seeds, moisture from
-        /// the seeds xor the moisture salt).
-        climate_octaves: u32,
     },
 }
 
-/// Lattice origin of one detail-noise octave for one job, split on the CPU in
-/// f64 (pipeline §4.4). `amplitude_m` includes the node's band-limit weight.
+/// One band-limited fBm layer on a dyadic ladder (`noise::DetailNoise` in
+/// the world crate): `octaves` octaves of wavelength `s_ladder · 2^level`
+/// from `first_level` down by one level each, seeds
+/// `octave_seed(salt, (ladder, level))` and amplitude `amplitude_m · gain^k`.
+/// The producer computes each octave's band-limit weight. `octaves = 0`
+/// disables the layer.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct AtlasOctave {
-    pub cell: [i32; 3],
-    pub seed: u32,
-    pub fraction: [f32; 3],
-    pub frequency_per_m: f32,
+pub struct AtlasLadderLayer {
+    pub salt: u32,
+    pub ladder: u32,
+    pub first_level: i32,
+    pub octaves: u32,
     pub amplitude_m: f32,
+    pub gain: f32,
+}
+
+impl AtlasLadderLayer {
+    fn validate(&self) -> Result<(), String> {
+        if self.octaves == 0 {
+            return Ok(());
+        }
+        let finest = self.first_level - (self.octaves.min(255) as i32 - 1);
+        if self.ladder as usize >= ATLAS_LADDERS
+            || self.octaves > 255
+            || !ATLAS_LADDER_LEVELS.contains(&self.first_level)
+            || !ATLAS_LADDER_LEVELS.contains(&finest)
+        {
+            return Err(format!("atlas ladder layer out of range: {self:?}"));
+        }
+        Ok(())
+    }
+
+    /// (salt, ladder | octaves << 8 | (first_level + 128) << 16, amplitude
+    /// bits, gain bits): `ladder_layer` in the producer shader.
+    fn packed(&self) -> [u32; 4] {
+        [
+            self.salt,
+            self.ladder | self.octaves << 8 | ((self.first_level + 128) as u32) << 16,
+            self.amplitude_m.to_bits(),
+            self.gain.to_bits(),
+        ]
+    }
+}
+
+/// Noise octaves of one job (M2 design §3): the fixed-point anchors of the
+/// chart centre per ladder, `A_m = round(c / s_m · 2^11)` and the residual
+/// `r_m = c / s_m − A_m · 2^-11` (computed on the CPU in f64; see
+/// `ladder::tile_anchors`), the band-limit texel, and the height-detail and
+/// climate-detail layers. The producer derives every octave's lattice cell
+/// and fraction from the anchors exactly.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AtlasOctaves {
+    pub anchor_cells: [[i32; 3]; ATLAS_LADDERS],
+    pub anchor_residuals: [[f32; 3]; ATLAS_LADDERS],
+    /// Texel footprint (m) the octaves' band-limit weights are computed for.
+    pub texel_m: f32,
+    pub detail: AtlasLadderLayer,
+    /// World maps: temperature from the octave seeds, moisture from the
+    /// seeds xor the moisture salt.
+    pub climate: AtlasLadderLayer,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -415,8 +462,8 @@ pub struct AtlasProduceJob {
     pub chart: AtlasChart,
     pub radius_m: f32,
     pub kind: AtlasTileKind,
-    /// Detail-noise octaves, at most `MAX_ATLAS_OCTAVES`.
-    pub octaves: Vec<AtlasOctave>,
+    /// Ladder anchors and noise layers.
+    pub octaves: AtlasOctaves,
 }
 
 /// Atlas layer plus the sub-rectangle `[origin, origin + scale]` of its chart
@@ -573,7 +620,6 @@ pub(crate) struct TerrainAtlasRenderer {
     source_layout: wgpu::BindGroupLayout,
     produce_group: wgpu::BindGroup,
     tiles: wgpu::Buffer,
-    octaves: wgpu::Buffer,
     dispatch: wgpu::Buffer,
     bounds: wgpu::Buffer,
     readbacks: Vec<Readback>,
@@ -710,7 +756,8 @@ impl TerrainAtlasRenderer {
                     },
                     count: None,
                 },
-                storage(5, true),
+                // Binding 5 (the per-job octave origins) retired with the
+                // ladder anchors in `Tile` (M2).
                 storage(6, false),
                 storage_texture(7, wgpu::TextureFormat::Rgba8Unorm),
                 storage_texture(8, wgpu::TextureFormat::Rgba16Float),
@@ -776,12 +823,6 @@ impl TerrainAtlasRenderer {
             label: Some("Terrain atlas producer dispatches"),
             size: DISPATCH_STRIDE * MAX_DISPATCHES,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let octaves = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Terrain atlas detail octave origins"),
-            size: OCTAVE_BUFFER_BYTES,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let bounds = device.create_buffer(&wgpu::BufferDescriptor {
@@ -857,10 +898,6 @@ impl TerrainAtlasRenderer {
                         offset: 0,
                         size: wgpu::BufferSize::new(16),
                     }),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: octaves.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
@@ -1113,7 +1150,6 @@ impl TerrainAtlasRenderer {
             source_layout,
             produce_group,
             tiles,
-            octaves,
             dispatch,
             bounds,
             readbacks,
@@ -1365,13 +1401,8 @@ impl TerrainAtlasRenderer {
                     job.source
                 ));
             }
-            if job.octaves.len() > MAX_ATLAS_OCTAVES {
-                return Err(format!(
-                    "atlas job has {} detail octaves; at most {MAX_ATLAS_OCTAVES}",
-                    job.octaves.len()
-                ));
-            }
-            Ok(())
+            job.octaves.detail.validate()?;
+            job.octaves.climate.validate()
         };
         let mut ordered: Vec<&AtlasProduceJob> = frame.jobs.iter().collect();
         ordered.sort_by_key(|job| job.source);
@@ -1387,7 +1418,6 @@ impl TerrainAtlasRenderer {
             validate(job)?;
         }
         // Tile slots: atlas jobs from 0, collision jobs from MAX_ATLAS_JOBS_PER_FRAME.
-        // Each slot's detail octaves start at slot * MAX_ATLAS_OCTAVES.
         for (first, jobs) in [(0, &ordered), (MAX_ATLAS_JOBS_PER_FRAME, &collision)] {
             if jobs.is_empty() {
                 continue;
@@ -1397,12 +1427,6 @@ impl TerrainAtlasRenderer {
                 pack_tile(&mut tile_bytes, job);
             }
             queue.write_buffer(&self.tiles, first as u64 * TILE_BYTES, &tile_bytes);
-            for (index, job) in jobs.iter().enumerate() {
-                if !job.octaves.is_empty() {
-                    let offset = (first + index) as u64 * MAX_ATLAS_OCTAVES as u64 * OCTAVE_BYTES;
-                    queue.write_buffer(&self.octaves, offset, &pack_octaves(&job.octaves));
-                }
-            }
         }
         if !ordered.is_empty() {
             let mut initial = Vec::with_capacity(ordered.len() * BOUNDS_WORDS_PER_JOB * 4);
@@ -2024,26 +2048,6 @@ fn hash_main(@builtin(global_invocation_id) id: vec3<u32>) {
     if inputs.is_empty() || inputs.len() > 64 * 65_535 {
         return Err("hash validation needs 1..=4194240 inputs".into());
     }
-    let source = format!("{}{ENTRY}", include_str!("shaders/terrain_noise.wgsl"));
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("Lattice hash validation"),
-        source: wgpu::ShaderSource::Wgsl(source.into()),
-    });
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("Lattice hash validation"),
-        layout: None,
-        module: &module,
-        entry_point: Some("hash_main"),
-        compilation_options: Default::default(),
-        cache: None,
-    });
-    let bytes = (inputs.len() * 16) as u64;
-    let input = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Lattice hash inputs"),
-        size: bytes,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
     let packed: Vec<u8> = inputs
         .iter()
         .flat_map(|(cell, seed)| {
@@ -2052,21 +2056,220 @@ fn hash_main(@builtin(global_invocation_id) id: vec3<u32>) {
                 .flat_map(i32::to_le_bytes)
         })
         .collect();
-    queue.write_buffer(&input, 0, &packed);
+    let words = run_noise_kernel(device, queue, ENTRY, "hash_main", &packed, inputs.len(), 4)?;
+    Ok(words
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| [chunk[0], chunk[1], chunk[2]])
+        .collect())
+}
+
+/// One probe of the producer's ladder noise (`terrain_noise.wgsl`): octave
+/// `(ladder, level)` of a layer with seed salt `salt`, split from a tile's
+/// anchor on that ladder at `local` metres from the tile centre, with the 4th
+/// lattice coordinate `w_cell + w_frac`. `cell4` is hashed with `salt` as the
+/// seed (`lattice_bits4`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LadderNoiseProbe {
+    pub anchor_cell: [i32; 3],
+    pub anchor_residual: [f32; 3],
+    pub ladder: u32,
+    pub level: i32,
+    pub salt: u32,
+    pub local: [f32; 3],
+    pub w_cell: i32,
+    pub w_frac: f32,
+    pub cell4: [i32; 4],
+}
+
+/// GPU results of one [`LadderNoiseProbe`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LadderNoiseResult {
+    /// `ladder_octave_seed(salt, ladder, level)`.
+    pub seed: u32,
+    /// `ladder_octave_offset(seed)`.
+    pub offset: [f32; 3],
+    /// `lattice_bits4(cell4, salt)`.
+    pub bits4: [u32; 4],
+    /// `ladder_split`: integer cell and f32 fraction (without the offset).
+    pub cell: [i32; 3],
+    pub fraction: [f32; 3],
+    /// `ladder_noise3`: value and d value / d local.
+    pub noise3: [f32; 4],
+    /// `ladder_noise4`: value, d value / d local, d value / d w.
+    pub noise4: [f32; 5],
+}
+
+/// Evaluate the producer's ladder seeds, offsets, 4D hash, split and 3D/4D
+/// octave noise for `probes` on a caller-owned device. Validation-only path:
+/// blocking, allocates per call.
+pub fn ladder_noise_for_validation(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    probes: &[LadderNoiseProbe],
+) -> Result<Vec<LadderNoiseResult>, String> {
+    const ENTRY: &str = "
+struct Probe {
+    a: vec4<u32>,
+    b: vec4<u32>,
+    c: vec4<u32>,
+    d: vec4<u32>,
+    e: vec4<u32>,
+}
+struct ProbeResult {
+    a: vec4<u32>,
+    b: vec4<u32>,
+    c: vec4<u32>,
+    d: vec4<u32>,
+    e: vec4<u32>,
+    f: vec4<u32>,
+}
+@group(0) @binding(0) var<storage, read> probe_inputs: array<Probe>;
+@group(0) @binding(1) var<storage, read_write> probe_outputs: array<ProbeResult>;
+@compute @workgroup_size(64)
+fn probe_main(@builtin(global_invocation_id) id: vec3<u32>) {
+    if id.x >= arrayLength(&probe_inputs) {
+        return;
+    }
+    let p = probe_inputs[id.x];
+    let anchor = bitcast<vec3<i32>>(p.a.xyz);
+    let ladder = p.a.w;
+    let residual = bitcast<vec3<f32>>(p.b.xyz);
+    let level = bitcast<i32>(p.b.w);
+    let local = bitcast<vec3<f32>>(p.c.xyz);
+    let salt = p.c.w;
+    let seed = ladder_octave_seed(salt, ladder, level);
+    let split = ladder_split(anchor, residual, ladder, level, local);
+    let n3 = ladder_noise3(anchor, residual, ladder, level, seed, local);
+    let n4 = ladder_noise4(anchor, residual, ladder, level, seed, local, bitcast<i32>(p.d.x),
+        bitcast<f32>(p.d.y));
+    var o: ProbeResult;
+    o.a = vec4<u32>(seed, bitcast<vec3<u32>>(ladder_octave_offset(seed)));
+    o.b = lattice_bits4(bitcast<vec4<i32>>(p.e), salt);
+    o.c = vec4<u32>(bitcast<vec3<u32>>(split.cell), 0u);
+    o.d = vec4<u32>(bitcast<vec3<u32>>(split.q), bitcast<u32>(n3.x));
+    o.e = vec4<u32>(bitcast<vec3<u32>>(n3.yzw), bitcast<u32>(n4.value));
+    o.f = vec4<u32>(bitcast<vec3<u32>>(n4.gradient), bitcast<u32>(n4.dw));
+    probe_outputs[id.x] = o;
+}
+";
+    if probes.is_empty() || probes.len() > 64 * 65_535 {
+        return Err("ladder validation needs 1..=4194240 probes".into());
+    }
+    let f = f32::to_bits;
+    let packed: Vec<u8> = probes
+        .iter()
+        .flat_map(|p| {
+            let c = p.anchor_cell.map(|v| v as u32);
+            let r = p.anchor_residual.map(f);
+            let l = p.local.map(f);
+            let e = p.cell4.map(|v| v as u32);
+            [
+                c[0],
+                c[1],
+                c[2],
+                p.ladder,
+                r[0],
+                r[1],
+                r[2],
+                p.level as u32,
+                l[0],
+                l[1],
+                l[2],
+                p.salt,
+                p.w_cell as u32,
+                f(p.w_frac),
+                0,
+                0,
+                e[0],
+                e[1],
+                e[2],
+                e[3],
+            ]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+        })
+        .collect();
+    let words = run_noise_kernel(
+        device,
+        queue,
+        ENTRY,
+        "probe_main",
+        &packed,
+        probes.len(),
+        24,
+    )?;
+    let float = f32::from_bits;
+    Ok(words
+        .as_chunks::<24>()
+        .0
+        .iter()
+        .map(|w| LadderNoiseResult {
+            seed: w[0],
+            offset: [float(w[1]), float(w[2]), float(w[3])],
+            bits4: [w[4], w[5], w[6], w[7]],
+            cell: [w[8] as i32, w[9] as i32, w[10] as i32],
+            fraction: [float(w[12]), float(w[13]), float(w[14])],
+            noise3: [float(w[15]), float(w[16]), float(w[17]), float(w[18])],
+            noise4: [
+                float(w[19]),
+                float(w[20]),
+                float(w[21]),
+                float(w[22]),
+                float(w[23]),
+            ],
+        })
+        .collect())
+}
+
+/// Run a validation kernel `entry` (appended to `terrain_noise.wgsl`) over
+/// `count` records: binding 0 holds `inputs`, binding 1 receives
+/// `output_words` u32 per record, which are read back.
+fn run_noise_kernel(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    entry: &str,
+    entry_point: &str,
+    inputs: &[u8],
+    count: usize,
+    output_words: usize,
+) -> Result<Vec<u32>, String> {
+    let source = format!("{}{entry}", include_str!("shaders/terrain_noise.wgsl"));
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("Noise validation"),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("Noise validation"),
+        layout: None,
+        module: &module,
+        entry_point: Some(entry_point),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let input = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Noise validation inputs"),
+        size: inputs.len() as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&input, 0, inputs);
+    let bytes = (count * output_words * 4) as u64;
     let output = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Lattice hash outputs"),
+        label: Some("Noise validation outputs"),
         size: bytes,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Lattice hash readback"),
+        label: Some("Noise validation readback"),
         size: bytes,
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
     let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("Lattice hash validation"),
+        label: Some("Noise validation"),
         layout: &pipeline.get_bind_group_layout(0),
         entries: &[
             wgpu::BindGroupEntry {
@@ -2084,7 +2287,7 @@ fn hash_main(@builtin(global_invocation_id) id: vec3<u32>) {
         let mut pass = encoder.begin_compute_pass(&Default::default());
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &group, &[]);
-        pass.dispatch_workgroups((inputs.len() as u32).div_ceil(64), 1, 1);
+        pass.dispatch_workgroups((count as u32).div_ceil(64), 1, 1);
     }
     encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, bytes);
     queue.submit([encoder.finish()]);
@@ -2097,12 +2300,10 @@ fn hash_main(@builtin(global_invocation_id) id: vec3<u32>) {
         .get_mapped_range()
         .map_err(|error| error.to_string())?;
     Ok(view
-        .as_chunks::<16>()
+        .as_chunks::<4>()
         .0
         .iter()
-        .map(|chunk| {
-            std::array::from_fn(|i| u32::from_le_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap()))
-        })
+        .map(|word| u32::from_le_bytes(*word))
         .collect())
 }
 
@@ -2414,14 +2615,12 @@ fn pack_tile(out: &mut Vec<u8>, job: &AtlasProduceJob) {
             detail_layers,
         } => (0u32, macro_layers.len() as u32, detail_layers.len() as u32),
         AtlasTileKind::Fields { .. } => (1, 0, 0),
-        AtlasTileKind::World {
-            climate_octaves, ..
-        } => (2, 0, *climate_octaves),
+        AtlasTileKind::World { .. } => (2, 0, 0),
     };
     for value in [job.layer, kind, macro_count, detail_count] {
         out.extend_from_slice(&value.to_le_bytes());
     }
-    out.extend(f32_bytes(&[job.radius_m, 0.0, 0.0, 0.0]));
+    out.extend(f32_bytes(&[job.radius_m, job.octaves.texel_m, 0.0, 0.0]));
     let mut origins = [[0.0f32; 4]; 5];
     let mut infos = [[0.0f32; 4]; 5];
     let mut cells = [[0i32; 4]; 6];
@@ -2488,42 +2687,33 @@ fn pack_tile(out: &mut Vec<u8>, job: &AtlasProduceJob) {
         out.extend(f32_bytes(value));
     }
     out.extend(f32_bytes(&weights));
-    let (mip_offset, mip_cells, base_cells, climate) = match job.kind {
+    let (mip_offset, mip_cells, base_cells) = match job.kind {
         AtlasTileKind::World {
             mip_offset,
             mip_cells,
             base_cells,
-            climate_octaves,
             ..
-        } => (mip_offset, mip_cells, base_cells, climate_octaves),
-        _ => (0, 0, 0, 0),
+        } => (mip_offset, mip_cells, base_cells),
+        _ => (0, 0, 0),
     };
-    // noise.x counts the height-detail octaves; climate octaves follow them.
-    let height_octaves = (job.octaves.len() as u32).saturating_sub(climate);
-    for value in [height_octaves, base_cells, mip_offset, mip_cells] {
+    for value in [0, base_cells, mip_offset, mip_cells] {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    // Ladder anchors: 4 ladders × xyz packed into three vec4s each.
+    let octaves = &job.octaves;
+    for value in octaves.anchor_cells.as_flattened() {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out.extend(f32_bytes(octaves.anchor_residuals.as_flattened()));
+    for value in octaves
+        .detail
+        .packed()
+        .into_iter()
+        .chain(octaves.climate.packed())
+    {
         out.extend_from_slice(&value.to_le_bytes());
     }
     debug_assert_eq!((out.len() - start) as u64, TILE_BYTES);
-}
-
-fn pack_octaves(octaves: &[AtlasOctave]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(octaves.len() * OCTAVE_BYTES as usize);
-    for octave in octaves {
-        for value in octave.cell {
-            out.extend_from_slice(&value.to_le_bytes());
-        }
-        out.extend_from_slice(&octave.seed.to_le_bytes());
-        out.extend(f32_bytes(&octave.fraction));
-        out.extend(f32_bytes(&[
-            octave.frequency_per_m,
-            octave.amplitude_m,
-            0.0,
-            0.0,
-            0.0,
-        ]));
-    }
-    debug_assert_eq!(out.len() as u64, octaves.len() as u64 * OCTAVE_BYTES);
-    out
 }
 
 fn pack_instance(out: &mut Vec<u8>, instance: &AtlasInstance) {
@@ -2724,10 +2914,32 @@ mod tests {
                     fractions: [[0.0; 3]; 6],
                     band_weights: [1.0; 3],
                 },
-                octaves: vec![AtlasOctave::default(); 2],
+                octaves: AtlasOctaves::default(),
             },
         );
         assert_eq!(bytes.len() as u64, TILE_BYTES);
+        let mut octaves = AtlasOctaves {
+            texel_m: 0.75,
+            detail: AtlasLadderLayer {
+                salt: 0xdead_beef,
+                ladder: 2,
+                first_level: -3,
+                octaves: 9,
+                amplitude_m: 24.0,
+                gain: 0.5,
+            },
+            climate: AtlasLadderLayer {
+                salt: 7,
+                ladder: 1,
+                first_level: 14,
+                octaves: 9,
+                amplitude_m: 0.2,
+                gain: 0.6,
+            },
+            ..Default::default()
+        };
+        octaves.anchor_cells[1][2] = -5;
+        octaves.anchor_residuals[3][0] = 0.25;
         let mut bytes = Vec::new();
         pack_tile(
             &mut bytes,
@@ -2745,9 +2957,8 @@ mod tests {
                     texel_origin: [-3, 7],
                     texel_fraction: [0.25, 0.5],
                     texel_jacobian: [[2.0, 0.0], [0.0, 2.0]],
-                    climate_octaves: 0,
                 },
-                octaves: Vec::new(),
+                octaves,
             },
         );
         assert_eq!(bytes.len() as u64, TILE_BYTES);
@@ -2759,10 +2970,42 @@ mod tests {
         assert_eq!(i32::from_le_bytes(word(248)), 5);
         assert_eq!(f32::from_le_bytes(word(340)), 0.5);
         assert_eq!(f32::from_le_bytes(word(352)), 2.0);
+        // scale.y = band-limit texel; anchor_cell from 464 (ladder 1 z is
+        // element 5), anchor_residual from 512 (ladder 3 x is element 9),
+        // detail at 560 and climate at 576 (`ladder_layer`).
+        assert_eq!(f32::from_le_bytes(word(68)), 0.75);
+        assert_eq!(i32::from_le_bytes(word(464 + 5 * 4)), -5);
+        assert_eq!(f32::from_le_bytes(word(512 + 9 * 4)), 0.25);
+        assert_eq!(u32::from_le_bytes(word(560)), 0xdead_beef);
+        let packed = u32::from_le_bytes(word(564));
+        assert_eq!(packed & 3, 2);
+        assert_eq!((packed >> 8) & 255, 9);
+        assert_eq!(((packed >> 16) & 255) as i32 - 128, -3);
+        assert_eq!(f32::from_le_bytes(word(568)), 24.0);
+        assert_eq!(f32::from_le_bytes(word(572)), 0.5);
+        assert_eq!(u32::from_le_bytes(word(576)), 7);
         assert_eq!(
-            pack_octaves(&[AtlasOctave::default(); 3]).len() as u64,
-            3 * OCTAVE_BYTES
+            ((u32::from_le_bytes(word(580)) >> 16) & 255) as i32 - 128,
+            14
         );
+        assert!(octaves.detail.validate().is_ok());
+        for bad in [
+            AtlasLadderLayer {
+                ladder: 4,
+                ..octaves.detail
+            },
+            AtlasLadderLayer {
+                first_level: 20,
+                ..octaves.detail
+            },
+            AtlasLadderLayer {
+                first_level: -4,
+                octaves: 9,
+                ..octaves.detail
+            },
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?}");
+        }
         let mut bytes = Vec::new();
         pack_instance(&mut bytes, &AtlasInstance::default());
         assert_eq!(bytes.len() as u64, INSTANCE_BYTES);

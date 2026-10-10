@@ -1,30 +1,32 @@
-//! Integer-hashed gradient noise on a split lattice and band-limited fBm
-//! detail (`ASTRUM_TERRAIN_PIPELINE.md` §4.4, §9.3, §17.1, App. A.1–A.3).
+//! Integer-hashed gradient noise and band-limited fBm detail on dyadic octave
+//! ladders (`ASTRUM_TERRAIN_PIPELINE.md` §4.4, §9.3, §17.1, App. A.1–A.3; M2
+//! Shape design §3).
 //!
 //! The GPU producer (`terrain_noise.wgsl`) evaluates the same functions in f32.
-//! It never sees an absolute lattice coordinate: per node and octave, the CPU
-//! splits `node_centre * frequency` in f64 into an integer cell and an f32
-//! fraction ([`DetailNoise::split`]), and the GPU adds the f32 offset of each
-//! sample from the node centre. This module is the f64 test oracle for that
-//! evaluation; hashing is integer-only so both sides pick identical lattice
-//! gradients.
+//! It never sees an absolute lattice coordinate: each tile carries fixed-point
+//! anchors of its chart centre ([`super::ladder::tile_anchors`]), from which
+//! the GPU derives every octave's integer cell and fraction exactly, then adds
+//! the f32 offset of each sample from the centre. This module is the f64 test
+//! oracle for that evaluation; hashing is integer-only so both sides pick
+//! identical lattice gradients, octave seeds and sub-cell offsets.
+use super::ladder::{LadderOctave, octave_noise3, octave_seed, snap_wavelength};
 use glam::DVec3;
 use serde::{Deserialize, Serialize};
 
-/// Largest number of octaves a definition may produce; also the per-node
-/// octave capacity of the GPU producer.
+/// Largest number of octaves a definition may produce (a content sanity
+/// limit; the GPU producer derives octaves from the tile anchors and keeps no
+/// per-octave table).
 pub const MAX_DETAIL_OCTAVES: usize = 16;
 /// Conservative bound of `|gradient_noise|` for unit lattice gradients
 /// (the attained maximum of 3D Perlin noise is about `sqrt(3)/2`).
 pub const GRADIENT_NOISE_BOUND: f64 = 1.0;
-/// Largest absolute lattice coordinate accepted, keeping every cell inside i32
-/// with headroom for the GPU's local cell offsets.
-const MAX_LATTICE_COORDINATE: f64 = (1u32 << 30) as f64;
 
 /// Authored band-limited fBm detail layer added to a body's surface height.
-/// Octave `k` has wavelength `base_wavelength_m / lacunarity^k` and amplitude
-/// `amplitude_m * gain^k`; octaves stop before the wavelength drops below
-/// `min_wavelength_m`.
+/// The base wavelength snaps to the nearest dyadic ladder rung
+/// ([`snap_wavelength`]); octave `k` has half the wavelength of octave `k - 1`
+/// on the same ladder and amplitude `amplitude_m * gain^k`; octaves stop
+/// before the wavelength drops below `min_wavelength_m`. The lacunarity must
+/// be 2 (the ladders' fixed ratio).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DetailNoiseDefinition {
@@ -52,7 +54,7 @@ impl DetailNoiseDefinition {
             || !finite
             || !(0.01..=100_000.0).contains(&self.min_wavelength_m)
             || !(self.min_wavelength_m..=100_000.0).contains(&self.base_wavelength_m)
-            || !(1.5..=4.0).contains(&self.lacunarity)
+            || self.lacunarity != 2.0
             || !(self.gain > 0.0 && self.gain < 1.0)
             || !(0.0..=1000.0).contains(&self.amplitude_m)
             || self.octave_count() > MAX_DETAIL_OCTAVES
@@ -62,14 +64,22 @@ impl DetailNoiseDefinition {
         Ok(())
     }
 
-    /// Number of octaves whose wavelength is at least `min_wavelength_m`.
+    /// Coarsest octave: the base wavelength snapped to its ladder rung.
+    pub fn first_octave(&self) -> LadderOctave {
+        snap_wavelength(self.base_wavelength_m)
+    }
+
+    /// Number of ladder octaves, from the snapped base down, whose wavelength
+    /// is at least `min_wavelength_m`.
     pub fn octave_count(&self) -> usize {
         let mut count = 0;
-        let mut wavelength = self.base_wavelength_m;
+        let mut octave = self.first_octave();
         // A small relative slack keeps exact authored ratios inclusive.
-        while wavelength >= self.min_wavelength_m * (1.0 - 1.0e-9) && count <= MAX_DETAIL_OCTAVES {
+        while octave.wavelength_m() >= self.min_wavelength_m * (1.0 - 1.0e-9)
+            && count <= MAX_DETAIL_OCTAVES
+        {
             count += 1;
-            wavelength /= self.lacunarity;
+            octave = octave.finer();
         }
         count
     }
@@ -93,26 +103,19 @@ impl DetailNoiseDefinition {
 /// One compiled octave.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DetailOctave {
+    pub octave: LadderOctave,
     pub frequency_per_m: f64,
     pub amplitude_m: f64,
+    /// `octave_seed(salt, octave)`.
     pub seed: u32,
 }
 
-/// Lattice origin of one octave for one node, split in f64 (§4.4). `cell` is
-/// `floor(centre * frequency)`, `fraction` the f32 remainder. `amplitude_m`
-/// already includes the node's band-limit weight.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct OctaveOrigin {
-    pub cell: [i32; 3],
-    pub seed: u32,
-    pub fraction: [f32; 3],
-    pub frequency_per_m: f32,
-    pub amplitude_m: f32,
-}
-
-/// Compiled detail layer of one body.
+/// Compiled detail layer of one body: consecutive octaves of one ladder.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DetailNoise {
+    salt: u32,
+    amplitude_m: f64,
+    gain: f64,
     octaves: Vec<DetailOctave>,
 }
 
@@ -124,24 +127,47 @@ impl DetailNoise {
         body_seed: u64,
     ) -> Result<Self, super::TerrainError> {
         definition.validate()?;
-        let base_seed =
+        let salt =
             splitmix(body_seed ^ (u64::from(definition.seed_salt) << 32) ^ 0x4e4f_4953_4500_0001)
                 as u32;
-        let octaves = (0..definition.octave_count())
-            .map(|k| {
-                let k32 = k as i32;
-                DetailOctave {
-                    frequency_per_m: definition.lacunarity.powi(k32) / definition.base_wavelength_m,
-                    amplitude_m: definition.amplitude_m * definition.gain.powi(k32),
-                    seed: base_seed.wrapping_add(k as u32),
-                }
-            })
-            .collect();
-        Ok(Self { octaves })
+        let mut octave = definition.first_octave();
+        let mut octaves = Vec::with_capacity(definition.octave_count());
+        for k in 0..definition.octave_count() {
+            if !octave.gpu_supported() {
+                return Err(super::TerrainError::InvalidConfig);
+            }
+            octaves.push(DetailOctave {
+                octave,
+                frequency_per_m: octave.frequency_per_m(),
+                amplitude_m: definition.amplitude_m * definition.gain.powi(k as i32),
+                seed: octave_seed(salt, octave),
+            });
+            octave = octave.finer();
+        }
+        Ok(Self {
+            salt,
+            amplitude_m: definition.amplitude_m,
+            gain: definition.gain,
+            octaves,
+        })
     }
 
     pub fn octaves(&self) -> &[DetailOctave] {
         &self.octaves
+    }
+
+    /// Seed salt of the octave seeds (`octave_seed(salt, octave)`).
+    pub fn salt(&self) -> u32 {
+        self.salt
+    }
+
+    /// Amplitude of the coarsest octave; octave `k` has `amplitude · gain^k`.
+    pub fn amplitude_m(&self) -> f64 {
+        self.amplitude_m
+    }
+
+    pub fn gain(&self) -> f64 {
+        self.gain
     }
 
     /// Conservative bound of the absolute height contribution.
@@ -162,16 +188,16 @@ impl DetailNoise {
                 continue;
             }
             let amplitude = octave.amplitude_m * weight;
-            let (v, g) = gradient_noise(p_m * octave.frequency_per_m, octave.seed);
+            let (v, g) = octave_noise3(p_m, octave.octave, octave.seed);
             value += amplitude * v;
-            gradient += g * (amplitude * octave.frequency_per_m);
+            gradient += g * amplitude;
         }
         (value, gradient)
     }
 
     /// Band-limited fBm value with every octave seed xor `salt`: an
-    /// independent field on the same lattice (the GPU producer mirrors it
-    /// from the same octave origins with the seed xor `salt`).
+    /// independent field on the same ladder (the GPU producer mirrors it with
+    /// the seed xor `salt`, including that seed's sub-cell offset).
     pub fn value_salted(&self, p_m: DVec3, texel_m: Option<f64>, salt: u32) -> f64 {
         self.octaves
             .iter()
@@ -180,41 +206,10 @@ impl DetailNoise {
                 if weight <= 0.0 {
                     return 0.0;
                 }
-                let (v, _) = gradient_noise(p_m * octave.frequency_per_m, octave.seed ^ salt);
+                let (v, _) = octave_noise3(p_m, octave.octave, octave.seed ^ salt);
                 octave.amplitude_m * weight * v
             })
             .sum()
-    }
-
-    /// Per-octave lattice split for a node centred at `centre_m` (body space,
-    /// metres) whose texels are `texel_m`. Octaves with zero band-limit weight
-    /// are omitted. Fails when a lattice coordinate leaves the integer range.
-    pub fn split(
-        &self,
-        centre_m: DVec3,
-        texel_m: f64,
-    ) -> Result<Vec<OctaveOrigin>, super::TerrainError> {
-        let mut origins = Vec::with_capacity(self.octaves.len());
-        for octave in &self.octaves {
-            let weight = octave_weight(octave.frequency_per_m, texel_m);
-            if weight <= 0.0 {
-                continue;
-            }
-            let scaled = centre_m * octave.frequency_per_m;
-            if !scaled.is_finite() || scaled.abs().max_element() >= MAX_LATTICE_COORDINATE {
-                return Err(super::TerrainError::InvalidConfig);
-            }
-            let base = scaled.floor();
-            let fraction = scaled - base;
-            origins.push(OctaveOrigin {
-                cell: base.to_array().map(|c| c as i32),
-                seed: octave.seed,
-                fraction: fraction.to_array().map(|f| f as f32),
-                frequency_per_m: octave.frequency_per_m as f32,
-                amplitude_m: (octave.amplitude_m * weight) as f32,
-            });
-        }
-        Ok(origins)
     }
 }
 
@@ -272,15 +267,16 @@ pub fn lattice_gradient(cell: [i32; 3], seed: u32) -> DVec3 {
 }
 
 /// Quintic-interpolated gradient noise at lattice coordinate `q`, with its
-/// gradient with respect to `q`.
+/// gradient with respect to `q`. Cells wrap to i32 like the GPU's (fine
+/// ladder octaves reach coordinates near 2^31).
 pub fn gradient_noise(q: DVec3, seed: u32) -> (f64, DVec3) {
     let base = q.floor();
-    let cell = base.to_array().map(|c| c as i32);
+    let cell = base.to_array().map(|c| c as i64 as i32);
     noise_from_split(cell, q - base, seed)
 }
 
 /// Gradient noise given the integer cell and the in-cell position `t`.
-fn noise_from_split(cell: [i32; 3], t: DVec3, seed: u32) -> (f64, DVec3) {
+pub(crate) fn noise_from_split(cell: [i32; 3], t: DVec3, seed: u32) -> (f64, DVec3) {
     let u = t * t * t * (t * (t * 6.0 - DVec3::splat(15.0)) + DVec3::splat(10.0));
     let du = t * t * (t * (t - DVec3::splat(2.0)) + DVec3::ONE) * 30.0;
     let mut value = 0.0;
@@ -318,6 +314,7 @@ fn splitmix(mut x: u64) -> u64 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::terrain::ladder::{TileAnchors, tests::gpu_style_noise3, tile_anchors};
 
     pub(crate) fn moon_like() -> DetailNoiseDefinition {
         DetailNoiseDefinition {
@@ -331,21 +328,19 @@ pub(crate) mod tests {
         }
     }
 
-    /// f32 replica of `terrain_noise.wgsl`: split origin plus local offset.
-    fn gpu_style(origins: &[OctaveOrigin], local: [f32; 3]) -> f32 {
-        let mut sum = 0.0f32;
-        for o in origins {
-            let q: [f32; 3] = std::array::from_fn(|i| o.fraction[i] + local[i] * o.frequency_per_m);
-            let fl = q.map(f32::floor);
-            let cell: [i32; 3] = std::array::from_fn(|i| o.cell[i] + fl[i] as i32);
-            let t = DVec3::new(
-                f64::from(q[0] - fl[0]),
-                f64::from(q[1] - fl[1]),
-                f64::from(q[2] - fl[2]),
-            );
-            sum += o.amplitude_m * noise_from_split(cell, t, o.seed).0 as f32;
-        }
-        sum
+    /// f32 replica of the producer's `detail_fbm`: per octave the GPU split
+    /// from the tile anchors plus the local offset.
+    fn gpu_style(noise: &DetailNoise, anchors: &TileAnchors, texel: f64, local: [f32; 3]) -> f64 {
+        noise
+            .octaves()
+            .iter()
+            .map(|o| {
+                let weight = octave_weight(o.frequency_per_m, texel);
+                o.amplitude_m
+                    * weight
+                    * gpu_style_noise3(anchors, o.octave, o.seed, glam::Vec3::from_array(local))
+            })
+            .sum()
     }
 
     #[test]
@@ -388,6 +383,10 @@ pub(crate) mod tests {
             noise.evaluate(x + DVec3::Z * h, None).0 - noise.evaluate(x - DVec3::Z * h, None).0,
         ) / (2.0 * h);
         assert!((g - fd).length() < 1e-5 * (1.0 + g.length()), "{g} vs {fd}");
+        // Cells beyond i32 wrap as on the GPU instead of saturating.
+        let far = DVec3::new(2.0f64.powi(31) + 0.25, 0.5, 0.5);
+        let wrapped = DVec3::new(-(2.0f64.powi(31)) + 0.25, 0.5, 0.5);
+        assert_eq!(gradient_noise(far, 4).0, gradient_noise(wrapped, 4).0);
     }
 
     #[test]
@@ -403,6 +402,10 @@ pub(crate) mod tests {
                 ..d
             },
             DetailNoiseDefinition {
+                lacunarity: 2.5,
+                ..d
+            },
+            DetailNoiseDefinition {
                 min_wavelength_m: 64.0,
                 ..d
             },
@@ -410,10 +413,10 @@ pub(crate) mod tests {
                 amplitude_m: f64::NAN,
                 ..d
             },
+            // 98,304 m down to 1.5 · 2^-7 m: 24 ladder octaves.
             DetailNoiseDefinition {
                 min_wavelength_m: 0.01,
                 base_wavelength_m: 1.0e5,
-                lacunarity: 1.5,
                 ..d
             },
         ] {
@@ -427,6 +430,20 @@ pub(crate) mod tests {
             }
             .configuration_identity()
         );
+        // Off-ladder bases snap: 20 km is 1.25 · 2^14 m, 9 octaves to 64 m.
+        let climate = DetailNoiseDefinition {
+            base_wavelength_m: 20_000.0,
+            min_wavelength_m: 64.0,
+            ..d
+        };
+        let noise = DetailNoise::new(&climate, 3).unwrap();
+        assert_eq!(noise.octaves().len(), 9);
+        assert_eq!(noise.octaves()[0].octave.wavelength_m(), 20_480.0);
+        assert_eq!(noise.octaves()[8].octave.wavelength_m(), 80.0);
+        for o in noise.octaves() {
+            assert_eq!(o.octave.ladder, 1);
+            assert_eq!(o.seed, octave_seed(noise.salt(), o.octave));
+        }
     }
 
     #[test]
@@ -438,8 +455,7 @@ pub(crate) mod tests {
         let n0 = DVec3::new(0.018, 0.011, 0.9997).normalize();
         let centre = n0 * radius;
         let texel = 0.05; // every octave fully weighted
-        let origins = noise.split(centre, texel).unwrap();
-        assert_eq!(origins.len(), 7);
+        let anchors = tile_anchors(centre).unwrap();
         let mut worst = 0.0f64;
         for i in 0..400 {
             let local = DVec3::new(
@@ -448,8 +464,8 @@ pub(crate) mod tests {
                 f64::from(i % 7) * 0.013,
             );
             let reference = noise.evaluate(centre + local, Some(texel)).0;
-            let split = gpu_style(&origins, local.as_vec3().to_array());
-            worst = worst.max((reference - f64::from(split)).abs());
+            let split = gpu_style(&noise, &anchors, texel, local.as_vec3().to_array());
+            worst = worst.max((reference - split).abs());
         }
         assert!(worst < 1.0e-4, "split error {worst} m");
     }
@@ -498,7 +514,7 @@ pub(crate) mod tests {
                 let wc = octave_weight(o.frequency_per_m, texel);
                 let wp = octave_weight(o.frequency_per_m, 2.0 * texel);
                 let w = (1.0 - t) * wc + t * wp;
-                per_octave += o.amplitude_m * w * gradient_noise(p * o.frequency_per_m, o.seed).0;
+                per_octave += o.amplitude_m * w * octave_noise3(p, o.octave, o.seed).0;
             }
             assert!((blended - per_octave).abs() < 1e-12);
             if t == 1.0 {
