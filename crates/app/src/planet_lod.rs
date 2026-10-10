@@ -256,6 +256,8 @@ pub struct PlanetLod {
     pub hold: bool,
     policy: Option<LodPolicy>,
     bodies: HashMap<BodyId, BodyLod>,
+    /// Replaced definitions still drawn until their rebound body is complete.
+    outgoing: HashMap<BodyId, BodyLod>,
     pending: HashMap<BodyId, PendingBind>,
     free_layers: Vec<u32>,
     layer_count: u32,
@@ -282,6 +284,29 @@ const VISIT_LIMIT: usize = 60_000;
 /// Below the renderer's 600-frame source eviction, so an idle body is
 /// released (and its source retired) before the renderer would drop it.
 const INACTIVE_RELEASE_FRAMES: u64 = 500;
+/// Longest wait, after its world map is baked, for a replacement to fill
+/// the view before it takes over from the definition it replaces.
+const REPLACEMENT_WAIT_S: f64 = 1.5;
+
+/// Per-frame inputs shared by every body.
+#[derive(Clone, Copy)]
+struct FrameContext {
+    policy: LodPolicy,
+    frustum: select::Frustum,
+    focal: f64,
+    mode: u32,
+    shadows: Option<ShadowCasterPolicy>,
+    shadow_body: Option<BodyId>,
+    projection: CelestialProjection,
+    now: Instant,
+}
+
+/// Where one body sits relative to the view this frame.
+#[derive(Clone, Copy)]
+struct BodyPlace {
+    observer: DVec3,
+    body_to_view: DMat3,
+}
 
 impl PlanetLod {
     pub fn new(policy: Option<LodPolicy>) -> Self {
@@ -291,6 +316,7 @@ impl PlanetLod {
             hold: false,
             policy,
             bodies: HashMap::new(),
+            outgoing: HashMap::new(),
             pending: HashMap::new(),
             free_layers: Vec::new(),
             layer_count: 0,
@@ -320,7 +346,13 @@ impl PlanetLod {
 
     /// Snapshot of every bound body's colliders for `SurfaceQuery` callers.
     pub fn collider_view(&self) -> collision::ColliderView {
-        collision::ColliderView::from_bodies(self.bodies.iter().filter_map(|(body, lod)| {
+        // A replaced definition keeps serving collision until it is retired.
+        let bodies = self
+            .bodies
+            .iter()
+            .filter(|(body, _)| !self.outgoing.contains_key(body))
+            .chain(self.outgoing.iter());
+        collision::ColliderView::from_bodies(bodies.filter_map(|(body, lod)| {
             lod.collision
                 .as_ref()
                 .map(|collision| (*body, Arc::clone(&collision.colliders)))
@@ -411,6 +443,12 @@ impl PlanetLod {
         }
     }
 
+    /// A rebind of `body` is still preparing, baking or filling tiles while
+    /// its previous definition draws.
+    pub fn replacing(&self, body: BodyId) -> bool {
+        self.pending.contains_key(&body) || self.outgoing.contains_key(&body)
+    }
+
     /// Why a world-map body's source could not be used, if it failed.
     pub fn world_bake_error(&self, body: BodyId) -> Option<&str> {
         self.bodies.get(&body)?.world_error.as_deref()
@@ -450,6 +488,7 @@ impl PlanetLod {
     fn ensure_layers(&mut self, config: TerrainAtlasConfig) {
         if self.layer_count != config.layers {
             self.bodies.clear();
+            self.outgoing.clear();
             self.tokens.clear();
             self.collision_tokens.clear();
             self.layer_count = config.layers;
@@ -473,7 +512,7 @@ impl PlanetLod {
             .get(&input.body)
             .is_some_and(|pending| pending.definition == *input.definition && pending.key == key);
         if !pending_matches {
-            self.release(input.body);
+            self.supersede(input.body);
             let (sender, receiver) = std::sync::mpsc::channel();
             let definition = input.definition.clone();
             let radius_m = input.radius_m;
@@ -541,13 +580,36 @@ impl PlanetLod {
     }
 
     fn release(&mut self, body: BodyId) {
-        if let Some(lod) = self.bodies.remove(&body) {
-            self.retired_sources.push(lod.source_key);
-            for node in lod.nodes.values() {
-                self.free_layers.push(node.layer);
-            }
-            self.tokens.retain(|_, (owner, _, _)| *owner != body);
+        if let Some(old) = self.outgoing.remove(&body) {
+            self.retire(body, old);
         }
+        if let Some(lod) = self.bodies.remove(&body) {
+            self.retire(body, lod);
+        }
+    }
+
+    /// A new definition replaces the bound one. The bound one keeps drawing
+    /// until the replacement is complete, unless an older one is already
+    /// kept (rapid edits) or it has nothing to draw yet.
+    fn supersede(&mut self, body: BodyId) {
+        let Some(current) = self.bodies.remove(&body) else {
+            return;
+        };
+        if current.world_ready && !current.nodes.is_empty() && !self.outgoing.contains_key(&body) {
+            self.outgoing.insert(body, current);
+        } else {
+            self.retire(body, current);
+        }
+    }
+
+    /// Frees one definition's atlas layers, tile tokens and GPU source.
+    fn retire(&mut self, body: BodyId, lod: BodyLod) {
+        self.retired_sources.push(lod.source_key);
+        for node in lod.nodes.values() {
+            self.free_layers.push(node.layer);
+        }
+        self.tokens
+            .retain(|_, (owner, slot, _)| !(*owner == body && *slot == lod.slot));
     }
 
     /// Prepare producer jobs and instances for this frame.
@@ -599,6 +661,16 @@ impl PlanetLod {
         let mut collision_budget = self
             .collision_policy
             .map_or(0, |collision| collision.jobs_per_frame as usize);
+        let ctx = FrameContext {
+            policy,
+            frustum,
+            focal,
+            mode,
+            shadows,
+            shadow_body,
+            projection,
+            now,
+        };
         for input in bodies {
             let source = view.prepare_source(input.body_fixed_frame)?;
             let observer = source.observer_in_source().metres();
@@ -606,338 +678,71 @@ impl PlanetLod {
             if pixels < policy.min_body_pixels {
                 continue;
             }
-            match self.bind(input) {
-                Ok(true) => {}
-                Ok(false) => continue,
+            // A rebind keeps the replaced definition drawing until its
+            // replacement is complete, so edits never flash the plain sphere.
+            let bound = match self.bind(input) {
+                Ok(bound) => bound,
                 Err(error) => {
                     self.last_error = Some(format!("{error:#}"));
-                    continue;
+                    false
                 }
+            };
+            let replacing = self.outgoing.contains_key(&input.body);
+            if !bound && !replacing {
+                continue;
             }
             let direction =
                 |v| -> Result<DVec3> { Ok(source.view_direction(Direction3::try_new(v)?)?.unit()) };
-            let body_to_view = DMat3::from_cols(
-                direction(DVec3::X)?,
-                direction(DVec3::Y)?,
-                direction(DVec3::Z)?,
-            );
-            let frame_number = self.frame;
-            let lod = self.bodies.get_mut(&input.body).expect("bound above");
-            lod.last_active = frame_number;
-            frame
-                .sources
-                .push((lod.source_key, Arc::clone(&lod.source)));
-            // A world-map body draws as a plain sphere until its Tier A bake is
-            // complete; pushing its source above keeps the bake advancing.
-            if !lod.world_ready {
-                continue;
-            }
-            let radius = input.radius_m;
-            let data_offset = policy.data_level_offset();
-            let ranges = lod_ranges(&policy, radius, focal);
-            let selection = {
-                let _span = crate::engine_profile::span("Atlas selection");
-                let measured = &lod.bounds;
-                let bound = lod.height_bound_m;
-                select::select(
-                    &select::SelectionInput {
-                        observer_body: observer,
-                        body_to_view,
-                        frustum,
-                        radius_m: radius,
-                        occluder_radius_m: radius - lod.height_bound_m,
-                        ranges: &ranges,
-                        max_level: policy.max_level,
-                        visit_limit: VISIT_LIMIT,
-                        restricted: true,
-                    },
-                    |address| {
-                        node_bounds(
-                            measured,
-                            address,
-                            bound,
-                            policy.base_resident_level,
-                            data_offset + MEASURED_LOOKAHEAD,
-                        )
-                    },
-                )
+            let place = BodyPlace {
+                observer,
+                body_to_view: DMat3::from_cols(
+                    direction(DVec3::X)?,
+                    direction(DVec3::Y)?,
+                    direction(DVec3::Z)?,
+                ),
             };
-
-            let _requests_span = crate::engine_profile::span("Atlas requests and draw list");
-            // Requests: base levels first, then missing selected nodes coarse-first.
-            let mut wanted: Vec<(u8, f64, CubePatchAddress)> = Vec::new();
-            if !self.hold {
-                for level in 0..=policy.base_resident_level {
-                    for face in astrum_math::surface::CubeFace::ALL {
-                        let count = 1u32 << level;
-                        for y in 0..count {
-                            for x in 0..count {
-                                let address = CubePatchAddress::try_new(face, level, x, y)?;
-                                if !lod.nodes.contains_key(&address) {
-                                    wanted.push((level, 0.0, address));
-                                }
-                            }
-                        }
+            let mut draw_new = bound;
+            if bound && replacing {
+                if self.replacement_complete(input.body, &policy) {
+                    if let Some(old) = self.outgoing.remove(&input.body) {
+                        self.retire(input.body, old);
                     }
-                }
-                let mut seen = HashSet::new();
-                let mut missing: Vec<_> = selection
-                    .selected
-                    .iter()
-                    .map(|s| (data_address(s.address, data_offset), s.distance_m))
-                    .filter(|(data, _)| !lod.nodes.contains_key(data) && seen.insert(*data))
-                    .map(|(data, distance)| (data.level(), distance, data))
-                    .collect();
-                missing.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
-                wanted.extend(missing);
-            }
-            let mut planned: HashSet<CubePatchAddress> = HashSet::new();
-            let mut jobs_this_body = 0usize;
-            'requests: for &(_, _, address) in &wanted {
-                let nodes = &self.bodies[&input.body].nodes;
-                let mut chain = Vec::new();
-                let mut cursor = Some(address);
-                while let Some(node) = cursor {
-                    if nodes.contains_key(&node) || planned.contains(&node) {
-                        break;
-                    }
-                    chain.push(node);
-                    cursor = node.parent();
-                }
-                for node in chain.into_iter().rev() {
-                    if budget == 0 {
-                        break 'requests;
-                    }
-                    let Some(layer) = allocate_layer(
-                        &mut self.free_layers,
-                        &mut self.bodies,
-                        frame_number,
-                        policy.base_resident_level,
-                        &mut self.evictions_total,
-                    ) else {
-                        break 'requests;
-                    };
-                    let lod = self.bodies.get_mut(&input.body).expect("bound above");
-                    let chart = select::chart(node);
-                    let kind = producer::tile_kind(&lod.recipe, node, &chart, policy.tile_cells)?;
-                    let octaves =
-                        producer::detail_octaves(&lod.recipe, node, &chart, policy.tile_cells)?;
-                    let token = self.next_token;
-                    self.next_token += 1;
-                    self.tokens.insert(token, (input.body, lod.slot, node));
-                    frame.jobs.push(AtlasProduceJob {
-                        source: lod.source_key,
-                        layer,
-                        token,
-                        chart: producer::atlas_chart(&chart),
-                        radius_m: radius as f32,
-                        kind,
-                        octaves,
-                    });
-                    lod.nodes.insert(
-                        node,
-                        Resident {
-                            layer,
-                            produced: now,
-                            last_used: frame_number,
-                        },
-                    );
-                    planned.insert(node);
-                    budget -= 1;
-                    jobs_this_body += 1;
+                } else {
+                    draw_new = false;
                 }
             }
-
-            // Instances from own data or the finest resident ancestor.
-            let lod = self.bodies.get_mut(&input.body).expect("bound above");
-            let mut stats = BodyStats {
-                selected: selection.selected.len(),
-                visited: selection.visited,
-                truncated: selection.truncated,
-                deferred: selection.deferred,
-                balance_splits: selection.balance_splits,
-                balance_unresolved: selection.balance_unresolved,
-                jobs_last_frame: jobs_this_body,
-                ..BodyStats::default()
-            };
-            for selected in &selection.selected {
-                let Some(built) = build_instance(
-                    &lod.nodes,
-                    selected,
-                    &NodeContext {
-                        data_offset,
-                        policy: &policy,
-                        ranges: &ranges,
-                        body_to_view,
-                        observer,
-                        radius,
-                        now,
-                        material: input.material,
-                        water: producer::water_look(&lod.recipe),
-                        mode,
-                        morph: true,
-                    },
-                ) else {
-                    stats.missing_visible += 1;
-                    continue;
-                };
-                if built.virtual_node {
-                    stats.virtual_nodes += 1;
-                    stats.missing_visible += 1;
-                }
-                if built.arrival < 1.0 {
-                    stats.fading += 1;
-                }
-                frame.instances.push(built.instance);
-                stats.drawn += 1;
-                if selected.coarser_edges != 0 {
-                    stats.snapped_nodes += 1;
-                }
-                stats.finest_level = stats.finest_level.max(selected.address.level());
-                // Mark data sources as used for LRU.
-                for owner in [built.owner, built.parent_owner] {
-                    if let Some(node) = lod.nodes.get_mut(&owner) {
-                        node.last_used = frame_number;
-                    }
-                }
+            if bound {
+                self.process_body(
+                    input,
+                    place,
+                    &ctx,
+                    &mut frame,
+                    &mut budget,
+                    &mut collision_budget,
+                    true,
+                    draw_new,
+                )?;
             }
-            if let Some(shadow_policy) = shadows.filter(|_| shadow_body == Some(input.body)) {
-                let _span = crate::engine_profile::span("Atlas shadow casters");
-                let view = ShadowView {
-                    body_to_view,
-                    observer_body_m: observer,
-                    reference_radius_m: radius,
-                    relief_m: lod.height_bound_m,
-                };
-                let body_centre = body_to_view * (-observer);
-                let sun_view = (shadow_policy.sun_centre_view_m - body_centre).normalize();
-                if let Some(cascades) = astrum_renderer::fit_cascades(
-                    &view,
-                    sun_view,
-                    projection,
-                    &shadow_policy.settings,
-                ) {
-                    let mut shadow = astrum_renderer::AtlasShadowFrame {
-                        cascades,
-                        ..Default::default()
-                    };
-                    let detail = f64::from(shadow_policy.settings.caster_detail).max(0.05);
-                    for c in 0..cascades.count as usize {
-                        // Cells of four texels near the cascade, growing linearly
-                        // with distance beyond its radius: distant sunward
-                        // casters only need coarse silhouettes.
-                        let texel = f64::from(cascades.texel_m[c]);
-                        let target = 4.0 * texel / detail;
-                        let reach = 0.5 * texel * f64::from(shadow_policy.settings.resolution);
-                        let caster_ranges: Vec<f64> = (0..=policy.max_level)
-                            .map(|level| {
-                                let cell = astrum_world::terrain::producer::tile_texel_m(
-                                    radius,
-                                    level,
-                                    policy.draw_cells,
-                                );
-                                if cell > target {
-                                    reach * cell / target
-                                } else {
-                                    0.0
-                                }
-                            })
-                            .collect();
-                        let measured = &lod.bounds;
-                        let bound = lod.height_bound_m;
-                        let casters = select::select(
-                            &select::SelectionInput {
-                                observer_body: observer,
-                                body_to_view,
-                                frustum: select::Frustum::cascade(cascades, c),
-                                radius_m: radius,
-                                occluder_radius_m: radius - lod.height_bound_m,
-                                ranges: &caster_ranges,
-                                max_level: policy.max_level,
-                                visit_limit: VISIT_LIMIT,
-                                restricted: false,
-                            },
-                            |address| {
-                                node_bounds(
-                                    measured,
-                                    address,
-                                    bound,
-                                    policy.base_resident_level,
-                                    data_offset + MEASURED_LOOKAHEAD,
-                                )
-                            },
-                        );
-                        let context = NodeContext {
-                            data_offset,
-                            policy: &policy,
-                            ranges: &caster_ranges,
-                            body_to_view,
-                            observer,
-                            radius,
-                            now,
-                            material: input.material,
-                            water: producer::water_look(&lod.recipe),
-                            mode,
-                            morph: false,
-                        };
-                        shadow.casters[c] = casters
-                            .selected
-                            .iter()
-                            .filter_map(|s| build_instance(&lod.nodes, s, &context))
-                            .map(|built| built.instance)
-                            .collect();
-                    }
-                    stats.shadow_casters = shadow.casters.iter().map(Vec::len).sum();
-                    frame.shadow = Some(shadow);
+            if let Some(old) = self.outgoing.remove(&input.body) {
+                // Draw the replaced definition in the body's slot for one pass.
+                let new = self.bodies.insert(input.body, old);
+                let result = self.process_body(
+                    input,
+                    place,
+                    &ctx,
+                    &mut frame,
+                    &mut budget,
+                    &mut collision_budget,
+                    false,
+                    true,
+                );
+                let old = match new {
+                    Some(new) => self.bodies.insert(input.body, new),
+                    None => self.bodies.remove(&input.body),
                 }
-            }
-            if let (Some(collision_policy), Some(collision), false) =
-                (self.collision_policy, lod.collision.as_mut(), self.hold)
-            {
-                let _span = crate::engine_profile::span("Collision page requests");
-                collision.prefetch(observer, radius, &collision_policy, frame_number);
-                for address in collision.schedule(frame_number, collision_budget) {
-                    let chart = select::chart(address);
-                    let cells = collision_policy.page_cells;
-                    let token = self.next_token;
-                    self.next_token += 1;
-                    self.collision_tokens
-                        .insert(token, (input.body, lod.slot, address, frame_number));
-                    frame.collision_jobs.push(AtlasProduceJob {
-                        source: lod.source_key,
-                        layer: 0,
-                        token,
-                        chart: producer::atlas_chart(&chart),
-                        radius_m: radius as f32,
-                        kind: producer::tile_kind(&lod.recipe, address, &chart, cells)?,
-                        octaves: producer::detail_octaves(&lod.recipe, address, &chart, cells)?,
-                    });
-                    collision_budget -= 1;
-                    self.collision_stats.requested_total += 1;
-                }
-                frame.collision_cells = collision_policy.page_cells;
-                stats.collision_pages = collision.colliders.page_count();
-                stats.collision_in_flight = collision.in_flight();
-            }
-            stats.resident = lod.nodes.len();
-            stats.data_tiles_in_use = lod
-                .nodes
-                .values()
-                .filter(|node| node.last_used == frame_number)
-                .count();
-            if lod.first_complete_s.is_none()
-                && stats.missing_visible == 0
-                && stats.fading == 0
-                && jobs_this_body == 0
-                && selection.deferred == 0
-                && !selection.truncated
-                && stats.drawn > 0
-            {
-                lod.first_complete_s = Some(lod.bound_at.elapsed().as_secs_f64());
-            }
-            lod.stats = stats;
-            if stats.drawn > 0 {
-                self.drawn_bodies.push(input.body);
+                .expect("the replaced definition was swapped in");
+                self.outgoing.insert(input.body, old);
+                result?;
             }
         }
         // Release bodies that have not been active for a while.
@@ -951,6 +756,17 @@ impl PlanetLod {
         for body in inactive {
             self.release(body);
         }
+        let stale: Vec<BodyId> = self
+            .outgoing
+            .iter()
+            .filter(|(_, lod)| frame_number - lod.last_active > INACTIVE_RELEASE_FRAMES)
+            .map(|(body, _)| *body)
+            .collect();
+        for body in stale {
+            if let Some(old) = self.outgoing.remove(&body) {
+                self.retire(body, old);
+            }
+        }
         if self.tokens.len() > 100_000 {
             // Readbacks dropped under pressure never return; forget old tokens.
             let floor = self.next_token.saturating_sub(50_000);
@@ -961,6 +777,390 @@ impl PlanetLod {
         frame.retired_sources = std::mem::take(&mut self.retired_sources);
         self.selection_ms = started.elapsed().as_secs_f64() * 1000.0;
         Ok(frame)
+    }
+
+    /// Selection, tile requests and instances of one bound body this frame.
+    /// `request` issues tile and collider jobs; `draw` emits instances and
+    /// shadow casters. A replacement fills tiles without drawing while the
+    /// definition it replaces draws without requesting.
+    #[allow(clippy::too_many_arguments)] // One body's share of the frame.
+    fn process_body(
+        &mut self,
+        input: &AtlasBodyInput<'_>,
+        place: BodyPlace,
+        ctx: &FrameContext,
+        frame: &mut TerrainAtlasFrame,
+        budget: &mut usize,
+        collision_budget: &mut usize,
+        request: bool,
+        draw: bool,
+    ) -> Result<()> {
+        let BodyPlace {
+            observer,
+            body_to_view,
+        } = place;
+        let FrameContext {
+            policy,
+            frustum,
+            focal,
+            mode,
+            shadows,
+            shadow_body,
+            projection,
+            now,
+        } = *ctx;
+        let frame_number = self.frame;
+        let lod = self.bodies.get_mut(&input.body).expect("bound above");
+        lod.last_active = frame_number;
+        frame
+            .sources
+            .push((lod.source_key, Arc::clone(&lod.source)));
+        // A world-map body draws as a plain sphere until its Tier A bake is
+        // complete; pushing its source above keeps the bake advancing.
+        if !lod.world_ready {
+            return Ok(());
+        }
+        let radius = input.radius_m;
+        let data_offset = policy.data_level_offset();
+        let ranges = lod_ranges(&policy, radius, focal);
+        let selection = {
+            let _span = crate::engine_profile::span("Atlas selection");
+            let measured = &lod.bounds;
+            let bound = lod.height_bound_m;
+            select::select(
+                &select::SelectionInput {
+                    observer_body: observer,
+                    body_to_view,
+                    frustum,
+                    radius_m: radius,
+                    occluder_radius_m: radius - lod.height_bound_m,
+                    ranges: &ranges,
+                    max_level: policy.max_level,
+                    visit_limit: VISIT_LIMIT,
+                    restricted: true,
+                },
+                |address| {
+                    node_bounds(
+                        measured,
+                        address,
+                        bound,
+                        policy.base_resident_level,
+                        data_offset + MEASURED_LOOKAHEAD,
+                    )
+                },
+            )
+        };
+
+        let _requests_span = crate::engine_profile::span("Atlas requests and draw list");
+        // Requests: base levels first, then missing selected nodes coarse-first.
+        let mut wanted: Vec<(u8, f64, CubePatchAddress)> = Vec::new();
+        if request && !self.hold {
+            for level in 0..=policy.base_resident_level {
+                for face in astrum_math::surface::CubeFace::ALL {
+                    let count = 1u32 << level;
+                    for y in 0..count {
+                        for x in 0..count {
+                            let address = CubePatchAddress::try_new(face, level, x, y)?;
+                            if !lod.nodes.contains_key(&address) {
+                                wanted.push((level, 0.0, address));
+                            }
+                        }
+                    }
+                }
+            }
+            let mut seen = HashSet::new();
+            let mut missing: Vec<_> = selection
+                .selected
+                .iter()
+                .map(|s| (data_address(s.address, data_offset), s.distance_m))
+                .filter(|(data, _)| !lod.nodes.contains_key(data) && seen.insert(*data))
+                .map(|(data, distance)| (data.level(), distance, data))
+                .collect();
+            missing.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+            wanted.extend(missing);
+        }
+        let mut planned: HashSet<CubePatchAddress> = HashSet::new();
+        let mut jobs_this_body = 0usize;
+        'requests: for &(_, _, address) in &wanted {
+            let nodes = &self.bodies[&input.body].nodes;
+            let mut chain = Vec::new();
+            let mut cursor = Some(address);
+            while let Some(node) = cursor {
+                if nodes.contains_key(&node) || planned.contains(&node) {
+                    break;
+                }
+                chain.push(node);
+                cursor = node.parent();
+            }
+            for node in chain.into_iter().rev() {
+                if *budget == 0 {
+                    break 'requests;
+                }
+                let Some(layer) = allocate_layer(
+                    &mut self.free_layers,
+                    &mut self.bodies,
+                    frame_number,
+                    policy.base_resident_level,
+                    &mut self.evictions_total,
+                ) else {
+                    break 'requests;
+                };
+                let lod = self.bodies.get_mut(&input.body).expect("bound above");
+                let chart = select::chart(node);
+                let kind = producer::tile_kind(&lod.recipe, node, &chart, policy.tile_cells)?;
+                let octaves =
+                    producer::detail_octaves(&lod.recipe, node, &chart, policy.tile_cells)?;
+                let token = self.next_token;
+                self.next_token += 1;
+                self.tokens.insert(token, (input.body, lod.slot, node));
+                frame.jobs.push(AtlasProduceJob {
+                    source: lod.source_key,
+                    layer,
+                    token,
+                    chart: producer::atlas_chart(&chart),
+                    radius_m: radius as f32,
+                    kind,
+                    octaves,
+                });
+                lod.nodes.insert(
+                    node,
+                    Resident {
+                        layer,
+                        produced: now,
+                        last_used: frame_number,
+                    },
+                );
+                planned.insert(node);
+                *budget -= 1;
+                jobs_this_body += 1;
+            }
+        }
+
+        // Instances from own data or the finest resident ancestor.
+        let lod = self.bodies.get_mut(&input.body).expect("bound above");
+        let mut stats = BodyStats {
+            selected: selection.selected.len(),
+            visited: selection.visited,
+            truncated: selection.truncated,
+            deferred: selection.deferred,
+            balance_splits: selection.balance_splits,
+            balance_unresolved: selection.balance_unresolved,
+            jobs_last_frame: jobs_this_body,
+            ..BodyStats::default()
+        };
+        for selected in &selection.selected {
+            let Some(built) = build_instance(
+                &lod.nodes,
+                selected,
+                &NodeContext {
+                    data_offset,
+                    policy: &policy,
+                    ranges: &ranges,
+                    body_to_view,
+                    observer,
+                    radius,
+                    now,
+                    material: input.material,
+                    water: producer::water_look(&lod.recipe),
+                    mode,
+                    morph: true,
+                },
+            ) else {
+                stats.missing_visible += 1;
+                continue;
+            };
+            if built.virtual_node {
+                stats.virtual_nodes += 1;
+                stats.missing_visible += 1;
+            }
+            if built.arrival < 1.0 {
+                stats.fading += 1;
+            }
+            if draw {
+                frame.instances.push(built.instance);
+            }
+            stats.drawn += 1;
+            if selected.coarser_edges != 0 {
+                stats.snapped_nodes += 1;
+            }
+            stats.finest_level = stats.finest_level.max(selected.address.level());
+            // Mark data sources as used for LRU.
+            for owner in [built.owner, built.parent_owner] {
+                if let Some(node) = lod.nodes.get_mut(&owner) {
+                    node.last_used = frame_number;
+                }
+            }
+        }
+        if let Some(shadow_policy) = shadows.filter(|_| draw && shadow_body == Some(input.body)) {
+            let _span = crate::engine_profile::span("Atlas shadow casters");
+            let view = ShadowView {
+                body_to_view,
+                observer_body_m: observer,
+                reference_radius_m: radius,
+                relief_m: lod.height_bound_m,
+            };
+            let body_centre = body_to_view * (-observer);
+            let sun_view = (shadow_policy.sun_centre_view_m - body_centre).normalize();
+            if let Some(cascades) =
+                astrum_renderer::fit_cascades(&view, sun_view, projection, &shadow_policy.settings)
+            {
+                let mut shadow = astrum_renderer::AtlasShadowFrame {
+                    cascades,
+                    ..Default::default()
+                };
+                let detail = f64::from(shadow_policy.settings.caster_detail).max(0.05);
+                for c in 0..cascades.count as usize {
+                    // Cells of four texels near the cascade, growing linearly
+                    // with distance beyond its radius: distant sunward
+                    // casters only need coarse silhouettes.
+                    let texel = f64::from(cascades.texel_m[c]);
+                    let target = 4.0 * texel / detail;
+                    let reach = 0.5 * texel * f64::from(shadow_policy.settings.resolution);
+                    let caster_ranges: Vec<f64> = (0..=policy.max_level)
+                        .map(|level| {
+                            let cell = astrum_world::terrain::producer::tile_texel_m(
+                                radius,
+                                level,
+                                policy.draw_cells,
+                            );
+                            if cell > target {
+                                reach * cell / target
+                            } else {
+                                0.0
+                            }
+                        })
+                        .collect();
+                    let measured = &lod.bounds;
+                    let bound = lod.height_bound_m;
+                    let casters = select::select(
+                        &select::SelectionInput {
+                            observer_body: observer,
+                            body_to_view,
+                            frustum: select::Frustum::cascade(cascades, c),
+                            radius_m: radius,
+                            occluder_radius_m: radius - lod.height_bound_m,
+                            ranges: &caster_ranges,
+                            max_level: policy.max_level,
+                            visit_limit: VISIT_LIMIT,
+                            restricted: false,
+                        },
+                        |address| {
+                            node_bounds(
+                                measured,
+                                address,
+                                bound,
+                                policy.base_resident_level,
+                                data_offset + MEASURED_LOOKAHEAD,
+                            )
+                        },
+                    );
+                    let context = NodeContext {
+                        data_offset,
+                        policy: &policy,
+                        ranges: &caster_ranges,
+                        body_to_view,
+                        observer,
+                        radius,
+                        now,
+                        material: input.material,
+                        water: producer::water_look(&lod.recipe),
+                        mode,
+                        morph: false,
+                    };
+                    shadow.casters[c] = casters
+                        .selected
+                        .iter()
+                        .filter_map(|s| build_instance(&lod.nodes, s, &context))
+                        .map(|built| built.instance)
+                        .collect();
+                }
+                stats.shadow_casters = shadow.casters.iter().map(Vec::len).sum();
+                frame.shadow = Some(shadow);
+            }
+        }
+        if let (Some(collision_policy), Some(collision), false) = (
+            self.collision_policy,
+            lod.collision.as_mut(),
+            self.hold || !request,
+        ) {
+            let _span = crate::engine_profile::span("Collision page requests");
+            collision.prefetch(observer, radius, &collision_policy, frame_number);
+            for address in collision.schedule(frame_number, *collision_budget) {
+                let chart = select::chart(address);
+                let cells = collision_policy.page_cells;
+                let token = self.next_token;
+                self.next_token += 1;
+                self.collision_tokens
+                    .insert(token, (input.body, lod.slot, address, frame_number));
+                frame.collision_jobs.push(AtlasProduceJob {
+                    source: lod.source_key,
+                    layer: 0,
+                    token,
+                    chart: producer::atlas_chart(&chart),
+                    radius_m: radius as f32,
+                    kind: producer::tile_kind(&lod.recipe, address, &chart, cells)?,
+                    octaves: producer::detail_octaves(&lod.recipe, address, &chart, cells)?,
+                });
+                *collision_budget -= 1;
+                self.collision_stats.requested_total += 1;
+            }
+            frame.collision_cells = collision_policy.page_cells;
+            stats.collision_pages = collision.colliders.page_count();
+            stats.collision_in_flight = collision.in_flight();
+        }
+        stats.resident = lod.nodes.len();
+        stats.data_tiles_in_use = lod
+            .nodes
+            .values()
+            .filter(|node| node.last_used == frame_number)
+            .count();
+        if lod.first_complete_s.is_none()
+            && stats.missing_visible == 0
+            && stats.fading == 0
+            && jobs_this_body == 0
+            && selection.deferred == 0
+            && !selection.truncated
+            && stats.drawn > 0
+        {
+            lod.first_complete_s = Some(lod.bound_at.elapsed().as_secs_f64());
+        }
+        lod.stats = stats;
+        if draw && stats.drawn > 0 {
+            self.drawn_bodies.push(input.body);
+        }
+        Ok(())
+    }
+
+    /// Whether a rebound body can replace the definition still drawn in its
+    /// place: its world map is baked, its base levels are resident and the
+    /// view is filled at the wanted detail, or a short wait has passed.
+    fn replacement_complete(&self, body: BodyId, policy: &LodPolicy) -> bool {
+        let Some(lod) = self.bodies.get(&body) else {
+            return false;
+        };
+        if !lod.world_ready {
+            return false;
+        }
+        let base_tiles: usize = (0..=policy.base_resident_level)
+            .map(|level| 6usize << (2 * u32::from(level)))
+            .sum();
+        let resident_base = lod
+            .nodes
+            .keys()
+            .filter(|address| address.level() <= policy.base_resident_level)
+            .count();
+        if resident_base < base_tiles {
+            return false;
+        }
+        let stats = lod.stats;
+        let filled = stats.drawn > 0
+            && stats.missing_visible == 0
+            && stats.fading == 0
+            && stats.jobs_last_frame == 0;
+        let waited = lod
+            .world_ready_s
+            .is_some_and(|ready| lod.bound_at.elapsed().as_secs_f64() - ready > REPLACEMENT_WAIT_S);
+        filled || waited
     }
 
     /// Fill the shared terrain summary used by the developer UI and snapshots.
