@@ -16,13 +16,16 @@ use std::sync::{
 /// Draw shader: shared scene lighting followed by the atlas draw stages.
 const DRAW_SHADER: &str = concat!(
     include_str!("shaders/lighting.wgsl"),
-    include_str!("shaders/terrain_atlas.wgsl")
+    include_str!("shaders/terrain_atlas.wgsl"),
+    include_str!("shaders/scatter_draw.wgsl")
 );
 /// Producer shader: shared split-lattice noise and cube-map sampling followed by
 /// the atlas producer.
 const PRODUCE_SHADER: &str = concat!(
     include_str!("shaders/terrain_noise.wgsl"),
     include_str!("shaders/cube_map.wgsl"),
+    include_str!("shaders/river_carve.wgsl"),
+    include_str!("shaders/material_rules.wgsl"),
     include_str!("shaders/terrain_atlas_produce.wgsl"),
     include_str!("shaders/landform_eval.wgsl")
 );
@@ -235,6 +238,10 @@ pub enum AtlasSource {
 pub struct AtlasWorldSource {
     pub bake: crate::tier_a::TierABakeInputs,
     pub surface: AtlasWorldSurface,
+    /// PROTOTYPE (M3 Water): read the bake back for the CPU hydrology and
+    /// report the source ready only once its rivers arrive
+    /// (`TerrainAtlasRenderer::set_world_rivers`).
+    pub hydrology: bool,
 }
 
 /// Colour of a world-map body (pipeline §10, M1): biome LUT (temperature ×
@@ -600,6 +607,11 @@ struct SourceGpu {
     /// World sources: the Tier A bake and its result buffer (bound in `group`).
     bake: Option<crate::tier_a::TierABake>,
     _world: wgpu::Buffer,
+    /// PROTOTYPE (M3 Water): packed rivers (binding 6), the pending
+    /// read-back for the hydrology worker, and whether readiness waits on it.
+    rivers: wgpu::Buffer,
+    world_fields: Option<crate::terrain_rivers::WorldFieldsReadback>,
+    hydrology: bool,
 }
 
 struct Readback {
@@ -638,6 +650,9 @@ pub(crate) struct TerrainAtlasRenderer {
     collision_results: Vec<AtlasCollisionPage>,
     sources: std::collections::HashMap<u64, SourceGpu>,
     pipeline: wgpu::RenderPipeline,
+    /// PROTOTYPE (M5 Life): procedural trees and boulders on drawn nodes.
+    scatter_pipeline: wgpu::RenderPipeline,
+    scatter_shadow_pipeline: wgpu::RenderPipeline,
     draw_group: wgpu::BindGroup,
     instances: wgpu::Buffer,
     instance_capacity: u64,
@@ -661,6 +676,10 @@ pub(crate) struct TerrainAtlasRenderer {
     frame: u64,
     results: Vec<AtlasBounds>,
     report: TerrainAtlasReport,
+    /// PROTOTYPE (M3 Water): read-back fields for the app's hydrology worker
+    /// and river buffers waiting to be bound.
+    world_fields: Vec<crate::terrain_rivers::AtlasWorldFields>,
+    pending_rivers: Vec<(u64, Vec<u32>)>,
 }
 
 impl TerrainAtlasRenderer {
@@ -802,6 +821,8 @@ impl TerrainAtlasRenderer {
                 uniform(3),
                 storage(4, true),
                 storage(5, true),
+                // PROTOTYPE (M3 Water): packed rivers and lake levels.
+                storage(6, true),
             ],
         });
         let produce_pipeline_layout =
@@ -945,7 +966,7 @@ impl TerrainAtlasRenderer {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: vertex_fragment,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         view_dimension: wgpu::TextureViewDimension::D2Array,
@@ -955,7 +976,7 @@ impl TerrainAtlasRenderer {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: vertex_fragment,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
@@ -991,7 +1012,7 @@ impl TerrainAtlasRenderer {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 6,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: vertex_fragment,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         view_dimension: wgpu::TextureViewDimension::D2Array,
@@ -1079,6 +1100,36 @@ impl TerrainAtlasRenderer {
             multiview_mask: None,
             cache: None,
         });
+        let scatter_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Terrain scatter (prototype trees and boulders)"),
+            layout: Some(&draw_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &draw_shader,
+                entry_point: Some("vs_scatter"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &draw_shader,
+                entry_point: Some("fs_scatter"),
+                compilation_options: Default::default(),
+                targets: &color_targets,
+            }),
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
         let shadow_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Terrain atlas shadow caster layout"),
@@ -1100,6 +1151,35 @@ impl TerrainAtlasRenderer {
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &wgpu::vertex_attr_array![0 => Float32x3],
                 })],
+            },
+            fragment: None,
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: crate::post::DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                bias: wgpu::DepthBiasState {
+                    constant: 2,
+                    slope_scale: 1.5,
+                    clamp: 0.0,
+                },
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let scatter_shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Terrain scatter sun shadow casters (prototype)"),
+            layout: Some(&shadow_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &draw_shader,
+                entry_point: Some("vs_scatter"),
+                compilation_options: Default::default(),
+                buffers: &[],
             },
             fragment: None,
             primitive: wgpu::PrimitiveState {
@@ -1168,6 +1248,8 @@ impl TerrainAtlasRenderer {
             collision_results: Vec::new(),
             sources: Default::default(),
             pipeline,
+            scatter_pipeline,
+            scatter_shadow_pipeline,
             draw_group,
             instances,
             instance_capacity,
@@ -1190,6 +1272,8 @@ impl TerrainAtlasRenderer {
             frame: 0,
             results: Vec::new(),
             report: TerrainAtlasReport::default(),
+            world_fields: Vec::new(),
+            pending_rivers: Vec::new(),
         })
     }
 
@@ -1214,6 +1298,46 @@ impl TerrainAtlasRenderer {
     /// sources that failed to upload, with the error.
     pub(crate) fn take_ready_sources(&mut self) -> Vec<(u64, Option<String>)> {
         std::mem::take(&mut self.ready_sources)
+    }
+
+    /// PROTOTYPE (M3 Water): finished world bakes read back for hydrology.
+    pub(crate) fn take_world_fields(&mut self) -> Vec<crate::terrain_rivers::AtlasWorldFields> {
+        std::mem::take(&mut self.world_fields)
+    }
+
+    /// PROTOTYPE (M3 Water): bind packed rivers to a world source and report
+    /// it ready (applied in the next `prepare`).
+    pub(crate) fn set_world_rivers(&mut self, source: u64, words: Vec<u32>) {
+        self.pending_rivers.push((source, words));
+    }
+
+    fn collect_world_fields(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        for (key, source) in self.sources.iter_mut() {
+            let Some(result) = source.world_fields.as_ref().and_then(|r| r.take(*key)) else {
+                continue;
+            };
+            source.world_fields = None;
+            match result {
+                Ok(fields) => self.world_fields.push(fields),
+                // Without hydrology the body still draws, uncarved.
+                Err(_) => self.ready_sources.push((*key, None)),
+            }
+        }
+        for (key, words) in std::mem::take(&mut self.pending_rivers) {
+            let Some(source) = self.sources.get_mut(&key) else {
+                continue;
+            };
+            source.rivers = crate::terrain_rivers::river_buffer(device, queue, &words);
+            source.group = source_group(
+                device,
+                &self.source_layout,
+                &source._textures,
+                &source._constants,
+                &source._world,
+                &source.rivers,
+            );
+            self.ready_sources.push((key, None));
+        }
     }
 
     fn collect_collision_readbacks(&mut self) {
@@ -1332,6 +1456,7 @@ impl TerrainAtlasRenderer {
             queue.write_buffer(&self.grid_uniform, 0, &f32_bytes(&grid));
         }
         self.collect_readbacks();
+        self.collect_world_fields(device, queue);
         if frame.jobs.len() > MAX_ATLAS_JOBS_PER_FRAME {
             return Err(format!(
                 "{} atlas jobs exceed the per-frame cap",
@@ -1386,7 +1511,17 @@ impl TerrainAtlasRenderer {
                 };
                 bake.encode(encoder, &self.tier_a, budget);
                 if bake.done() {
-                    self.ready_sources.push((*key, None));
+                    if source.hydrology {
+                        source.world_fields =
+                            Some(crate::terrain_rivers::WorldFieldsReadback::record(
+                                device,
+                                encoder,
+                                bake.result(),
+                                bake.face_cells(),
+                            ));
+                    } else {
+                        self.ready_sources.push((*key, None));
+                    }
                 }
             }
         }
@@ -1621,6 +1756,9 @@ impl TerrainAtlasRenderer {
             if let Some(bake) = source.bake.as_mut() {
                 bake.release_scratch();
             }
+            if let Some(readback) = &source.world_fields {
+                readback.on_submitted();
+            }
         }
         for readback in self
             .readbacks
@@ -1657,6 +1795,10 @@ impl TerrainAtlasRenderer {
         pass.set_vertex_buffer(0, self.vertices.slice(..));
         pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..self.index_count, 0, 0..self.staged_instances);
+        // PROTOTYPE (M5 Life): 1024 scatter slots of 72 procedural vertices per
+        // drawn node (scatter_draw.wgsl); bind groups are shared.
+        pass.set_pipeline(&self.scatter_pipeline);
+        pass.draw(0..72, 0..self.staged_instances * 1024);
     }
 
     /// Uploads per-cascade caster lists back to back.
@@ -1720,6 +1862,11 @@ impl TerrainAtlasRenderer {
         pass.set_vertex_buffer(0, self.vertices.slice(..));
         pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..self.index_count, 0, start..end);
+        // PROTOTYPE (M5 Life): plants cast shadows in the two nearest cascades.
+        if cascade < 2 {
+            pass.set_pipeline(&self.scatter_shadow_pipeline);
+            pass.draw(0..72, start * 1024..end * 1024);
+        }
     }
 }
 
@@ -2516,27 +2663,57 @@ fn upload_source(
     queue.write_buffer(&surface, 0, &surface_bytes);
     let profile_buffer = uniform(&profile_bytes, "Terrain atlas profile constants");
     let fields_buffer = uniform(&fields_bytes, "Terrain atlas field constants");
+    let textures = [macro_texture, detail_texture];
+    let constants = [profile_buffer, fields_buffer, surface];
+    let rivers =
+        crate::terrain_rivers::river_buffer(device, queue, &crate::terrain_rivers::DISABLED_RIVERS);
+    let group = source_group(device, layout, &textures, &constants, &world, &rivers);
+    let hydrology = matches!(source, AtlasSource::World(world) if world.hydrology);
+    Ok(SourceGpu {
+        _textures: textures,
+        _constants: constants,
+        group,
+        last_used: 0,
+        bake,
+        _world: world,
+        rivers,
+        world_fields: None,
+        hydrology,
+    })
+}
+
+/// Producer source bind group: profile images, profile/field constants
+/// (`constants[0..2]`), Tier A world fields, surface colours (`constants[2]`)
+/// and the packed rivers.
+fn source_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    textures: &[wgpu::Texture; 2],
+    constants: &[wgpu::Buffer; 3],
+    world: &wgpu::Buffer,
+    rivers: &wgpu::Buffer,
+) -> wgpu::BindGroup {
     let view =
         |texture: &wgpu::Texture| texture.create_view(&wgpu::TextureViewDescriptor::default());
-    let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("Terrain atlas producer source"),
         layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::TextureView(&view(&macro_texture)),
+                resource: wgpu::BindingResource::TextureView(&view(&textures[0])),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::TextureView(&view(&detail_texture)),
+                resource: wgpu::BindingResource::TextureView(&view(&textures[1])),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
-                resource: profile_buffer.as_entire_binding(),
+                resource: constants[0].as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 3,
-                resource: fields_buffer.as_entire_binding(),
+                resource: constants[1].as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 4,
@@ -2544,17 +2721,13 @@ fn upload_source(
             },
             wgpu::BindGroupEntry {
                 binding: 5,
-                resource: surface.as_entire_binding(),
+                resource: constants[2].as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: rivers.as_entire_binding(),
             },
         ],
-    });
-    Ok(SourceGpu {
-        _textures: [macro_texture, detail_texture],
-        _constants: [profile_buffer, fields_buffer, surface],
-        group,
-        last_used: 0,
-        bake,
-        _world: world,
     })
 }
 

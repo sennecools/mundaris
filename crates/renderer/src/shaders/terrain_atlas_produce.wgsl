@@ -690,7 +690,48 @@ fn climate_detail(local: vec3<f32>) -> vec2<f32> {
     return sum * vec2<f32>(surface_f32(1u), surface_f32(2u));
 }
 
-fn world_albedo(d: vec3<f32>, normal: vec3<f32>, local: vec3<f32>) -> vec3<f32> {
+// PROTOTYPE (M4 Surface): linear colours of rock and loose materials and the
+// strata thickness, as `material_rules::surface_colour`.
+const ROCK_LINEAR: vec3<f32> = vec3<f32>(0.17, 0.15, 0.13);
+const SCREE_LINEAR: vec3<f32> = vec3<f32>(0.24, 0.22, 0.2);
+const SAND_LINEAR: vec3<f32> = vec3<f32>(0.42, 0.35, 0.24);
+const WET_SEDIMENT_LINEAR: vec3<f32> = vec3<f32>(0.09, 0.085, 0.065);
+const STRATA_PERIOD_M: f32 = 40.0;
+
+// Ground colour under the snow rule (mirrors material_rules::surface_colour).
+fn surface_colour(height: f32, slope: f32, moisture: f32, aux: vec3<f32>, soil: vec3<f32>, warp: f32) -> vec3<f32> {
+    var input: MaterialInput;
+    input.height_m = height;
+    input.slope = slope;
+    input.uphill_slope = 0.0;
+    input.temperature_c = 100.0;
+    input.moisture = moisture;
+    input.hardness = aux.x;
+    input.sediment = aux.y;
+    input.flow = aux.z;
+    let w = material_weights(input);
+    let rock = strata_colour_factor(strata_tone(height, warp, STRATA_PERIOD_M), strata_visibility(slope, aux.x));
+    return w.bedrock * ROCK_LINEAR * rock + w.scree * SCREE_LINEAR + (w.soil + w.snow) * soil
+        + w.sand * SAND_LINEAR + w.wet_sediment * WET_SEDIMENT_LINEAR;
+}
+
+// Hardness, sediment and flow (aux0 bytes 1..3) of the node's mip at `d`,
+// bilinear like the CPU's unpacked ShapeMaps mips. Level 0 is result run 6.
+fn world_aux(d: vec3<f32>) -> vec3<f32> {
+    let stride = 6u * cube_level_n * cube_level_n;
+    let base = select(tile.noise.z + 4u * stride, 6u * stride, tile.noise.z == 0u);
+    var out: vec3<f32>;
+    cube_decode = 3u;
+    out.x = cube_sample(base, d, false);
+    cube_decode = 4u;
+    out.y = cube_sample(base, d, false);
+    cube_decode = 5u;
+    out.z = cube_sample(base, d, false);
+    cube_decode = 0u;
+    return out;
+}
+
+fn world_albedo(d: vec3<f32>, normal: vec3<f32>, local: vec3<f32>, height: f32) -> vec3<f32> {
     cube_level_n = tile.noise.w;
     let stride = 6u * cube_level_n * cube_level_n;
     let detail = climate_detail(local);
@@ -699,7 +740,10 @@ fn world_albedo(d: vec3<f32>, normal: vec3<f32>, local: vec3<f32>) -> vec3<f32> 
     let slope = acos(clamp(dot(normal, d), -1.0, 1.0));
     let snow = (1.0 - smoothstep(surface_f32(8u) - surface_f32(9u), surface_f32(8u) + surface_f32(9u), t))
         * (1.0 - smoothstep(surface_f32(10u), surface_f32(11u), slope));
-    return mix(biome_colour(t, m), surface_vec3(12u), snow);
+    let amplitude = surface_f32(1u);
+    let warp = select(0.0, detail.x / amplitude, amplitude > 0.0);
+    let ground = surface_colour(height, slope, m, world_aux(d), biome_colour(t, m), warp);
+    return mix(ground, surface_vec3(12u), snow);
 }
 
 // Coast contour in the normal page's w for world maps: the signed distance
@@ -717,7 +761,14 @@ fn page_water(st: vec2<f32>, value: vec4<f32>) -> f32 {
     let c = clamp(dot(value.xyz, up), 1.0e-3, 1.0);
     let slope = max(sqrt(1.0 - c * c) / c, 1.0e-3);
     let texel = tile.scale.x * tile.face_u.w / f32(dispatch.cells);
-    return clamp(-value.w / (slope * texel * WATER_CONTOUR_TEXELS), -1.0, 1.0);
+    let sea = clamp(-value.w / (slope * texel * WATER_CONTOUR_TEXELS), -1.0, 1.0);
+    if sample_water_depth > -1.0e29 {
+        // Lakes and rivers: the same contour against the carved ground.
+        let ground_slope = max(sample_ground_slope, 1.0e-3);
+        let inland = clamp(sample_water_depth / (ground_slope * texel * WATER_CONTOUR_TEXELS), -1.0, 1.0);
+        return max(sea, inland);
+    }
+    return sea;
 }
 
 // Page albedo texel for an evaluated sample `value` (normal, height) at `st`.
@@ -727,7 +778,7 @@ fn page_albedo(st: vec2<f32>, value: vec4<f32>) -> vec4<f32> {
     }
     let p = chart_point(st);
     let local = p.diff * tile.scale.x;
-    return vec4<f32>(linear_to_srgb(world_albedo(normalize(p.n), value.xyz, local)), 1.0);
+    return vec4<f32>(linear_to_srgb(world_albedo(normalize(p.n), value.xyz, local, value.w)), 1.0);
 }
 
 // Page climate texel at `st`: temperature and moisture from the node's mip (as
@@ -772,10 +823,34 @@ fn evaluate(st: vec2<f32>) -> vec4<f32> {
         sample_value.gradient += detail.yzw * tile.scale.x;
     }
     let n = normalize(p.n);
+    // PROTOTYPE (M3 Water): carve rivers into world tiles and lay lakes and
+    // river ribbons as flat water (river_carve.wgsl).
+    sample_water_depth = -1.0e30;
+    if tile.info.y == 2u {
+        let texel = tile.scale.x * tile.face_u.w / f32(dispatch.cells);
+        let carve = river_carve(n, sample_value.height, sample_value.gradient, 0.75 * texel);
+        sample_value.height = carve.height;
+        sample_value.gradient = carve.gradient;
+        let ground_gradient = carve.gradient - n * dot(n, carve.gradient);
+        sample_ground_slope = length(ground_gradient) / (tile.scale.x + carve.height);
+        if carve.water > -1.0e29 {
+            sample_water_depth = carve.water - carve.height;
+            if carve.water > carve.height && carve.water > 0.0 {
+                sample_value.height = carve.water;
+                sample_value.gradient = vec3<f32>(0.0);
+            }
+        }
+    }
     let tangent_gradient = sample_value.gradient - n * dot(n, sample_value.gradient);
     let normal = normalize(n - tangent_gradient / (tile.scale.x + sample_value.height));
     return vec4<f32>(normal, sample_value.height);
 }
+
+// PROTOTYPE (M3 Water): water depth above the carved ground at the last
+// evaluated sample (-1e30 without lake or river water) and the ground slope,
+// for the water contour in page_water.
+var<private> sample_water_depth: f32;
+var<private> sample_ground_slope: f32;
 
 fn ordered(value: f32) -> u32 {
     let bits = bitcast<u32>(value);

@@ -1700,6 +1700,12 @@ impl GravityOrbitsDemo {
                 .receive_bounds(renderer.take_terrain_atlas_bounds());
             self.atlas
                 .receive_ready_sources(renderer.take_terrain_ready_sources());
+            // PROTOTYPE (M3 Water): hydrology on read-back world bakes.
+            self.atlas
+                .receive_world_fields(renderer.take_terrain_world_fields());
+            for (source, words) in self.atlas.take_world_rivers() {
+                renderer.set_terrain_world_rivers(source, words);
+            }
             // Read-back colliders (ADR 0023): store arrived pages and schedule
             // the pages under last frame's camera query misses.
             self.atlas

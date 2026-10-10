@@ -12,6 +12,7 @@
 //! node tables are disposable derived state keyed by body, definition, radius
 //! and terrain revision; body motion only changes per-frame transforms.
 pub mod collision;
+pub mod hydrology;
 pub mod producer;
 pub mod select;
 pub mod tier_a;
@@ -277,6 +278,8 @@ pub struct PlanetLod {
     /// Collision job token -> (body, bind slot, page, request frame).
     collision_tokens: HashMap<u64, (BodyId, u64, CubePatchAddress, u64)>,
     collision_stats: collision::CollisionStats,
+    /// PROTOTYPE (M3 Water): hydrology workers for read-back world bakes.
+    hydrology: hydrology::HydrologyJobs,
 }
 
 const SAMPLE_HISTORY: usize = 256;
@@ -335,6 +338,7 @@ impl PlanetLod {
             collision_policy: None,
             collision_tokens: HashMap::new(),
             collision_stats: collision::CollisionStats::default(),
+            hydrology: hydrology::HydrologyJobs::default(),
         }
     }
 
@@ -441,6 +445,28 @@ impl PlanetLod {
                 Some(error) => lod.world_error = Some(error),
             }
         }
+    }
+
+    /// PROTOTYPE (M3 Water): start hydrology for world bakes read back by
+    /// the renderer.
+    pub fn receive_world_fields(&mut self, fields: Vec<astrum_renderer::AtlasWorldFields>) {
+        for field in fields {
+            let radius_m = self
+                .bodies
+                .values()
+                .chain(self.outgoing.values())
+                .find(|lod| lod.source_key == field.source)
+                .and_then(|lod| match lod.recipe.as_ref() {
+                    ProducerRecipe::World(world) => Some(world.field.inputs().radius_m),
+                    _ => None,
+                });
+            self.hydrology.start(field, radius_m);
+        }
+    }
+
+    /// PROTOTYPE (M3 Water): packed rivers ready for the renderer.
+    pub fn take_world_rivers(&mut self) -> Vec<(u64, Vec<u32>)> {
+        self.hydrology.poll()
     }
 
     /// A rebind of `body` is still preparing, baking or filling tiles while
