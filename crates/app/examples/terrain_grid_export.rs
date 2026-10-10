@@ -112,20 +112,36 @@ fn main() {
     let east = centre.any_orthonormal_vector();
     let north = centre.cross(east);
     let half = cells as f64 * spacing / 2.0;
+    // ASTRUM_EXPORT_RIVERS=1: carve rivers (M3 hydrology on the CPU maps,
+    // prototype parameters) after the landforms, as the GPU producer does.
+    let rivers = (std::env::var("ASTRUM_EXPORT_RIVERS").as_deref() == Ok("1")).then(|| {
+        use astrum_world::terrain::hydrology::{self, HydrologyInput, HydrologyParams};
+        let astrum_world::terrain::producer::ProducerRecipe::World(world) = &recipe else {
+            panic!("rivers need a world-map body");
+        };
+        let maps = world.field.maps().unwrap();
+        hydrology::run(&HydrologyInput {
+            elevation: &maps.fields.elevation,
+            moisture: &maps.fields.moisture,
+            radius_m: radius,
+            params: HydrologyParams::prototype(),
+        })
+    });
     let started = std::time::Instant::now();
     let mut heights = vec![0.0f32; cells * cells];
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     let rows_per = cells.div_ceil(threads);
     std::thread::scope(|scope| {
         for (chunk, rows) in heights.chunks_mut(rows_per * cells).enumerate() {
-            let recipe = &recipe;
+            let (recipe, rivers) = (&recipe, &rivers);
             scope.spawn(move || {
                 for (k, out) in rows.iter_mut().enumerate() {
                     let (i, j) = (k % cells, chunk * rows_per + k / cells);
                     let u = (i as f64 + 0.5) * spacing - half;
                     let v = (j as f64 + 0.5) * spacing - half;
                     let d = (centre * radius + east * u + north * v).normalize();
-                    *out = recipe.evaluate(d, spacing).unwrap().height_m as f32;
+                    let h = recipe.evaluate(d, spacing).unwrap().height_m;
+                    *out = rivers.as_ref().map_or(h, |r| r.carve(d, h).height_m) as f32;
                 }
             });
         }
