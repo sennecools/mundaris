@@ -5,6 +5,7 @@ edition.workspace = true
 publish = false
 
 [dependencies]
+astrum_core = { path = "../core" }
 astrum_math = { path = "../math" }
 glam.workspace = true
 serde.workspace = true

@@ -189,6 +189,7 @@ version = "0.0.1"
 name = "astrum_flora"
 version = "0.0.1"
 dependencies = [
+ "astrum_core",
  "astrum_math",
  "glam",
  "png",
