@@ -225,6 +225,52 @@ pub fn strata_colour_factor(strata: &Strata, visibility: f32) -> f32 {
     1.0 + 0.35 * strata.tone * visibility
 }
 
+/// PROTOTYPE (M4 Surface): linear mean colours of the rock and loose
+/// materials; soil takes the biome tint. Mirrored in
+/// `terrain_atlas_produce.wgsl` (`surface_materials`).
+pub const ROCK_LINEAR: [f32; 3] = [0.17, 0.15, 0.13];
+pub const SCREE_LINEAR: [f32; 3] = [0.24, 0.22, 0.2];
+pub const SAND_LINEAR: [f32; 3] = [0.42, 0.35, 0.24];
+pub const WET_SEDIMENT_LINEAR: [f32; 3] = [0.09, 0.085, 0.065];
+/// PROTOTYPE: mean strata layer thickness (m).
+pub const STRATA_PERIOD_M: f32 = 40.0;
+
+/// Ground colour under the snow rule: material weights (snow disabled; the
+/// world look's snow rule is applied on top) blending rock with strata,
+/// scree, the biome `soil` tint, sand and wet sediment. `warp` is a
+/// low-frequency noise in about -1..1 for the strata.
+#[allow(clippy::too_many_arguments)]
+pub fn surface_colour(
+    height_m: f32,
+    slope: f32,
+    moisture: f32,
+    hardness: f32,
+    sediment: f32,
+    flow: f32,
+    soil: [f32; 3],
+    warp: f32,
+) -> [f32; 3] {
+    let w = material_weights(&MaterialInput {
+        height_m,
+        slope,
+        uphill_slope: 0.0,
+        temperature_c: 100.0,
+        moisture,
+        hardness,
+        sediment,
+        flow,
+    });
+    let strata = strata_band(height_m, warp, STRATA_PERIOD_M);
+    let rock = strata_colour_factor(&strata, strata_visibility(slope, hardness));
+    std::array::from_fn(|k| {
+        w.bedrock * ROCK_LINEAR[k] * rock
+            + w.scree * SCREE_LINEAR[k]
+            + (w.soil + w.snow) * soil[k]
+            + w.sand * SAND_LINEAR[k]
+            + w.wet_sediment * WET_SEDIMENT_LINEAR[k]
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

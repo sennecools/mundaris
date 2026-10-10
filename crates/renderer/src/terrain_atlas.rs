@@ -16,7 +16,8 @@ use std::sync::{
 /// Draw shader: shared scene lighting followed by the atlas draw stages.
 const DRAW_SHADER: &str = concat!(
     include_str!("shaders/lighting.wgsl"),
-    include_str!("shaders/terrain_atlas.wgsl")
+    include_str!("shaders/terrain_atlas.wgsl"),
+    include_str!("shaders/scatter_draw.wgsl")
 );
 /// Producer shader: shared split-lattice noise and cube-map sampling followed by
 /// the atlas producer.
@@ -24,6 +25,7 @@ const PRODUCE_SHADER: &str = concat!(
     include_str!("shaders/terrain_noise.wgsl"),
     include_str!("shaders/cube_map.wgsl"),
     include_str!("shaders/river_carve.wgsl"),
+    include_str!("shaders/material_rules.wgsl"),
     include_str!("shaders/terrain_atlas_produce.wgsl")
 );
 
@@ -638,6 +640,8 @@ pub(crate) struct TerrainAtlasRenderer {
     collision_results: Vec<AtlasCollisionPage>,
     sources: std::collections::HashMap<u64, SourceGpu>,
     pipeline: wgpu::RenderPipeline,
+    /// PROTOTYPE (M5 Life): procedural trees and boulders on drawn nodes.
+    scatter_pipeline: wgpu::RenderPipeline,
     draw_group: wgpu::BindGroup,
     instances: wgpu::Buffer,
     instance_capacity: u64,
@@ -951,7 +955,7 @@ impl TerrainAtlasRenderer {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: vertex_fragment,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         view_dimension: wgpu::TextureViewDimension::D2Array,
@@ -961,7 +965,7 @@ impl TerrainAtlasRenderer {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: vertex_fragment,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
@@ -997,7 +1001,7 @@ impl TerrainAtlasRenderer {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 6,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: vertex_fragment,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         view_dimension: wgpu::TextureViewDimension::D2Array,
@@ -1071,6 +1075,36 @@ impl TerrainAtlasRenderer {
             }),
             primitive: wgpu::PrimitiveState {
                 front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let scatter_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Terrain scatter (prototype trees and boulders)"),
+            layout: Some(&draw_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &draw_shader,
+                entry_point: Some("vs_scatter"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &draw_shader,
+                entry_point: Some("fs_scatter"),
+                compilation_options: Default::default(),
+                targets: &color_targets,
+            }),
+            primitive: wgpu::PrimitiveState {
                 cull_mode: None,
                 ..Default::default()
             },
@@ -1174,6 +1208,7 @@ impl TerrainAtlasRenderer {
             collision_results: Vec::new(),
             sources: Default::default(),
             pipeline,
+            scatter_pipeline,
             draw_group,
             instances,
             instance_capacity,
@@ -1719,6 +1754,10 @@ impl TerrainAtlasRenderer {
         pass.set_vertex_buffer(0, self.vertices.slice(..));
         pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..self.index_count, 0, 0..self.staged_instances);
+        // PROTOTYPE (M5 Life): 256 scatter slots of 48 procedural vertices per
+        // drawn node (scatter_draw.wgsl); bind groups are shared.
+        pass.set_pipeline(&self.scatter_pipeline);
+        pass.draw(0..48, 0..self.staged_instances * 256);
     }
 
     /// Uploads per-cascade caster lists back to back.

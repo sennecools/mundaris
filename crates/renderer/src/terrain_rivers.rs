@@ -100,7 +100,11 @@ impl WorldFieldsReadback {
 }
 
 /// Storage buffer holding packed river words (at least the header).
-pub(crate) fn river_buffer(device: &wgpu::Device, queue: &wgpu::Queue, words: &[u32]) -> wgpu::Buffer {
+pub(crate) fn river_buffer(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    words: &[u32],
+) -> wgpu::Buffer {
     let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("Terrain atlas world rivers"),

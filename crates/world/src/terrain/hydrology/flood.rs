@@ -1,11 +1,11 @@
 //! Priority-flood depression filling (§7.1, Barnes et al. 2014 with an
 //! epsilon gradient), steepest-descent receivers and lakes.
 use super::{HydrologyParams, NO_RECEIVER};
+use crate::terrain::noise::gradient_noise;
 use crate::terrain::{
     tier_a::erosion::Level,
     world_map::{CubeMap, neighbours},
 };
-use crate::terrain::noise::gradient_noise;
 use std::{cmp::Ordering, collections::BinaryHeap};
 
 /// Seed of the routing noise.

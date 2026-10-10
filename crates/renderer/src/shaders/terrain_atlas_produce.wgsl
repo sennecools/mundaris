@@ -80,7 +80,14 @@ var<private> tile: Tile;
 // Face cells of the elevation mip sampled through cube_map.wgsl.
 var<private> cube_level_n: u32;
 
+// PROTOTYPE (M4 Surface): byte 0..3 of a packed unorm8 field (aux0) when
+// below 4, else the f32 field itself.
+var<private> cube_byte: u32 = 4u;
+
 fn cube_field(index: u32) -> f32 {
+    if cube_byte < 4u {
+        return f32((bitcast<u32>(world_fields[index]) >> (8u * cube_byte)) & 255u) / 255.0;
+    }
     return world_fields[index];
 }
 
@@ -679,7 +686,48 @@ fn climate_detail(local: vec3<f32>) -> vec2<f32> {
     return sum * vec2<f32>(surface_f32(1u), surface_f32(2u));
 }
 
-fn world_albedo(d: vec3<f32>, normal: vec3<f32>, local: vec3<f32>) -> vec3<f32> {
+// PROTOTYPE (M4 Surface): linear colours of rock and loose materials and the
+// strata thickness, as `material_rules::surface_colour`.
+const ROCK_LINEAR: vec3<f32> = vec3<f32>(0.17, 0.15, 0.13);
+const SCREE_LINEAR: vec3<f32> = vec3<f32>(0.24, 0.22, 0.2);
+const SAND_LINEAR: vec3<f32> = vec3<f32>(0.42, 0.35, 0.24);
+const WET_SEDIMENT_LINEAR: vec3<f32> = vec3<f32>(0.09, 0.085, 0.065);
+const STRATA_PERIOD_M: f32 = 40.0;
+
+// Ground colour under the snow rule (mirrors material_rules::surface_colour).
+fn surface_colour(height: f32, slope: f32, moisture: f32, aux: vec3<f32>, soil: vec3<f32>, warp: f32) -> vec3<f32> {
+    var input: MaterialInput;
+    input.height_m = height;
+    input.slope = slope;
+    input.uphill_slope = 0.0;
+    input.temperature_c = 100.0;
+    input.moisture = moisture;
+    input.hardness = aux.x;
+    input.sediment = aux.y;
+    input.flow = aux.z;
+    let w = material_weights(input);
+    let rock = strata_colour_factor(strata_tone(height, warp, STRATA_PERIOD_M), strata_visibility(slope, aux.x));
+    return w.bedrock * ROCK_LINEAR * rock + w.scree * SCREE_LINEAR + (w.soil + w.snow) * soil
+        + w.sand * SAND_LINEAR + w.wet_sediment * WET_SEDIMENT_LINEAR;
+}
+
+// Hardness, sediment and flow (aux0 bytes 1..3) of the node's mip at `d`,
+// bilinear like the CPU's unpacked ShapeMaps mips. Level 0 is result run 6.
+fn world_aux(d: vec3<f32>) -> vec3<f32> {
+    let stride = 6u * cube_level_n * cube_level_n;
+    let base = select(tile.noise.z + 4u * stride, 6u * stride, tile.noise.z == 0u);
+    var out: vec3<f32>;
+    cube_byte = 1u;
+    out.x = cube_sample(base, d, false);
+    cube_byte = 2u;
+    out.y = cube_sample(base, d, false);
+    cube_byte = 3u;
+    out.z = cube_sample(base, d, false);
+    cube_byte = 4u;
+    return out;
+}
+
+fn world_albedo(d: vec3<f32>, normal: vec3<f32>, local: vec3<f32>, height: f32) -> vec3<f32> {
     cube_level_n = tile.noise.w;
     let stride = 6u * cube_level_n * cube_level_n;
     let detail = climate_detail(local);
@@ -688,7 +736,10 @@ fn world_albedo(d: vec3<f32>, normal: vec3<f32>, local: vec3<f32>) -> vec3<f32> 
     let slope = acos(clamp(dot(normal, d), -1.0, 1.0));
     let snow = (1.0 - smoothstep(surface_f32(8u) - surface_f32(9u), surface_f32(8u) + surface_f32(9u), t))
         * (1.0 - smoothstep(surface_f32(10u), surface_f32(11u), slope));
-    return mix(biome_colour(t, m), surface_vec3(12u), snow);
+    let amplitude = surface_f32(1u);
+    let warp = select(0.0, detail.x / amplitude, amplitude > 0.0);
+    let ground = surface_colour(height, slope, m, world_aux(d), biome_colour(t, m), warp);
+    return mix(ground, surface_vec3(12u), snow);
 }
 
 // Coast contour in the normal page's w for world maps: the signed distance
@@ -723,7 +774,7 @@ fn page_albedo(st: vec2<f32>, value: vec4<f32>) -> vec4<f32> {
     }
     let p = chart_point(st);
     let local = p.diff * tile.scale.x;
-    return vec4<f32>(linear_to_srgb(world_albedo(normalize(p.n), value.xyz, local)), 1.0);
+    return vec4<f32>(linear_to_srgb(world_albedo(normalize(p.n), value.xyz, local, value.w)), 1.0);
 }
 
 // Page climate texel at `st`: temperature and moisture from the node's mip (as

@@ -348,15 +348,53 @@ impl ProducerRecipe {
         let sample = self.evaluate(direction, texel_m)?;
         let maps = recipe.field.maps()?;
         let n = direction.normalize();
-        let (temperature, moisture) = maps.climate(maps.mip_for(texel_m, recipe.radius_m), n);
+        let level = maps.mip_for(texel_m, recipe.radius_m);
+        let (temperature, moisture) = maps.climate(level, n);
         let look = recipe.field.look();
         let (dt, dm) = look.climate_offsets(n * recipe.radius_m, texel_m);
-        Ok(Some(look.land(
-            temperature + dt,
-            moisture + dm,
-            n,
-            sample.normal,
-        )))
+        let (t, m) = (temperature + dt, moisture + dm);
+        // PROTOTYPE (M4 Surface): ground materials from slope, height and the
+        // Tier A hardness, sediment and flow under the world look's snow rule
+        // (`material_rules::surface_colour`; GPU `world_albedo`).
+        let tint = look.lut.sample(t, m);
+        let slope = sample.normal.dot(n).clamp(-1.0, 1.0).acos();
+        let step = |e0: f64, e1: f64, x: f64| {
+            let s = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+            s * s * (3.0 - 2.0 * s)
+        };
+        let snow = (1.0
+            - step(
+                look.snow_temperature_c - look.snow_blend_c,
+                look.snow_temperature_c + look.snow_blend_c,
+                t,
+            ))
+            * (1.0 - step(look.snow_slope_rad.0, look.snow_slope_rad.1, slope));
+        let (hardness, sediment, flow) = maps.shape.as_ref().map_or((0.0, 0.0, 0.0), |s| {
+            (
+                s.hardness_mips[level].bilinear(n),
+                s.sediment_mips[level].bilinear(n),
+                s.flow_mips[level].bilinear(n),
+            )
+        });
+        let warp = look
+            .climate
+            .as_ref()
+            .filter(|c| c.temperature_c > 0.0)
+            .map_or(0.0, |c| dt / c.temperature_c);
+        let ground = crate::terrain::material_rules::surface_colour(
+            sample.height_m as f32,
+            slope as f32,
+            m as f32,
+            hardness as f32,
+            sediment as f32,
+            flow as f32,
+            tint.map(|c| c as f32),
+            warp as f32,
+        );
+        Ok(Some(std::array::from_fn(|k| {
+            let g = f64::from(ground[k]);
+            g + (look.snow_albedo[k] - g) * snow
+        })))
     }
 }
 

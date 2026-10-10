@@ -45,17 +45,36 @@ pub fn provide_gpu_world(context: &GpuContext, recipe: &ProducerRecipe) {
         map.data_mut().copy_from_slice(gpu.run(run));
         map
     };
-    world.field.provide(TierAFields {
-        elevation: map(0),
-        temperature: map(1),
-        moisture: map(2),
-        wind_east: map(3),
-        wind_north: map(4),
-        sea_level: f64::from(gpu.sea_level),
-        noise_low: f64::from(gpu.noise_low),
-        noise_high: f64::from(gpu.noise_high),
-        ocean_fraction: f64::NAN,
-    });
+    let words = |run: usize| {
+        let mut map = CubeMap::new(n, 0u32);
+        map.data_mut().copy_from_slice(&gpu.run_words(run));
+        map
+    };
+    let mut boundary_coord = CubeMap::new(n, 0i32);
+    for (o, w) in boundary_coord.data_mut().iter_mut().zip(gpu.run_words(5)) {
+        *o = w as i32;
+    }
+    // The shape runs feed the landform recipes (M2 Shape).
+    let shape = astrum_world::terrain::tier_a::TierAShape {
+        boundary_coord,
+        aux0: words(6),
+        aux1: words(7),
+        landform: words(8),
+    };
+    world.field.provide_with_shape(
+        TierAFields {
+            elevation: map(0),
+            temperature: map(1),
+            moisture: map(2),
+            wind_east: map(3),
+            wind_north: map(4),
+            sea_level: f64::from(gpu.sea_level),
+            noise_low: f64::from(gpu.noise_low),
+            noise_high: f64::from(gpu.noise_high),
+            ocean_fraction: f64::NAN,
+        },
+        &shape,
+    );
 }
 
 /// Producer jobs for `nodes` exactly as the runtime builds them (noise

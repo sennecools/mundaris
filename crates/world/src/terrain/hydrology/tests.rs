@@ -181,3 +181,38 @@ fn profiles_are_monotone_and_meet_the_terrain() {
     assert!((carve::floodplain_profile(1.0) - 1.0).abs() < 1e-12);
     assert!(carve::floodplain_profile(0.4) < 0.05);
 }
+
+#[test]
+fn packed_rivers_follow_the_documented_layout() {
+    let n = 32;
+    let (elevation, moisture, radius_m) = baked(n, 7);
+    let hydrology = run_on(&elevation, &moisture, radius_m);
+    let words = gpu::pack(&hydrology);
+    let graph = &hydrology.rivers;
+    assert_eq!(words[0] as usize, graph.vertices.len());
+    assert_eq!(words[1] as usize, hydrology.hash.cells);
+    assert_eq!(words[7], 1);
+    assert_eq!(f32::from_bits(words[8]), radius_m as f32);
+    let vertex = words[6] as usize;
+    for (i, v) in graph.vertices.iter().enumerate().take(50) {
+        let at = vertex + gpu::VERTEX_WORDS * i;
+        assert_eq!(f32::from_bits(words[at + 6]), v.bed_m as f32);
+        assert_eq!(words[at + 7], v.downstream);
+    }
+    let starts = words[2] as usize;
+    let cells = 6 * hydrology.hash.cells * hydrology.hash.cells;
+    assert_eq!(
+        words[starts + cells] as usize,
+        hydrology.hash.segments.len()
+    );
+    assert_eq!(words[3] as usize, starts + cells + 1);
+    let lakes = words[5] as usize;
+    let expected = if hydrology.fill.lakes.is_empty() {
+        0
+    } else {
+        n
+    };
+    assert_eq!(lakes, expected);
+    assert_eq!(words.len(), words[4] as usize + 6 * lakes * lakes);
+    assert_eq!(gpu::disabled()[7], 0);
+}

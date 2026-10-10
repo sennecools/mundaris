@@ -68,17 +68,18 @@ impl HydrologyJobs {
     /// Finished jobs: (source key, packed rivers).
     pub fn poll(&mut self) -> Vec<(u64, Vec<u32>)> {
         let mut done = Vec::new();
-        self.jobs.retain(|(source, receiver)| match receiver.try_recv() {
-            Ok(words) => {
-                done.push((*source, words));
-                false
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => true,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                done.push((*source, gpu::disabled()));
-                false
-            }
-        });
+        self.jobs
+            .retain(|(source, receiver)| match receiver.try_recv() {
+                Ok(words) => {
+                    done.push((*source, words));
+                    false
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => true,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    done.push((*source, gpu::disabled()));
+                    false
+                }
+            });
         done
     }
 }
