@@ -83,5 +83,5 @@
         depth_scale_m: 120.0,
     ),
     // Measured for the canonical seed; gpu_terrain_colour.rs checks it (0.005).
-    average_colour: (0.100, 0.112, 0.104),
+    average_colour: (0.110, 0.118, 0.107),
 )

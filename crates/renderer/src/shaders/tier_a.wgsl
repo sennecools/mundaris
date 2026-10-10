@@ -344,11 +344,8 @@ fn moisture_finish(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     var m = 0.5;
     if has(STAGE_MOISTURE) {
-        if fields[run(RUN_ELEVATION) + t.k] < 0.0 {
-            m = 1.0;
-        } else {
-            m = 1.0 - exp(-fields[run(RUN_PRECIPITATION) + t.k] / params.moisture.z);
-        }
+        // Over the sea too (see the CPU oracle): no wet rim bleeds into coasts.
+        m = 1.0 - exp(-fields[run(RUN_PRECIPITATION) + t.k] / params.moisture.z);
     }
     fields[run(RUN_MOISTURE) + t.k] = m;
 }

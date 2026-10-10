@@ -550,17 +550,52 @@ pub fn tier_a_for_validation_budgeted(
     inputs: &TierABakeInputs,
     passes: usize,
 ) -> Result<TierAReadback, String> {
-    let pipelines = TierAPipelines::new(device);
-    let mut bake = TierABake::new(device, queue, &pipelines, inputs)?;
+    TierAValidation::new(device).bake(device, queue, inputs, passes)
+}
+
+/// Compiled Tier A pipelines reused across validation bakes, so comparisons
+/// between bakes do not also compare two driver compilations of the shader
+/// (observed to differ once right after a shader change).
+pub struct TierAValidation {
+    pipelines: TierAPipelines,
+}
+
+impl TierAValidation {
+    pub fn new(device: &wgpu::Device) -> Self {
+        Self {
+            pipelines: TierAPipelines::new(device),
+        }
+    }
+
+    /// Bake `inputs` with at most `passes` passes per submission.
+    pub fn bake(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        inputs: &TierABakeInputs,
+        passes: usize,
+    ) -> Result<TierAReadback, String> {
+        bake_for_validation(device, queue, &self.pipelines, inputs, passes)
+    }
+}
+
+fn bake_for_validation(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipelines: &TierAPipelines,
+    inputs: &TierABakeInputs,
+    passes: usize,
+) -> Result<TierAReadback, String> {
+    let mut bake = TierABake::new(device, queue, pipelines, inputs)?;
     let mut encoder = device.create_command_encoder(&Default::default());
-    bake.encode(&mut encoder, &pipelines, passes.max(1));
+    bake.encode(&mut encoder, pipelines, passes.max(1));
     while !bake.done() {
         queue.submit([std::mem::replace(
             &mut encoder,
             device.create_command_encoder(&Default::default()),
         )
         .finish()]);
-        bake.encode(&mut encoder, &pipelines, passes.max(1));
+        bake.encode(&mut encoder, pipelines, passes.max(1));
     }
     let read = |encoder: &mut wgpu::CommandEncoder, source: &wgpu::Buffer, size: u64| {
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {

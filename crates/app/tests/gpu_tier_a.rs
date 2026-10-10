@@ -147,21 +147,20 @@ fn production_size_bake_is_frame_split_stable_with_full_mip_chains() {
     };
     assert_eq!(inputs.face_cells, 512);
     let packed = bake_inputs(&inputs);
-    let whole =
-        astrum_renderer::tier_a::tier_a_for_validation(&context.device, &context.queue, &packed)
-            .unwrap();
-    let split = astrum_renderer::tier_a::tier_a_for_validation_budgeted(
-        &context.device,
-        &context.queue,
-        &packed,
-        24,
-    )
-    .unwrap();
+    // One set of compiled pipelines for both bakes: twice, right after a Tier
+    // A shader change, two separate compilations disagreed in ~1–2 % of
+    // values (driver cache state; never reproduced afterwards). Sharing them
+    // isolates what this test is about, the frame split.
+    let validation = astrum_renderer::tier_a::TierAValidation::new(&context.device);
+    let whole = validation
+        .bake(&context.device, &context.queue, &packed, usize::MAX)
+        .unwrap();
+    let split = validation
+        .bake(&context.device, &context.queue, &packed, 24)
+        .unwrap();
     assert_eq!(whole.sea_level, split.sea_level);
-    // Usually bit-identical. Two full-suite runs differed in ~1–2 % of
-    // values (never reproduced in isolation, cause not established; the two
-    // bakes compile their pipelines separately), so compare within bounds far
-    // below the GPU-vs-CPU tolerances: a dispatch race would exceed them.
+    // Expected bit-identical; the bounds (far below the GPU-vs-CPU
+    // tolerances) still fail on any dispatch race.
     let len = 6 * inputs.face_cells * inputs.face_cells;
     let bounds = [1.0e-3, 1.0e-4, 1.0e-5, 1.0e-6, 1.0e-6];
     let mut differing = 0;

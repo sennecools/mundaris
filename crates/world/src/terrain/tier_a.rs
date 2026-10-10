@@ -367,12 +367,11 @@ pub fn bake(inputs: &TierAInputs) -> Result<TierAFields, TerrainError> {
                 precipitation[k] += rain;
             }
         }
-        for (k, value) in moisture.data_mut().iter_mut().enumerate() {
-            *value = if elevation.data()[k] < 0.0 {
-                1.0
-            } else {
-                (1.0 - (-precipitation[k] / p.precipitation_scale).exp()) as f32
-            };
+        // Over the sea too: rain falls there as well, and a fixed 1.0 on ocean
+        // texels would bleed into coastal land wherever colour interpolates
+        // between world-map texels (wet rims along every coast).
+        for (value, rain) in moisture.data_mut().iter_mut().zip(&precipitation) {
+            *value = (1.0 - (-rain / p.precipitation_scale).exp()) as f32;
         }
     }
 
