@@ -6,6 +6,7 @@
 //! sized to the viewport → overlays → tessellate → surface acquire (the vsync
 //! wait under FIFO) → encode and submit → present.
 
+mod dock;
 mod panels;
 mod profiler_panel;
 mod surface;
@@ -18,14 +19,16 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use egui::{Frame, Key, KeyboardShortcut, Margin, Modifiers};
-use serde::{Deserialize, Serialize};
 use astrum_app::{
     GravityOrbitsDemo,
     engine_profile::span,
     studio::view::{StudioAction, StudioView},
 };
 use astrum_renderer::{GpuContext, Renderer};
+use dock::Tab;
+use egui::{Frame, Key, KeyboardShortcut, Margin, Modifiers};
+use egui_dock::{DockArea, DockState};
+use serde::{Deserialize, Serialize};
 use tracing::info;
 use winit::{
     application::ApplicationHandler,
@@ -214,25 +217,33 @@ pub enum InspectorTab {
 }
 
 impl InspectorTab {
-    pub const ALL: [Self; 3] = [Self::Body, Self::Planet, Self::Render];
-    pub const NAMES: [&'static str; 3] = ["Body", "Planet", "Render"];
     pub fn index(self) -> usize {
         self as usize
     }
 }
 
 /// Panel layout remembered between runs (`LAYOUT_PATH`, relative to the
-/// working directory's build output).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// working directory's build output): the workspace and one dock tree per
+/// workspace. Layout files from before docking only carry panel sizes; they
+/// seed the default dock trees once and are not written again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 struct StudioLayout {
     workspace: Workspace,
+    editor_dock: Option<DockState<Tab>>,
+    performance_dock: Option<DockState<Tab>>,
+    #[serde(skip_serializing)]
     inspector_tab: InspectorTab,
+    #[serde(skip_serializing)]
     log_open: bool,
+    #[serde(skip_serializing)]
     outliner_width: f32,
+    #[serde(skip_serializing)]
     inspector_width: f32,
+    #[serde(skip_serializing)]
     log_height: f32,
     /// Profiler height in the Performance workspace; 0 picks 60 % of the window.
+    #[serde(skip_serializing)]
     performance_height: f32,
 }
 
@@ -240,6 +251,8 @@ impl Default for StudioLayout {
     fn default() -> Self {
         Self {
             workspace: Workspace::Editor,
+            editor_dock: None,
+            performance_dock: None,
             inspector_tab: InspectorTab::Body,
             log_open: false,
             outliner_width: 240.0,
@@ -254,10 +267,14 @@ const LAYOUT_PATH: &str = "target/studio-layout.json";
 
 impl StudioLayout {
     fn load() -> Self {
-        std::fs::read_to_string(LAYOUT_PATH)
+        let mut layout: Self = std::fs::read_to_string(LAYOUT_PATH)
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        for workspace in Workspace::ALL {
+            dock::repair(layout.dock_mut(workspace));
+        }
+        layout
     }
 
     fn save(&self) {
@@ -265,9 +282,69 @@ impl StudioLayout {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Ok(text) = serde_json::to_string_pretty(self) {
+        if let Ok(text) = serde_json::to_string_pretty(&self.to_json()) {
             let _ = std::fs::write(path, text);
         }
+    }
+
+    /// The layout as JSON. Dock trees keep per-node screen rects that can be
+    /// infinite (never shown) and serialise as `null`, which would not read
+    /// back; they are recomputed every frame, so they are written as 0.
+    fn to_json(&self) -> serde_json::Value {
+        /// Rect corners are `{x, y}` objects; only their nulls are rewritten
+        /// (other nulls are real `None`s).
+        fn zero_nulls(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Array(items) => items.iter_mut().for_each(zero_nulls),
+                serde_json::Value::Object(map) => {
+                    for (key, item) in map.iter_mut() {
+                        if item.is_null() && (key == "x" || key == "y") {
+                            *item = serde_json::Value::from(0.0);
+                        } else {
+                            zero_nulls(item);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut json = serde_json::to_value(self).unwrap_or_default();
+        for key in ["editor_dock", "performance_dock"] {
+            if let Some(dock) = json.get_mut(key).filter(|dock| dock.is_object()) {
+                zero_nulls(dock);
+            }
+        }
+        json
+    }
+
+    /// Default dock tree of `workspace`, sized from the legacy panel sizes.
+    fn default_dock(&self, workspace: Workspace) -> DockState<Tab> {
+        match workspace {
+            Workspace::Editor => dock::editor_layout(
+                self.outliner_width,
+                self.inspector_width,
+                self.log_height,
+                self.log_open,
+                self.inspector_tab,
+            ),
+            Workspace::Performance => dock::performance_layout(self.performance_height / 830.0),
+        }
+    }
+
+    fn dock_mut(&mut self, workspace: Workspace) -> &mut DockState<Tab> {
+        let default = self.default_dock(workspace);
+        let slot = match workspace {
+            Workspace::Editor => &mut self.editor_dock,
+            Workspace::Performance => &mut self.performance_dock,
+        };
+        slot.get_or_insert(default)
+    }
+
+    /// Restores the default layout of `workspace` (Panels → Reset layout).
+    fn reset_dock(&mut self, workspace: Workspace) {
+        let fresh = Self::default();
+        let default = fresh.default_dock(workspace);
+        *self.dock_mut(workspace) = default;
     }
 }
 
@@ -278,6 +355,8 @@ struct UiState {
     layout: StudioLayout,
     timeline: profiler_panel::TimelineState,
     scene: Option<SceneTexture>,
+    /// The profiler tab was visible last frame (keeps its data refreshed).
+    profiler_shown: bool,
 }
 
 struct Presentation {
@@ -472,7 +551,7 @@ fn contained<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
 }
 
 /// Lays out the Studio for one frame and runs the engine frame inside the
-/// viewport. Returns the milliseconds spent in UI work (excluding the engine).
+/// viewport tab. Returns the milliseconds spent in UI work (excluding the engine).
 fn draw(
     root: &mut egui::Ui,
     engine: &mut Engine,
@@ -483,12 +562,18 @@ fn draw(
     let started = Instant::now();
     let ui_span = span("UI draw");
     let mut actions = Vec::new();
-    let mut profiler_inputs = Vec::new();
     let mut stop_automation = false;
-    {
+    let UiState {
+        viewport,
+        layout,
+        timeline,
+        scene: scene_texture,
+        profiler_shown,
+    } = ui_state;
+    let workspace = layout.workspace;
+    let (tab_actions, profiler_inputs, interactions, slot, shown) = {
         let view = engine.demo.studio_view();
         let panel = &engine.panel_view;
-        let layout = &mut ui_state.layout;
         // Planet undo and redo, unless a text field has the keyboard.
         if view.planet.is_some() && !root.ctx().egui_wants_keyboard_input() {
             let (undo, redo) = root.ctx().input_mut(|input| {
@@ -496,7 +581,8 @@ fn draw(
                 let redo = input.consume_shortcut(&KeyboardShortcut::new(
                     Modifiers::COMMAND | Modifiers::SHIFT,
                     Key::Z,
-                )) || input.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Y));
+                )) || input
+                    .consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Y));
                 let undo =
                     input.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Z));
                 (undo, redo)
@@ -509,6 +595,15 @@ fn draw(
             }
         }
         let chrome = |margin: Margin| Frame::new().fill(theme::SURFACE_1).inner_margin(margin);
+        let mut toggles = panels::PanelToggles::default();
+        {
+            let state = layout.dock_mut(workspace);
+            for (index, tab) in Tab::ALL.iter().enumerate() {
+                toggles.open[index] = dock::is_open(state, *tab);
+            }
+        }
+        let before = toggles;
+        let mut next_workspace = workspace;
         egui::Panel::top("toolbar")
             .exact_size(40.0)
             .frame(chrome(Margin::symmetric(theme::SPACE_3 as i8, 0)))
@@ -517,89 +612,68 @@ fn draw(
                     ui,
                     view,
                     &panel.time_text,
-                    &mut layout.workspace,
+                    &mut next_workspace,
+                    &mut toggles,
                     &mut actions,
                 )
             });
-        let editor = layout.workspace == Workspace::Editor;
+        let log_index = Tab::ALL
+            .iter()
+            .position(|tab| *tab == Tab::Log)
+            .unwrap_or(0);
         egui::Panel::bottom("status")
             .exact_size(26.0)
             .frame(chrome(Margin::symmetric(theme::SPACE_3 as i8, 0)))
             .show(root, |ui| {
-                let log_open = editor.then_some(&mut layout.log_open);
-                stop_automation = panels::status_bar(ui, view, panel, log_open)
+                stop_automation =
+                    panels::status_bar(ui, view, panel, Some(&mut toggles.open[log_index]))
             });
-        match layout.workspace {
-            Workspace::Editor => {
-                let shown = egui::Panel::left("outliner")
-                    .resizable(true)
-                    .default_size(layout.outliner_width)
-                    .size_range(180.0..=420.0)
-                    .frame(chrome(Margin::same(theme::SPACE_3 as i8)))
-                    .show(root, |ui| {
-                        contained(ui, |ui| panels::outliner(ui, view, &mut actions))
-                    });
-                layout.outliner_width = shown.response.rect.width();
-                let shown = egui::Panel::right("inspector")
-                    .resizable(true)
-                    .default_size(layout.inspector_width)
-                    .size_range(280.0..=560.0)
-                    .frame(chrome(Margin::same(theme::SPACE_3 as i8)))
-                    .show(root, |ui| {
-                        contained(ui, |ui| {
-                            panels::inspector(
-                                ui,
-                                view,
-                                panel,
-                                &mut layout.inspector_tab,
-                                &mut actions,
-                            )
-                        })
-                    });
-                layout.inspector_width = shown.response.rect.width();
-                if layout.log_open {
-                    let shown = egui::Panel::bottom("log")
-                        .resizable(true)
-                        .default_size(layout.log_height)
-                        .size_range(90.0..=420.0)
-                        .frame(chrome(Margin::same(theme::SPACE_2 as i8)))
-                        .show(root, |ui| {
-                            contained(ui, |ui| {
-                                panels::section_header(ui, "LOG", "");
-                                panels::log(ui, panel);
-                            })
-                        });
-                    layout.log_height = shown.response.rect.height();
+        if toggles.reset {
+            layout.reset_dock(workspace);
+        } else if toggles != before {
+            let state = layout.dock_mut(workspace);
+            for (index, tab) in Tab::ALL.iter().enumerate() {
+                if toggles.open[index] != before.open[index] {
+                    dock::set_open(state, *tab, toggles.open[index]);
                 }
             }
-            Workspace::Performance => {
-                let available = root.available_height();
-                let default = if layout.performance_height > 0.0 {
-                    layout.performance_height
-                } else {
-                    available * 0.6
-                };
-                let shown = egui::Panel::bottom("performance")
-                    .resizable(true)
-                    .default_size(default)
-                    .size_range(240.0..=(available - 160.0).max(260.0))
-                    .frame(chrome(Margin::same(theme::SPACE_2 as i8)))
-                    .show(root, |ui| {
-                        contained(ui, |ui| {
-                            profiler_inputs = profiler_panel::show(
-                                ui,
-                                &engine.profiler_data,
-                                &mut ui_state.timeline,
-                            );
-                        })
-                    });
-                layout.performance_height = shown.response.rect.height();
-            }
         }
-    }
+        layout.workspace = next_workspace;
+
+        let mut tabs = dock::Tabs {
+            view,
+            panel,
+            profiler: &engine.profiler_data,
+            timeline,
+            viewport_input: viewport,
+            actions: Vec::new(),
+            profiler_inputs: Vec::new(),
+            interactions: Vec::new(),
+            viewport: None,
+            profiler_shown: false,
+        };
+        let style = dock::style(root.style());
+        egui::CentralPanel::no_frame().show(root, |ui| {
+            DockArea::new(layout.dock_mut(workspace))
+                .id(egui::Id::new(("studio-dock", workspace.index())))
+                .style(style)
+                .show_close_buttons(false)
+                .show_leaf_close_all_buttons(false)
+                .show_leaf_collapse_buttons(false)
+                .show_inside(ui, &mut tabs);
+        });
+        (
+            tabs.actions,
+            tabs.profiler_inputs,
+            tabs.interactions,
+            tabs.viewport,
+            tabs.profiler_shown,
+        )
+    };
+    *profiler_shown = shown;
     drop(ui_span);
     let mut ui_ms = started.elapsed().as_secs_f64() * 1000.0;
-    for action in actions {
+    for action in actions.into_iter().chain(tab_actions) {
         engine.action(action);
     }
     for input in profiler_inputs {
@@ -608,70 +682,67 @@ fn draw(
     if stop_automation {
         engine.human_input("human_stop");
     }
+    for interaction in interactions {
+        engine.interaction(interaction);
+    }
 
-    egui::CentralPanel::no_frame().show(root, |ui| {
-        let rect = ui.max_rect();
-        let interactions = ui_state
-            .viewport
-            .interact(ui, rect, engine.demo.studio_view());
-        for interaction in interactions {
-            engine.interaction(interaction);
-        }
-        let scale = ui.ctx().pixels_per_point();
-        let width = (rect.width() * scale).round().max(0.0) as u32;
-        let height = (rect.height() * scale).round().max(0.0) as u32;
-        let profiler_open = ui_state.layout.workspace == Workspace::Performance;
-        engine.frame(width, height, scale, profiler_open);
+    // The engine renders at the viewport tab's size; a hidden viewport (another
+    // tab active in its node) renders nothing but keeps the frame loop going.
+    let scale = root.ctx().pixels_per_point();
+    let size = |extent: f32| (extent * scale).round().max(0.0) as u32;
+    let (width, height) = slot.as_ref().map_or((0, 0), |slot| {
+        (size(slot.rect.width()), size(slot.rect.height()))
+    });
+    engine.frame(width, height, scale, shown);
 
-        let overlay = Instant::now();
-        let _span = span("UI draw");
-        let texture = engine.renderer.scene_texture();
-        if let Some(texture) = texture
-            && ui_state.scene.as_ref().map(|scene| &scene.texture) != Some(texture)
-        {
-            // The scene holds sRGB-encoded colour in `SCENE_TEXTURE_FORMAT`
-            // (Rgba8Unorm); egui samples textures as gamma-space values, so the
-            // plain view is the matching one (an sRGB view would decode twice).
-            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            let id = match &ui_state.scene {
-                Some(scene) => {
-                    egui_renderer.update_egui_texture_from_wgpu_texture(
-                        device,
-                        &view,
-                        wgpu::FilterMode::Nearest,
-                        scene.id,
-                    );
-                    scene.id
-                }
-                None => {
-                    egui_renderer.register_native_texture(device, &view, wgpu::FilterMode::Nearest)
-                }
-            };
-            ui_state.scene = Some(SceneTexture {
-                texture: texture.clone(),
-                id,
-            });
-        }
-        let scene = texture.and(ui_state.scene.as_ref().map(|scene| scene.id));
+    let overlay = Instant::now();
+    let _span = span("UI draw");
+    let texture = engine.renderer.scene_texture();
+    if let Some(texture) = texture
+        && scene_texture.as_ref().map(|scene| &scene.texture) != Some(texture)
+    {
+        // The scene holds sRGB-encoded colour in `SCENE_TEXTURE_FORMAT`
+        // (Rgba8Unorm); egui samples textures as gamma-space values, so the
+        // plain view is the matching one (an sRGB view would decode twice).
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let id = match scene_texture {
+            Some(scene) => {
+                egui_renderer.update_egui_texture_from_wgpu_texture(
+                    device,
+                    &view,
+                    wgpu::FilterMode::Nearest,
+                    scene.id,
+                );
+                scene.id
+            }
+            None => egui_renderer.register_native_texture(device, &view, wgpu::FilterMode::Nearest),
+        };
+        *scene_texture = Some(SceneTexture {
+            texture: texture.clone(),
+            id,
+        });
+    }
+    if let Some(slot) = slot {
+        let scene = texture.and(scene_texture.as_ref().map(|scene| scene.id));
         viewport::paint(
-            ui,
-            rect,
+            &slot.painter,
+            slot.rect,
             scene,
             engine.demo.studio_view(),
             &engine.panel_view.hud,
         );
         let mut overlay_actions = Vec::new();
         viewport::overlay_controls(
-            ui.ctx(),
-            rect,
+            root.ctx(),
+            slot.rect,
             engine.demo.studio_view(),
             &mut overlay_actions,
         );
         for action in overlay_actions {
             engine.action(action);
         }
-        ui_ms += overlay.elapsed().as_secs_f64() * 1000.0;
-    });
+    }
+    ui_ms += overlay.elapsed().as_secs_f64() * 1000.0;
     ui_ms
 }
 
@@ -698,7 +769,6 @@ impl ApplicationHandler<AppEvent> for StudioApp {
             .on_window_event(presentation.window.as_ref(), &event);
         match event {
             WindowEvent::CloseRequested => {
-                self.ui.layout.save();
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
@@ -744,6 +814,12 @@ impl ApplicationHandler<AppEvent> for StudioApp {
         }
     }
 
+    /// Every exit path (window close, developer shutdown, engine error) saves
+    /// the panel layout.
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.ui.layout.save();
+    }
+
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         // Continuous rendering; FIFO presentation blocks in surface acquire, so
         // frames follow the display rate. Occluded or minimized windows idle.
@@ -759,4 +835,37 @@ impl ApplicationHandler<AppEvent> for StudioApp {
 /// Builds the event loop's error for a failed startup outside the loop.
 pub fn loop_error(error: winit::error::EventLoopError) -> anyhow::Error {
     anyhow!("running the Studio event loop: {error}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_layout_files_migrate_to_dock_trees() {
+        let legacy = r#"{"workspace":"Performance","inspector_tab":"Render","log_open":true,
+            "outliner_width":200.0,"inspector_width":400.0,"log_height":150.0,
+            "performance_height":500.0}"#;
+        let mut layout: StudioLayout = serde_json::from_str(legacy).unwrap();
+        assert_eq!(layout.workspace, Workspace::Performance);
+        assert!(dock::is_open(layout.dock_mut(Workspace::Editor), Tab::Log));
+        let render = layout
+            .dock_mut(Workspace::Editor)
+            .find_tab(&Tab::Render)
+            .unwrap();
+        let leaf = layout
+            .dock_mut(Workspace::Editor)
+            .leaf(render.node_path())
+            .unwrap();
+        assert_eq!(leaf.active.0, render.tab.0);
+        // Saved files carry dock trees and drop the legacy sizes.
+        let text = layout.to_json().to_string();
+        assert!(!text.contains("outliner_width"));
+        let mut again: StudioLayout = serde_json::from_str(&text).unwrap();
+        assert!(dock::is_open(again.dock_mut(Workspace::Editor), Tab::Log));
+        assert!(dock::is_open(
+            again.dock_mut(Workspace::Performance),
+            Tab::Profiler
+        ));
+    }
 }

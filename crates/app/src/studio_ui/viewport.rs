@@ -250,8 +250,14 @@ fn label_color(state: LabelState) -> Color32 {
 }
 
 /// Paints the scene texture, labels and HUD into `rect`.
-pub fn paint(ui: &Ui, rect: Rect, scene: Option<TextureId>, view: &StudioView, hud: &[StatItem]) {
-    let painter = ui.painter_at(rect);
+pub fn paint(
+    painter: &egui::Painter,
+    rect: Rect,
+    scene: Option<TextureId>,
+    view: &StudioView,
+    hud: &[StatItem],
+) {
+    let painter = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
     painter.rect_filled(rect, CornerRadius::ZERO, SURFACE_0);
     if let Some(texture) = scene {
         painter.image(

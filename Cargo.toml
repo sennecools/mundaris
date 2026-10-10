@@ -31,6 +31,7 @@ wgpu = "30"
 egui = "=0.36.2"
 egui-wgpu = "=0.36.2"
 egui-winit = { version = "=0.36.2", default-features = false }
+egui_dock = { version = "=0.21.1", features = ["serde"] }
 winit = "0.30"
 
 [workspace.lints.rust]

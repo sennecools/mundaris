@@ -27,6 +27,7 @@ tracing-subscriber.workspace = true
 egui.workspace = true
 egui-wgpu.workspace = true
 egui-winit.workspace = true
+egui_dock.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 sha2 = "0.10"

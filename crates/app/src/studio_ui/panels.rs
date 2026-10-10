@@ -216,6 +216,7 @@ pub fn toolbar(
     view: &StudioView,
     time_text: &str,
     workspace: &mut Workspace,
+    panels: &mut PanelToggles,
     actions: &mut Vec<StudioAction>,
 ) {
     ui.horizontal_centered(|ui| {
@@ -229,6 +230,8 @@ pub fn toolbar(
         if let Some(index) = tabs(ui, &Workspace::NAMES, workspace.index()) {
             *workspace = Workspace::ALL[index];
         }
+        ui.add_space(SPACE_1);
+        panels_menu(ui, panels);
         ui.add_space(SPACE_3);
         ui.separator();
         let play = if view.paused {
@@ -323,28 +326,28 @@ pub fn outliner(ui: &mut Ui, view: &StudioView, actions: &mut Vec<StudioAction>)
 
 /// Tabbed inspector for the selected body. `panel` is the throttled copy used
 /// for readable text; `view` is live state.
+/// One inspector page (a dock tab since the docking amendment). The Body page
+/// opens with the selected body's name.
 pub fn inspector(
     ui: &mut Ui,
     view: &StudioView,
     panel: &StudioView,
-    tab: &mut InspectorTab,
+    tab: InspectorTab,
     actions: &mut Vec<StudioAction>,
 ) {
-    ui.vertical(|ui| {
-        ui.spacing_mut().item_spacing.y = 2.0;
-        ui.label(
-            RichText::new(&panel.inspector_title)
-                .size(17.0)
-                .strong()
-                .color(TEXT_PRIMARY),
-        );
-        ui.label(RichText::new(&panel.inspector_subtitle).color(TEXT_SECONDARY));
-    });
-    ui.add_space(SPACE_1);
-    if let Some(index) = tabs(ui, &InspectorTab::NAMES, tab.index()) {
-        *tab = InspectorTab::ALL[index];
+    if tab == InspectorTab::Body {
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.label(
+                RichText::new(&panel.inspector_title)
+                    .size(17.0)
+                    .strong()
+                    .color(TEXT_PRIMARY),
+            );
+            ui.label(RichText::new(&panel.inspector_subtitle).color(TEXT_SECONDARY));
+        });
+        ui.separator();
     }
-    ui.separator();
     egui::ScrollArea::vertical()
         .id_salt(("inspector-scroll", tab.index()))
         .auto_shrink([false, false])
@@ -793,4 +796,29 @@ pub fn log(ui: &mut Ui, panel: &StudioView) {
                 });
             }
         });
+}
+
+/// Open state of every dock tab ([`super::dock::Tab::ALL`] order) for the
+/// Panels menu; the shell applies changes to the workspace's dock tree.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PanelToggles {
+    pub open: [bool; super::dock::Tab::ALL.len()],
+    pub reset: bool,
+}
+
+/// "Panels" menu: show or hide each panel, or restore the default layout.
+fn panels_menu(ui: &mut Ui, panels: &mut PanelToggles) {
+    ui.menu_button("Panels", |ui| {
+        for (index, tab) in super::dock::Tab::ALL.iter().enumerate() {
+            if *tab == super::dock::Tab::Viewport {
+                continue;
+            }
+            ui.checkbox(&mut panels.open[index], tab.title());
+        }
+        ui.separator();
+        if ui.button("Reset layout").clicked() {
+            panels.reset = true;
+            ui.close();
+        }
+    });
 }
