@@ -243,11 +243,11 @@ fn forest_cover(inst: Instance, st: vec2<f32>, normal_body: vec3<f32>, climate: 
             }
         }
         let inside = select(0.0, 1.0, best >= 0.0);
-        let pattern = mix(0.45, 0.55 + 0.75 * lit, inside);
+        let pattern = mix(0.3, 0.45 + 0.9 * lit, inside);
         // Expected pattern: crown share of the ground times the mean lit
         // term of a dome seen from above (2/3 of the sun's height).
         let share = clamp((site.tree + site.shrub) * 3.14159265 * rc * rc, 0.0, 0.95);
-        let mean = mix(0.45, 0.55 + 0.75 * (2.0 / 3.0) * max(sun_t.z, 0.0), share);
+        let mean = mix(0.3, 0.45 + 0.9 * (2.0 / 3.0) * max(sun_t.z, 0.0), share);
         colour *= mix(1.0, pattern / max(mean, 0.05), detail);
     }
     // Stand-scale variation (~90 m clumps), fading once the grid is too
