@@ -29,6 +29,8 @@ const CULL_SHADER: &str = concat!(
 );
 /// Placed plants the culling pass can hold (64 bytes each).
 const PLANT_CAPACITY: u64 = 262_144;
+/// Placed grass tufts the culling pass can hold (64 bytes each).
+const GRASS_CAPACITY: u64 = 262_144;
 /// Candidate slots per drawn node (`SCATTER_SLOTS` in scatter_draw.wgsl).
 const PLANT_SLOTS: u32 = 1024;
 /// Producer shader: shared split-lattice noise and cube-map sampling followed by
@@ -685,6 +687,10 @@ pub(crate) struct TerrainAtlasRenderer {
     scatter_pipeline: wgpu::RenderPipeline,
     scatter_shadow_pipeline: wgpu::RenderPipeline,
     scatter_cull: wgpu::ComputePipeline,
+    grass_cull: wgpu::ComputePipeline,
+    grass_pipeline: wgpu::RenderPipeline,
+    grass_ro_group: wgpu::BindGroup,
+    _grass: wgpu::Buffer,
     plants_ro_group: wgpu::BindGroup,
     plants_rw_group: wgpu::BindGroup,
     empty_group: wgpu::BindGroup,
@@ -1053,7 +1059,7 @@ impl TerrainAtlasRenderer {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 5,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: vertex_fragment,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         view_dimension: wgpu::TextureViewDimension::D2Array,
@@ -1183,6 +1189,7 @@ impl TerrainAtlasRenderer {
             entries: &[
                 plant_storage(0, false, wgpu::ShaderStages::COMPUTE),
                 plant_storage(1, false, wgpu::ShaderStages::COMPUTE),
+                plant_storage(2, false, wgpu::ShaderStages::COMPUTE),
             ],
         });
         let empty_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1195,9 +1202,15 @@ impl TerrainAtlasRenderer {
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
+        let grass = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Terrain grass"),
+            size: GRASS_CAPACITY * 64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
         let plant_args = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Terrain plant draw arguments"),
-            size: 32,
+            size: 64,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::INDIRECT
                 | wgpu::BufferUsages::COPY_DST,
@@ -1223,7 +1236,19 @@ impl TerrainAtlasRenderer {
                     binding: 1,
                     resource: plant_args.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: grass.as_entire_binding(),
+                },
             ],
+        });
+        let grass_ro_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Terrain grass (draw)"),
+            layout: &plants_ro_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: grass.as_entire_binding(),
+            }],
         });
         let empty_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Terrain empty"),
@@ -1275,12 +1300,50 @@ impl TerrainAtlasRenderer {
             cache: None,
         });
         log_pipeline_time("cs_scatter", started);
+        let grass_cull = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Terrain grass cull"),
+            layout: Some(&cull_layout),
+            module: &cull_shader,
+            entry_point: Some("cs_grass"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
         let scatter_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Terrain scatter (prototype trees and boulders)"),
             layout: Some(&scatter_draw_layout),
             vertex: wgpu::VertexState {
                 module: &draw_shader,
                 entry_point: Some("vs_scatter"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &draw_shader,
+                entry_point: Some("fs_scatter"),
+                compilation_options: Default::default(),
+                targets: &color_targets,
+            }),
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let grass_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Terrain grass (prototype)"),
+            layout: Some(&scatter_draw_layout),
+            vertex: wgpu::VertexState {
+                module: &draw_shader,
+                entry_point: Some("vs_grass"),
                 compilation_options: Default::default(),
                 buffers: &[],
             },
@@ -1426,6 +1489,10 @@ impl TerrainAtlasRenderer {
             scatter_pipeline,
             scatter_shadow_pipeline,
             scatter_cull,
+            grass_cull,
+            grass_pipeline,
+            grass_ro_group,
+            _grass: grass,
             plants_ro_group,
             plants_rw_group,
             empty_group,
@@ -1910,7 +1977,8 @@ impl TerrainAtlasRenderer {
         } else {
             0
         };
-        let args = [96u32, 0, 0, 0, staged, 0, 0, 0];
+        // Plants at words 0..3 (staged node count at 4), grass at 8..11.
+        let args = [96u32, 0, 0, 0, staged, 0, 0, 0, 18, 0, 0, 0, 0, 0, 0, 0];
         let bytes: Vec<u8> = args.iter().flat_map(|w| w.to_le_bytes()).collect();
         queue.write_buffer(&self.plant_args, 0, &bytes);
         if staged == 0 {
@@ -1926,6 +1994,8 @@ impl TerrainAtlasRenderer {
         pass.set_bind_group(1, &self.draw_group, &[]);
         pass.set_bind_group(2, &self.empty_group, &[]);
         pass.set_bind_group(3, &self.plants_rw_group, &[]);
+        pass.dispatch_workgroups(groups.min(65_535), groups.div_ceil(65_535), 1);
+        pass.set_pipeline(&self.grass_cull);
         pass.dispatch_workgroups(groups.min(65_535), groups.div_ceil(65_535), 1);
     }
 
@@ -2016,6 +2086,9 @@ impl TerrainAtlasRenderer {
             pass.set_pipeline(&self.scatter_pipeline);
             pass.set_bind_group(3, &self.plants_ro_group, &[]);
             pass.draw_indirect(&self.plant_args, 0);
+            pass.set_pipeline(&self.grass_pipeline);
+            pass.set_bind_group(3, &self.grass_ro_group, &[]);
+            pass.draw_indirect(&self.plant_args, 32);
         }
     }
 

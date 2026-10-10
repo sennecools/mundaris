@@ -333,6 +333,13 @@ fn ground_detail(inst: Instance, st: vec2<f32>, footprint_px: f32) -> vec2<f32> 
     return vec2<f32>(1.0 + sum, 0.5 + hue);
 }
 
+// View distance to the node centre on the ground (`anchor` is at the
+// reference radius, which can lie kilometres below the terrain).
+fn sc_node_distance(inst: Instance) -> f32 {
+    let centre = vec2<f32>(0.5);
+    return length(to_view(inst, body_position(inst, centre, blended_height(inst, centre, 0.0))));
+}
+
 // One placed plant for the draw, in view space: stem foot and scale, yawed
 // horizontal axis and crown spread, up, then kind and three hash seeds
 // (shape, brightness, hue).
@@ -365,7 +372,7 @@ fn sc_place(index: u32) -> Placed {
     let width = inst.face_u.w;
     let q0 = inst.n0.w;
     // Whole node beyond the plant distance: nothing to draw.
-    if length(inst.anchor.xyz) - 0.75 * width / q0 * radius > SCATTER_MAX_DISTANCE_M {
+    if sc_node_distance(inst) - 0.75 * width / q0 * radius > SCATTER_MAX_DISTANCE_M {
         return out;
     }
     let u_min = dot(inst.n0.xyz, inst.face_u.xyz) * q0 - 0.5 * width;
@@ -465,6 +472,131 @@ fn sc_place(index: u32) -> Placed {
     out.plant.e1 = vec4<f32>(to_view_dir * e1, spread);
     out.plant.up = vec4<f32>(to_view_dir * up_body, 0.0);
     out.plant.info = vec4<u32>(kind, h.x ^ h.y, h2.x ^ h2.y, h.y ^ h2.z);
+    out.ok = true;
+    return out;
+}
+// ---------------------------------------------------------------- grass
+
+// PROTOTYPE (M5 Life): grass tufts on a 1 m world grid near the camera, the
+// same hierarchical rank scheme as the plants (keep(d) = (GRASS_FULL / d)²,
+// none beyond GRASS_MAX), so tufts thin smoothly with distance and never pop
+// on refinement. Meadows get dense grass; forest cores, steep rock, water
+// and dry desert little or none.
+const GRASS_CELL_BITS: u32 = 19u;
+const GRASS_FULL_M: f32 = 22.0;
+const GRASS_MAX_M: f32 = 70.0;
+const GRASS_VERTS: u32 = 18u;
+
+fn grass_keep(d: f32) -> f32 {
+    let ratio = GRASS_FULL_M / max(d, 0.5);
+    return min(1.0, ratio * ratio) * (1.0 - smoothstep(0.75 * GRASS_MAX_M, GRASS_MAX_M, d));
+}
+
+fn sc_place_grass(index: u32) -> Placed {
+    var out: Placed;
+    out.ok = false;
+    let inst = instances[index / SCATTER_SLOTS];
+    let slot = index % SCATTER_SLOTS;
+    let mode = u32(inst.b2v_x.w + 0.5);
+    if inst.surface.x < 0.5 || !(mode == 0u || mode == 9u || mode == 11u) {
+        return out;
+    }
+    let radius = inst.anchor.w;
+    let width = inst.face_u.w;
+    let q0 = inst.n0.w;
+    if sc_node_distance(inst) - 0.75 * width / q0 * radius > GRASS_MAX_M {
+        return out;
+    }
+    let u_min = dot(inst.n0.xyz, inst.face_u.xyz) * q0 - 0.5 * width;
+    let v_min = dot(inst.n0.xyz, inst.face_v.xyz) * q0 - 0.5 * width;
+    let cells_per_unit = f32(1u << (GRASS_CELL_BITS - 1u));
+    let across = max(round(width * cells_per_unit), 1.0);
+    let face = sc_face(inst.n0.xyz);
+    let i0 = u32(round((u_min + 1.0) * cells_per_unit));
+    let j0 = u32(round((v_min + 1.0) * cells_per_unit));
+    var side = u32(across);
+    var k = 0u;
+    while side > SCATTER_SIDE {
+        side = side >> 1u;
+        k = k + 1u;
+    }
+    let a = slot % SCATTER_SIDE;
+    let b = slot / SCATTER_SIDE;
+    if a >= side || b >= side {
+        return out;
+    }
+    var ci = (i0 >> k) + a;
+    var cj = (j0 >> k) + b;
+    let salt = face * 64u + 32u;
+    for (var level = k; level > 0u; level = level - 1u) {
+        let q = sc_pcg3d(vec3<u32>(ci, cj, salt + level)).x >> 30u;
+        ci = ci * 2u + (q & 1u);
+        cj = cj * 2u + (q >> 1u);
+    }
+    var lambda = k;
+    loop {
+        let next = lambda + 1u;
+        if next > SCATTER_MAX_LEVEL {
+            break;
+        }
+        let q = sc_pcg3d(vec3<u32>(ci >> next, cj >> next, salt + next)).x >> 30u;
+        let own = ((ci >> lambda) & 1u) | (((cj >> lambda) & 1u) << 1u);
+        if q != own {
+            break;
+        }
+        lambda = next;
+    }
+    let h = sc_pcg3d(vec3<u32>(ci, cj, salt + 31u));
+    let h2 = sc_pcg3d(h ^ vec3<u32>(0x9a55u));
+    let rank = exp2(-2.0 * f32(lambda)) * (0.25 + 0.75 * sc_unit(h2.z ^ h.x));
+    let u = (f32(ci) + sc_unit(h.x)) / cells_per_unit - 1.0;
+    let v = (f32(cj) + sc_unit(h.y)) / cells_per_unit - 1.0;
+    let st = vec2<f32>((u - u_min) / width, (v - v_min) / width);
+    if any(st < vec2<f32>(0.0)) || any(st > vec2<f32>(1.0)) {
+        return out;
+    }
+    let ground = blended_height(inst, st, 0.0);
+    let keep = grass_keep(length(to_view(inst, body_position(inst, st, ground))));
+    let grow = clamp((keep - rank) / (0.35 * keep + 1.0e-12), 0.0, 1.0);
+    if grow <= 0.0 {
+        return out;
+    }
+    let own_uv = normal_uv(own_st(inst, st));
+    let page_n = textureSampleLevel(normal_atlas, normal_sampler, own_uv, i32(inst.own.x), 0.0);
+    if page_n.w > -0.3 {
+        return out;
+    }
+    let climate = textureSampleLevel(climate_atlas, normal_sampler, own_uv, i32(inst.own.x), 0.0);
+    let up_body = normalize(inst.n0.xyz + chart_diff(inst, st));
+    let slope = acos(clamp(dot(normalize(page_n.xyz), up_body), -1.0, 1.0));
+    // Forest field on the plant grid (8 m cells) for the shade of forest cores.
+    let plant_cells = f32(1u << (SCATTER_CELL_BITS - 1u));
+    let site = sc_forest(face, (u + 1.0) * plant_cells, (v + 1.0) * plant_cells, 0.0, climate.x, climate.y, slope, ground);
+    let meadow = (1.0 - 0.75 * site.core)
+        * smoothstep(-3.0, 4.0, climate.x)
+        * smoothstep(0.06, 0.3, climate.y)
+        * (1.0 - smoothstep(30.0 * SCATTER_DEG, 45.0 * SCATTER_DEG, slope));
+    if sc_unit(h.z) >= 0.95 * meadow {
+        return out;
+    }
+    let scale = mix(0.6, 1.4, sc_unit(h2.y)) * smoothstep(0.0, 1.0, grow);
+    let yaw = sc_unit(h2.x) * 6.2831853;
+    let e1r = normalize(inst.face_u.xyz - up_body * dot(inst.face_u.xyz, up_body));
+    let e2r = cross(up_body, e1r);
+    let e1 = e1r * cos(yaw) + e2r * sin(yaw);
+    let to_view_dir = mat3x3<f32>(inst.b2v_x.xyz, inst.b2v_y.xyz, inst.b2v_z.xyz);
+    let dry = 1.0 - smoothstep(0.08, 0.35, climate.y);
+    out.plant.base = vec4<f32>(to_view(inst, body_position(inst, st, ground - 0.03)), scale);
+    out.plant.e1 = vec4<f32>(to_view_dir * e1, dry);
+    out.plant.up = vec4<f32>(to_view_dir * up_body, 0.0);
+    // Blade colour from the page albedo (sRGB) so grass matches the biome,
+    // slightly greener and more saturated, drying to straw in dry climates.
+    let page_a = textureSampleLevel(albedo_atlas, normal_sampler, own_uv, i32(inst.own.x), 0.0);
+    let ground_lin = pow(page_a.rgb, vec3<f32>(2.2));
+    let lush = ground_lin * vec3<f32>(0.85, 1.1, 0.75) * (0.85 + 0.3 * sc_unit(h2.x));
+    let straw = vec3<f32>(0.2, 0.17, 0.08);
+    let blade = mix(lush, straw, dry * 0.6);
+    out.plant.info = vec4<u32>(4u, h.x ^ h2.y, pack4x8unorm(vec4<f32>(sqrt(clamp(blade, vec3<f32>(0.0), vec3<f32>(1.0))), 0.0)), h.y ^ h2.z);
     out.ok = true;
     return out;
 }
