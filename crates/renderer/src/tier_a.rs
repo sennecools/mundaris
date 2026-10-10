@@ -75,6 +75,7 @@ pub struct TierABakeInputs {
     pub moisture_step_rad: f32,
     pub moisture_spread: f32,
     pub precipitation_scale: f32,
+    pub rain_convergence: f32,
     pub pole: [f32; 3],
 }
 
@@ -154,7 +155,7 @@ impl TierABakeInputs {
                 self.moisture_step_rad,
                 self.moisture_spread,
                 self.precipitation_scale,
-                0.0,
+                self.rain_convergence,
             ]),
             f([self.pole[0], self.pole[1], self.pole[2], 0.0]),
         ]

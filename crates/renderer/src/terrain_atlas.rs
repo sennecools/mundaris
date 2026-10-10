@@ -1937,9 +1937,9 @@ pub fn produce_for_validation(
 }
 
 /// Produce collision pages through the runtime path (producer dispatch, staging
-/// ring, asynchronous map) on a caller-owned device. Each "frame" submits an
-/// empty encoder and polls without waiting, so the result also reports how
-/// many submissions passed before the pages arrived. Validation only.
+/// ring, asynchronous map) on a caller-owned device. Each "frame" submits and
+/// waits for its work, so the result also reports how many frames of pipeline
+/// latency passed before the pages arrived. Validation only.
 pub fn collision_for_validation(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -1983,14 +1983,16 @@ pub fn collision_for_validation(
         frame.collision_jobs.clear();
         queue.submit([encoder.finish()]);
         atlas.on_submitted();
+        // Each "frame" waits for its own GPU work, so the count is frames of
+        // pipeline latency (readback ring), not wall-clock time that other
+        // GPU users on the adapter would stretch.
         device
-            .poll(wgpu::PollType::Poll)
+            .poll(wgpu::PollType::wait_indefinitely())
             .map_err(|error| error.to_string())?;
         pages.extend(atlas.take_collision_pages());
         if pages.len() >= jobs.len() {
             return Ok((pages, submissions));
         }
-        std::thread::sleep(std::time::Duration::from_millis(2));
     }
     Err(format!(
         "{} of {} collision pages arrived",

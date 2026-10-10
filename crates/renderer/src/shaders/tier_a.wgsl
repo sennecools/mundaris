@@ -18,7 +18,7 @@ struct Params {
     climate: vec4<f32>,     // equator °C, pole °C, axial tilt rad, lapse °C/km
     moderation: vec4<f32>,  // ocean moderation, blur step rad, noise °C, noise frequency
     wind: vec4<f32>,        // cells per hemisphere, meridional fraction, evaporation, rain
-    moisture: vec4<f32>,    // step rad, spread, precipitation scale, unused
+    moisture: vec4<f32>,    // step rad, spread, precipitation scale, rain convergence
     pole: vec4<f32>,        // body-fixed rotation axis
 }
 
@@ -263,6 +263,13 @@ fn base_temperature(x: f32) -> f32 {
 const HALF_PI: f32 = 1.5707963267948966;
 const PI: f32 = 3.141592653589793;
 
+// Rain scale by the circulation cells (`tier_a::rain_modulation`): wetter where
+// the cells converge (cos(2 · cells · |lat|) > 0), drier where they diverge.
+fn rain_modulation(x: f32) -> f32 {
+    let latitude = abs(asin(clamp(x, -1.0, 1.0)));
+    return 1.0 + params.moisture.w * cos(2.0 * params.wind.x * latitude);
+}
+
 fn wind_at(x: f32) -> vec2<f32> {
     let latitude = asin(clamp(x, -1.0, 1.0));
     let a = abs(latitude) / HALF_PI;
@@ -331,7 +338,7 @@ fn moisture_step(@builtin(global_invocation_id) id: vec3<u32>) {
     if fields[run(RUN_ELEVATION) + t.k] < 0.0 {
         evaporate = params.wind.z * evaporation_factor(fields[run(RUN_TEMPERATURE) + t.k]);
     }
-    let rain = upwind * params.wind.w;
+    let rain = upwind * params.wind.w * rain_modulation(dot(d, params.pole.xyz));
     fields[run(pass_info.dst) + t.k] = upwind + evaporate - rain;
     fields[run(RUN_PRECIPITATION) + t.k] += rain;
 }

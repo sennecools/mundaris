@@ -261,10 +261,10 @@ fn read_back_colliders_match_the_cpu_oracle_within_a_few_frames() {
             collision.page_cells,
         )
         .unwrap();
-        // Wall-clock latency: other GPU tests share the adapter, so allow
-        // slack; the measured count is printed below (typically 3).
+        // Frames of pipeline latency (each validation frame waits for its
+        // GPU work, so other adapter users do not stretch it).
         assert!(
-            submissions <= 30,
+            submissions <= 4,
             "pages arrived after {submissions} submissions"
         );
         let mut worst = (0.0f64, 0.0f64);

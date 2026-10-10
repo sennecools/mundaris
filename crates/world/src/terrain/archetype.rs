@@ -107,6 +107,11 @@ pub struct MoistureRanges {
     pub rain: Range,
     /// Accumulated precipitation that maps to moisture `1 - 1/e`.
     pub precipitation_scale: f64,
+    /// Rain modulation by the circulation cells: rain is scaled by
+    /// `1 + convergence · cos(2 · cells · |latitude|)`, wetter where the
+    /// cells converge (equator, ~60°) and drier where they diverge (~30°,
+    /// poles). 0 disables it.
+    pub convergence: f64,
 }
 
 /// Snow cover rule (§10.1): `temperature < T_snow` blended over `blend_c`,
@@ -277,6 +282,7 @@ impl PlanetArchetype {
             && m.rain.valid(0.0, 1.0)
             && m.precipitation_scale.is_finite()
             && m.precipitation_scale > 0.0
+            && (0.0..=0.95).contains(&m.convergence)
             && !self.biome_lut.is_empty()
             && self.climate_detail.valid()
             && !self.snow.material.is_empty()
@@ -344,6 +350,7 @@ impl PlanetArchetype {
             evaporation: m.evaporation.sample(draw(STAGE_MOISTURE, 0)),
             rain: m.rain.sample(draw(STAGE_MOISTURE, 1)),
             precipitation_scale: m.precipitation_scale,
+            rain_convergence: m.convergence,
             continent_seed: stage_seed(body_seed, STAGE_CONTINENTS) as u32,
             warp_seed: stage_seed(body_seed, STAGE_WARP) as u32,
             temperature_seed: stage_seed(body_seed, STAGE_TEMPERATURE) as u32,
@@ -404,6 +411,7 @@ pub struct PlanetParams {
     pub evaporation: f64,
     pub rain: f64,
     pub precipitation_scale: f64,
+    pub rain_convergence: f64,
     pub continent_seed: u32,
     pub warp_seed: u32,
     pub temperature_seed: u32,
@@ -448,6 +456,7 @@ pub const PARAM_FIELDS: &[ParamField] = fields! {
     evaporation: 0.0, 1.0;
     rain: 0.0, 1.0;
     precipitation_scale: 1.0e-3, 1.0e3;
+    rain_convergence: 0.0, 0.95;
 };
 
 impl PlanetArchetype {

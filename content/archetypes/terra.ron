@@ -55,6 +55,9 @@
         // Rain-out per step: moisture falls to 1/e over about 25-40 steps inland.
         rain: (0.025, 0.04),
         precipitation_scale: 1.2,
+        // Circulation-cell rain: wetter at the equator and ~60°, drier at
+        // ~30° and the poles (Hadley, Ferrel and polar cells).
+        convergence: 0.6,
     ),
     // Surface colour (§10): tint from the biome LUT by temperature × moisture.
     biome_lut: "lut/terra_whittaker.ron",
@@ -83,5 +86,5 @@
         depth_scale_m: 120.0,
     ),
     // Measured for the canonical seed; gpu_terrain_colour.rs checks it (0.005).
-    average_colour: (0.110, 0.118, 0.107),
+    average_colour: (0.102, 0.113, 0.105),
 )

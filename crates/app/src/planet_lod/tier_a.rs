@@ -60,6 +60,7 @@ pub fn bake_inputs(inputs: &TierAInputs) -> TierABakeInputs {
         moisture_step_rad: (p.moisture_step_m / r) as f32,
         moisture_spread: p.moisture_spread as f32,
         precipitation_scale: p.precipitation_scale as f32,
+        rain_convergence: p.rain_convergence as f32,
         pole: inputs.pole.as_vec3().to_array(),
     }
 }

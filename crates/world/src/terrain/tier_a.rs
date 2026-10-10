@@ -212,6 +212,16 @@ pub fn wind(x: f64, params: &PlanetParams) -> (f64, f64) {
     (-s, -latitude.signum() * params.wind_meridional * s)
 }
 
+/// Rain scale at `x = sin(latitude)` from the circulation cells: the cells'
+/// meridional wind `-m · sin(2 · cells · |lat|)` converges (air rises, more
+/// rain) where `cos(2 · cells · |lat|) > 0` and diverges (air sinks, deserts)
+/// where it is negative: the equator and ~60° are wet, ~30° and the poles dry
+/// for three cells.
+pub fn rain_modulation(x: f64, params: &PlanetParams) -> f64 {
+    let latitude = x.clamp(-1.0, 1.0).asin().abs();
+    1.0 + params.rain_convergence * (2.0 * f64::from(params.wind_cells) * latitude).cos()
+}
+
 /// Fraction of rain-out moisture that evaporates from the ocean at `t_c`.
 pub fn evaporation_factor(t_c: f64) -> f64 {
     ((t_c + 10.0) / 40.0).clamp(0.1, 1.0)
@@ -362,7 +372,7 @@ pub fn bake(inputs: &TierAInputs) -> Result<TierAFields, TerrainError> {
                 } else {
                     0.0
                 };
-                let rain = upwind * p.rain;
+                let rain = upwind * p.rain * rain_modulation(d.dot(inputs.pole), p);
                 carried.data_mut()[k] = (upwind + evaporate - rain) as f32;
                 precipitation[k] += rain;
             }
@@ -481,6 +491,35 @@ mod tests {
             }
         }
         assert!(high_land > 0, "the bake has land above 1 km");
+    }
+
+    #[test]
+    fn circulation_cells_give_a_wet_equator_and_dry_subtropics() {
+        let n = 64;
+        let base = inputs(n, 7);
+        let directions: Vec<DVec3> = (0..6 * n * n)
+            .map(|k| texel_direction(k / (n * n), k % n, (k / n) % n, n))
+            .collect();
+        // Mean moisture over all texels in a latitude band (degrees).
+        let band = |fields: &TierAFields, lo: f64, hi: f64| {
+            area_mean(&fields.moisture, n, |k| {
+                let latitude = directions[k].dot(base.pole).abs().asin().to_degrees();
+                (lo..hi).contains(&latitude)
+            })
+        };
+        let with = bake(&base).unwrap();
+        let mut flat = base.clone();
+        flat.params.rain_convergence = 0.0;
+        let without = bake(&flat).unwrap();
+        let gap = |f: &TierAFields| band(f, 0.0, 10.0) - band(f, 25.0, 35.0);
+        assert!(gap(&with) > 0.0, "equator wetter than the subtropics");
+        assert!(
+            gap(&with) > gap(&without) + 0.05,
+            "convergence widens the gap: {} vs {}",
+            gap(&with),
+            gap(&without)
+        );
+        assert_eq!(with.elevation, without.elevation, "moisture only");
     }
 
     #[test]
