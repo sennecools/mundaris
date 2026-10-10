@@ -21,7 +21,6 @@ mod hierarchy;
 pub mod ladder;
 mod moon_fields;
 mod moon_profile;
-pub mod ladder;
 pub mod noise;
 pub mod producer;
 pub mod world_field;
