@@ -770,6 +770,8 @@ impl PlanetParams {
 /// One editor-adjustable parameter: name, authored bounds and accessors.
 pub struct ParamField {
     pub name: &'static str,
+    /// Editor section (planet editor groups by it, in registry order).
+    pub group: &'static str,
     pub min: f64,
     pub max: f64,
     get: fn(&PlanetParams) -> f64,
@@ -777,8 +779,9 @@ pub struct ParamField {
 }
 
 macro_rules! fields {
-    ($($name:ident: $min:expr, $max:expr;)*) => {
+    ($($group:literal: $name:ident: $min:expr, $max:expr;)*) => {
         &[$(ParamField {
+            group: $group,
             name: stringify!($name),
             min: $min,
             max: $max,
@@ -790,42 +793,42 @@ macro_rules! fields {
 
 /// Continuous parameters exposed to overrides (planet editor, terrain files).
 pub const PARAM_FIELDS: &[ParamField] = fields! {
-    ocean_coverage: 0.0, 0.98;
-    continent_wavelength_m: 1.0e3, 1.0e8;
-    warp_wavelength_m: 1.0e3, 1.0e8;
-    warp_strength: 0.0, 2.0;
-    land_height_m: 0.0, 2.0e4;
-    ocean_depth_m: 1.0, 2.0e4;
-    shelf_depth_m: 0.0, 2.0e3;
-    equator_c: -250.0, 500.0;
-    pole_c: -250.0, 500.0;
-    axial_tilt_deg: 0.0, 90.0;
-    lapse_c_per_km: 0.0, 50.0;
-    ocean_moderation: 0.0, 1.0;
-    temperature_noise_c: 0.0, 50.0;
-    evaporation: 0.0, 1.0;
-    rain: 0.0, 1.0;
-    precipitation_scale: 1.0e-3, 1.0e3;
-    rain_convergence: 0.0, 0.95;
-    plate_count: 2.0, MAX_MAJOR_PLATES;
-    continental_fraction: 0.0, 1.0;
-    plate_warp_strength: 0.0, 1.0;
-    plate_speed: 0.01, 2.0;
-    crust_weight: 0.0, 0.9;
-    collision_height_m: 0.0, 1.0e4;
-    arc_height_m: 0.0, 1.0e4;
-    trench_depth_m: 0.0, 1.2e4;
-    ridge_height_m: 0.0, 5.0e3;
-    orogen_width_m: 1.0e4, 1.0e6;
-    orogen_roughness: 0.0, 1.0;
-    hardness_noise: 0.0, 0.5;
-    wind_deflection: 0.0, 1.0;
-    orographic_rain: 0.0, 1.0;
-    lee_drying: 0.0, 1.0;
-    erosion_strength: 0.0, 100.0;
-    erosion_uplift_m: 0.0, 5.0e3;
-    talus_deg: 5.0, 80.0;
-    deposition: 0.0, 1.0;
+    "Continents": ocean_coverage: 0.0, 0.98;
+    "Continents": continent_wavelength_m: 1.0e3, 1.0e8;
+    "Continents": warp_wavelength_m: 1.0e3, 1.0e8;
+    "Continents": warp_strength: 0.0, 2.0;
+    "Continents": land_height_m: 0.0, 2.0e4;
+    "Ocean": ocean_depth_m: 1.0, 2.0e4;
+    "Ocean": shelf_depth_m: 0.0, 2.0e3;
+    "Temperature": equator_c: -250.0, 500.0;
+    "Temperature": pole_c: -250.0, 500.0;
+    "Temperature": axial_tilt_deg: 0.0, 90.0;
+    "Temperature": lapse_c_per_km: 0.0, 50.0;
+    "Temperature": ocean_moderation: 0.0, 1.0;
+    "Temperature": temperature_noise_c: 0.0, 50.0;
+    "Moisture": evaporation: 0.0, 1.0;
+    "Moisture": rain: 0.0, 1.0;
+    "Moisture": precipitation_scale: 1.0e-3, 1.0e3;
+    "Moisture": rain_convergence: 0.0, 0.95;
+    "Tectonics": plate_count: 2.0, MAX_MAJOR_PLATES;
+    "Tectonics": continental_fraction: 0.0, 1.0;
+    "Tectonics": plate_warp_strength: 0.0, 1.0;
+    "Tectonics": plate_speed: 0.01, 2.0;
+    "Tectonics": crust_weight: 0.0, 0.9;
+    "Tectonics": collision_height_m: 0.0, 1.0e4;
+    "Tectonics": arc_height_m: 0.0, 1.0e4;
+    "Tectonics": trench_depth_m: 0.0, 1.2e4;
+    "Tectonics": ridge_height_m: 0.0, 5.0e3;
+    "Tectonics": orogen_width_m: 1.0e4, 1.0e6;
+    "Tectonics": orogen_roughness: 0.0, 1.0;
+    "Rock hardness": hardness_noise: 0.0, 0.5;
+    "Rain shadow": wind_deflection: 0.0, 1.0;
+    "Rain shadow": orographic_rain: 0.0, 1.0;
+    "Rain shadow": lee_drying: 0.0, 1.0;
+    "Erosion": erosion_strength: 0.0, 100.0;
+    "Erosion": erosion_uplift_m: 0.0, 5.0e3;
+    "Erosion": talus_deg: 5.0, 80.0;
+    "Erosion": deposition: 0.0, 1.0;
 };
 
 impl PlanetArchetype {

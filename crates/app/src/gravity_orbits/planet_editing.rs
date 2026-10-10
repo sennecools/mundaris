@@ -133,6 +133,7 @@ impl GravityOrbitsDemo {
                     .unwrap_or((field.min, field.max));
                 PlanetParamItem {
                     name: field.name.to_string(),
+                    group: field.group,
                     value,
                     range: [low.min(value), high.max(value)],
                     overridden: editable.override_of(field.name).is_some(),

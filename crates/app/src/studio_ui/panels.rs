@@ -26,43 +26,6 @@ const LABEL_SHARE: f32 = 0.42;
 /// Width of the value box beside a [`fill_slider`].
 const VALUE_WIDTH: f32 = 72.0;
 
-/// Planet parameter groups by field name. PROTOTYPE: the grouping lives in
-/// the UI until parameters carry their group in the archetype schema;
-/// unknown (new) fields land in "Other".
-const PARAM_GROUPS: [(&str, &[&str]); 4] = [
-    (
-        "Continents",
-        &[
-            "ocean_coverage",
-            "continent_wavelength_m",
-            "warp_wavelength_m",
-            "warp_strength",
-            "land_height_m",
-        ],
-    ),
-    ("Ocean", &["ocean_depth_m", "shelf_depth_m"]),
-    (
-        "Temperature",
-        &[
-            "equator_c",
-            "pole_c",
-            "axial_tilt_deg",
-            "lapse_c_per_km",
-            "ocean_moderation",
-            "temperature_noise_c",
-        ],
-    ),
-    (
-        "Moisture",
-        &[
-            "evaporation",
-            "rain",
-            "precipitation_scale",
-            "rain_convergence",
-        ],
-    ),
-];
-
 pub fn view_mode_name(mode: TerrainViewMode) -> &'static str {
     match mode {
         TerrainViewMode::Lit => "Lit",
@@ -606,21 +569,17 @@ fn planet_tab(ui: &mut Ui, planet: Option<&PlanetView>, actions: &mut Vec<Studio
             }
         });
     });
-    let mut shown = vec![false; planet.params.len()];
-    for (group, names) in PARAM_GROUPS {
-        section(ui, group, group == "Continents", |ui| {
-            for name in names {
-                if let Some(index) = planet.params.iter().position(|p| p.name == *name) {
-                    shown[index] = true;
-                    param_row(ui, index, &planet.params[index], actions);
-                }
-            }
-        });
+    // Sections in registry order (`archetype::ParamField::group`).
+    let mut groups: Vec<&str> = Vec::new();
+    for param in &planet.params {
+        if !groups.contains(&param.group) {
+            groups.push(param.group);
+        }
     }
-    if shown.iter().any(|shown| !shown) {
-        section(ui, "Other", true, |ui| {
+    for group in groups {
+        section(ui, group, group == "Continents", |ui| {
             for (index, param) in planet.params.iter().enumerate() {
-                if !shown[index] {
+                if param.group == group {
                     param_row(ui, index, param, actions);
                 }
             }

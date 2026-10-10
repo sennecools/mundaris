@@ -113,6 +113,8 @@ pub struct StudioView {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PlanetParamItem {
     pub name: String,
+    /// Editor section (`ParamField::group`).
+    pub group: &'static str,
     pub value: f64,
     /// Slider range.
     pub range: [f64; 2],
