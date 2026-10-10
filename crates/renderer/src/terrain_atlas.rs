@@ -642,6 +642,7 @@ pub(crate) struct TerrainAtlasRenderer {
     pipeline: wgpu::RenderPipeline,
     /// PROTOTYPE (M5 Life): procedural trees and boulders on drawn nodes.
     scatter_pipeline: wgpu::RenderPipeline,
+    scatter_shadow_pipeline: wgpu::RenderPipeline,
     draw_group: wgpu::BindGroup,
     instances: wgpu::Buffer,
     instance_capacity: u64,
@@ -1161,6 +1162,35 @@ impl TerrainAtlasRenderer {
             multiview_mask: None,
             cache: None,
         });
+        let scatter_shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Terrain scatter sun shadow casters (prototype)"),
+            layout: Some(&shadow_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &draw_shader,
+                entry_point: Some("vs_scatter"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: None,
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: crate::post::DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                bias: wgpu::DepthBiasState {
+                    constant: 2,
+                    slope_scale: 1.5,
+                    clamp: 0.0,
+                },
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
         let shadow_capacity = 1024;
         let shadow_instances = instance_buffer(device, shadow_capacity);
         let shadow_group = self::draw_group(
@@ -1209,6 +1239,7 @@ impl TerrainAtlasRenderer {
             sources: Default::default(),
             pipeline,
             scatter_pipeline,
+            scatter_shadow_pipeline,
             draw_group,
             instances,
             instance_capacity,
@@ -1754,10 +1785,10 @@ impl TerrainAtlasRenderer {
         pass.set_vertex_buffer(0, self.vertices.slice(..));
         pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..self.index_count, 0, 0..self.staged_instances);
-        // PROTOTYPE (M5 Life): 256 scatter slots of 48 procedural vertices per
+        // PROTOTYPE (M5 Life): 1024 scatter slots of 72 procedural vertices per
         // drawn node (scatter_draw.wgsl); bind groups are shared.
         pass.set_pipeline(&self.scatter_pipeline);
-        pass.draw(0..48, 0..self.staged_instances * 256);
+        pass.draw(0..72, 0..self.staged_instances * 1024);
     }
 
     /// Uploads per-cascade caster lists back to back.
@@ -1821,6 +1852,11 @@ impl TerrainAtlasRenderer {
         pass.set_vertex_buffer(0, self.vertices.slice(..));
         pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..self.index_count, 0, start..end);
+        // PROTOTYPE (M5 Life): plants cast shadows in the two nearest cascades.
+        if cascade < 2 {
+            pass.set_pipeline(&self.scatter_shadow_pipeline);
+            pass.draw(0..72, start * 1024..end * 1024);
+        }
     }
 }
 

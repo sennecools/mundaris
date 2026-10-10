@@ -1,25 +1,42 @@
-// PROTOTYPE (M5 Life): procedural conifers, shrubs and boulders drawn on the
-// selected world-map terrain nodes (pipeline §12), appended to the terrain
-// draw shader (same bindings and helpers).
+// PROTOTYPE (M5 Life): procedural forests (conifers, broadleaf trees), shrubs
+// and boulders drawn on the selected world-map terrain nodes (pipeline §12),
+// appended to the terrain draw shader (same bindings and helpers).
 //
-// Placement: base cells are a fixed 2^SCATTER_CELL_BITS grid per cube face
-// (~10 m on Rust), so trees are anchored to the world, not to nodes. Every
-// drawn node owns SCATTER_SIDE² slots; a node wider than SCATTER_SIDE base
-// cells maps each slot to one coarse cell and descends to a base cell by
-// hashed quadrant choices, so a coarse node draws a subset of the trees its
-// children draw (no pop on refinement, thinning with distance). One candidate
-// per base cell, jittered and accepted by a density from the page climate,
-// slope and height (species ranges from scatter.wgsl). Water pages (sea,
-// lakes, rivers) carry none. Geometry is procedural (48 vertices: crown or
-// rock top, trunk or rock base), flat shaded, lit like terrain, no shadows.
+// Placement. Base cells are a fixed 2^SCATTER_CELL_BITS grid per cube face
+// (~10 m on Rust), so plants are anchored to the world, not to nodes. One
+// candidate per base cell, jittered.
+//
+// LOD without seams or pops. A base cell's level λ is how many consecutive
+// ancestors (2×2 quadrant hierarchy, hashed choices) pick it; P(λ ≥ k) = 4^-k.
+// Its rank r lies in [4^-(λ+1), 4^-λ), so P(r < x) ≈ x and every candidate
+// with r < 4^-k has λ ≥ k. A drawn node SCATTER_SIDE² slots wide in coarse
+// cells enumerates exactly the candidates with λ ≥ k (descending by the same
+// hashed choices), and a candidate is shown while r < keep(d), with
+// keep(d) = (SCATTER_FULL_M / d)² continuous in view distance. CDLOD draws a
+// node of size S only beyond ~1.5 S, where keep ≤ 4^-k, so every node holds
+// all the plants its distance asks for: density is continuous across node
+// levels and refinement adds nothing that pops. Plants grow in as keep(d)
+// passes their rank. Beyond the drawn plants the terrain fragment shader
+// lays the canopy colour (forest_cover) with a strength that rises as keep
+// falls, so forests read as forests from orbit.
+//
+// Forest field. Climate suitability sets how much of the land is forest; four
+// octaves of value noise (~4 km to ~60 m) against a suitability threshold make
+// large contiguous forests in good climates and patches in marginal ones. A
+// fringe outside each forest carries shrubs, small trees and lone trees;
+// trees shrink towards the forest edge and the cold tree line. Conifers take
+// over from broadleaf trees with cold.
 
-const SCATTER_SIDE: u32 = 16u;
-const SCATTER_SLOTS: u32 = 256u;
-const SCATTER_VERTS: u32 = 48u;
+const SCATTER_SIDE: u32 = 32u;
+const SCATTER_SLOTS: u32 = 1024u;
+const SCATTER_VERTS: u32 = 72u;
 const SCATTER_CELL_BITS: u32 = 16u;
-// Nodes wider than this (m) draw nothing.
-const SCATTER_MAX_NODE_M: f32 = 2000.0;
+// Full density within this view distance (m); keep(d) = (FULL / d)².
+const SCATTER_FULL_M: f32 = 350.0;
+// No plants beyond this view distance (m), faded over the last 30 %.
+const SCATTER_MAX_DISTANCE_M: f32 = 16000.0;
 const SCATTER_DEG: f32 = 0.017453292;
+const SCATTER_MAX_LEVEL: u32 = 12u;
 
 struct ScatterOut {
     @builtin(position) clip_position: vec4<f32>,
@@ -50,23 +67,6 @@ fn sc_range(min_v: f32, max_v: f32, falloff: f32, x: f32) -> f32 {
     return clamp(1.0 - d / max(falloff, 1.0e-6), 0.0, 1.0);
 }
 
-// Density of species `k` (0 conifer, 1 shrub, 2 boulder) at a site; the
-// ranges follow scatter.wgsl's species_def.
-fn sc_density(k: u32, t: f32, m: f32, slope: f32, h: f32) -> f32 {
-    let rock = smoothstep(25.0 * SCATTER_DEG, 45.0 * SCATTER_DEG, slope);
-    if k == 0u {
-        return 0.85 * sc_range(-8.0, 16.0, 4.0, t) * sc_range(0.3, 1.0, 0.1, m)
-            * sc_range(0.0, 3000.0, 200.0, h) * sc_range(0.0, 38.0 * SCATTER_DEG, 8.0 * SCATTER_DEG, slope)
-            * (1.0 - rock);
-    }
-    if k == 1u {
-        return 0.7 * sc_range(-2.0, 32.0, 6.0, t) * sc_range(0.2, 1.0, 0.1, m)
-            * sc_range(0.0, 2400.0, 300.0, h) * sc_range(0.0, 45.0 * SCATTER_DEG, 10.0 * SCATTER_DEG, slope)
-            * (1.0 - 0.5 * rock);
-    }
-    return 0.35 * sc_range(0.0, 60.0 * SCATTER_DEG, 10.0 * SCATTER_DEG, slope) * (0.25 + 0.75 * rock);
-}
-
 // Smooth value noise in 0..1 over base-cell coordinates (x, y) of a face.
 fn sc_value(face: u32, x: f32, y: f32, salt: u32) -> f32 {
     let i = floor(x);
@@ -94,78 +94,175 @@ fn sc_face(n: vec3<f32>) -> u32 {
     return select(5u, 4u, n.z >= 0.0);
 }
 
-// Local corner `corner` of triangle `tri` (0..15) of species `k` at `scale`:
-// triangles 0..7 the crown (or rock top), 8..15 the trunk (or rock base).
-fn sc_corner(k: u32, tri: u32, corner: u32, scale: f32) -> vec3<f32> {
-    var crown_base = 2.0;
-    var crown_top = 11.0;
-    var crown_r = 2.3;
-    var trunk_r = 0.3;
-    var trunk_bottom = -0.6;
-    if k == 1u {
-        crown_base = 0.3;
-        crown_top = 2.4;
-        crown_r = 1.7;
-        trunk_r = 0.15;
-    } else if k == 2u {
-        crown_base = 0.35;
-        crown_top = 1.1;
-        crown_r = 1.25;
-        trunk_r = 1.25;
-        trunk_bottom = -0.4;
-    }
-    if tri < 8u {
-        if corner == 0u {
-            return vec3<f32>(0.0, 0.0, crown_top) * scale;
-        }
-        let a = f32((tri + corner - 1u) % 8u) * (6.2831853 / 8.0);
-        return vec3<f32>(cos(a) * crown_r, sin(a) * crown_r, crown_base) * scale;
-    }
-    // Trunk / rock base: 4 quads (two triangles each) around 4 sides.
-    let q = (tri - 8u) / 2u;
-    let second = (tri - 8u) % 2u;
-    let a0 = f32(q) * (6.2831853 / 4.0);
-    let a1 = f32(q + 1u) * (6.2831853 / 4.0);
-    let top = crown_base;
-    var r_top = trunk_r;
-    if k == 2u {
-        r_top = crown_r;
-    }
-    let p00 = vec3<f32>(cos(a0) * trunk_r, sin(a0) * trunk_r, trunk_bottom);
-    let p10 = vec3<f32>(cos(a1) * trunk_r, sin(a1) * trunk_r, trunk_bottom);
-    let p01 = vec3<f32>(cos(a0) * r_top, sin(a0) * r_top, top);
-    let p11 = vec3<f32>(cos(a1) * r_top, sin(a1) * r_top, top);
-    var p = p00;
-    if second == 0u {
-        p = select(select(p01, p10, corner == 1u), p00, corner == 0u);
-    } else {
-        p = select(select(p01, p11, corner == 1u), p10, corner == 0u);
-    }
-    return p * scale;
+// Plant probabilities of one base cell (they sum to at most 1).
+struct ForestSite {
+    tree: f32,
+    shrub: f32,
+    boulder: f32,
+    // 1 in a forest's core, 0 outside: trees shrink towards the edge.
+    core: f32,
+    // Share of conifers among trees.
+    conifer: f32,
+    // Tree-line stunting, 1 = full size.
+    stature: f32,
 }
 
-// Expected tree cover (0..1) at node chart position `st`: the scatter's
-// conifer and shrub densities times its clearing noise, for the far tint.
-fn forest_cover(inst: Instance, st: vec2<f32>, normal_body: vec3<f32>, climate: vec2<f32>, ground: f32) -> f32 {
+// Forest field at base-cell coordinates (ci, cj) of `face`. `footprint` is
+// the sample spacing in base cells: octaves finer than about four samples
+// fade to their mean (band limit for the far tint); 0 for single plants.
+fn sc_forest(face: u32, ci: f32, cj: f32, footprint: f32, t: f32, m: f32, slope: f32, h: f32) -> ForestSite {
+    var site: ForestSite;
+    let warm = sc_range(-7.0, 30.0, 6.0, t);
+    let wet = smoothstep(0.16, 0.42, m);
+    let steep = smoothstep(32.0 * SCATTER_DEG, 48.0 * SCATTER_DEG, slope);
+    let suit = warm * wet * (1.0 - steep) * (1.0 - smoothstep(3200.0, 3800.0, h));
+    let o1 = mix(sc_value(face, ci / 400.0, cj / 400.0, 40u), 0.5, smoothstep(100.0, 200.0, footprint));
+    let o2 = mix(sc_value(face, ci / 100.0, cj / 100.0, 41u), 0.5, smoothstep(25.0, 50.0, footprint));
+    let o3 = mix(sc_value(face, ci / 25.0, cj / 25.0, 42u), 0.5, smoothstep(6.0, 12.0, footprint));
+    let o4 = mix(sc_value(face, ci / 6.0, cj / 6.0, 43u), 0.5, smoothstep(1.5, 3.0, footprint));
+    let n = 0.45 * o1 + 0.3 * o2 + 0.15 * o3 + 0.1 * o4;
+    // Good climates are mostly forest with clearings; marginal ones patchy.
+    let threshold = 1.0 - 0.72 * suit;
+    let core = smoothstep(threshold - 0.05, threshold + 0.05, n) * step(0.02, suit);
+    let fringe = smoothstep(threshold - 0.3, threshold - 0.03, n) * (1.0 - core);
+    site.core = core;
+    // Dense in the core, thinning through the fringe, lone trees elsewhere.
+    site.tree = suit * (0.9 * core + 0.18 * fringe * fringe + 0.06 * fringe) + 0.025 * suit;
+    let shrubby = sc_range(-3.0, 32.0, 6.0, t) * smoothstep(0.06, 0.3, m) * (1.0 - steep);
+    site.shrub = shrubby * (0.35 * fringe + 0.06 * core + 0.04);
+    let rock = smoothstep(25.0 * SCATTER_DEG, 45.0 * SCATTER_DEG, slope);
+    site.boulder = 0.02 + 0.25 * rock * (1.0 - smoothstep(60.0 * SCATTER_DEG, 70.0 * SCATTER_DEG, slope));
+    let total = site.tree + site.shrub + site.boulder;
+    if total > 1.0 {
+        site.tree /= total;
+        site.shrub /= total;
+        site.boulder /= total;
+    }
+    site.conifer = clamp(smoothstep(15.0, 5.0, t) + 0.3 * smoothstep(1800.0, 2800.0, h), 0.0, 1.0);
+    site.stature = mix(0.4, 1.0, smoothstep(-7.0, 1.0, t)) * mix(0.6, 1.0, core);
+    return site;
+}
+
+// keep(d): share of candidates shown at view distance `d` (m).
+fn sc_keep(d: f32) -> f32 {
+    let ratio = SCATTER_FULL_M / max(d, 1.0);
+    return min(1.0, ratio * ratio)
+        * (1.0 - smoothstep(0.7 * SCATTER_MAX_DISTANCE_M, SCATTER_MAX_DISTANCE_M, d));
+}
+
+// Shapes: kind 0 conifer, 1 broadleaf, 2 shrub, 3 boulder. Part A
+// (triangles 0..7) is an 8-sided cone or upper pyramid, part B (8..15) a
+// second cone (conifer) or the lower pyramid, part C (16..23) a 4-sided
+// trunk. Returns the local corner (metres before scaling, z up).
+struct Part {
+    ring_z: f32,
+    ring_r: f32,
+    apex_z: f32,
+}
+
+fn sc_part(kind: u32, part: u32) -> Part {
+    var p: Part;
+    if kind == 0u {
+        if part == 0u {
+            p = Part(2.0, 3.1, 9.0);
+        } else {
+            p = Part(6.0, 2.2, 13.0);
+        }
+    } else if kind == 1u {
+        if part == 0u {
+            p = Part(6.5, 4.4, 11.5);
+        } else {
+            p = Part(6.5, 4.4, 3.0);
+        }
+    } else if kind == 2u {
+        if part == 0u {
+            p = Part(0.8, 1.6, 2.1);
+        } else {
+            p = Part(0.8, 1.6, -0.6);
+        }
+    } else {
+        if part == 0u {
+            p = Part(0.4, 1.2, 1.0);
+        } else {
+            p = Part(0.4, 1.2, -0.3);
+        }
+    }
+    return p;
+}
+
+fn sc_corner(kind: u32, tri: u32, corner: u32, seed: u32) -> vec3<f32> {
+    if tri < 16u {
+        let part = sc_part(kind, tri / 8u);
+        let i = tri % 8u;
+        if corner == 0u {
+            return vec3<f32>(0.0, 0.0, part.apex_z);
+        }
+        let j = (i + corner - 1u) % 8u;
+        let a = f32(j) * (6.2831853 / 8.0);
+        var r = part.ring_r;
+        if kind == 3u {
+            // Irregular rocks: per-vertex radius from the seed.
+            r *= 0.65 + 0.7 * sc_unit(sc_pcg3d(vec3<u32>(seed, j, 7u)).x);
+        } else if kind == 1u {
+            r *= 0.85 + 0.3 * sc_unit(sc_pcg3d(vec3<u32>(seed, j, 9u)).x);
+        }
+        return vec3<f32>(cos(a) * r, sin(a) * r, part.ring_z);
+    }
+    // Trunk: 4 quads, two triangles each.
+    var trunk_r = 0.32;
+    var trunk_top = 2.4;
+    if kind == 1u {
+        trunk_r = 0.38;
+        trunk_top = 4.0;
+    } else if kind >= 2u {
+        trunk_r = 0.0;
+        trunk_top = 0.0;
+    }
+    let t = tri - 16u;
+    let q = t / 2u;
+    let a0 = f32(q) * (6.2831853 / 4.0);
+    let a1 = f32(q + 1u) * (6.2831853 / 4.0);
+    let p00 = vec3<f32>(cos(a0) * trunk_r, sin(a0) * trunk_r, -0.6);
+    let p10 = vec3<f32>(cos(a1) * trunk_r, sin(a1) * trunk_r, -0.6);
+    let p01 = vec3<f32>(cos(a0) * trunk_r * 0.7, sin(a0) * trunk_r * 0.7, trunk_top);
+    let p11 = vec3<f32>(cos(a1) * trunk_r * 0.7, sin(a1) * trunk_r * 0.7, trunk_top);
+    if t % 2u == 0u {
+        return select(select(p01, p10, corner == 1u), p00, corner == 0u);
+    }
+    return select(select(p01, p11, corner == 1u), p10, corner == 0u);
+}
+
+// Chart coordinates of node position `st` in base cells.
+fn sc_cells(inst: Instance, st: vec2<f32>) -> vec2<f32> {
     let width = inst.face_u.w;
     let q0 = inst.n0.w;
     let cells_per_unit = f32(1u << (SCATTER_CELL_BITS - 1u));
     let u = dot(inst.n0.xyz, inst.face_u.xyz) * q0 + (st.x - 0.5) * width;
     let v = dot(inst.n0.xyz, inst.face_v.xyz) * q0 + (st.y - 0.5) * width;
-    let ci = (u + 1.0) * cells_per_unit;
-    let cj = (v + 1.0) * cells_per_unit;
-    let face = sc_face(inst.n0.xyz);
-    // Band limit: each octave fades to its mean once a drawn grid cell spans
-    // more than a quarter of its wavelength (in base cells).
-    let footprint = width * cells_per_unit / grid.draw.x;
-    let coarse = mix(sc_value(face, ci / 48.0, cj / 48.0, 40u), 0.5, smoothstep(12.0, 24.0, footprint));
-    let fine = mix(sc_value(face, ci / 12.0, cj / 12.0, 41u), 0.5, smoothstep(3.0, 6.0, footprint));
-    let wooded = smoothstep(0.38, 0.6, 0.65 * coarse + 0.35 * fine);
+    return vec2<f32>((u + 1.0) * cells_per_unit, (v + 1.0) * cells_per_unit);
+}
+
+// Canopy colour and strength (0..1) for the terrain fragment at node
+// position `st` and view distance `d`: the forest field band-limited to the
+// drawn grid, near the camera only the darker forest floor (the drawn trees
+// carry the canopy), far away the full canopy.
+fn forest_cover(inst: Instance, st: vec2<f32>, normal_body: vec3<f32>, climate: vec2<f32>, ground: f32, d: f32) -> vec4<f32> {
+    let c = sc_cells(inst, st);
+    let cells_per_unit = f32(1u << (SCATTER_CELL_BITS - 1u));
+    let footprint = inst.face_u.w * cells_per_unit / grid.draw.x;
     let up_body = normalize(inst.n0.xyz + chart_diff(inst, st));
     let slope = acos(clamp(dot(normal_body, up_body), -1.0, 1.0));
-    let trees = sc_density(0u, climate.x, climate.y, slope, ground) * wooded
-        + 0.4 * sc_density(1u, climate.x, climate.y, slope, ground) * mix(0.3, 1.0, wooded);
-    return clamp(trees, 0.0, 1.0);
+    let site = sc_forest(sc_face(inst.n0.xyz), c.x, c.y, footprint, climate.x, climate.y, slope, ground);
+    var colour = mix(vec3<f32>(0.04, 0.07, 0.025), vec3<f32>(0.02, 0.04, 0.025), site.conifer);
+    // Canopy texture: crowns and gaps (~30 m) and clumps (~90 m), each fading
+    // to its mean once the drawn grid is too coarse to carry it.
+    let face = sc_face(inst.n0.xyz);
+    let crowns = mix(sc_value(face, c.x / 3.0, c.y / 3.0, 44u), 0.5, smoothstep(0.75, 1.5, footprint));
+    let clumps = mix(sc_value(face, c.x / 9.0, c.y / 9.0, 45u), 0.5, smoothstep(2.25, 4.5, footprint));
+    colour *= 0.55 + 0.6 * crowns + 0.35 * (clumps - 0.5);
+    let cover = clamp(site.tree * site.stature + 0.4 * site.shrub, 0.0, 1.0);
+    let far = 1.0 - sc_keep(d);
+    return vec4<f32>(colour, cover * mix(0.45, 0.9, far));
 }
 
 fn sc_hidden() -> ScatterOut {
@@ -190,8 +287,8 @@ fn vs_scatter(@builtin(vertex_index) vertex: u32, @builtin(instance_index) index
     let radius = inst.anchor.w;
     let width = inst.face_u.w;
     let q0 = inst.n0.w;
-    let node_m = width / q0 * radius;
-    if node_m > SCATTER_MAX_NODE_M {
+    // Whole node beyond the plant distance: nothing to draw.
+    if length(inst.anchor.xyz) - 0.75 * width / q0 * radius > SCATTER_MAX_DISTANCE_M {
         return sc_hidden();
     }
     // Chart (face-plane) coordinates of the node's lower corner.
@@ -221,12 +318,35 @@ fn vs_scatter(@builtin(vertex_index) vertex: u32, @builtin(instance_index) index
         ci = ci * 2u + (q & 1u);
         cj = cj * 2u + (q >> 1u);
     }
+    // λ: further ancestors that also pick this cell.
+    var lambda = k;
+    loop {
+        let next = lambda + 1u;
+        if next > SCATTER_MAX_LEVEL {
+            break;
+        }
+        let q = sc_pcg3d(vec3<u32>(ci >> next, cj >> next, face * 64u + next)).x >> 30u;
+        let own = ((ci >> lambda) & 1u) | (((cj >> lambda) & 1u) << 1u);
+        if q != own {
+            break;
+        }
+        lambda = next;
+    }
     let h = sc_pcg3d(vec3<u32>(ci, cj, face * 64u + 63u));
     let h2 = sc_pcg3d(h ^ vec3<u32>(0x5ca77e5u));
+    let rank = exp2(-2.0 * f32(lambda)) * (0.25 + 0.75 * sc_unit(h2.z ^ h.x));
     let u = (f32(ci) + 0.15 + 0.7 * sc_unit(h.x)) / cells_per_unit - 1.0;
     let v = (f32(cj) + 0.15 + 0.7 * sc_unit(h.y)) / cells_per_unit - 1.0;
     let st = vec2<f32>((u - u_min) / width, (v - v_min) / width);
     if any(st < vec2<f32>(0.0)) || any(st > vec2<f32>(1.0)) {
+        return sc_hidden();
+    }
+    let ground = blended_height(inst, st, 0.0);
+    let base_view = to_view(inst, body_position(inst, st, ground));
+    let keep = sc_keep(length(base_view));
+    // Grow in over the last 35 % of keep before the rank.
+    let grow = clamp((keep - rank) / (0.35 * keep + 1.0e-12), 0.0, 1.0);
+    if grow <= 0.0 {
         return sc_hidden();
     }
     // Site from the node's own page.
@@ -237,51 +357,61 @@ fn vs_scatter(@builtin(vertex_index) vertex: u32, @builtin(instance_index) index
         return sc_hidden();
     }
     let climate = textureSampleLevel(climate_atlas, normal_sampler, own_uv, i32(inst.own.x), 0.0);
-    let ground = blended_height(inst, st, 0.0);
     let diff = chart_diff(inst, st);
     let up_body = normalize(inst.n0.xyz + diff);
     let normal_body = normalize(page_n.xyz);
     let slope = acos(clamp(dot(normal_body, up_body), -1.0, 1.0));
-    // Clearings and forest edges: two octaves of value noise (~500 m and
-    // ~120 m) gate trees and shrubs.
-    let cover = 0.65 * sc_value(face, f32(ci) / 48.0, f32(cj) / 48.0, 40u)
-        + 0.35 * sc_value(face, f32(ci) / 12.0, f32(cj) / 12.0, 41u);
-    let wooded = smoothstep(0.38, 0.6, cover);
-    let d0 = sc_density(0u, climate.x, climate.y, slope, ground) * wooded;
-    let d1 = sc_density(1u, climate.x, climate.y, slope, ground) * mix(0.3, 1.0, wooded);
-    let d2 = sc_density(2u, climate.x, climate.y, slope, ground);
-    let total = d0 + d1 + d2;
-    if sc_unit(h.z) >= min(total, 1.0) {
+    let site = sc_forest(face, f32(ci), f32(cj), 0.0, climate.x, climate.y, slope, ground);
+    let roll = sc_unit(h.z);
+    var kind = 3u;
+    var scale = 1.0;
+    if roll < site.tree {
+        kind = select(1u, 0u, sc_unit(h2.x) < site.conifer);
+        scale = mix(0.75, 1.3, sc_unit(h2.y)) * site.stature;
+    } else if roll < site.tree + site.shrub {
+        kind = 2u;
+        scale = mix(0.6, 1.4, sc_unit(h2.y));
+    } else if roll < site.tree + site.shrub + site.boulder {
+        kind = 3u;
+        scale = mix(0.5, 2.2, sc_unit(h2.y) * sc_unit(h2.x));
+    } else {
         return sc_hidden();
     }
-    let pick = sc_unit(h2.x) * total;
-    var species = 2u;
-    if pick < d0 {
-        species = 0u;
-    } else if pick < d0 + d1 {
-        species = 1u;
-    }
-    let scale = mix(0.7, 1.35, sc_unit(h2.y)) * select(1.0, mix(0.6, 1.8, sc_unit(h2.z)), species == 2u);
+    scale *= smoothstep(0.0, 1.0, grow);
     let yaw = sc_unit(h2.z) * 6.2831853;
-    // Local frame: up, and a yawed horizontal pair from the face U axis.
+    // Local frame: up, and a yawed horizontal pair from the face U axis; a
+    // slight lean for rocks only.
     let e1r = normalize(inst.face_u.xyz - up_body * dot(inst.face_u.xyz, up_body));
     let e2r = cross(up_body, e1r);
     let e1 = e1r * cos(yaw) + e2r * sin(yaw);
     let e2 = cross(up_body, e1);
     let tri = vertex / 3u;
     let corner = vertex % 3u;
-    let c0 = sc_corner(species, tri, 0u, scale);
-    let c1 = sc_corner(species, tri, 1u, scale);
-    let c2 = sc_corner(species, tri, 2u, scale);
-    let local = sc_corner(species, tri, corner, scale);
+    let seed = h.x ^ h.y;
+    let shape = vec3<f32>(select(1.0, clamp(1.25 * inverseSqrt(max(keep, 1.0e-6)), 1.0, 30.0), kind <= 2u));
+    let c0 = sc_corner(kind, tri, 0u, seed) * vec3<f32>(shape.x, shape.y, 1.0);
+    let c1 = sc_corner(kind, tri, 1u, seed) * vec3<f32>(shape.x, shape.y, 1.0);
+    let c2 = sc_corner(kind, tri, 2u, seed) * vec3<f32>(shape.x, shape.y, 1.0);
+    // Each kept tree or shrub stands for the 1 / keep candidates around it:
+    // its crown spreads sideways (not up) so far forests close into a
+    // canopy at true canopy height with a bumpy silhouette.
+    var spread = 1.0;
+    if kind <= 2u {
+        spread = clamp(1.25 * inverseSqrt(max(keep, 1.0e-6)), 1.0, 30.0);
+    }
+    let local = sc_corner(kind, tri, corner, seed) * vec3<f32>(scale * spread, scale * spread, scale);
     var local_n = normalize(cross(c1 - c0, c2 - c0));
-    // Face outward (away from the stem axis).
-    let centre = (c0 + c1 + c2) / 3.0;
-    if dot(local_n, vec3<f32>(centre.x, centre.y, 0.0)) < 0.0 {
+    // Face outward from the part's axis point.
+    var axis_z = 0.0;
+    if tri < 16u {
+        axis_z = sc_part(kind, tri / 8u).ring_z;
+    }
+    let centre = (c0 + c1 + c2) / 3.0 - vec3<f32>(0.0, 0.0, axis_z);
+    if dot(local_n, centre) < 0.0 {
         local_n = -local_n;
     }
     let to_body = mat3x3<f32>(e1, e2, up_body);
-    let base = body_position(inst, st, ground - 0.2);
+    let base = body_position(inst, st, ground - 0.15 * scale);
     let view_position = to_view(inst, base + to_body * local);
     let n_body = to_body * local_n;
     var out: ScatterOut;
@@ -290,14 +420,16 @@ fn vs_scatter(@builtin(vertex_index) vertex: u32, @builtin(instance_index) index
     out.normal = normalize(inst.b2v_x.xyz * n_body.x + inst.b2v_y.xyz * n_body.y + inst.b2v_z.xyz * n_body.z);
     out.up = normalize(inst.b2v_x.xyz * up_body.x + inst.b2v_y.xyz * up_body.y + inst.b2v_z.xyz * up_body.z);
     let tint = 0.8 + 0.4 * sc_unit(h2.x ^ h2.y);
-    if species == 2u {
+    if kind == 3u {
         out.albedo = vec3<f32>(0.2, 0.19, 0.17) * tint;
-    } else if tri >= 8u {
-        out.albedo = vec3<f32>(0.08, 0.05, 0.03);
-    } else if species == 0u {
-        out.albedo = vec3<f32>(0.03, 0.065, 0.03) * tint;
+    } else if tri >= 16u {
+        out.albedo = vec3<f32>(0.075, 0.05, 0.03);
+    } else if kind == 0u {
+        out.albedo = vec3<f32>(0.022, 0.05, 0.028) * tint;
+    } else if kind == 1u {
+        out.albedo = vec3<f32>(0.045, 0.085, 0.025) * tint;
     } else {
-        out.albedo = vec3<f32>(0.06, 0.09, 0.035) * tint;
+        out.albedo = vec3<f32>(0.055, 0.07, 0.03) * tint;
     }
     return out;
 }

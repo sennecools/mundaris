@@ -213,8 +213,8 @@ fn fs_main(input: VertexOut) -> SceneOut {
         let own_c = textureSampleLevel(climate_atlas, normal_sampler, input.own_uv, input.layers.x, 0.0);
         let parent_c = textureSampleLevel(climate_atlas, normal_sampler, input.parent_uv, input.layers.y, 0.0);
         let climate = mix(mix(parent_c, own_c, input.blend.x), parent_c, input.blend.y);
-        let cover = forest_cover(inst, input.grid_st, normalize(sampled.xyz), climate.xy, input.ground);
-        land_albedo = mix(land_albedo, vec3<f32>(0.022, 0.04, 0.02), 0.75 * cover);
+        let canopy = forest_cover(inst, input.grid_st, normalize(sampled.xyz), climate.xy, input.ground, length(input.view_pos));
+        land_albedo = mix(land_albedo, canopy.rgb, canopy.a);
     }
     let n0_view = inst.b2v_x.xyz * inst.n0.x + inst.b2v_y.xyz * inst.n0.y + inst.b2v_z.xyz * inst.n0.z;
     let up = normalize(input.view_pos - (inst.anchor.xyz - n0_view * inst.anchor.w));
