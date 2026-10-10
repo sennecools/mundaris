@@ -54,11 +54,12 @@ impl ExposureMode {
 /// adapter lacks fall back to the largest supported count below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AntiAliasing {
-    #[default]
     Off,
     /// Post-process edge blur on the tonemapped image (FXAA 3.11 quality).
     Fxaa,
     Msaa2,
+    /// Default: user choice 2026-10-10 after the side-by-side comparison.
+    #[default]
     Msaa4,
     Msaa8,
     /// Temporal: jittered frames reprojected and clipped (camera motion only).
@@ -245,7 +246,8 @@ impl Default for RenderSettings {
                 line_width_scale: 1.0,
                 opacity: 1.0,
             },
-            anti_aliasing: AntiAliasing::Off,
+            // User choice 2026-10-10 after the side-by-side comparison.
+            anti_aliasing: AntiAliasing::Msaa4,
         }
     }
 }
