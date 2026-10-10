@@ -869,18 +869,18 @@ fn puffs(m: &mut Mesh, sk: &Skeleton, sp: &SpeciesFile, seed: u64, count: usize,
     let pointed = sp.genome.crown_shape == crate::genome::CrownShape::Cone;
     let (unit, faces) = icosphere(detail);
     let wind = [2, 60, 0, class::ORGAN];
-    for c in 0..k {
+    for (c, &centre) in centres.iter().enumerate() {
         let members: Vec<usize> = (0..pts.len()).filter(|&i| owner[i] == c).collect();
         if members.is_empty() {
             continue;
         }
         let n = members.len() as f64;
-        let spread = (members.iter().map(|&i| pts[i].distance_squared(centres[c])).sum::<f64>() / n).sqrt();
+        let spread = (members.iter().map(|&i| pts[i].distance_squared(centre)).sum::<f64>() / n).sqrt();
         let size = members.iter().map(|&i| organs[i].size).sum::<f64>() / n;
         let r = 1.25 * spread + 0.9 * size;
         let radii = DVec3::new(r, r, 0.85 * r);
         let base = m.vertices.len() as u32;
-        let out_dir = (centres[c] - crown).normalize_or(DVec3::Z);
+        let out_dir = (centre - crown).normalize_or(DVec3::Z);
         for (vi, u) in unit.iter().enumerate() {
             let lump = 1.0 + 0.24 * (rng.unit(c as u64 * 64 + vi as u64, 12) - 0.5);
             let mut local = *u * radii * lump;
@@ -891,7 +891,7 @@ fn puffs(m: &mut Mesh, sk: &Skeleton, sp: &SpeciesFile, seed: u64, count: usize,
                 local.y *= 1.0 - 0.5 * up;
                 local.z += 0.45 * r * up;
             }
-            let pos = centres[c] + local;
+            let pos = centre + local;
             let crown_n = (pos - crown).normalize_or(DVec3::Z);
             let nrm = (0.45 * *u + 0.55 * crown_n + 0.15 * DVec3::Z).normalize();
             let h = ((pos.z - lo.z) / span).clamp(0.0, 1.0);
@@ -900,7 +900,7 @@ fn puffs(m: &mut Mesh, sk: &Skeleton, sp: &SpeciesFile, seed: u64, count: usize,
             let col = lerp3(scale3(sp.look.organ, 0.7), scale3(sp.look.organ_tip, 1.2), t);
             // Faces turned into the crown are darker (cheap AO).
             let ao = (0.6 + 0.4 * (0.5 + 0.5 * u.dot(out_dir))) as f32;
-            m.push(pos, nrm, col, ao, centres[c], wind);
+            m.push(pos, nrm, col, ao, centre, wind);
         }
         for f in &faces {
             m.indices.extend_from_slice(&[base + f[0], base + f[1], base + f[2]]);
