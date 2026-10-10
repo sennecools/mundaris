@@ -67,9 +67,8 @@ pub struct ForestSite {
     pub shrubland: f64,
     /// Canopy size factor (suitability edge and core).
     pub stature: f64,
-    /// Expected share of the view the plants' crowns hide (Boolean model:
-    /// 1 - exp(-gain · crown area per cell seen at the view angle)) for the
-    /// `view` given to [`Placement::forest_view`]: the far tint strength.
+    /// Expected share of the view the crowns of the undrawn plants hide, for
+    /// the `view` given to [`Placement::forest_view`]: the far tint strength.
     pub cover: f64,
     /// Canopy colour for the far tint (linear RGB).
     pub color: [f64; 3],
@@ -101,7 +100,7 @@ impl Placement<'_> {
     /// Forest field at the nominal view (straight down, all plants, 100 m²
     /// cells); see [`Self::forest_view`].
     pub fn forest(&self, face: u32, ci: f64, cj: f64, footprint: f64, s: &Site) -> ForestSite {
-        self.forest_view(face, ci, cj, footprint, s, [NOMINAL_GAIN, 1.0])
+        self.forest_view(face, ci, cj, footprint, s, [NOMINAL_GAIN, 0.0, 1.0])
     }
 
     /// Expected crown areas (m², top and side) of one plant of `layer`
@@ -122,11 +121,11 @@ impl Placement<'_> {
     }
 
     /// Forest field (mirror of `sc_forest`); `footprint` in base cells, 0
-    /// for single plants. `view` = (gain, cosine of the view zenith angle):
-    /// `cover` is the expected share of the view hidden by the crowns, with
-    /// `gain` × crown area per cell the mean crown count over a point (gain
-    /// = 1 / cell area when every plant is drawn).
-    pub fn forest_view(&self, face: u32, ci: f64, cj: f64, footprint: f64, s: &Site, view: [f64; 2]) -> ForestSite {
+    /// for single plants. `view` = (1 / cell area m², share of plants still
+    /// drawn, cosine of the view zenith angle): `cover` is the expected share
+    /// of the view hidden by the crowns the drawn plants leave out (the far
+    /// tint strength; checked by `examples/flora_cover_check.rs`).
+    pub fn forest_view(&self, face: u32, ci: f64, cj: f64, footprint: f64, s: &Site, view: [f64; 3]) -> ForestSite {
         let suit = self.layer_suit(Layer::Canopy, s);
         let f1 = smoothstep(100.0, 200.0, footprint);
         let f2 = smoothstep(25.0, 50.0, footprint);
@@ -152,7 +151,7 @@ impl Placement<'_> {
         let mut site = ForestSite { canopy: suit, shrubland: shrubby, ..Default::default() };
         let crown_c = self.layer_crown(Layer::Canopy, s);
         let crown_s = self.layer_crown(Layer::Shrub, s);
-        let cos_v = view[1].clamp(0.05, 1.0);
+        let cos_v = view[2].clamp(0.05, 1.0);
         let nodes: &[f64] = if sigma > 0.0 { &NOISE_QUANTILES } else { &[0.0] };
         let w = 1.0 / nodes.len() as f64;
         for &x in nodes {
@@ -179,7 +178,7 @@ impl Placement<'_> {
             let top = tree * stature * stature * crown_c[0] + shrub * crown_s[0];
             let side = tree * stature * stature * crown_c[1] + shrub * crown_s[1];
             let seen = (top * top * cos_v * cos_v + side * side * (1.0 - cos_v * cos_v)).sqrt() / cos_v;
-            site.cover += w * (1.0 - (-view[0] * seen).exp());
+            site.cover += w * hidden_by_undrawn(view[0] * seen, view[1]);
         }
         // Canopy colour: species colours weighted like the species choice.
         let mut c = [0.0; 3];
@@ -236,8 +235,23 @@ pub const NOISE_QUANTILES: [f64; 16] = [
 /// Fallback canopy colour (the old M5 broadleaf tint).
 pub const DEFAULT_CANOPY: [f64; 3] = [0.04, 0.07, 0.025];
 
-/// Gain of [`Placement::forest`]: every plant drawn, 100 m² cells.
+/// Inverse cell area of [`Placement::forest`] (100 m² cells; every plant
+/// counted as undrawn).
 pub const NOMINAL_GAIN: f64 = 0.01;
+
+/// Packing of one jittered candidate per cell: crowns overlap less than
+/// Poisson-placed ones, so a mean crown count λ over a point hides
+/// 1 - exp(-λ(1 + c·λ)) (fit to `examples/flora_cover_check.rs`).
+pub const JITTER_PACKING: f64 = 0.5;
+
+/// Share of the view hidden by the plants that thinning to `keep` leaves
+/// out, over what the kept plants leave visible: with all plants hiding
+/// C(λ) and the kept ones C(keep·λ), that is 1 - (1 - C(λ)) / (1 - C(keep·λ)).
+pub fn hidden_by_undrawn(lambda: f64, keep: f64) -> f64 {
+    let all = lambda * (1.0 + JITTER_PACKING * lambda);
+    let kept = keep * lambda * (1.0 + JITTER_PACKING * keep * lambda);
+    1.0 - (kept - all).exp()
+}
 
 /// Crown areas (m², top and side) at scale 1 when none was measured.
 pub const DEFAULT_CROWN: [f64; 2] = [25.0, 35.0];
