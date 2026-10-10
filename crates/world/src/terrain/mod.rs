@@ -13,6 +13,7 @@ mod prepared;
 mod surface;
 pub mod archetype;
 pub mod biome_lut;
+pub mod hydrology;
 pub mod landform;
 pub mod surface_query;
 pub mod tier_a;
