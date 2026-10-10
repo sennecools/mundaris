@@ -188,6 +188,14 @@ pub struct TectonicsRanges {
     pub softness_km: f64,
     /// `boundary_coord` is clamped to ± this distance.
     pub boundary_clamp_km: f64,
+    /// Smooth-maximum temperature where the relief of boundaries meeting at a
+    /// triple junction merges (lane proposal `plate-junctions-PROPOSAL.md`).
+    #[serde(default = "default_junction_blend_km")]
+    pub junction_blend_km: f64,
+}
+
+fn default_junction_blend_km() -> f64 {
+    0.4
 }
 
 /// Rock hardness (§6.5.3): per-plate rock family (oceanic plates volcanic,
@@ -502,6 +510,7 @@ impl PlanetArchetype {
             .all(|w| km(*w, 1.0, 1.0e3))
             && km(t.arc_offset_km, t.arc_width_km, 1.0e3)
             && km(t.boundary_clamp_km, 10.0, 1.0e3)
+            && km(t.junction_blend_km, 0.05, 5.0)
             && [h.crystalline, h.volcanic, h.sedimentary]
                 .iter()
                 .all(|v| unit(*v))
@@ -578,6 +587,7 @@ impl PlanetArchetype {
             crust_width_m: 1000.0 * tc.crust_width_km,
             boundary_softness_m: 1000.0 * tc.softness_km,
             boundary_clamp_m: 1000.0 * tc.boundary_clamp_km,
+            junction_blend_m: 1000.0 * tc.junction_blend_km,
             hardness_crystalline: hd.crystalline,
             hardness_volcanic: hd.volcanic,
             hardness_sedimentary: hd.sedimentary,
@@ -727,6 +737,7 @@ pub struct PlanetParams {
     pub crust_width_m: f64,
     pub boundary_softness_m: f64,
     pub boundary_clamp_m: f64,
+    pub junction_blend_m: f64,
     // Hardness (M2): see `HardnessRanges`.
     pub hardness_crystalline: f64,
     pub hardness_volcanic: f64,
@@ -821,6 +832,7 @@ pub const PARAM_FIELDS: &[ParamField] = fields! {
     "Tectonics": ridge_height_m: 0.0, 5.0e3, "m";
     "Tectonics": orogen_width_m: 1.0e4, 1.0e6, "m";
     "Tectonics": orogen_roughness: 0.0, 1.0;
+    "Tectonics": junction_blend_m: 50.0, 5.0e3, "m";
     "Rock hardness": hardness_noise: 0.0, 0.5;
     "Rain shadow": wind_deflection: 0.0, 1.0;
     "Rain shadow": orographic_rain: 0.0, 1.0;
@@ -945,6 +957,7 @@ impl PlanetParams {
                     self.crust_width_m.to_bits(),
                     self.boundary_softness_m.to_bits(),
                     self.boundary_clamp_m.to_bits(),
+                    self.junction_blend_m.to_bits(),
                     self.hardness_crystalline.to_bits(),
                     self.hardness_volcanic.to_bits(),
                     self.hardness_sedimentary.to_bits(),

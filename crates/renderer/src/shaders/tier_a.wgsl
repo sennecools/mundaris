@@ -26,7 +26,7 @@ struct Params {
     heights2: vec4<f32>,    // rift m, transform m, roughness, roughness frequency
     widths: vec4<f32>,      // orogen, arc width, arc offset, trench width (m)
     widths2: vec4<f32>,     // ridge, rift, transform, crust widths (m)
-    hardness: vec4<f32>,    // noise amplitude, noise frequency, unused, unused
+    hardness: vec4<f32>,    // noise amplitude, noise frequency, junction blend m, unused
     seeds2: vec4<u32>,      // hardness seed, unused...
     shadow: vec4<f32>,      // unused, deflection, deflection slope, slowdown
     orographic: vec4<f32>,  // orographic rain, lee drying, reference slope, unused
@@ -274,10 +274,10 @@ fn motion(w: vec3<f32>, a: Plate, b: Plate, tangent: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(conv, div, smoothstep(0.05, 0.4, shear) * (1.0 - conv - div));
 }
 
-// `tectonics::EDGE_CANDIDATES`, `JUNCTION_BLEND_M`, `VOLCANIC_BLEND`.
+// `tectonics::EDGE_CANDIDATES`, `VOLCANIC_BLEND`; the junction blend (m) is
+// `params.hardness.z` (`PlanetParams::junction_blend_m`).
 const EDGE_CANDIDATES: u32 = 6u;
 const EDGE_PAIRS: u32 = 15u;
-const JUNCTION_BLEND_M: f32 = 400.0;
 const VOLCANIC_BLEND: f32 = 0.1;
 
 // Distance (m) past the end of the boundary of candidates `a` and `b`
@@ -315,7 +315,8 @@ fn beyond_end(w: vec3<f32>, a: u32, b: u32, candidates: array<u32, 6>, n: u32) -
 }
 
 // Smooth maximum of `count` non-negative values (`tectonics::smooth_max`).
-fn smooth_max(values: array<f32, 15>, count: u32, t: f32) -> f32 {
+fn smooth_max(values: array<f32, 15>, count: u32, temperature: f32) -> f32 {
+    let t = max(temperature, 1.0e-3);
     var m = 0.0;
     for (var k = 0u; k < count; k = k + 1u) {
         m = max(m, values[k]);
@@ -446,8 +447,8 @@ fn tectonics(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
     let rough = params.heights2.z * fbm(d, params.heights2.w, 4u, 2.0, 0.5, params.seeds.w + 64u);
-    let oro = smooth_max(orogenic, edges, JUNCTION_BLEND_M);
-    let dh = smooth_max(raised, edges, JUNCTION_BLEND_M) - smooth_max(lowered, edges, JUNCTION_BLEND_M);
+    let oro = smooth_max(orogenic, edges, params.hardness.z);
+    let dh = smooth_max(raised, edges, params.hardness.z) - smooth_max(lowered, edges, params.hardness.z);
     let uplift = clamp(oro * (1.0 + rough) / max(params.heights.x, 1.0), 0.0, 1.0);
     let volc = clamp(smooth_max(volcanic, edges, VOLCANIC_BLEND), 0.0, 1.0);
     let bc = clamp(delta_min * coord / total, -params.plates.w, params.plates.w);

@@ -195,6 +195,8 @@ pub struct TierABakeInputs {
     pub crust_width_m: f32,
     pub hardness_noise: f32,
     pub hardness_noise_frequency: f32,
+    /// Smooth-maximum temperature where boundary relief meets (m).
+    pub junction_blend_m: f32,
     /// Relief smoothing and wind blur step (rad).
     pub smoothing_step_rad: f32,
     pub wind_deflection: f32,
@@ -354,7 +356,7 @@ impl TierABakeInputs {
                 self.transform_width_m,
                 self.crust_width_m,
             ]),
-            f([self.hardness_noise, self.hardness_noise_frequency, 0.0, 0.0]),
+            f([self.hardness_noise, self.hardness_noise_frequency, self.junction_blend_m, 0.0]),
             u([self.hardness_seed, 0, 0, 0]),
             f([
                 self.smoothing_step_rad,

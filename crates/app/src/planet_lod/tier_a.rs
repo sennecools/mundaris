@@ -112,6 +112,7 @@ pub fn bake_inputs(inputs: &TierAInputs) -> TierABakeInputs {
         crust_width_m: p.crust_width_m as f32,
         hardness_noise: p.hardness_noise as f32,
         hardness_noise_frequency: (r / p.hardness_noise_wavelength_m) as f32,
+        junction_blend_m: p.junction_blend_m as f32,
         smoothing_step_rad: smoothing_step_rad(p, r) as f32,
         wind_deflection: p.wind_deflection as f32,
         deflection_slope: p.deflection_slope as f32,

@@ -282,10 +282,6 @@ impl Motion {
 /// Plates whose boundaries shape the relief at a point: the highest power
 /// scores (ties to the lower index).
 pub const EDGE_CANDIDATES: usize = 6;
-/// Smooth-maximum temperature (m) where the relief of several boundaries
-/// meets at a junction (prototype constant for the archetype's
-/// `junction_blend_m`).
-pub const JUNCTION_BLEND_M: f64 = 400.0;
 /// Smooth-maximum temperature of the volcanic weight (0..1).
 pub const VOLCANIC_BLEND: f64 = 0.1;
 
@@ -294,6 +290,7 @@ pub const VOLCANIC_BLEND: f64 = 0.1;
 /// for one non-zero value (zeros add nothing), at most `t·ln(count)` above
 /// `m`, smooth where values meet.
 pub fn smooth_max(values: &[f64], t: f64) -> f64 {
+    let t = t.max(1e-3);
     let m = values.iter().copied().fold(0.0, f64::max);
     if m <= 0.0 {
         return 0.0;
@@ -521,8 +518,8 @@ pub fn tectonic_sample(
     // Roughness of the orogenic relief (belts, arcs): seeds the drainage
     // network that erosion then incises.
     let rough = p.orogen_roughness * orogen_noise(d, p, radius_m);
-    let orogenic = smooth_max(&orogenic, JUNCTION_BLEND_M);
-    let dh = smooth_max(&raised, JUNCTION_BLEND_M) - smooth_max(&lowered, JUNCTION_BLEND_M);
+    let orogenic = smooth_max(&orogenic, p.junction_blend_m);
+    let dh = smooth_max(&raised, p.junction_blend_m) - smooth_max(&lowered, p.junction_blend_m);
     out.dh_m = dh + rough * orogenic;
     out.uplift = (orogenic * (1.0 + rough) / p.collision_height_m.max(1.0)).clamp(0.0, 1.0);
     out.volcanic = smooth_max(&volcanic, VOLCANIC_BLEND).clamp(0.0, 1.0);

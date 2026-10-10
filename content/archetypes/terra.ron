@@ -94,6 +94,7 @@
         crust_width_km: 120.0,
         softness_km: 40.0,
         boundary_clamp_km: 300.0,
+        junction_blend_km: 0.4,
     ),
     // Rock hardness 0 (soft sedimentary) .. 1 (hard crystalline); slows
     // erosion by up to 80 %.
