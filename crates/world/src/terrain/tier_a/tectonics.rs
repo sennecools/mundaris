@@ -14,7 +14,12 @@
 //! junctions. Relative Euler-pole velocity gives convergence and shear and
 //! continuous class weights; uplift, trenches, ridges and rifts are
 //! closed-form profiles of δ (the doc's "convolve with a falloff" becomes
-//! analytic), with seeded roughness on the orogenic relief.
+//! analytic), with seeded roughness on the orogenic relief. Relief comes from
+//! every boundary between the `EDGE_CANDIDATES` highest-scoring plates, in
+//! any cell: past a boundary's end (a triple junction) its profiles continue
+//! as a rounded cap over the distance along the boundary, and smooth maxima
+//! merge the relief of boundaries that meet (lane proposal
+//! `plate-junctions-PROPOSAL.md`).
 //! `boundary_coord = δ_min·Σ ŵ_j·sign(j − i)` is linear through each boundary
 //! and replaces `boundary_tangent` (§6.3). (Blending `Σ ŵ_j·sign·δ_ij` as first
 //! designed adds km-scale offsets from neighbours a few `τ` away, different on
@@ -258,13 +263,98 @@ struct Motion {
     trans: f64,
 }
 
-/// Profiles of one neighbour boundary at distance `delta` (m) for own plate
-/// `(i, a)` and neighbour `(j, b)`: (dh, positive orogenic relief, volcanic,
-/// class).
+impl Motion {
+    /// Class weights at warped direction `w` from the relative velocity of
+    /// plate `a` against `b`; `tangent` is `P_w(c_a − c_b)` (the normal
+    /// towards `b` is its negative).
+    fn new(w: DVec3, a: &Plate, b: &Plate, tangent: DVec3) -> Self {
+        let normal = -tangent / tangent.length().max(1e-12);
+        let v = (a.spin - b.spin).cross(w);
+        let c = v.dot(normal);
+        let t = v.dot(w.cross(normal)).abs();
+        let conv = smoothstep(CLASS_RAMP.0, CLASS_RAMP.1, c);
+        let div = smoothstep(CLASS_RAMP.0, CLASS_RAMP.1, -c);
+        let trans = smoothstep(CLASS_RAMP.0, CLASS_RAMP.1, t) * (1.0 - conv - div);
+        Self { conv, div, trans }
+    }
+}
+
+/// Plates whose boundaries shape the relief at a point: the highest power
+/// scores (ties to the lower index).
+pub const EDGE_CANDIDATES: usize = 6;
+/// Smooth-maximum temperature (m) where the relief of several boundaries
+/// meets at a junction (prototype constant for the archetype's
+/// `junction_blend_m`).
+pub const JUNCTION_BLEND_M: f64 = 400.0;
+/// Smooth-maximum temperature of the volcanic weight (0..1).
+pub const VOLCANIC_BLEND: f64 = 0.1;
+
+/// Smooth maximum of non-negative `values` with temperature `t`:
+/// `m + t·ln(Σᵢ(e^{(vᵢ−m)/t} − e^{−m/t}) + e^{−m/t})`, `m` the largest. Exact
+/// for one non-zero value (zeros add nothing), at most `t·ln(count)` above
+/// `m`, smooth where values meet.
+pub fn smooth_max(values: &[f64], t: f64) -> f64 {
+    let m = values.iter().copied().fold(0.0, f64::max);
+    if m <= 0.0 {
+        return 0.0;
+    }
+    let floor = (-m / t).exp();
+    let sum: f64 = values.iter().map(|v| ((v - m) / t).exp() - floor).sum();
+    m + t * (sum + floor).ln()
+}
+
+/// Distance (m) along the boundary of plates `a` and `b` past its end at
+/// warped direction `w`: 0 while `a` and `b` own the foot point on their
+/// bisector plane, else how far the foot point lies inside another
+/// candidate's cell along the boundary (linearised power margin over its rate
+/// along the boundary). Symmetric in `a` and `b`.
+fn beyond_end(
+    w: DVec3,
+    plates: &[Plate],
+    (a, b): (usize, usize),
+    candidates: &[usize],
+    radius_m: f64,
+) -> f64 {
+    let (pa, pb) = (&plates[a], &plates[b]);
+    let dc = pa.centre - pb.centre;
+    let along = w.dot(dc);
+    let f = along + (pa.weight - pb.weight);
+    let tangent = dc - w * along;
+    let foot = (w - tangent * (f / tangent.length_squared().max(1e-24))).normalize();
+    let score = (foot.dot(pa.centre) + pa.weight).max(foot.dot(pb.centre) + pb.weight);
+    let normal = dc - foot * foot.dot(dc);
+    let edge = foot.cross(normal).normalize_or_zero();
+    let middle = 0.5 * (pa.centre + pb.centre);
+    let mut beyond = 0.0f64;
+    for &k in candidates {
+        if k == a || k == b {
+            continue;
+        }
+        let pk = &plates[k];
+        let margin = foot.dot(pk.centre) + pk.weight - score;
+        if margin > 0.0 {
+            let g = pk.centre - middle;
+            let g = g - foot * foot.dot(g);
+            let rate = g.dot(edge).abs().max(0.2 * g.length()).max(1e-12);
+            beyond = beyond.max(radius_m * margin / rate);
+        }
+    }
+    beyond
+}
+
+/// Profiles of one boundary for the plate `(i, a)` on whose side the point
+/// lies and the other plate `(j, b)`: (dh, positive orogenic relief,
+/// volcanic, class). `delta` (m) is the distance to their bisector plane,
+/// `beyond` (m) the distance along the boundary past its end (0 where the
+/// boundary exists). Profiles even in the signed distance use the capsule
+/// distance `√(δ² + beyond²)`, so belts end in rounded caps; the one-sided
+/// arc fades by `bump(beyond / arc width)` instead, which keeps it
+/// continuous where the two sides meet beyond the end.
 fn profiles(
     (i, a): (usize, &Plate),
     (j, b): (usize, &Plate),
     delta: f64,
+    beyond: f64,
     motion: Motion,
     p: &PlanetParams,
 ) -> (f64, f64, f64, BoundaryClass) {
@@ -272,7 +362,8 @@ fn profiles(
     let mut dh = 0.0;
     let mut orogenic = 0.0;
     let mut volcanic = 0.0;
-    let arc = bump((delta - p.arc_offset_m) / p.arc_width_m);
+    let arc = bump((delta - p.arc_offset_m) / p.arc_width_m) * bump(beyond / p.arc_width_m);
+    let delta = delta.hypot(beyond);
     let trench = -p.trench_depth_m * conv * bump(delta / p.trench_width_m);
     // Convergent: belts, coastal ranges and island arcs on the overriding
     // side; trenches straddle ocean-continent and ocean-ocean boundaries (the
@@ -376,8 +467,7 @@ pub fn tectonic_sample(
         distance_m: delta_min,
         ..Default::default()
     };
-    let (mut dh, mut orogenic, mut volcanic, mut coord, mut crust, mut hardness) =
-        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    let (mut coord, mut crust, mut hardness) = (0.0, 0.0, 0.0);
     let mut nearest = (f64::INFINITY, BoundaryClass::Interior);
     let crust_of = |plate: &Plate| if plate.continental { 1.0 } else { -1.0 };
     for (j, b) in plates.iter().enumerate() {
@@ -386,37 +476,56 @@ pub fn tectonic_sample(
         }
         let (delta, tangent) = deltas[j];
         let weight = (-(delta - delta_min) / tau).exp();
-        // Normal towards the neighbour, relative velocity of the own plate.
-        let normal = -tangent / tangent.length().max(1e-12);
-        let v = (a.spin - b.spin).cross(w);
-        let c = v.dot(normal);
-        let t = v.dot(w.cross(normal)).abs();
-        let conv = smoothstep(CLASS_RAMP.0, CLASS_RAMP.1, c);
-        let div = smoothstep(CLASS_RAMP.0, CLASS_RAMP.1, -c);
-        let trans = smoothstep(CLASS_RAMP.0, CLASS_RAMP.1, t) * (1.0 - conv - div);
-        let motion = Motion { conv, div, trans };
-        let (h, o, vol, class) = profiles((own, a), (j, b), delta, motion, p);
         let blend = 0.5 * (1.0 - smoothstep(0.0, p.crust_width_m, delta));
         let sign = if j > own { 1.0 } else { -1.0 };
         total += weight;
-        dh += weight * h;
-        orogenic += weight * o;
-        volcanic += weight * vol;
         coord += weight * sign;
         crust += weight * (crust_of(a) + (crust_of(b) - crust_of(a)) * blend);
         hardness += weight * (a.hardness + (b.hardness - a.hardness) * blend);
         if delta < nearest.0 {
-            nearest = (delta, class);
+            let motion = Motion::new(w, a, b, tangent);
+            nearest = (delta, profiles((own, a), (j, b), delta, 0.0, motion, p).3);
         }
     }
     let total = total.max(1e-300);
+    // Relief from every boundary between the candidate plates, evaluated in
+    // any cell (belts end in caps past a triple junction instead of at the
+    // third plate's cell edge); smooth maxima merge where boundaries meet.
+    let mut ranked: Vec<(f64, usize)> = plates
+        .iter()
+        .enumerate()
+        .map(|(k, plate)| (w.dot(plate.centre) + plate.weight, k))
+        .collect();
+    ranked.sort_by(|x, y| y.0.total_cmp(&x.0).then(x.1.cmp(&y.1)));
+    let candidates: Vec<usize> = ranked.iter().take(EDGE_CANDIDATES).map(|r| r.1).collect();
+    let (mut raised, mut lowered, mut orogenic, mut volcanic) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (x, &(score_x, i)) in ranked.iter().take(EDGE_CANDIDATES).enumerate() {
+        for &(score_y, j) in &ranked[x + 1..candidates.len()] {
+            // The side of the point: the higher score (ranked first on ties).
+            debug_assert!(score_x >= score_y);
+            let (pa, pb) = (&plates[i], &plates[j]);
+            let dc = pa.centre - pb.centre;
+            let along = w.dot(dc);
+            let tangent = dc - w * along;
+            let delta = radius_m * (along + pa.weight - pb.weight) / tangent.length().max(1e-12);
+            let beyond = beyond_end(w, plates, (i, j), &candidates, radius_m);
+            let motion = Motion::new(w, pa, pb, tangent);
+            let (h, o, vol, _) = profiles((i, pa), (j, pb), delta, beyond, motion, p);
+            raised.push(h.max(0.0));
+            lowered.push((-h).max(0.0));
+            orogenic.push(o);
+            volcanic.push(vol);
+        }
+    }
     // Roughness of the orogenic relief (belts, arcs): seeds the drainage
     // network that erosion then incises.
     let rough = p.orogen_roughness * orogen_noise(d, p, radius_m);
-    let orogenic = orogenic / total;
-    out.dh_m = dh / total + rough * orogenic;
+    let orogenic = smooth_max(&orogenic, JUNCTION_BLEND_M);
+    let dh = smooth_max(&raised, JUNCTION_BLEND_M) - smooth_max(&lowered, JUNCTION_BLEND_M);
+    out.dh_m = dh + rough * orogenic;
     out.uplift = (orogenic * (1.0 + rough) / p.collision_height_m.max(1.0)).clamp(0.0, 1.0);
-    out.volcanic = (volcanic / total).clamp(0.0, 1.0);
+    out.volcanic = smooth_max(&volcanic, VOLCANIC_BLEND).clamp(0.0, 1.0);
     // The nearest distance times the soft-weighted side: linear through every
     // boundary (0 on both sides) and continuous where the nearest boundary
     // switches; blending the distances themselves would add km-scale offsets
@@ -564,5 +673,100 @@ mod tests {
             .count();
         assert!(interior as f64 > 0.8 * (6 * n * n) as f64);
         assert!(input.stages.contains(&TierAStage::Tectonics));
+    }
+
+    /// Triple-junction scorer: uplift gradients near junctions against the
+    /// flanks of belts away from them.
+    #[derive(Debug)]
+    pub(crate) struct JunctionScore {
+        pub junctions: usize,
+        /// 95th percentile |∇uplift| per km on belt flanks > 2 orogen widths
+        /// from any junction.
+        pub flank_p95: f64,
+        /// Largest |∇uplift| per km within one orogen width of a junction.
+        pub junction_max: f64,
+        /// Junctions whose neighbourhood exceeds twice the flank p95.
+        pub wedges: usize,
+    }
+
+    pub(crate) fn junction_score(n: usize, seed: u64) -> JunctionScore {
+        let input = inputs(n, seed);
+        let (p, r) = (&input.params, input.radius_m);
+        let set = plates(p, p.tectonic_seed);
+        let directions = crate::terrain::world_map::texel_directions(n);
+        let samples: Vec<TectonicSample> = directions
+            .iter()
+            .map(|d| tectonic_sample(*d, &set, p, r))
+            .collect();
+        let texel_km = r * std::f64::consts::FRAC_PI_2 / n as f64 / 1000.0;
+        let gradient: Vec<f64> = (0..samples.len())
+            .map(|k| {
+                neighbours(k, n)
+                    .iter()
+                    .map(|&m| (samples[k].uplift - samples[m].uplift).abs())
+                    .fold(0.0, f64::max)
+                    / texel_km
+            })
+            .collect();
+        let junctions: Vec<DVec3> = (0..samples.len())
+            .filter(|&k| {
+                let mut ids = vec![samples[k].plate];
+                for m in neighbours(k, n) {
+                    for q in neighbours(m, n) {
+                        ids.push(samples[q].plate);
+                    }
+                }
+                ids.sort_unstable();
+                ids.dedup();
+                ids.len() >= 3
+            })
+            .map(|k| directions[k])
+            .collect();
+        let width = p.orogen_width_m / r;
+        let nearest = |d: DVec3| {
+            junctions
+                .iter()
+                .map(|j| d.angle_between(*j))
+                .fold(f64::INFINITY, f64::min)
+        };
+        let mut flanks = Vec::new();
+        let mut near = vec![0.0f64; junctions.len()];
+        for (k, d) in directions.iter().enumerate() {
+            let distance = nearest(*d);
+            if distance > 2.0 * width && samples[k].uplift > 0.05 {
+                flanks.push(gradient[k]);
+            } else if distance < width {
+                for (j, value) in junctions.iter().zip(near.iter_mut()) {
+                    if d.angle_between(*j) < width {
+                        *value = value.max(gradient[k]);
+                    }
+                }
+            }
+        }
+        flanks.sort_by(f64::total_cmp);
+        // No belts away from junctions (NaN): nothing to compare against.
+        let flank_p95 = flanks
+            .get(flanks.len() * 95 / 100)
+            .copied()
+            .unwrap_or(f64::NAN);
+        JunctionScore {
+            junctions: junctions.len(),
+            flank_p95,
+            junction_max: near.iter().copied().fold(0.0, f64::max),
+            wedges: near.iter().filter(|&&g| g > 2.0 * flank_p95).count(),
+        }
+    }
+
+    #[test]
+    fn belts_end_smoothly_at_triple_junctions() {
+        // Before the boundary caps: junction maxima 8.2× and 6.4× the flank
+        // p95 on seeds 7 and 11 (33 and 53 wedge texels); after: below 1.8×.
+        for seed in [7, 11, 23] {
+            let score = junction_score(128, seed);
+            println!("seed {seed}: {score:?}");
+            assert!(score.junctions > 50, "{score:?}");
+            assert_eq!(score.wedges, 0, "seed {seed}: {score:?}");
+            assert!(score.junction_max < 2.0 * score.flank_p95, "seed {seed}: {score:?}");
+        }
     }
 }
