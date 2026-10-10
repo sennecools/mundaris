@@ -210,7 +210,7 @@ fn forest_cover(inst: Instance, st: vec2<f32>, normal_body: vec3<f32>, climate: 
     let face = sc_face(inst.n0.xyz);
     let crowns = mix(sc_value(face, c.x / 3.0, c.y / 3.0, 44u), 0.5, smoothstep(0.75, 1.5, footprint));
     let clumps = mix(sc_value(face, c.x / 9.0, c.y / 9.0, 45u), 0.5, smoothstep(2.25, 4.5, footprint));
-    colour *= 0.55 + 0.6 * crowns + 0.35 * (clumps - 0.5);
+    colour *= 1.0 + 0.6 * (crowns - 0.5) + 0.35 * (clumps - 0.5);
     return vec4<f32>(colour, clamp(site.cover, 0.0, 0.98));
 }
 

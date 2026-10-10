@@ -310,16 +310,19 @@ pub fn crown_areas(mesh: &crate::Mesh) -> [f64; 2] {
     [area(0, 1), 0.5 * (area(0, 2) + area(1, 2))]
 }
 
-/// Canopy colour seen from afar: the organ colour darkened by crown
-/// self-shadowing.
+/// Canopy colour seen from afar (far tint albedo).
 pub fn canopy_color(sp: &SpeciesFile) -> [f64; 3] {
     let o = sp.look.organ;
     let t = sp.look.organ_tip;
-    // Calibrated against native captures (2026-10-10, evidence lod-v4): a
-    // closed canopy of drawn crowns (lit, with self-shadow and gaps) has the
-    // radiance of flat lit ground of about 0.38 of the organ/tip colour mix.
-    [0, 1, 2].map(|a| 0.38 * (0.5 * o[a] as f64 + 0.5 * t[a] as f64))
+    // The organ/tip mix is the mean albedo of the baked impostors (within
+    // 10 %). Native captures with fixed exposure and sky light (2026-10-10,
+    // evidence lod-v6): a closed drawn canopy has about the radiance of flat
+    // lit ground of that albedo (self-shadow offset by sun-facing sides).
+    [0, 1, 2].map(|a| CANOPY_RADIANCE * (0.5 * o[a] as f64 + 0.5 * t[a] as f64))
 }
+
+/// Far tint albedo over the organ/tip mix (calibrated, see `canopy_color`).
+pub const CANOPY_RADIANCE: f64 = 1.0;
 
 /// Procedural far shape (M5 kinds): 0 conifer, 1 broadleaf, 2 shrub.
 pub fn far_kind(sp: &SpeciesFile) -> u32 {
