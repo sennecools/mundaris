@@ -85,13 +85,21 @@ impl Shell<'_> {
     /// Sets one genome or niche parameter of the selected species by key.
     fn species_param(&mut self, key: &str, value: &Value) -> Result<()> {
         let view = self.species.view();
-        let mut matches = view.params.iter().enumerate().filter(|(_, item)| item.key == key);
+        let mut matches = view
+            .params
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.key == key);
         let (index, item) = matches
             .next()
             .ok_or_else(|| anyhow!("unknown species parameter {key:?}"))?;
-        ensure!(matches.next().is_none(), "species parameter {key:?} is ambiguous");
-        let value = param_value(&item.kind, value)
-            .ok_or_else(|| anyhow!("species parameter {key:?}: {value} out of range or wrong type"))?;
+        ensure!(
+            matches.next().is_none(),
+            "species parameter {key:?} is ambiguous"
+        );
+        let value = param_value(&item.kind, value).ok_or_else(|| {
+            anyhow!("species parameter {key:?}: {value} out of range or wrong type")
+        })?;
         let before = view.error;
         self.species.edit(ParamEdit::Set(index, value));
         let after = self.species.view().error;
@@ -129,12 +137,20 @@ fn param_value(kind: &ParamKind, value: &Value) -> Option<ParamValue> {
             .map(ParamValue::Float),
         ParamKind::Int { min, max } => value
             .as_i64()
-            .or_else(|| value.as_f64().filter(|v| v.fract() == 0.0).map(|v| v as i64))
+            .or_else(|| {
+                value
+                    .as_f64()
+                    .filter(|v| v.fract() == 0.0)
+                    .map(|v| v as i64)
+            })
             .filter(|v| (min..=max).contains(v))
             .map(ParamValue::Int),
         ParamKind::Choice { options } => match value {
             Value::String(name) => options.iter().position(|option| option == name),
-            _ => value.as_u64().map(|v| v as usize).filter(|v| *v < options.len()),
+            _ => value
+                .as_u64()
+                .map(|v| v as usize)
+                .filter(|v| *v < options.len()),
         }
         .map(ParamValue::Choice),
         ParamKind::Bool => value.as_bool().map(ParamValue::Bool),
@@ -152,16 +168,31 @@ mod tests {
         assert!(workspace_named("garden").is_err());
         assert_eq!(tab_named("line-up").unwrap(), Tab::LineUp);
         assert_eq!(tab_named("lineup").unwrap(), Tab::LineUp);
-        let float = ParamKind::Float { min: 0.0, max: 2.0, log: false };
-        assert_eq!(param_value(&float, &json!(1.5)), Some(ParamValue::Float(1.5)));
+        let float = ParamKind::Float {
+            min: 0.0,
+            max: 2.0,
+            log: false,
+        };
+        assert_eq!(
+            param_value(&float, &json!(1.5)),
+            Some(ParamValue::Float(1.5))
+        );
         assert_eq!(param_value(&float, &json!(3)), None);
-        let choice = ParamKind::Choice { options: &["a", "b"] };
-        assert_eq!(param_value(&choice, &json!("b")), Some(ParamValue::Choice(1)));
+        let choice = ParamKind::Choice {
+            options: &["a", "b"],
+        };
+        assert_eq!(
+            param_value(&choice, &json!("b")),
+            Some(ParamValue::Choice(1))
+        );
         assert_eq!(param_value(&choice, &json!(2)), None);
         assert_eq!(
             param_value(&ParamKind::Int { min: 1, max: 9 }, &json!(4.0)),
             Some(ParamValue::Int(4))
         );
-        assert_eq!(param_value(&ParamKind::Bool, &json!(true)), Some(ParamValue::Bool(true)));
+        assert_eq!(
+            param_value(&ParamKind::Bool, &json!(true)),
+            Some(ParamValue::Bool(true))
+        );
     }
 }
