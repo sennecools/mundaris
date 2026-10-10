@@ -460,6 +460,7 @@ impl WorldField {
             radius_m / p.temperature_noise_wavelength_m,
             4.0 * radius_m / p.plate_warp_wavelength_m,
             4.0 * radius_m / p.hardness_noise_wavelength_m,
+            8.0 * radius_m / p.orogen_roughness_wavelength_m,
         ];
         if highest
             .iter()

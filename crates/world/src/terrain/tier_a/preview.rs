@@ -63,6 +63,9 @@ fn preview() {
             }
         }
     }
+    if std::env::var("ASTRUM_TIER_A_PARAMS").is_ok() {
+        println!("{:#?}", input.params);
+    }
     let started = std::time::Instant::now();
     let output = bake_full(&input).unwrap();
     let d = &output.diagnostics;
