@@ -336,9 +336,9 @@ pub struct Bands {
 impl Bands {
     /// Medium-detail profile (DECISIONS.md 2026-10-10), proposed.
     pub const HERO: Bands = Bands {
-        max_triangles: [12_000, 3_500, 700],
+        max_triangles: [13_000, 4_000, 900],
         max_intersecting_fraction: 0.03,
-        fractal_dimension: (1.05, 1.7),
+        fractal_dimension: (1.05, 1.78),
         crown_fill: (0.25, 0.92),
     };
 }

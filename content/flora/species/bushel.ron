@@ -3,6 +3,7 @@
 SpeciesFile(
     schema: 1,
     name: "bushel",
+    role: Shrub,
     genome: (
         form: Shrub,
         height_m: 2.2,

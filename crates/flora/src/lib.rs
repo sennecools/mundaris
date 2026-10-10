@@ -36,10 +36,20 @@ pub fn variant_seed(species: &SpeciesFile, variant: u32) -> u64 {
     hash::derive(hash::name_key(&species.name), variant as u64)
 }
 
-/// Grow one individual and score it.
-pub fn grow_plant(species: &SpeciesFile, kit: &Kit, seed: u64) -> GrownPlant {
+/// Grow one individual: skeleton and LOD meshes, no scoring (runtime path).
+pub fn grow_meshes(
+    species: &SpeciesFile,
+    kit: &Kit,
+    seed: u64,
+) -> (grow::Skeleton, [Mesh; LOD_COUNT]) {
     let skeleton = grow::grow(&species.genome, seed);
     let lods = mesh::build_lods(&skeleton, species, kit, seed);
+    (skeleton, lods)
+}
+
+/// Grow one individual and score it.
+pub fn grow_plant(species: &SpeciesFile, kit: &Kit, seed: u64) -> GrownPlant {
+    let (skeleton, lods) = grow_meshes(species, kit, seed);
     let metrics = PlantMetrics {
         structure: metrics::structure(&skeleton),
         silhouette: metrics::silhouette(&lods[0]),

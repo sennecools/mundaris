@@ -21,9 +21,25 @@ pub const SCHEMA: u32 = 1;
 pub struct SpeciesFile {
     pub schema: u32,
     pub name: String,
+    /// PROTOTYPE: which M5 forest-field slot the species fills, until G2
+    /// places species from their ecology envelopes.
+    #[serde(default)]
+    pub role: Role,
     pub genome: Genome,
     pub ecology: Ecology,
     pub look: Look,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Role {
+    #[default]
+    Unplaced,
+    /// Cold-forest tree (M5 kind 0).
+    Conifer,
+    /// Temperate-forest tree (M5 kind 1).
+    Broadleaf,
+    /// Fringe shrub (M5 kind 2).
+    Shrub,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

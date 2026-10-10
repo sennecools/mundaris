@@ -19,7 +19,31 @@
 //! Pure, deterministic CPU f64 code: fixed iteration order, counter-based
 //! hashing only (`hash.rs`), no hash-map iteration.
 
-use std::collections::HashMap;
+use std::collections::HashMap as StdHashMap;
+use std::hash::{BuildHasherDefault, Hasher};
+
+/// FxHash (rustc): fast, deterministic; grid keys are small integers.
+#[derive(Default, Clone, Copy)]
+struct Fx(u64);
+
+impl Hasher for Fx {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.write_u64(*b as u64);
+        }
+    }
+    fn write_u64(&mut self, v: u64) {
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+    fn write_i64(&mut self, v: i64) {
+        self.write_u64(v as u64);
+    }
+}
+
+type HashMap<K, V> = StdHashMap<K, V, BuildHasherDefault<Fx>>;
 
 use glam::DVec3;
 
@@ -35,6 +59,9 @@ const OCCUPANCY: f64 = 1.6;
 const CONE_COS: f64 = 0.5; // 60° half-angle; Palubicki use 45°, wider keeps laterals fed.
 const MAX_MARKERS: usize = 6000;
 const MAX_SHOOT: u32 = 3;
+/// Idle cycles after which a lateral / apical bud aborts.
+const BUD_ABORT_LATERAL: u32 = 3;
+const BUD_ABORT_APICAL: u32 = 6;
 const MAX_NODES: usize = 6000;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -119,6 +146,8 @@ struct Bud {
     space: DVec3,
     /// Node counter on its axis for phyllotaxis.
     serial: u32,
+    /// Consecutive cycles without perceived space.
+    idle: u32,
 }
 
 struct Grower<'g> {
@@ -131,6 +160,8 @@ struct Grower<'g> {
     marker_alive: Vec<bool>,
     marker_grid: HashMap<(i64, i64, i64), Vec<u32>>,
     marker_cell: f64,
+    marker_lo: DVec3,
+    marker_hi: DVec3,
     next_axis: u32,
     shed: u32,
 }
@@ -214,8 +245,10 @@ fn grow_sot(g: &Genome, seed: u64) -> Skeleton {
         buds: Vec::new(),
         markers: Vec::new(),
         marker_alive: Vec::new(),
-        marker_grid: HashMap::new(),
+        marker_grid: HashMap::default(),
         marker_cell: (OCCUPANCY * g.internode_m).max(1e-3),
+        marker_lo: DVec3::ZERO,
+        marker_hi: DVec3::ZERO,
         next_axis: 0,
         shed: 0,
     };
@@ -293,6 +326,17 @@ impl Grower<'_> {
             }
         }
         self.marker_alive = vec![true; self.markers.len()];
+        self.marker_lo = self
+            .markers
+            .iter()
+            .fold(DVec3::splat(f64::MAX), |a, m| a.min(*m));
+        self.marker_hi = self
+            .markers
+            .iter()
+            .fold(DVec3::splat(f64::MIN), |a, m| a.max(*m));
+        if self.markers.is_empty() {
+            (self.marker_lo, self.marker_hi) = (DVec3::ZERO, DVec3::ZERO);
+        }
         for (k, m) in self.markers.iter().enumerate() {
             self.marker_grid
                 .entry(cell(*m, self.marker_cell))
@@ -353,6 +397,7 @@ impl Grower<'_> {
                 v: 0.0,
                 space: DVec3::ZERO,
                 serial: rank,
+                idle: 0,
             });
         }
     }
@@ -383,6 +428,7 @@ impl Grower<'_> {
                 v: 0.0,
                 space: DVec3::ZERO,
                 serial: 0,
+                idle: 0,
             });
         }
     }
@@ -393,50 +439,79 @@ impl Grower<'_> {
         // 1. Environment: each marker feeds the nearest perceiving bud.
         let max_l = g.internode_m.max(g.internode_at(g.max_order));
         let bud_cell = PERCEPTION * max_l;
-        let mut grid: HashMap<(i64, i64, i64), Vec<u32>> = HashMap::new();
+        // Alive buds packed with their perception reach, in a dense grid
+        // over the marker box (a bud farther than its reach from that box
+        // perceives nothing).
+        struct Seen {
+            pos: DVec3,
+            dir: DVec3,
+            reach2: f64,
+            bud: u32,
+        }
+        let mut seen: Vec<Seen> = Vec::new();
         for (i, b) in self.buds.iter_mut().enumerate() {
             b.q = 0.0;
             b.v = 0.0;
             b.space = DVec3::ZERO;
             if b.alive {
-                grid.entry(cell(self.nodes[b.node as usize].pos, bud_cell))
-                    .or_default()
-                    .push(i as u32);
+                let reach = PERCEPTION * g.internode_at(b.order);
+                seen.push(Seen {
+                    pos: self.nodes[b.node as usize].pos,
+                    dir: b.dir,
+                    reach2: reach * reach,
+                    bud: i as u32,
+                });
             }
         }
+        let grid = DenseGrid::build(
+            self.marker_lo - DVec3::splat(bud_cell),
+            self.marker_hi + DVec3::splat(bud_cell),
+            bud_cell,
+            seen.iter().map(|s| s.pos),
+        );
         let mut any = false;
         for (m, &mp) in self.markers.iter().enumerate() {
             if !self.marker_alive[m] {
                 continue;
             }
-            let c = cell(mp, bud_cell);
             let mut best: Option<(f64, u32)> = None;
-            for dx in -1..=1 {
-                for dy in -1..=1 {
-                    for dz in -1..=1 {
-                        let Some(list) = grid.get(&(c.0 + dx, c.1 + dy, c.2 + dz)) else {
-                            continue;
-                        };
-                        for &bi in list {
-                            let b = &self.buds[bi as usize];
-                            let to = mp - self.nodes[b.node as usize].pos;
-                            let d = to.length();
-                            let reach = PERCEPTION * g.internode_at(b.order);
-                            if d > reach || d < 1e-9 || to.dot(b.dir) / d < CONE_COS {
-                                continue;
-                            }
-                            if best.is_none_or(|(bd, bb)| d < bd || (d == bd && bi < bb)) {
-                                best = Some((d, bi));
-                            }
-                        }
-                    }
+            grid.around(mp, |k| {
+                let s = &seen[k as usize];
+                let to = mp - s.pos;
+                let d2 = to.length_squared();
+                if d2 > s.reach2 || d2 < 1e-18 {
+                    return;
                 }
-            }
+                let d = d2.sqrt();
+                if to.dot(s.dir) < CONE_COS * d {
+                    return;
+                }
+                let bi = s.bud;
+                if best.is_none_or(|(bd, bb)| d < bd || (d == bd && bi < bb)) {
+                    best = Some((d, bi));
+                }
+            });
             if let Some((d, bi)) = best {
                 let b = &mut self.buds[bi as usize];
                 b.q = 1.0;
                 b.space += (mp - self.nodes[b.node as usize].pos) / d;
                 any = true;
+            }
+        }
+        // Buds that perceive no free space for a while abort (dormant buds
+        // die), so the crown interior stops costing perception work.
+        for b in &mut self.buds {
+            if b.alive {
+                b.idle = if b.q > 0.0 { 0 } else { b.idle + 1 };
+                if b.idle
+                    >= if b.apical {
+                        BUD_ABORT_APICAL
+                    } else {
+                        BUD_ABORT_LATERAL
+                    }
+                {
+                    b.alive = false;
+                }
             }
         }
         if !any {
@@ -640,7 +715,7 @@ impl Grower<'_> {
         let tips: Vec<usize> = (1..n)
             .filter(|&i| self.node_alive[i] && !has_child[i])
             .collect();
-        let mut shadow: HashMap<(i64, i64, i64), f64> = HashMap::new();
+        let mut shadow: HashMap<(i64, i64, i64), f64> = HashMap::default();
         for &t in &tips {
             let c = cell(self.nodes[t].pos, vox);
             for q in 1..=DEPTH {
@@ -1005,5 +1080,86 @@ fn add_tip_fruit(sk: &mut Skeleton, g: &Genome, seed: u64) {
             order: 0,
             tipness: 1.0,
         });
+    }
+}
+
+/// Dense uniform grid (compressed rows) over a box; points outside are not
+/// stored. Iteration order is deterministic (insertion order per cell).
+struct DenseGrid {
+    lo: DVec3,
+    inv: f64,
+    dims: [i64; 3],
+    start: Vec<u32>,
+    items: Vec<u32>,
+}
+
+impl DenseGrid {
+    fn build(lo: DVec3, hi: DVec3, cell: f64, points: impl Iterator<Item = DVec3> + Clone) -> Self {
+        let inv = 1.0 / cell;
+        let ext = ((hi - lo) * inv).ceil();
+        let dims = [
+            ext.x.max(1.0) as i64,
+            ext.y.max(1.0) as i64,
+            ext.z.max(1.0) as i64,
+        ];
+        let mut g = DenseGrid {
+            lo,
+            inv,
+            dims,
+            start: Vec::new(),
+            items: Vec::new(),
+        };
+        let n = (dims[0] * dims[1] * dims[2]) as usize;
+        let mut count = vec![0u32; n + 1];
+        for p in points.clone() {
+            if let Some(c) = g.index(p) {
+                count[c + 1] += 1;
+            }
+        }
+        for i in 0..n {
+            count[i + 1] += count[i];
+        }
+        let mut fill = count.clone();
+        g.items = vec![0; count[n] as usize];
+        for (k, p) in points.enumerate() {
+            if let Some(c) = g.index(p) {
+                g.items[fill[c] as usize] = k as u32;
+                fill[c] += 1;
+            }
+        }
+        g.start = count;
+        g
+    }
+
+    fn coords(&self, p: DVec3) -> [i64; 3] {
+        let q = (p - self.lo) * self.inv;
+        [q.x.floor() as i64, q.y.floor() as i64, q.z.floor() as i64]
+    }
+
+    fn index(&self, p: DVec3) -> Option<usize> {
+        let c = self.coords(p);
+        (0..3)
+            .all(|a| c[a] >= 0 && c[a] < self.dims[a])
+            .then(|| ((c[2] * self.dims[1] + c[1]) * self.dims[0] + c[0]) as usize)
+    }
+
+    /// Visit items in the 3×3×3 cells around `p`.
+    fn around(&self, p: DVec3, mut f: impl FnMut(u32)) {
+        let c = self.coords(p);
+        for z in (c[2] - 1).max(0)..=(c[2] + 1).min(self.dims[2] - 1) {
+            for y in (c[1] - 1).max(0)..=(c[1] + 1).min(self.dims[1] - 1) {
+                let row = (z * self.dims[1] + y) * self.dims[0];
+                let x0 = (c[0] - 1).max(0);
+                let x1 = (c[0] + 1).min(self.dims[0] - 1);
+                if x0 > x1 {
+                    continue;
+                }
+                let a = self.start[(row + x0) as usize] as usize;
+                let b = self.start[(row + x1 + 1) as usize] as usize;
+                for &k in &self.items[a..b] {
+                    f(k);
+                }
+            }
+        }
     }
 }

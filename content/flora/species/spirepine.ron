@@ -4,6 +4,7 @@
 SpeciesFile(
     schema: 1,
     name: "spirepine",
+    role: Conifer,
     genome: (
         form: Tree,
         height_m: 18.0,
@@ -36,8 +37,8 @@ SpeciesFile(
         cross_section: Round,
         surface: Scaled,
         organ: Needle,
-        organ_size_m: 0.5,
-        organ_cluster: 4,
+        organ_size_m: 0.6,
+        organ_cluster: 3,
         organ_orientation: Along,
         organ_reach: 4,
         fruit: Pod,

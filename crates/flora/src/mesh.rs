@@ -26,7 +26,8 @@ pub mod class {
 }
 
 /// 36-byte vertex. Positions in metres, plant frame (z up, origin at the
-/// base). Colour is linear RGB × 255 with alpha = ambient occlusion.
+/// base). Colour is sqrt-encoded linear RGB (decode: square) with alpha =
+/// ambient occlusion (linear).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct FloraVertex {
@@ -110,7 +111,7 @@ impl Mesh {
         } else {
             DVec3::Z
         };
-        let c = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let c = |x: f32| (x.clamp(0.0, 1.0).sqrt() * 255.0).round() as u8;
         self.vertices.push(FloraVertex {
             position: pos.as_vec3().into(),
             normal: [snorm(n.x), snorm(n.y), snorm(n.z), 0],
@@ -223,7 +224,7 @@ pub fn triangle_budget(g: &Genome) -> usize {
     use crate::genome::GrowthForm::*;
     let h = g.height_m.max(0.01);
     let b = match g.form {
-        Tree => (9000.0 * (h / 15.0).sqrt()).clamp(3000.0, 10_000.0),
+        Tree => (11_000.0 * (h / 15.0).sqrt()).clamp(3000.0, 12_000.0),
         Shrub | Cushion | Columnar => (3500.0 * (h / 2.0).sqrt()).clamp(1200.0, 5000.0),
         Tuft | Rosette => 900.0,
         FungalCap => 1200.0,
@@ -532,16 +533,36 @@ fn parts(
     };
     let organ_tris = kit.organ(g.organ).map_or(0, |s| s.triangles.len());
     let fruit_tris = kit.fruit(g.fruit).map_or(0, |s| s.triangles.len());
-    let wanted: f64 = sk
+    let organs = sk
         .parts
         .iter()
-        .map(|p| if p.kind == PartKind::Organ { organ_tris } else { fruit_tris } as f64)
-        .sum();
-    // Area-preserving thinning to the budget, never below 5 % of organs.
-    let keep = (budget / wanted.max(1.0)).min(keep_max).clamp(0.05, 1.0);
+        .filter(|p| p.kind == PartKind::Organ)
+        .count() as f64;
+    let fruits = sk.parts.len() as f64 - organs;
+    let wanted = organs * organ_tris as f64 + fruits * fruit_tris as f64;
+    // Area-preserving thinning to the budget. Below half the organs, kept
+    // organs become foliage sprays (one kit card standing for a cluster),
+    // which read as leaf mass instead of oversized single leaves.
+    let mut keep = (budget / wanted.max(1.0)).min(keep_max).clamp(0.02, 1.0);
+    // Sprays only below LOD0 (LOD0 keeps the true organ shape).
+    let spray = kit
+        .shape_named(&format!("{:?}Spray", g.organ))
+        .or_else(|_| kit.shape_named("Spray"))
+        .ok()
+        .filter(|_| keep < 0.5 && organ_tris > 0 && keep_max < 1.0);
+    if let Some(s) = spray {
+        let tris = organs * s.triangles.len() as f64 + fruits * fruit_tris as f64;
+        keep = (budget / tris.max(1.0)).min(keep_max).clamp(0.02, 1.0);
+    }
+    let organ_area = kit.organ(g.organ).map_or(1.0, shape_area);
+    let spray_scale = spray.map_or(1.0, |s| {
+        (2.5 * organ_area / (shape_area(s) * keep))
+            .sqrt()
+            .clamp(1.0, 6.0)
+    });
     for (i, p) in sk.parts.iter().enumerate() {
         let (shape, mut size) = match p.kind {
-            PartKind::Organ => (kit.organ(g.organ), p.size),
+            PartKind::Organ => (spray.or(kit.organ(g.organ)), p.size),
             PartKind::Fruit => (kit.fruit(g.fruit), p.size),
         };
         let Some(shape) = shape else { continue };
@@ -550,7 +571,11 @@ fn parts(
                 continue;
             }
             if p.kind == PartKind::Organ {
-                size *= (1.0 / keep).sqrt().min(3.0);
+                size *= if spray.is_some() {
+                    spray_scale
+                } else {
+                    (1.0 / keep).sqrt().min(3.0)
+                };
             }
         }
         let fwd = p.forward;
@@ -645,14 +670,22 @@ fn clumps(m: &mut Mesh, sk: &Skeleton, sp: &SpeciesFile, budget: f64) {
         }
         let r = (var / n).map(|v| v.sqrt() * 1.6) + DVec3::splat(size * 0.6);
         let col = lerp3(sp.look.organ, sp.look.organ_tip, tip / n as f32);
-        ellipsoid(m, c, r, col);
+        ellipsoid(
+            m,
+            c,
+            r,
+            col,
+            sp.genome.crown_shape == crate::genome::CrownShape::Cone,
+        );
     }
 }
 
-fn ellipsoid(m: &mut Mesh, c: DVec3, r: DVec3, col: [f32; 3]) {
+fn ellipsoid(m: &mut Mesh, c: DVec3, r: DVec3, col: [f32; 3], pointed: bool) {
     let (seg, rings) = (6u32, 4u32);
     let wind = [2, 60, 0, class::ORGAN];
-    let top = m.push(c + DVec3::Z * r.z, DVec3::Z, col, 1.0, c, wind);
+    // Cone crowns get pointed clumps (shed-snow silhouette survives LOD2).
+    let apex = if pointed { 2.0 } else { 1.0 };
+    let top = m.push(c + DVec3::Z * r.z * apex, DVec3::Z, col, 1.0, c, wind);
     let mut rows = Vec::new();
     for k in 1..rings {
         let th = k as f64 / rings as f64 * std::f64::consts::PI;
@@ -680,4 +713,16 @@ fn ellipsoid(m: &mut Mesh, c: DVec3, r: DVec3, col: [f32; 3]) {
                 .extend_from_slice(&[a + s, b + s, b + s1, a + s, b + s1, a + s1]);
         }
     }
+}
+
+/// Area of a kit shape in its unit frame.
+fn shape_area(s: &crate::kit::KitShape) -> f64 {
+    s.triangles
+        .iter()
+        .map(|t| {
+            let p = |i: u16| glam::DVec3::from(s.positions[i as usize].map(|c| c as f64));
+            0.5 * (p(t[1]) - p(t[0])).cross(p(t[2]) - p(t[0])).length()
+        })
+        .sum::<f64>()
+        .max(1e-6)
 }

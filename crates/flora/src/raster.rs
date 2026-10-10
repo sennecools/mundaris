@@ -112,7 +112,8 @@ pub fn draw(canvas: &mut Canvas, mesh: &Mesh, cam: &Camera) {
             Vec3::new(v.normal[0] as f32, v.normal[1] as f32, v.normal[2] as f32) / 127.0
         };
         let col = |v: &crate::mesh::FloraVertex| {
-            Vec3::new(v.color[0] as f32, v.color[1] as f32, v.color[2] as f32) / 255.0
+            let c = Vec3::new(v.color[0] as f32, v.color[1] as f32, v.color[2] as f32) / 255.0;
+            c * c
         };
         let (na, nb, nc) = (n(va), n(vb), n(vc));
         let (ca, cb, cc) = (col(va), col(vb), col(vc));
