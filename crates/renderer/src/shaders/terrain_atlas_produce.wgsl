@@ -706,7 +706,14 @@ fn page_water(st: vec2<f32>, value: vec4<f32>) -> f32 {
     let c = clamp(dot(value.xyz, up), 1.0e-3, 1.0);
     let slope = max(sqrt(1.0 - c * c) / c, 1.0e-3);
     let texel = tile.scale.x * tile.face_u.w / f32(dispatch.cells);
-    return clamp(-value.w / (slope * texel * WATER_CONTOUR_TEXELS), -1.0, 1.0);
+    let sea = clamp(-value.w / (slope * texel * WATER_CONTOUR_TEXELS), -1.0, 1.0);
+    if sample_water_depth > -1.0e29 {
+        // Lakes and rivers: the same contour against the carved ground.
+        let ground_slope = max(sample_ground_slope, 1.0e-3);
+        let inland = clamp(sample_water_depth / (ground_slope * texel * WATER_CONTOUR_TEXELS), -1.0, 1.0);
+        return max(sea, inland);
+    }
+    return sea;
 }
 
 // Page albedo texel for an evaluated sample `value` (normal, height) at `st`.
@@ -757,10 +764,34 @@ fn evaluate(st: vec2<f32>) -> vec4<f32> {
         sample_value.gradient += detail.yzw * tile.scale.x;
     }
     let n = normalize(p.n);
+    // PROTOTYPE (M3 Water): carve rivers into world tiles and lay lakes and
+    // river ribbons as flat water (river_carve.wgsl).
+    sample_water_depth = -1.0e30;
+    if tile.info.y == 2u {
+        let texel = tile.scale.x * tile.face_u.w / f32(dispatch.cells);
+        let carve = river_carve(n, sample_value.height, sample_value.gradient, 0.75 * texel);
+        sample_value.height = carve.height;
+        sample_value.gradient = carve.gradient;
+        let ground_gradient = carve.gradient - n * dot(n, carve.gradient);
+        sample_ground_slope = length(ground_gradient) / (tile.scale.x + carve.height);
+        if carve.water > -1.0e29 {
+            sample_water_depth = carve.water - carve.height;
+            if carve.water > carve.height && carve.water > 0.0 {
+                sample_value.height = carve.water;
+                sample_value.gradient = vec3<f32>(0.0);
+            }
+        }
+    }
     let tangent_gradient = sample_value.gradient - n * dot(n, sample_value.gradient);
     let normal = normalize(n - tangent_gradient / (tile.scale.x + sample_value.height));
     return vec4<f32>(normal, sample_value.height);
 }
+
+// PROTOTYPE (M3 Water): water depth above the carved ground at the last
+// evaluated sample (-1e30 without lake or river water) and the ground slope,
+// for the water contour in page_water.
+var<private> sample_water_depth: f32;
+var<private> sample_ground_slope: f32;
 
 fn ordered(value: f32) -> u32 {
     let bits = bitcast<u32>(value);

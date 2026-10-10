@@ -5,7 +5,11 @@ use crate::terrain::{
     tier_a::erosion::Level,
     world_map::{CubeMap, neighbours},
 };
+use crate::terrain::noise::gradient_noise;
 use std::{cmp::Ordering, collections::BinaryHeap};
+
+/// Seed of the routing noise.
+const ROUTING_SEED: u32 = 0x7269_7672;
 
 /// No lake at a texel.
 pub const NO_LAKE: u32 = u32::MAX;
@@ -90,7 +94,23 @@ impl PartialOrd for Entry {
 pub fn fill(elevation: &CubeMap<f32>, level: &Level, params: &HydrologyParams) -> Fill {
     let n = elevation.n();
     let texels = 6 * n * n;
-    let original: Vec<f64> = elevation.data().iter().map(|h| f64::from(*h)).collect();
+    // Routing surface: the elevation plus a small smooth noise, so filled
+    // flats drain along wandering paths instead of straight lines radiating
+    // from their outlet (PROTOTYPE: stands in for flats resolution).
+    let frequency = n as f64 / (2.0 * params.routing_noise_texels.max(1.0));
+    let original: Vec<f64> = elevation
+        .data()
+        .iter()
+        .enumerate()
+        .map(|(k, h)| {
+            let h = f64::from(*h);
+            if h < 0.0 || params.routing_noise_m <= 0.0 {
+                return h;
+            }
+            let noise = gradient_noise(level.directions[k] * frequency, ROUTING_SEED).0;
+            (h + params.routing_noise_m * noise).max(0.0)
+        })
+        .collect();
     let mut ocean: Vec<bool> = original.iter().map(|h| *h < 0.0).collect();
     if !ocean.iter().any(|o| *o) {
         // No ocean: the lowest texel is the single outlet.
@@ -99,12 +119,14 @@ pub fn fill(elevation: &CubeMap<f32>, level: &Level, params: &HydrologyParams) -
             .expect("texels");
         ocean[lowest] = true;
     }
+    // Pits of the input surface (without the routing noise).
+    let raw = elevation.data();
     let pits_before = (0..texels)
         .filter(|&k| {
             !ocean[k]
                 && (0..8).all(|s| {
                     let m = level.neighbours[k][s] as usize;
-                    m == k || original[m] >= original[k]
+                    m == k || raw[m] >= raw[k]
                 })
         })
         .count();

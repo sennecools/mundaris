@@ -694,6 +694,16 @@ impl CelestialRenderer {
             .as_mut()
             .map_or_else(Vec::new, |atlas| atlas.take_ready_sources())
     }
+    pub(crate) fn take_world_fields(&mut self) -> Vec<crate::AtlasWorldFields> {
+        self.terrain_atlas
+            .as_mut()
+            .map_or_else(Vec::new, |atlas| atlas.take_world_fields())
+    }
+    pub(crate) fn set_world_rivers(&mut self, source: u64, words: Vec<u32>) {
+        if let Some(atlas) = &mut self.terrain_atlas {
+            atlas.set_world_rivers(source, words);
+        }
+    }
     pub(crate) fn take_collision_pages(&mut self) -> Vec<crate::AtlasCollisionPage> {
         self.terrain_atlas
             .as_mut()

@@ -13,6 +13,12 @@ impl FrameHost<'_> {
     pub fn take_terrain_ready_sources(&mut self) -> Vec<(u64, Option<String>)> {
         self.renderer.take_terrain_ready_sources()
     }
+    pub fn take_terrain_world_fields(&mut self) -> Vec<astrum_renderer::AtlasWorldFields> {
+        self.renderer.take_terrain_world_fields()
+    }
+    pub fn set_terrain_world_rivers(&mut self, source: u64, words: Vec<u32>) {
+        self.renderer.set_terrain_world_rivers(source, words);
+    }
     pub fn take_terrain_collision_pages(&mut self) -> Vec<astrum_renderer::AtlasCollisionPage> {
         self.renderer.take_terrain_collision_pages()
     }

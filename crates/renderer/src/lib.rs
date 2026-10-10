@@ -21,6 +21,7 @@ mod render_settings;
 mod shadows;
 pub mod sky;
 pub mod terrain_atlas;
+pub mod terrain_rivers;
 pub mod tier_a;
 #[cfg(feature = "terrain-capture")]
 pub mod terrain_capture;
@@ -54,6 +55,7 @@ pub use terrain_atlas::{
     TerrainAtlasReport, TerrainViewMode, collision_for_validation, ladder_noise_for_validation,
     lattice_hash_for_validation, produce_for_validation,
 };
+pub use terrain_rivers::AtlasWorldFields;
 pub use view::*;
 
 use tracing::info;
@@ -364,6 +366,20 @@ impl Renderer {
         self.celestial
             .as_mut()
             .map_or_else(Vec::new, |c| c.take_ready_sources())
+    }
+    /// PROTOTYPE (M3 Water): finished world bakes read back for the app's
+    /// hydrology worker (sources created with `hydrology`).
+    pub fn take_terrain_world_fields(&mut self) -> Vec<AtlasWorldFields> {
+        self.celestial
+            .as_mut()
+            .map_or_else(Vec::new, |c| c.take_world_fields())
+    }
+    /// PROTOTYPE (M3 Water): packed rivers for a world source; it reports
+    /// ready once they are bound.
+    pub fn set_terrain_world_rivers(&mut self, source: u64, words: Vec<u32>) {
+        if let Some(c) = self.celestial.as_mut() {
+            c.set_world_rivers(source, words);
+        }
     }
     /// Collision pages read back since the last call (pipeline §15.1).
     pub fn take_terrain_collision_pages(&mut self) -> Vec<AtlasCollisionPage> {

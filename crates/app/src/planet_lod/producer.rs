@@ -64,6 +64,11 @@ pub fn atlas_source(recipe: &ProducerRecipe) -> Result<AtlasSource> {
         ProducerRecipe::World(world) => AtlasSource::World(Box::new(AtlasWorldSource {
             bake: super::tier_a::bake_inputs(world.field.inputs()),
             surface: super::tier_a::surface(world.field.look()),
+            // PROTOTYPE (M3 Water): bodies with macro erosion get rivers.
+            hydrology: world
+                .field
+                .inputs()
+                .has(astrum_world::terrain::archetype::TierAStage::Erosion),
         })),
     })
 }

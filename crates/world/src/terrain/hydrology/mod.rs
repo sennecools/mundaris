@@ -23,6 +23,7 @@
 //! floodplain) blended by bed slope; no GPU mirror tests yet.
 pub mod carve;
 pub mod flood;
+pub mod gpu;
 pub mod rivers;
 #[cfg(test)]
 mod tests;
@@ -40,6 +41,10 @@ pub const NO_RECEIVER: u32 = u32::MAX;
 pub struct HydrologyParams {
     /// Fill gradient added per texel across flats and depressions (m).
     pub epsilon_m: f64,
+    /// Amplitude (m) and wavelength (texels) of the routing noise added to
+    /// land before filling.
+    pub routing_noise_m: f64,
+    pub routing_noise_texels: f64,
     /// A filled region is a lake when it is deeper than this somewhere (m).
     pub lake_min_depth_m: f64,
     /// Smallest lake, in texels.
@@ -83,6 +88,8 @@ impl HydrologyParams {
     pub fn prototype() -> Self {
         Self {
             epsilon_m: 1.0e-3,
+            routing_noise_m: 1.5,
+            routing_noise_texels: 3.0,
             lake_min_depth_m: 2.0,
             lake_min_texels: 3,
             endorheic_ratio: 4.0,
